@@ -7,7 +7,8 @@ from typing import Any, Iterable
 
 
 SECONDS_PER_DAY = 86400
-SCORING_VERSION = 7
+SCORING_VERSION = 8
+WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 TRADE_BEHAVIOR_EXCLUDE_RATE = 0.5
 ESPORTS_TAGS = {
@@ -511,7 +512,7 @@ def build_candidate_wallets_from_holders(
     return candidates[:max_candidate_wallets]
 
 
-def wilson_lower_bound(successes: int, n: int, z: float = 1.96) -> float:
+def wilson_lower_bound(successes: int, n: int, z: float = WILSON_Z) -> float:
     if n <= 0:
         return 0.0
     p = successes / n
@@ -584,6 +585,7 @@ def summarize_closed_positions(
         "esports_roi": round(realized_pnl / total_cost, 8) if total_cost else 0.0,
         "median_market_roi": round(median(rois), 8) if rois else 0.0,
         "positive_market_rate": round(positive / count, 8) if count else 0.0,
+        "wilson_z": WILSON_Z,
         "wilson_win_rate_lower_bound": round(wilson_lower_bound(positive, count), 8),
         "avg_position_size": round(total_bought / count, 6) if count else 0.0,
         "median_position_size": round(median(sizes), 6) if sizes else 0.0,

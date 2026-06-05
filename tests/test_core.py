@@ -478,6 +478,34 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(summary["esports_roi"], 1.0)
         self.assertEqual(summary["median_market_roi"], 1.0)
 
+    def test_closed_position_wilson_uses_80_percent_confidence(self):
+        positions = []
+        for index in range(11):
+            positions.append(
+                {
+                    "conditionId": f"m{index}",
+                    "totalBought": 100,
+                    "realizedPnl": 60,
+                    "avgPrice": 0.5,
+                    "timestamp": 100 + index,
+                }
+            )
+        for index in range(11, 13):
+            positions.append(
+                {
+                    "conditionId": f"m{index}",
+                    "totalBought": 100,
+                    "realizedPnl": -50,
+                    "avgPrice": 0.5,
+                    "timestamp": 100 + index,
+                }
+            )
+
+        summary = summarize_closed_positions(positions, {f"m{index}" for index in range(13)}, now_ts=200)
+
+        self.assertEqual(summary["wilson_z"], 1.28)
+        self.assertAlmostEqual(summary["wilson_win_rate_lower_bound"], 0.68063869)
+
     def test_low_edge_profit_rate_is_excluded_by_roi_floor(self):
         positions = [
             {"conditionId": f"m{i}", "totalBought": 100, "realizedPnl": 2, "avgPrice": 0.98, "timestamp": 100 + i}
@@ -2880,8 +2908,8 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.max_requests_per_second, 10)
         self.assertEqual(args.request_burst, 5)
         self.assertEqual(args.max_retry_after_seconds, 60)
-        self.assertEqual(args.max_closed_positions_per_wallet, 500)
-        self.assertEqual(args.max_esports_closed_positions_per_wallet, 50)
+        self.assertEqual(args.max_closed_positions_per_wallet, 1000)
+        self.assertEqual(args.max_esports_closed_positions_per_wallet, 100)
         self.assertEqual(args.min_profile_participated_markets, 3)
         self.assertEqual(args.min_profile_avg_market_cash, 1_500)
         self.assertEqual(args.market_trades_cache_ttl_days, 7)

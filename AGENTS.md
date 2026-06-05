@@ -139,13 +139,14 @@ ROI as display context, not the primary A/B criterion.
 and excluded from win rate, ROI, and sample count. Track them separately as
 `neutral_market_count`.
 
-A/B grading uses Wilson win-rate lower bound so small perfect samples do not
-beat larger strong samples. It also compares Wilson lower bound against entry
-price, because breakeven win rate equals buy price in binary markets. A-grade
-wallets need enough filtered samples, enough capital at risk, low entry price,
-positive entry edge, and non-bot/non-stale behavior. Losses lower Wilson and are
-recorded in reasons, but a large strong sample can still qualify. Very small
-capital wallets are downgraded as experimental/noise.
+A/B grading uses Wilson win-rate lower bound at 80% confidence (`z=1.28`) so
+small perfect samples do not beat larger strong samples without making 2-3
+losses nearly fatal. It also compares Wilson lower bound against entry price,
+because breakeven win rate equals buy price in binary markets. A-grade wallets
+need enough filtered samples, enough capital at risk, low entry price, positive
+entry edge, and non-bot/non-stale behavior. Losses lower Wilson and are recorded
+in reasons, but a large strong sample can still qualify. Very small capital
+wallets are downgraded as experimental/noise.
 
 The exported `smart_wallet_leaderboard.json` is stricter than raw A/B grading.
 It is a core A-wallet list for follow-signal use; B wallets remain useful for
@@ -181,14 +182,14 @@ market_batch_size = 50
 market_batch_count = 2
 default market coverage = top100 by volume
 max_pages_per_market = 3
-max_closed_positions_per_wallet = 500
-max_esports_closed_positions_per_wallet = 50
+max_closed_positions_per_wallet = 1000
+max_esports_closed_positions_per_wallet = 100
 check_current_positions = false by default
 ```
 
 Wallet profiling fetches recent closed positions sorted by timestamp, filters
 them by `conditionId in esports_classification_set`, and scores at most the
-latest 50 esports closed positions per wallet. The raw closed-position cap
+latest 100 esports closed positions per wallet. The raw closed-position cap
 remains higher so wallets with other categories mixed into their history can
 still surface enough esports records.
 

@@ -141,9 +141,12 @@ wallets by default. A wallet must be recently active, participate in at least 3
 discovery-window markets, have meaningful average market size, have no
 same-condition two-sided market flags, and have no tail-entry flags.
 
-Wallet history is capped for scoring: each profile uses at most the latest 50
-closed esports main markets found in that wallet's recent closed-position
-history. Non-esports markets are filtered out by conditionId before scoring.
+Wallet history is capped for scoring: each profile reads up to 1000 recent raw
+closed positions and scores at most the latest 100 closed esports main markets
+found in that wallet's history. Non-esports markets are filtered out by
+conditionId before scoring. Wilson lower bound uses 80% confidence (`z=1.28`)
+for ranking so strong wallets with a few historical losses are not treated like
+noise.
 
 Tail entry means late timing plus high average entry price. Plain late entry is
 only an observation field: a wallet may keep buying after match start if it keeps
