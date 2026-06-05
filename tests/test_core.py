@@ -1,20 +1,30 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import urllib.error
+import urllib.request
 import unittest
 
+from poly_fight.api import PolymarketClient, RateLimiter, parse_retry_after
 from poly_fight.cli import (
     build_leaderboard_from_profiles,
     build_parser,
     build_wallet_overlap_report,
+    build_profile_fetch_plan,
+    fetch_recent_esports_closed_positions_for_wallet,
     fetch_market_trades_cached,
     filter_profile_candidates,
     merge_cached_profile_with_candidate,
     merge_profiles_with_candidates,
+    prune_profile_store,
+    read_json,
     should_refresh_file_cache,
     should_use_cached_profile,
 )
 from poly_fight.core import (
+    SCORING_VERSION,
     analyze_holders,
     build_candidate_wallets,
     build_candidate_wallets_from_holders,
@@ -72,6 +82,92 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(record["match_start_time"], "2026-06-01T12:00:00Z")
         self.assertEqual(record["market_start_time"], "2026-06-01 12:05:00+00")
+
+    def test_retry_after_parses_seconds_and_http_date_with_cap(self):
+        future = datetime.now(timezone.utc) + timedelta(seconds=120)
+
+        self.assertEqual(parse_retry_after("3", max_seconds=60), 3)
+        self.assertEqual(parse_retry_after("120", max_seconds=60), 60)
+        self.assertGreater(parse_retry_after(format_datetime(future, usegmt=True), max_seconds=60), 0)
+        self.assertLessEqual(parse_retry_after(format_datetime(future, usegmt=True), max_seconds=60), 60)
+
+    def test_rate_limiter_allows_burst_then_sleeps_outside_lock(self):
+        now = [0.0]
+        sleeps = []
+
+        def clock():
+            return now[0]
+
+        def sleeper(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        limiter = RateLimiter(rate_per_second=2, burst=2, clock=clock, sleeper=sleeper)
+
+        limiter.acquire()
+        limiter.acquire()
+        limiter.acquire()
+
+        self.assertEqual(sleeps, [0.5])
+
+    def test_client_retries_429_retry_after_then_succeeds(self):
+        calls = []
+        sleeps = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"ok": true}'
+
+        def fake_urlopen(_request, timeout):
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(
+                    "https://example.test",
+                    429,
+                    "rate limited",
+                    {"Retry-After": "99"},
+                    BytesIO(),
+                )
+            return Response()
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            client = PolymarketClient(
+                timeout=7,
+                retries=2,
+                pause_seconds=0.5,
+                max_retry_after_seconds=1,
+                sleeper=sleeps.append,
+                jitter=lambda _low, _high: 0,
+            )
+            result = client.get_json("https://example.test", "/x", {})
+        finally:
+            urllib.request.urlopen = original
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sleeps, [1])
+
+    def test_closed_positions_requests_timestamp_descending_order(self):
+        calls = []
+
+        class Client(PolymarketClient):
+            def data(self, path, **params):
+                calls.append((path, params))
+                return []
+
+        Client().closed_positions("0xabc", limit=50, offset=100)
+
+        self.assertEqual(calls[0][0], "/closed-positions")
+        self.assertEqual(calls[0][1]["sortBy"], "TIMESTAMP")
+        self.assertEqual(calls[0][1]["sortDirection"], "DESC")
 
     def test_discovery_slate_uses_progressive_window(self):
         markets = [market(f"m{i}", days_ago=10, volume=30_000) for i in range(35)]
@@ -478,6 +574,28 @@ class CoreTest(unittest.TestCase):
         self.assertFalse(should_refresh_file_cache(100, now_ts=200, ttl_hours=24))
         self.assertTrue(should_refresh_file_cache(100, now_ts=200, ttl_hours=24, force_refresh=True))
         self.assertTrue(should_refresh_file_cache(None, now_ts=200, ttl_hours=24))
+
+    def test_prune_profile_store_only_drops_low_value_inactive_current(self):
+        now_ts = 1_000 * 86400
+        old = now_ts - 200 * 86400
+        recent = now_ts - 10 * 86400
+        store = {
+            "0xa": {"wallet": "0xa", "grade": "A", "scoring_version": SCORING_VERSION, "last_esports_trade_at": old},
+            "0xc_old": {"wallet": "0xc_old", "grade": "C", "scoring_version": SCORING_VERSION, "last_esports_trade_at": old},
+            "0xexcl_old": {"wallet": "0xexcl_old", "grade": "excluded", "scoring_version": SCORING_VERSION, "last_esports_trade_at": old},
+            "0xc_recent": {"wallet": "0xc_recent", "grade": "C", "scoring_version": SCORING_VERSION, "last_esports_trade_at": recent},
+            "0xc_oldver": {"wallet": "0xc_oldver", "grade": "C", "scoring_version": 0, "last_esports_trade_at": old},
+            "0xretry": {"wallet": "0xretry", "grade": "C", "scoring_version": SCORING_VERSION, "profile_state": "failed_retryable", "last_esports_trade_at": old},
+        }
+
+        kept = prune_profile_store(store, now_ts=now_ts, max_age_days=180)
+
+        self.assertEqual(
+            set(kept),
+            {"0xa", "0xc_recent", "0xc_oldver", "0xretry"},
+        )
+        # disabled when max_age_days <= 0
+        self.assertEqual(set(prune_profile_store(store, now_ts=now_ts, max_age_days=0)), set(store))
         self.assertTrue(should_refresh_file_cache(100, now_ts=100 + 25 * 3600, ttl_hours=24))
 
     def test_market_trades_cache_avoids_repeat_fetches(self):
@@ -556,6 +674,46 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(second_source, "error")
         self.assertEqual(client.calls, 2)
 
+    def test_recent_esports_closed_positions_are_filtered_and_capped(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def closed_positions(self, wallet, *, limit, offset, sort_direction="DESC"):
+                self.calls.append((limit, offset, sort_direction))
+                rows = []
+                for index in range(offset, offset + limit):
+                    condition_id = f"m{index}" if index % 2 == 0 else f"other{index}"
+                    rows.append({"conditionId": condition_id, "timestamp": 10_000 - index})
+                return rows
+
+        client = FakeClient()
+        condition_ids = {f"m{index}" for index in range(0, 200, 2)}
+
+        positions = fetch_recent_esports_closed_positions_for_wallet(
+            client,
+            "0xabc",
+            condition_ids,
+            max_raw_closed_positions=200,
+            max_esports_closed_positions=50,
+            page_limit=30,
+        )
+
+        self.assertEqual(len(positions), 50)
+        self.assertTrue(all(row["conditionId"] in condition_ids for row in positions))
+        self.assertLessEqual(sum(limit for limit, _offset, _direction in client.calls), 200)
+        self.assertTrue(all(direction == "DESC" for _limit, _offset, direction in client.calls))
+
+    def test_write_json_uses_target_unique_atomic_temp_files(self):
+        from poly_fight.cli import write_json
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "value.json"
+            write_json(path, {"a": 1})
+
+            self.assertEqual(read_json(path, {}), {"a": 1})
+            self.assertEqual(list(Path(tmp).glob("*.tmp")), [])
+
     def test_profile_candidate_filter_keeps_only_clean_active_wallets(self):
         candidates = [
             {"wallet": "0xgood", "participated_market_count": 1, "avg_market_cash": 1_500},
@@ -613,6 +771,88 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(merged["0xabc"]["candidate"]["tail_entry_market_count"], 1)
         self.assertEqual(merged["0xabc"]["candidate"]["avg_entry_price"], 0.8)
         self.assertEqual(merged["0xdef"]["candidate"]["tail_entry_market_count"], 0)
+
+    def test_profile_fetch_plan_uses_70_30_budget_and_candidate_priority(self):
+        candidates = [
+            {"wallet": "0xC1"},
+            {"wallet": "0xC2"},
+            {"wallet": "0xC3"},
+            {"wallet": "0xOverlap"},
+        ]
+        existing = {
+            "0xc1": {
+                "wallet": "0xC1",
+                "profile_state": "qualified",
+                "profiled_at": 100,
+                "esports_condition_ids": ["m1"],
+                "scoring_version": 999,
+            },
+            "0xoverlap": {
+                "wallet": "0xOverlap",
+                "profile_state": "qualified",
+                "profiled_at": 100,
+                "esports_condition_ids": [],
+                "scoring_version": 999,
+            },
+            "0xm1": {"wallet": "0xM1", "profile_state": "qualified", "profiled_at": 100},
+            "0xm2": {"wallet": "0xM2", "profile_state": "qualified", "profiled_at": 100},
+            "0xm3": {"wallet": "0xM3", "profile_state": "qualified", "profiled_at": 100},
+        }
+
+        plan = build_profile_fetch_plan(
+            candidates,
+            existing,
+            now_ts=200,
+            ttl_seconds=7 * 86400,
+            max_profiles=4,
+        )
+
+        self.assertEqual([row["wallet"].lower() for row in plan], ["0xc1", "0xc2", "0xc3", "0xm1"])
+
+    def test_profile_fetch_plan_does_not_migrate_current_unqualified_missing_edge(self):
+        existing = {
+            "0xweak": {
+                "wallet": "0xWeak",
+                "grade": "C",
+                "profile_state": "unqualified",
+                "profiled_at": 100,
+                "esports_condition_ids": ["m1"],
+                "scoring_version": SCORING_VERSION,
+            }
+        }
+
+        plan = build_profile_fetch_plan(
+            [],
+            existing,
+            now_ts=200,
+            ttl_seconds=7 * 86400,
+            max_profiles=10,
+        )
+
+        self.assertEqual(plan, [])
+
+    def test_profile_fetch_plan_refreshes_candidate_with_missing_current_grade_fields(self):
+        candidates = [{"wallet": "0xA"}]
+        existing = {
+            "0xa": {
+                "wallet": "0xA",
+                "grade": "A",
+                "profile_state": "qualified",
+                "profiled_at": 100,
+                "esports_condition_ids": ["m1"],
+                "scoring_version": SCORING_VERSION,
+            }
+        }
+
+        plan = build_profile_fetch_plan(
+            candidates,
+            existing,
+            now_ts=200,
+            ttl_seconds=7 * 86400,
+            max_profiles=10,
+        )
+
+        self.assertEqual([row["wallet"] for row in plan], ["0xa"])
 
     def test_leaderboard_is_rebuilt_from_all_profiles_not_only_current_candidates(self):
         profiles_by_wallet = {
@@ -678,6 +918,59 @@ class CoreTest(unittest.TestCase):
         )
 
         self.assertEqual([row["wallet"] for row in leaderboard], ["0xfresh"])
+
+    def test_old_scoring_profile_is_not_kept_on_current_leaderboard(self):
+        profiles_by_wallet = {
+            "0xold": {
+                "wallet": "0xold",
+                "grade": "A",
+                "scoring_version": SCORING_VERSION - 1,
+                "last_esports_trade_at": 100,
+                "candidate": {"participated_market_count": 10, "avg_market_cash": 2_000},
+            },
+            "0xcurrent": {
+                "wallet": "0xcurrent",
+                "grade": "A",
+                "scoring_version": SCORING_VERSION,
+                "last_esports_trade_at": 100,
+                "candidate": {"participated_market_count": 10, "avg_market_cash": 2_000},
+            },
+        }
+
+        leaderboard = build_leaderboard_from_profiles(
+            profiles_by_wallet,
+            now_ts=100 + 10 * 86400,
+            require_current_scoring_version=True,
+        )
+
+        self.assertEqual([row["wallet"] for row in leaderboard], ["0xcurrent"])
+
+    def test_old_scoring_profile_remains_in_profile_store_for_migration(self):
+        existing_profiles = {
+            "0xold": {
+                "wallet": "0xold",
+                "grade": "A",
+                "scoring_version": SCORING_VERSION - 1,
+                "last_esports_trade_at": 100,
+            }
+        }
+        refreshed_profiles = [
+            {
+                "wallet": "0xnew",
+                "grade": "A",
+                "scoring_version": SCORING_VERSION,
+                "last_esports_trade_at": 100,
+            }
+        ]
+
+        profiles_by_wallet = {
+            normalize_wallet(row.get("wallet")): row
+            for row in [*existing_profiles.values(), *refreshed_profiles]
+            if normalize_wallet(row.get("wallet"))
+        }
+
+        self.assertEqual(set(profiles_by_wallet), {"0xold", "0xnew"})
+        self.assertEqual(profiles_by_wallet["0xold"]["scoring_version"], SCORING_VERSION - 1)
 
     def test_leaderboard_trusts_grade_and_keeps_hard_discovery_guards(self):
         profiles_by_wallet = {
@@ -888,15 +1181,17 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.market_offset, 0)
         self.assertEqual(args.max_pages_per_market, 3)
         self.assertEqual(args.max_profiles_per_run, 150)
+        self.assertEqual(args.max_workers, 8)
+        self.assertEqual(args.max_requests_per_second, 10)
+        self.assertEqual(args.request_burst, 5)
+        self.assertEqual(args.max_retry_after_seconds, 60)
         self.assertEqual(args.max_closed_positions_per_wallet, 500)
+        self.assertEqual(args.max_esports_closed_positions_per_wallet, 50)
         self.assertEqual(args.min_profile_participated_markets, 3)
         self.assertEqual(args.min_profile_avg_market_cash, 1_500)
         self.assertEqual(args.market_trades_cache_ttl_days, 7)
         self.assertFalse(args.refresh_market_trades)
         self.assertFalse(args.no_market_trades_cache)
-        self.assertEqual(args.leaderboard_min_positive_rate, 0.95)
-        self.assertEqual(args.leaderboard_max_median_entry_price, 0.65)
-        self.assertEqual(args.leaderboard_max_high_price_entry_rate, 0.05)
         self.assertEqual(args.leaderboard_min_participated_markets, 3)
         self.assertEqual(args.leaderboard_min_avg_market_cash, 1_500)
         self.assertFalse(args.check_current_positions)

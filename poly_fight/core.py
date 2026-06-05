@@ -646,6 +646,7 @@ def profile_candidate_wallet(
             "reasons": ["profile_failed"],
             "error": str(exc),
             "profiled_at": now_ts,
+            "scoring_version": SCORING_VERSION,
         }
 
 

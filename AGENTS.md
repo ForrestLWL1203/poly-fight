@@ -155,6 +155,9 @@ Default collection should be fast and focused:
 ```text
 reuse esports_classification_set cache for 24h unless --refresh-classification
 reuse raw_market_trades cache for 7d unless --refresh-market-trades
+max_workers = 8
+max_requests_per_second = 10
+request_burst = 5
 target_markets = 20
 discovery_lookback_days = 14
 market_batch_size = 50
@@ -162,7 +165,28 @@ market_batch_count = 2
 default market coverage = top100 by volume
 max_pages_per_market = 3
 max_closed_positions_per_wallet = 500
+max_esports_closed_positions_per_wallet = 50
 check_current_positions = false by default
+```
+
+Wallet profiling fetches recent closed positions sorted by timestamp, filters
+them by `conditionId in esports_classification_set`, and scores at most the
+latest 50 esports closed positions per wallet. The raw closed-position cap
+remains higher so wallets with other categories mixed into their history can
+still surface enough esports records.
+
+Network collection is concurrent but rate-limited. Treat rps as the true
+throughput knob and workers as waiting slots. If Polymarket returns more 429/503
+responses, lower `--max-requests-per-second` first. `--max-requests-per-second
+0` disables the limiter only for debugging; pair it with lower workers.
+
+Profile fetching uses a deterministic budget before dispatch:
+
+```text
+70% new profile candidates
+30% existing-profile schema/scoring migration
+unused budget spills to the other side
+candidate wallet wins when duplicated across both sets
 ```
 
 For broader discovery, prefer batching over a single huge run:

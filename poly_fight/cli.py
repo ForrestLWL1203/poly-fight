@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import math
 import json
+import os
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .api import PolymarketClient
+from .api import PolymarketClient, RateLimiter
 from .core import (
     SCORING_VERSION,
     analyze_holders,
@@ -17,10 +21,25 @@ from .core import (
     classify_wallet,
     event_to_market_record,
     normalize_wallet,
+    parse_dt,
     profile_candidate_wallet,
     summarize_closed_positions,
     to_float,
 )
+
+
+def build_client(args: argparse.Namespace) -> PolymarketClient:
+    rate_per_second = getattr(args, "max_requests_per_second", 10)
+    rate_limiter = (
+        RateLimiter(rate_per_second=rate_per_second, burst=getattr(args, "request_burst", 5))
+        if rate_per_second and rate_per_second > 0
+        else None
+    )
+    return PolymarketClient(
+        timeout=args.timeout,
+        rate_limiter=rate_limiter,
+        max_retry_after_seconds=getattr(args, "max_retry_after_seconds", 60),
+    )
 
 
 DATA_DIR = Path("data")
@@ -34,7 +53,14 @@ def read_json(path: Path, default: Any) -> Any:
 
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
 
 
 def fetch_market_trades(
@@ -118,24 +144,34 @@ def fetch_market_trades_cached(
     return trades, partial, "error" if errored else "api"
 
 
-def fetch_closed_positions_for_wallet(
+def fetch_recent_esports_closed_positions_for_wallet(
     client: PolymarketClient,
     wallet: str,
+    esports_condition_ids: set[str],
     *,
-    max_closed_positions: int,
+    max_raw_closed_positions: int,
+    max_esports_closed_positions: int,
     page_limit: int = 500,
 ) -> list[dict]:
     positions: list[dict] = []
+    fetched = 0
     offset = 0
-    while len(positions) < max_closed_positions:
-        batch = client.closed_positions(wallet, limit=page_limit, offset=offset)
+    while fetched < max_raw_closed_positions and len(positions) < max_esports_closed_positions:
+        limit = min(page_limit, max_raw_closed_positions - fetched)
+        batch = client.closed_positions(wallet, limit=limit, offset=offset)
         if not batch:
             break
-        positions.extend(batch)
-        if len(batch) < page_limit:
+        fetched += len(batch)
+        for position in batch:
+            condition_id = str(position.get("conditionId") or position.get("condition_id") or "").lower()
+            if condition_id in esports_condition_ids:
+                positions.append(position)
+                if len(positions) >= max_esports_closed_positions:
+                    break
+        if len(batch) < limit:
             break
-        offset += page_limit
-    return positions[:max_closed_positions]
+        offset += limit
+    return positions[:max_esports_closed_positions]
 
 
 def should_use_cached_profile(cached: dict[str, Any] | None, *, now_ts: int, ttl_seconds: int) -> bool:
@@ -195,11 +231,14 @@ def build_leaderboard_from_profiles(
     min_participated_markets: int = 1,
     min_avg_market_cash: float = 1_500,
     require_tail_entry_field: bool = False,
+    require_current_scoring_version: bool = False,
 ) -> list[dict[str, Any]]:
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
     max_inactive_seconds = max_inactive_days * 86400
     leaderboard = []
     for profile in profiles_by_wallet.values():
+        if require_current_scoring_version and int(profile.get("scoring_version") or 0) != SCORING_VERSION:
+            continue
         if profile.get("grade") != "A":
             continue
         last_trade = int(profile.get("last_esports_trade_at") or 0)
@@ -262,6 +301,35 @@ def merge_cached_profile_with_candidate(cached: dict[str, Any], candidate: dict[
     return {**cached, "candidate": candidate}
 
 
+def prune_profile_store(
+    profiles_by_wallet: dict[str, dict[str, Any]],
+    *,
+    now_ts: int,
+    max_age_days: int,
+) -> dict[str, dict[str, Any]]:
+    """Drop only low-value, current-version, long-inactive profiles.
+
+    Keeps A/B (the asset), any stale-schema profile (migration still needs them),
+    and failed_retryable (still owed a retry). Prunes only grade C/excluded that
+    are current scoring version and have not traded esports within max_age_days.
+    """
+    if max_age_days <= 0:
+        return profiles_by_wallet
+    cutoff = now_ts - max_age_days * 86400
+    kept: dict[str, dict[str, Any]] = {}
+    for wallet, profile in profiles_by_wallet.items():
+        current_version = int(profile.get("scoring_version") or 0) == SCORING_VERSION
+        prunable = (
+            current_version
+            and profile.get("grade") in {"C", "excluded"}
+            and profile.get("profile_state") != "failed_retryable"
+            and int(profile.get("last_esports_trade_at") or 0) < cutoff
+        )
+        if not prunable:
+            kept[wallet] = profile
+    return kept
+
+
 def merge_profiles_with_candidates(
     profiles_by_wallet: dict[str, dict[str, Any]],
     candidates: list[dict[str, Any]],
@@ -274,18 +342,128 @@ def merge_profiles_with_candidates(
     return merged
 
 
+def profile_needs_schema_migration(profile: dict[str, Any] | None) -> bool:
+    if not profile:
+        return False
+    if int(profile.get("scoring_version") or 0) != SCORING_VERSION:
+        return True
+    if not isinstance(profile.get("esports_condition_ids"), list):
+        return True
+    if profile.get("grade") in {"A", "B"} and "entry_edge" not in profile:
+        return True
+    return False
+
+
+def build_profile_fetch_plan(
+    profile_candidates: list[dict[str, Any]],
+    existing_profiles: dict[str, dict[str, Any]],
+    *,
+    now_ts: int,
+    ttl_seconds: int,
+    max_profiles: int,
+) -> list[dict[str, Any]]:
+    if max_profiles <= 0:
+        return []
+
+    candidate_items: list[dict[str, Any]] = []
+    seen_candidates: set[str] = set()
+    for candidate in profile_candidates:
+        wallet = normalize_wallet(candidate.get("wallet"))
+        if not wallet or wallet in seen_candidates:
+            continue
+        seen_candidates.add(wallet)
+        normalized = {**candidate, "wallet": wallet}
+        cached = existing_profiles.get(wallet)
+        if (
+            not should_use_cached_profile(cached, now_ts=now_ts, ttl_seconds=ttl_seconds)
+            or profile_needs_schema_migration(cached)
+        ):
+            candidate_items.append(normalized)
+
+    migration_items: list[dict[str, Any]] = []
+    seen_migration: set[str] = set()
+    for wallet, profile in existing_profiles.items():
+        wallet = normalize_wallet(wallet or profile.get("wallet"))
+        if not wallet or wallet in seen_candidates or wallet in seen_migration:
+            continue
+        if not profile_needs_schema_migration(profile):
+            continue
+        seen_migration.add(wallet)
+        candidate = dict(profile.get("candidate") or {})
+        candidate["wallet"] = wallet
+        migration_items.append(candidate)
+
+    candidate_budget = min(len(candidate_items), math.ceil(max_profiles * 0.7))
+    selected_candidates = candidate_items[:candidate_budget]
+    selected_wallets = {row["wallet"] for row in selected_candidates}
+
+    remaining = max_profiles - len(selected_candidates)
+    selected_migrations = [row for row in migration_items if row["wallet"] not in selected_wallets][:remaining]
+    selected_wallets.update(row["wallet"] for row in selected_migrations)
+
+    remaining = max_profiles - len(selected_candidates) - len(selected_migrations)
+    if remaining > 0:
+        selected_candidates.extend(
+            row for row in candidate_items[candidate_budget:] if row["wallet"] not in selected_wallets
+        )
+        selected_candidates = selected_candidates[: candidate_budget + remaining]
+
+    return [*selected_candidates, *selected_migrations]
+
+
+def run_ordered_io_tasks(items: list[Any], worker, *, max_workers: int) -> list[Any]:
+    if len(items) <= 1 or max_workers <= 1:
+        results = []
+        for item in items:
+            try:
+                results.append(worker(item))
+            except Exception as exc:
+                results.append(exc)
+        return results
+    results: list[Any] = [None] * len(items)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(worker, item): index for index, item in enumerate(items)}
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception as exc:
+                results[index] = exc
+    return results
+
+
+def make_retryable_profile(candidate: dict[str, Any], exc: Exception, *, now_ts: int) -> dict[str, Any]:
+    wallet = normalize_wallet(candidate.get("wallet"))
+    return {
+        "wallet": wallet,
+        "candidate": {**candidate, "wallet": wallet},
+        "grade": "unknown",
+        "profile_state": "failed_retryable",
+        "reasons": ["profile_failed"],
+        "error": str(exc),
+        "profiled_at": now_ts,
+        "scoring_version": SCORING_VERSION,
+    }
+
+
 def command_build_leaderboard(args: argparse.Namespace) -> int:
-    client = PolymarketClient(timeout=args.timeout)
+    client = build_client(args)
     data_dir = Path(args.data_dir)
     now_ts = int(datetime.now(timezone.utc).timestamp())
 
     classification_path = data_dir / "esports_classification_set.json"
+    classification_meta_path = data_dir / "esports_classification_set.meta.json"
+    classification_meta = {"gamma_pages": args.gamma_pages}
     classification_source = "api"
-    if classification_path.exists() and not should_refresh_file_cache(
-        classification_path.stat().st_mtime,
-        now_ts=now_ts,
-        ttl_hours=args.classification_cache_ttl_hours,
-        force_refresh=args.refresh_classification,
+    if (
+        classification_path.exists()
+        and read_json(classification_meta_path, None) == classification_meta
+        and not should_refresh_file_cache(
+            classification_path.stat().st_mtime,
+            now_ts=now_ts,
+            ttl_hours=args.classification_cache_ttl_hours,
+            force_refresh=args.refresh_classification,
+        )
     ):
         classification_set = read_json(classification_path, [])
         classification_source = "cache"
@@ -293,6 +471,7 @@ def command_build_leaderboard(args: argparse.Namespace) -> int:
         closed_events = client.list_events_paginated(closed=True, active=None, max_pages=args.gamma_pages)
         classification_set = build_classification_set(closed_events)
         write_json(classification_path, classification_set)
+        write_json(classification_meta_path, classification_meta)
 
     lookback_steps = (args.discovery_lookback_days,) if args.discovery_lookback_days else (7, 14, 30)
     market_batch_size = args.market_batch_size or 50
@@ -319,12 +498,25 @@ def command_build_leaderboard(args: argparse.Namespace) -> int:
     market_trades_cache_hits = 0
     market_trades_api_fetches = 0
     if args.discovery_source == "holders":
-        for market in discovery_slate:
+        def fetch_holders_for_market(market: dict[str, Any]) -> tuple[str, list[dict], list[float], bool]:
             condition_id = market["condition_id"]
             try:
-                holders_by_market[condition_id] = client.holders(condition_id, limit=args.holders_limit)
-                prices_by_market[condition_id] = market.get("outcome_prices") or []
-            except RuntimeError:
+                return condition_id, client.holders(condition_id, limit=args.holders_limit), market.get("outcome_prices") or [], False
+            except Exception:
+                return condition_id, [], market.get("outcome_prices") or [], True
+
+        holder_results = run_ordered_io_tasks(
+            discovery_slate,
+            fetch_holders_for_market,
+            max_workers=args.max_workers,
+        )
+        for result in holder_results:
+            if isinstance(result, Exception):
+                continue
+            condition_id, holders, prices, partial = result
+            holders_by_market[condition_id] = holders
+            prices_by_market[condition_id] = prices
+            if partial:
                 partial_markets.append(condition_id)
         candidates = build_candidate_wallets_from_holders(
             holders_by_market,
@@ -336,20 +528,34 @@ def command_build_leaderboard(args: argparse.Namespace) -> int:
             max_candidate_wallets=args.max_candidate_wallets,
         )
     else:
-        for market in discovery_slate:
+        def fetch_trades_for_market(market: dict[str, Any]) -> tuple[str, list[dict], bool, str]:
             condition_id = market["condition_id"]
-            trades, partial, trades_source = fetch_market_trades_cached(
-                client,
-                condition_id,
-                data_dir=data_dir,
-                now_ts=now_ts,
-                page_limit=args.trades_page_limit,
-                max_pages=args.max_pages_per_market,
-                min_trade_cash=args.min_trade_cash,
-                cache_ttl_days=args.market_trades_cache_ttl_days,
-                force_refresh=args.refresh_market_trades,
-                use_cache=not args.no_market_trades_cache,
-            )
+            try:
+                trades, partial, trades_source = fetch_market_trades_cached(
+                    client,
+                    condition_id,
+                    data_dir=data_dir,
+                    now_ts=now_ts,
+                    page_limit=args.trades_page_limit,
+                    max_pages=args.max_pages_per_market,
+                    min_trade_cash=args.min_trade_cash,
+                    cache_ttl_days=args.market_trades_cache_ttl_days,
+                    force_refresh=args.refresh_market_trades,
+                    use_cache=not args.no_market_trades_cache,
+                )
+                return condition_id, trades, partial, trades_source
+            except Exception:
+                return condition_id, [], True, "error"
+
+        trade_results = run_ordered_io_tasks(
+            discovery_slate,
+            fetch_trades_for_market,
+            max_workers=args.max_workers,
+        )
+        for result in trade_results:
+            if isinstance(result, Exception):
+                continue
+            condition_id, trades, partial, trades_source = result
             trades_by_market[condition_id] = trades
             if partial:
                 partial_markets.append(condition_id)
@@ -359,8 +565,6 @@ def command_build_leaderboard(args: argparse.Namespace) -> int:
                 market_trades_api_fetches += 1
         market_end_times = {}
         market_start_times = {}
-        from .core import parse_dt
-
         for market in discovery_slate:
             end_dt = parse_dt(market.get("end_date"))
             if end_dt:
@@ -392,24 +596,25 @@ def command_build_leaderboard(args: argparse.Namespace) -> int:
         normalize_wallet(row.get("wallet")): row for row in read_json(data_dir / "wallet_profiles.json", [])
     }
     condition_ids = {row["condition_id"] for row in classification_set}
-    profiles = []
-    profiled_count = 0
-    for candidate in profile_candidates:
-        wallet = candidate["wallet"]
-        cached = existing_profiles.get(wallet)
-        if should_use_cached_profile(cached, now_ts=now_ts, ttl_seconds=args.profile_refresh_ttl_days * 86400):
-            rated = merge_cached_profile_with_candidate(cached, candidate)
-        elif profiled_count >= args.max_profiles_per_run:
-            continue
-        else:
-            profiled_count += 1
-            rated = profile_candidate_wallet(
+    profile_fetch_plan = build_profile_fetch_plan(
+        profile_candidates,
+        existing_profiles,
+        now_ts=now_ts,
+        ttl_seconds=args.profile_refresh_ttl_days * 86400,
+        max_profiles=args.max_profiles_per_run,
+    )
+
+    def profile_one_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return profile_candidate_wallet(
                 candidate,
                 condition_ids,
-                closed_positions_loader=lambda w: fetch_closed_positions_for_wallet(
+                closed_positions_loader=lambda w: fetch_recent_esports_closed_positions_for_wallet(
                     client,
                     w,
-                    max_closed_positions=args.max_closed_positions_per_wallet,
+                    condition_ids,
+                    max_raw_closed_positions=args.max_closed_positions_per_wallet,
+                    max_esports_closed_positions=args.max_esports_closed_positions_per_wallet,
                 ),
                 current_positions_loader=(
                     (lambda w: client.positions(w, limit=100))
@@ -418,12 +623,26 @@ def command_build_leaderboard(args: argparse.Namespace) -> int:
                 ),
                 now_ts=now_ts,
             )
-        profiles.append(rated)
+        except Exception as exc:
+            return make_retryable_profile(candidate, exc, now_ts=now_ts)
+
+    profile_results = run_ordered_io_tasks(
+        profile_fetch_plan,
+        profile_one_candidate,
+        max_workers=args.max_workers,
+    )
+    profiles = [
+        make_retryable_profile(profile_fetch_plan[index], result, now_ts=now_ts)
+        if isinstance(result, Exception)
+        else result
+        for index, result in enumerate(profile_results)
+    ]
+    profiled_count = len(profile_fetch_plan)
 
     profiles_by_wallet = {
         normalize_wallet(row.get("wallet")): row
         for row in [*existing_profiles.values(), *profiles]
-        if int(row.get("scoring_version") or 0) == SCORING_VERSION
+        if normalize_wallet(row.get("wallet"))
     }
     profiles_by_wallet = merge_profiles_with_candidates(profiles_by_wallet, candidates)
     leaderboard = build_leaderboard_from_profiles(
@@ -432,37 +651,14 @@ def command_build_leaderboard(args: argparse.Namespace) -> int:
         min_participated_markets=args.leaderboard_min_participated_markets,
         min_avg_market_cash=args.leaderboard_min_avg_market_cash,
         require_tail_entry_field=True,
-    )
-    for row in [item for item in leaderboard if not item.get("esports_condition_ids")]:
-        if profiled_count >= args.max_profiles_per_run:
-            break
-        candidate = row.get("candidate") or {"wallet": row.get("wallet")}
-        profiled_count += 1
-        refreshed = profile_candidate_wallet(
-            candidate,
-            condition_ids,
-            closed_positions_loader=lambda w: fetch_closed_positions_for_wallet(
-                client,
-                w,
-                max_closed_positions=args.max_closed_positions_per_wallet,
-            ),
-            current_positions_loader=(
-                (lambda w: client.positions(w, limit=100))
-                if args.check_current_positions
-                else (lambda w: [])
-            ),
-            now_ts=now_ts,
-        )
-        profiles_by_wallet[normalize_wallet(refreshed.get("wallet"))] = refreshed
-    profiles_by_wallet = merge_profiles_with_candidates(profiles_by_wallet, candidates)
-    leaderboard = build_leaderboard_from_profiles(
-        profiles_by_wallet,
-        now_ts=now_ts,
-        min_participated_markets=args.leaderboard_min_participated_markets,
-        min_avg_market_cash=args.leaderboard_min_avg_market_cash,
-        require_tail_entry_field=True,
+        require_current_scoring_version=True,
     )
     overlap_report = build_wallet_overlap_report(leaderboard)
+    profiles_by_wallet = prune_profile_store(
+        profiles_by_wallet,
+        now_ts=now_ts,
+        max_age_days=args.profile_store_max_age_days,
+    )
     write_json(data_dir / "wallet_profiles.json", list(profiles_by_wallet.values()))
     write_json(data_dir / "smart_wallet_leaderboard.json", leaderboard)
     write_json(data_dir / "leaderboard_wallet_overlap.json", overlap_report)
@@ -515,11 +711,7 @@ def find_active_market(client: PolymarketClient, args: argparse.Namespace) -> di
         if args.condition_id and record.get("condition_id") != args.condition_id.lower():
             continue
         end = record.get("end_date")
-        end_dt = None
-        if end:
-            from .core import parse_dt
-
-            end_dt = parse_dt(end)
+        end_dt = parse_dt(end) if end else None
         if not args.event_slug and not args.condition_id:
             if not end_dt:
                 continue
@@ -533,7 +725,7 @@ def find_active_market(client: PolymarketClient, args: argparse.Namespace) -> di
 
 
 def command_analyze_event(args: argparse.Namespace) -> int:
-    client = PolymarketClient(timeout=args.timeout)
+    client = build_client(args)
     data_dir = Path(args.data_dir)
     leaderboard_rows = read_json(data_dir / "smart_wallet_leaderboard.json", [])
     leaderboard = {normalize_wallet(row.get("wallet")): row for row in leaderboard_rows}
@@ -556,14 +748,13 @@ def command_analyze_event(args: argparse.Namespace) -> int:
         **result,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    from .core import parse_dt
-
     end_dt = parse_dt(market.get("end_date"))
     if end_dt:
         output["hours_to_end"] = round((end_dt - datetime.now(timezone.utc)).total_seconds() / 3600, 2)
     write_json(data_dir / "last_event_analysis.json", output)
     print(json.dumps(output, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
+
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -576,6 +767,10 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--gamma-pages", type=int, default=10)
         subparser.add_argument("--refresh-classification", action="store_true")
         subparser.add_argument("--classification-cache-ttl-hours", type=int, default=24)
+        subparser.add_argument("--max-workers", type=int, default=8)
+        subparser.add_argument("--max-requests-per-second", type=float, default=10)
+        subparser.add_argument("--request-burst", type=int, default=5)
+        subparser.add_argument("--max-retry-after-seconds", type=float, default=60)
         subparser.add_argument("--min-market-volume", type=float, default=25_000)
         subparser.add_argument("--fallback-min-market-volume", type=float, default=10_000)
         subparser.add_argument("--discovery-lookback-days", type=int, default=14)
@@ -600,16 +795,15 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--max-candidate-wallets", type=int, default=1000)
         subparser.add_argument("--max-profiles-per-run", type=int, default=150)
         subparser.add_argument("--max-closed-positions-per-wallet", type=int, default=500)
+        subparser.add_argument("--max-esports-closed-positions-per-wallet", type=int, default=50)
         subparser.add_argument("--min-profile-participated-markets", type=int, default=3)
         subparser.add_argument("--min-profile-avg-market-cash", type=float, default=1_500)
-        subparser.add_argument("--leaderboard-min-positive-rate", type=float, default=0.95, help=argparse.SUPPRESS)
-        subparser.add_argument("--leaderboard-max-median-entry-price", type=float, default=0.65, help=argparse.SUPPRESS)
-        subparser.add_argument("--leaderboard-max-high-price-entry-rate", type=float, default=0.05, help=argparse.SUPPRESS)
         subparser.add_argument("--leaderboard-min-participated-markets", type=int, default=3)
         subparser.add_argument("--leaderboard-min-avg-market-cash", type=float, default=1_500)
         subparser.add_argument("--allow-dirty-profile-candidates", action="store_true")
         subparser.add_argument("--check-current-positions", action="store_true")
         subparser.add_argument("--profile-refresh-ttl-days", type=int, default=7)
+        subparser.add_argument("--profile-store-max-age-days", type=int, default=180)
         subparser.set_defaults(func=command_build_leaderboard)
 
     build = subparsers.add_parser("build-leaderboard")

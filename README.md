@@ -24,6 +24,17 @@ python3 -m poly_fight.cli collect
 python3 -m poly_fight.cli collect --discovery-source holders
 ```
 
+Collection uses bounded network concurrency by default:
+
+```bash
+python3 -m poly_fight.cli collect --max-workers 8 --max-requests-per-second 10 --request-burst 5
+```
+
+`--max-requests-per-second` is the real throughput ceiling. If 429/503 errors
+increase, lower rps first, for example `--max-requests-per-second 4`.
+`--max-requests-per-second 0` disables rate limiting for debugging; use that
+carefully and lower workers at the same time.
+
 Analyze a current esports event:
 
 ```bash
@@ -49,6 +60,10 @@ only core A-grade wallets for follow-signal research. A wallet must be recently
 active, participate in at least 3 discovery-window markets, have meaningful
 average market size, have no same-condition two-sided market flags, and have no
 tail-entry flags.
+
+Wallet history is capped for scoring: each profile uses at most the latest 50
+closed esports main markets found in that wallet's recent closed-position
+history. Non-esports markets are filtered out by conditionId before scoring.
 
 Tail entry means late timing plus high average entry price. Plain late entry is
 only an observation field: a wallet may keep buying after match start if it keeps
