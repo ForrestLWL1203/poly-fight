@@ -47,6 +47,7 @@ Run one paper follow tick:
 
 ```bash
 python3 -m poly_fight.cli follow --stake-usdc 1
+python3 -m poly_fight.cli follow --stake-usdc 1 --quarantine-sell-frac 0.2 --consensus-block-opposite
 ```
 
 Run the paper follow loop:
@@ -69,6 +70,16 @@ After cold start, the client fetches up to `--user-trades-max-pages` pages
 (default 3) until it reaches the previous cursor. BUY trades in watched esports
 markets create paper legs; SELL trades mirror-exit the open paper position.
 
+The follow runner keeps tracking markets that already have open paper signals,
+even after match start. If strict wallets appear on opposite outcomes of the
+same conditionId, both sides are marked `contested=True` and
+`would_follow=False` while still being retained for learning. The first
+post-start price snapshot is stored as closing-line value (`wallet_clv` /
+`our_clv`). Material same-market SELLs, including split sells whose cumulative
+size exceeds `--quarantine-sell-frac` (default 0.2), and opposite-side BUYs
+quarantine the wallet in SQLite so it is excluded from later follow ticks until
+the next clean leaderboard cycle.
+
 On wallet cold start, the follow loop also checks current positions once. If an
 A wallet already holds a watched future-start esports market and the current
 price is still within `--max-slippage-over-entry` of that wallet's average
@@ -81,6 +92,23 @@ the tick. Broader event/build/write failures are caught by `run`, logged as
 only stop the process after `--max-consecutive-error-seconds` (default 600) of
 continuous failures.
 
+Run the read-only dashboard API:
+
+```bash
+export POLY_FIGHT_DASH_PASSWORD='change-me'
+export POLY_FIGHT_DASH_COOKIE_SECRET='change-me-too'
+python3 -m poly_fight.cli serve --data-dir data --host 127.0.0.1 --port 8787
+```
+
+Open `http://127.0.0.1:8787`, then login with `admin` and the dashboard
+password. For VPS domain deployment, put the service behind nginx + TLS and run
+with `--host 0.0.0.0 --cookie-secure`. The dashboard is read-only: it reads
+`follow.db`, `smart_wallet_leaderboard.json`, `active_market_cache.json`, and
+`follow_run_log.jsonl`; only the wallet-trades endpoint proxies live Data API
+requests with the same rate-limited client. Overview and wallet APIs expose v4
+quality fields such as contested count, clean-vs-contested performance, average
+CLV, and quarantine status.
+
 Outputs are written under `data/`:
 
 ```text
@@ -92,17 +120,26 @@ smart_wallet_leaderboard.json
 build_summary.json
 last_event_analysis.json
 follow/follow_state.json
-follow/follow_signals_open.json
-follow/follow_results.jsonl
-follow/follow_performance.json
+follow/follow.db
+follow/active_market_cache.json
 follow/follow_run_log.jsonl
 ```
 
+`follow.db` is the primary long-running follow state. It stores wallet cursors,
+open/closed paper signals, legs, behavior events, results, wallet quarantine,
+CLV/contested fields, and performance.
+`follow_state.json` is now a small compatibility file with DB/cache metadata.
+`active_market_cache.json` is refreshed on the event-cache TTL instead of being
+rewritten inside state every tick. `follow_performance.json` is treated as a
+legacy migration input or optional export, not a per-tick synchronized state
+file. Collection caches and
+`smart_wallet_leaderboard.json` remain JSON files.
+
 `smart_wallet_leaderboard.json` is intentionally strict. By default it exports
-only core A-grade wallets for follow-signal research. A wallet must be recently
-active, participate in at least 3 discovery-window markets, have meaningful
-average market size, have no same-condition two-sided market flags, and have no
-tail-entry flags.
+only core A-grade wallets for follow-signal research, capped at the top 30
+wallets by default. A wallet must be recently active, participate in at least 3
+discovery-window markets, have meaningful average market size, have no
+same-condition two-sided market flags, and have no tail-entry flags.
 
 Wallet history is capped for scoring: each profile uses at most the latest 50
 closed esports main markets found in that wallet's recent closed-position

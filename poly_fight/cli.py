@@ -15,6 +15,8 @@ from typing import Any
 from .api import PolymarketClient, RateLimiter
 from .core import (
     SCORING_VERSION,
+    TRADE_BEHAVIOR_EXCLUDE_RATE,
+    TRADE_BEHAVIOR_MIN_MARKETS,
     analyze_holders,
     build_candidate_wallets,
     build_candidate_wallets_from_holders,
@@ -30,7 +32,10 @@ from .core import (
 )
 from .follow import (
     aggregate_follow_performance,
+    apply_closing_line_snapshots,
+    apply_contested_flags,
     bootstrap_position_trades,
+    contested_markets,
     current_position_keys,
     desired_tick_interval,
     detect_new_positions,
@@ -49,6 +54,7 @@ from .follow import (
     upsert_follow_signal,
     winner_outcome_index,
 )
+from .storage import FollowStore
 
 
 def build_client(args: argparse.Namespace) -> PolymarketClient:
@@ -242,20 +248,31 @@ def load_active_market_cache(
     client: PolymarketClient,
     state: dict[str, Any],
     *,
+    cache_path: Path | None = None,
     now_ts: int,
     gamma_pages: int,
     ttl_seconds: int,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any], str]:
-    cached = state.get("active_market_cache") or {}
+    legacy_cached = state.pop("active_market_cache", None) or {}
+    if cache_path and legacy_cached:
+        write_json(cache_path, legacy_cached)
+        if now_ts - int(legacy_cached.get("updated_at") or 0) < ttl_seconds:
+            markets = {row["condition_id"]: row for row in legacy_cached.get("markets") or []}
+            return markets, state, "legacy_state_cache"
+    cached = read_json(cache_path, {}) if cache_path else {}
     if cached and now_ts - int(cached.get("updated_at") or 0) < ttl_seconds:
         markets = {row["condition_id"]: row for row in cached.get("markets") or []}
         return markets, state, "cache"
     events = client.list_events_paginated(closed=False, active=True, max_pages=gamma_pages, order="startTime")
     markets = market_records_from_events(events)
-    state["active_market_cache"] = {
+    cache_value = {
         "updated_at": now_ts,
         "markets": list(markets.values()),
     }
+    if cache_path:
+        write_json(cache_path, cache_value)
+    else:
+        state["active_market_cache"] = cache_value
     return markets, state, "api"
 
 
@@ -282,6 +299,7 @@ def fetch_resolutions_for_open_signals(
     open_signals: list[dict[str, Any]],
     *,
     state: dict[str, Any],
+    store: FollowStore | None = None,
     now_ts: int,
     gamma_pages: int,
     ttl_seconds: int,
@@ -295,16 +313,35 @@ def fetch_resolutions_for_open_signals(
     if not eligible_signals:
         return {}
     needed = {str(signal.get("condition_id") or "").lower() for signal in eligible_signals}
-    cached = state.get("closed_market_cache") or {}
-    if cached and now_ts - int(cached.get("updated_at") or 0) < ttl_seconds:
+    cached = state.pop("closed_market_cache", None) or {}
+    if store:
+        closed_markets, _updated_at, fresh = store.load_market_cache(
+            cache_kind="closed",
+            now_ts=now_ts,
+            ttl_seconds=ttl_seconds,
+        )
+        if fresh:
+            cached = {}
+        elif cached:
+            store.save_market_cache(
+                {row["condition_id"]: row for row in cached.get("markets") or []},
+                cache_kind="closed",
+                updated_at=int(cached.get("updated_at") or 0),
+            )
+    if not store and cached and now_ts - int(cached.get("updated_at") or 0) < ttl_seconds:
         closed_markets = {row["condition_id"]: row for row in cached.get("markets") or []}
+    elif store and closed_markets and fresh:
+        pass
     else:
         events = client.list_events_paginated(closed=True, active=None, max_pages=gamma_pages, order="endDate")
         closed_markets = market_records_from_events(events)
-        state["closed_market_cache"] = {
-            "updated_at": now_ts,
-            "markets": list(closed_markets.values()),
-        }
+        if store:
+            store.save_market_cache(closed_markets, cache_kind="closed", updated_at=now_ts)
+        else:
+            state["closed_market_cache"] = {
+                "updated_at": now_ts,
+                "markets": list(closed_markets.values()),
+            }
     resolutions = {}
     for condition_id, market in closed_markets.items():
         if condition_id in needed:
@@ -470,6 +507,7 @@ def build_leaderboard_from_profiles(
     min_avg_market_cash: float = 1_500,
     require_tail_entry_field: bool = False,
     require_current_scoring_version: bool = False,
+    max_leaderboard_wallets: int = 30,
 ) -> list[dict[str, Any]]:
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
     max_inactive_seconds = max_inactive_days * 86400
@@ -478,6 +516,23 @@ def build_leaderboard_from_profiles(
         if require_current_scoring_version and int(profile.get("scoring_version") or 0) != SCORING_VERSION:
             continue
         if profile.get("grade") != "A":
+            continue
+        if to_float(profile.get("esports_roi")) < 0.30:
+            continue
+        behavior_market_count = int(profile.get("historical_trade_behavior_market_count") or 0)
+        sold_rate = to_float(profile.get("sold_before_resolution_market_rate"))
+        if (
+            int(profile.get("sold_before_resolution_market_count") or 0) > 0
+            and behavior_market_count >= TRADE_BEHAVIOR_MIN_MARKETS
+            and sold_rate > TRADE_BEHAVIOR_EXCLUDE_RATE
+        ):
+            continue
+        two_sided_trade_rate = to_float(profile.get("two_sided_trade_market_rate"))
+        if (
+            int(profile.get("two_sided_trade_market_count") or 0) > 0
+            and behavior_market_count >= TRADE_BEHAVIOR_MIN_MARKETS
+            and two_sided_trade_rate > TRADE_BEHAVIOR_EXCLUDE_RATE
+        ):
             continue
         last_trade = int(profile.get("last_esports_trade_at") or 0)
         if not last_trade or now_ts - last_trade > max_inactive_seconds:
@@ -495,7 +550,10 @@ def build_leaderboard_from_profiles(
         if int(candidate.get("tail_entry_market_count") or 0) > 0:
             continue
         leaderboard.append(profile)
-    return sorted(leaderboard, key=lambda row: (row.get("grade", ""), -to_float(row.get("esports_roi"))))
+    ranked = sorted(leaderboard, key=lambda row: (row.get("grade", ""), -to_float(row.get("esports_roi"))))
+    if max_leaderboard_wallets > 0:
+        return ranked[:max_leaderboard_wallets]
+    return ranked
 
 
 def build_wallet_overlap_report(wallets: list[dict[str, Any]]) -> dict[str, Any]:
@@ -689,6 +747,7 @@ def command_build_leaderboard(args: argparse.Namespace, client: PolymarketClient
     data_dir = Path(args.data_dir)
     now_ts = int(datetime.now(timezone.utc).timestamp())
 
+    lookback_steps = (args.discovery_lookback_days,) if args.discovery_lookback_days else (7, 14, 30)
     classification_path = data_dir / "esports_classification_set.json"
     classification_meta_path = data_dir / "esports_classification_set.meta.json"
     classification_meta = {"gamma_pages": args.gamma_pages}
@@ -707,11 +766,13 @@ def command_build_leaderboard(args: argparse.Namespace, client: PolymarketClient
         classification_source = "cache"
     else:
         closed_events = client.list_events_paginated(closed=True, active=None, max_pages=args.gamma_pages)
-        classification_set = build_classification_set(closed_events)
+        classification_set = build_classification_set(
+            closed_events,
+            now=datetime.fromtimestamp(now_ts, timezone.utc),
+        )
         write_json(classification_path, classification_set)
         write_json(classification_meta_path, classification_meta)
 
-    lookback_steps = (args.discovery_lookback_days,) if args.discovery_lookback_days else (7, 14, 30)
     market_batch_size = args.market_batch_size or 50
     market_count = args.max_markets_per_run or market_batch_size * args.market_batch_count
     market_offset = args.market_offset
@@ -833,7 +894,7 @@ def command_build_leaderboard(args: argparse.Namespace, client: PolymarketClient
     existing_profiles = {
         normalize_wallet(row.get("wallet")): row for row in read_json(data_dir / "wallet_profiles.json", [])
     }
-    condition_ids = {row["condition_id"] for row in classification_set}
+    condition_ids = {row["condition_id"] for row in discovery_slate}
     profile_fetch_plan = build_profile_fetch_plan(
         profile_candidates,
         existing_profiles,
@@ -858,6 +919,11 @@ def command_build_leaderboard(args: argparse.Namespace, client: PolymarketClient
                     (lambda w: client.positions(w, limit=100))
                     if args.check_current_positions
                     else (lambda w: [])
+                ),
+                historical_trades_loader=lambda w, condition_id: client.trades_for_user_market(
+                    w,
+                    condition_id,
+                    limit=500,
                 ),
                 now_ts=now_ts,
             )
@@ -890,6 +956,7 @@ def command_build_leaderboard(args: argparse.Namespace, client: PolymarketClient
         min_avg_market_cash=args.leaderboard_min_avg_market_cash,
         require_tail_entry_field=True,
         require_current_scoring_version=True,
+        max_leaderboard_wallets=args.max_leaderboard_wallets,
     )
     overlap_report = build_wallet_overlap_report(leaderboard)
     profiles_by_wallet = prune_profile_store(
@@ -1007,25 +1074,41 @@ def command_follow(
     follow_dir = data_dir / "follow"
     now_ts = int(datetime.now(timezone.utc).timestamp())
 
-    leaderboard_rows = read_json(data_dir / "smart_wallet_leaderboard.json", [])
-    follow_wallets = eligible_follow_wallets(
-        leaderboard_rows,
-        now_ts=now_ts,
-        recency_days=args.follow_recency_days,
-    )
     state_path = follow_dir / "follow_state.json"
     open_path = follow_dir / "follow_signals_open.json"
     perf_path = follow_dir / "follow_performance.json"
     results_path = follow_dir / "follow_results.jsonl"
     run_log_path = follow_dir / "follow_run_log.jsonl"
+    active_cache_path = follow_dir / "active_market_cache.json"
+    store = FollowStore(follow_dir / "follow.db")
+    store.import_legacy_json(
+        state_path=state_path,
+        open_path=open_path,
+        results_path=results_path,
+        perf_path=perf_path,
+    )
+    leaderboard_path = data_dir / "smart_wallet_leaderboard.json"
+    leaderboard_rows = read_json(leaderboard_path, [])
+    leaderboard_wallets = {normalize_wallet(row.get("wallet")) for row in leaderboard_rows if normalize_wallet(row.get("wallet"))}
+    leaderboard_validated_at = int(leaderboard_path.stat().st_mtime) if leaderboard_path.exists() else 0
+    store.clear_revalidated_quarantine(leaderboard_wallets, validated_at=leaderboard_validated_at)
+    quarantined_wallets = set(store.load_wallet_quarantine())
+    follow_wallets = eligible_follow_wallets(
+        leaderboard_rows,
+        now_ts=now_ts,
+        recency_days=args.follow_recency_days,
+        quarantined_wallets=quarantined_wallets,
+    )
 
     state = read_json(state_path, {"wallet_trade_state": {}})
-    open_signals = read_json(open_path, [])
-    performance = read_json(perf_path, {})
+    wallet_trade_state = store.load_wallet_trade_state()
+    open_signals = store.load_open_signals()
+    performance = store.load_performance()
 
     active_markets, state, active_source = load_active_market_cache(
         client,
         state,
+        cache_path=active_cache_path,
         now_ts=now_ts,
         gamma_pages=args.gamma_pages,
         ttl_seconds=args.event_cache_ttl_minutes * 60,
@@ -1045,17 +1128,28 @@ def command_follow(
         max_tick_seconds=args.max_tick_seconds,
     )
 
-    wallet_trade_state = dict(state.get("wallet_trade_state") or {})
+    wallet_trade_state = dict(wallet_trade_state or state.get("wallet_trade_state") or {})
     total_new_trade_count = 0
     watched_new_trade_count = 0
     ignored_trade_count = 0
     new_signal_count = 0
     exited_signal_count = 0
     hedge_event_count = 0
+    quarantine_event_count = 0
+    contested_signal_count = 0
+    closing_line_snapshot_count = 0
     cold_start_wallet_count = 0
     bootstrap_position_count = 0
     bootstrap_position_request_count = 0
     trade_request_count = 0
+
+    tracked_condition_ids = {str(condition_id).lower() for condition_id in watched}
+    tracked_condition_ids.update(str(signal.get("condition_id") or "").lower() for signal in open_signals)
+    markets_for_follow = {
+        condition_id: market
+        for condition_id, market in active_markets.items()
+        if condition_id in tracked_condition_ids or condition_id in watched
+    }
 
     if gate_open and follow_wallets:
         def fetch_trades_for_wallet(row: dict[str, Any]) -> tuple[str, list[dict], list[dict]]:
@@ -1106,33 +1200,45 @@ def command_follow(
                         open_signals,
                         wallet=wallet,
                         trades=bootstrap_trades,
-                        markets_by_condition=watched,
+                        markets_by_condition=markets_for_follow or watched,
                         now_ts=now_ts,
                         stake_usdc=args.stake_usdc,
                         max_follow_legs=args.max_follow_legs,
                         max_slippage=args.max_slippage_over_entry,
                         require_pre_match=args.require_pre_match,
+                        quarantine_sell_frac=args.quarantine_sell_frac,
                     )
                     after_ids = {signal.get("signal_id") for signal in open_signals}
                     new_signal_count += len(after_ids - before_ids)
                     bootstrap_position_count += len(bootstrap_trades)
+                    for event in stats.get("quarantine_events") or []:
+                        store.upsert_wallet_quarantine(event.get("wallet"), reason=str(event.get("reason") or ""), ts=int(event.get("timestamp") or now_ts))
+                        quarantine_event_count += 1
                 wallet_trade_state[wallet] = {
                     "last_trade_cursor": next_cursor,
                     "last_seen_at": now_ts,
                 }
                 continue
-            watched_trades = [trade for trade in new_trades if trade_condition_id(trade) in watched]
+            tracked_condition_ids = {str(condition_id).lower() for condition_id in watched}
+            tracked_condition_ids.update(str(signal.get("condition_id") or "").lower() for signal in open_signals)
+            markets_for_follow = {
+                condition_id: market
+                for condition_id, market in active_markets.items()
+                if condition_id in tracked_condition_ids or condition_id in watched
+            }
+            watched_trades = [trade for trade in new_trades if trade_condition_id(trade) in tracked_condition_ids]
             before_ids = {signal.get("signal_id") for signal in open_signals}
             open_signals, stats = process_follow_trades(
                 open_signals,
                 wallet=wallet,
                 trades=watched_trades,
-                markets_by_condition=watched,
+                markets_by_condition=markets_for_follow or watched,
                 now_ts=now_ts,
                 stake_usdc=args.stake_usdc,
                 max_follow_legs=args.max_follow_legs,
                 max_slippage=args.max_slippage_over_entry,
                 require_pre_match=args.require_pre_match,
+                quarantine_sell_frac=args.quarantine_sell_frac,
             )
             after_ids = {signal.get("signal_id") for signal in open_signals}
             new_signal_count += len(after_ids - before_ids)
@@ -1141,6 +1247,9 @@ def command_follow(
             ignored_trade_count += stats.get("ignored_trade_count", 0) + (len(new_trades) - len(watched_trades))
             exited_signal_count += stats.get("exited_signal_count", 0)
             hedge_event_count += stats.get("hedge_event_count", 0)
+            for event in stats.get("quarantine_events") or []:
+                store.upsert_wallet_quarantine(event.get("wallet"), reason=str(event.get("reason") or ""), ts=int(event.get("timestamp") or now_ts))
+                quarantine_event_count += 1
             wallet_trade_state[wallet] = {
                 "last_trade_cursor": next_cursor,
                 "last_seen_at": now_ts,
@@ -1149,20 +1258,26 @@ def command_follow(
     state["wallet_trade_state"] = wallet_trade_state
     state["updated_at"] = now_ts
 
+    open_signals, clv_stats = apply_closing_line_snapshots(open_signals, active_markets, now_ts=now_ts)
+    closing_line_snapshot_count += clv_stats.get("closing_line_snapshot_count", 0)
+    if args.consensus_block_opposite:
+        contested_condition_ids = contested_markets(open_signals, now_ts=now_ts)
+        open_signals, contested_stats = apply_contested_flags(open_signals, contested_condition_ids, now_ts=now_ts)
+        contested_signal_count += contested_stats.get("contested_signal_count", 0)
+
     exited_signals = [signal for signal in open_signals if signal.get("status") == "exited"]
     open_signals = [signal for signal in open_signals if signal.get("status") != "exited"]
     resolutions = fetch_resolutions_for_open_signals(
         client,
         open_signals,
         state=state,
+        store=store,
         now_ts=now_ts,
         gamma_pages=args.gamma_pages,
         ttl_seconds=args.event_cache_ttl_minutes * 60,
     )
     open_signals, settled = settle_open_signals(open_signals, resolutions, now_ts=now_ts)
     result_events = [*exited_signals, *settled]
-    if result_events:
-        append_jsonl(results_path, result_events)
     if result_events:
         performance = aggregate_follow_performance(performance, result_events)
     else:
@@ -1185,6 +1300,9 @@ def command_follow(
         "new_signal_count": new_signal_count,
         "exited_signal_count": exited_signal_count,
         "hedge_event_count": hedge_event_count,
+        "quarantine_event_count": quarantine_event_count,
+        "contested_signal_count": contested_signal_count,
+        "closing_line_snapshot_count": closing_line_snapshot_count,
         "open_signal_count": len(open_signals),
         "settled_signal_count": len(settled),
         "desired_next_interval_seconds": next_interval,
@@ -1193,19 +1311,24 @@ def command_follow(
     from .follow import prune_jsonl
 
     run_log_rows = prune_jsonl([*run_log_rows, run_log_row], now_ts=now_ts, retention_days=args.run_log_retention_days)
-    result_rows = read_jsonl(results_path)
-    result_rows = prune_jsonl(result_rows, now_ts=now_ts, retention_days=args.results_retention_days)
-
+    store.save_follow_snapshot(
+        wallet_trade_state=wallet_trade_state,
+        open_signals=open_signals,
+        result_events=result_events,
+        performance=performance,
+    )
+    state = {
+        "updated_at": now_ts,
+        "db_path": str(follow_dir / "follow.db"),
+        "active_market_cache_path": str(active_cache_path),
+        "schema_version": 1,
+    }
     write_json(state_path, state)
-    write_json(open_path, open_signals)
-    write_json(perf_path, performance)
     write_jsonl(run_log_path, run_log_rows)
-    if args.results_retention_days > 0:
-        write_jsonl(results_path, result_rows)
 
     summary = {
         **run_log_row,
-        "settled_result_count_total": len(result_rows),
+        "settled_result_count_total": len(store.load_results()),
         "output_dir": str(follow_dir),
     }
     if emit:
@@ -1314,6 +1437,35 @@ def command_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_serve(args: argparse.Namespace) -> int:
+    from .dashboard import DashboardConfig, create_server
+
+    password = os.environ.get("POLY_FIGHT_DASH_PASSWORD", "")
+    cookie_secret = os.environ.get("POLY_FIGHT_DASH_COOKIE_SECRET", "")
+    config = DashboardConfig(
+        data_dir=Path(args.data_dir),
+        host=args.host,
+        port=args.port,
+        username=args.user,
+        password=password,
+        cookie_secret=cookie_secret,
+        session_ttl_seconds=args.session_ttl_seconds,
+        cookie_secure=args.cookie_secure,
+        client=build_client(args),
+        observe_window_hours=args.observe_window_hours,
+    )
+    server = create_server(config)
+    host, port = server.server_address[:2]
+    print(f"dashboard listening on http://{host}:{port} data_dir={args.data_dir}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("dashboard stopped", flush=True)
+    finally:
+        server.server_close()
+    return 0
+
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Polymarket esports smart-wallet analysis")
@@ -1358,6 +1510,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--min-profile-avg-market-cash", type=float, default=1_500)
         subparser.add_argument("--leaderboard-min-participated-markets", type=int, default=3)
         subparser.add_argument("--leaderboard-min-avg-market-cash", type=float, default=1_500)
+        subparser.add_argument("--max-leaderboard-wallets", type=int, default=30)
         subparser.add_argument("--allow-dirty-profile-candidates", action="store_true")
         subparser.add_argument("--check-current-positions", action="store_true")
         subparser.add_argument("--profile-refresh-ttl-days", type=int, default=7)
@@ -1385,6 +1538,10 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--max-follow-legs", type=int, default=10)
         subparser.add_argument("--min-tick-seconds", type=int, default=180)
         subparser.add_argument("--max-tick-seconds", type=int, default=900)
+        subparser.add_argument("--consensus-min-same-side", type=int, default=1)
+        subparser.add_argument("--consensus-block-opposite", dest="consensus_block_opposite", action="store_true", default=True)
+        subparser.add_argument("--no-consensus-block-opposite", dest="consensus_block_opposite", action="store_false")
+        subparser.add_argument("--quarantine-sell-frac", type=float, default=0.2)
         subparser.add_argument("--max-workers", type=int, default=8)
         subparser.add_argument("--max-requests-per-second", type=float, default=10)
         subparser.add_argument("--request-burst", type=int, default=5)
@@ -1428,12 +1585,28 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-follow-legs", type=int, default=10)
     run.add_argument("--min-tick-seconds", type=int, default=180)
     run.add_argument("--max-tick-seconds", type=int, default=900)
+    run.add_argument("--consensus-min-same-side", type=int, default=1)
+    run.add_argument("--consensus-block-opposite", dest="consensus_block_opposite", action="store_true", default=True)
+    run.add_argument("--no-consensus-block-opposite", dest="consensus_block_opposite", action="store_false")
+    run.add_argument("--quarantine-sell-frac", type=float, default=0.2)
     run.add_argument("--error-retry-seconds", type=int, default=180)
     run.add_argument("--max-consecutive-error-seconds", type=int, default=600)
     run.add_argument("--pool-refresh-hours", type=float, default=24)
     run.add_argument("--skip-initial-build", action="store_true")
     run.add_argument("--max-run-ticks", type=int, default=0)
     run.set_defaults(func=command_run)
+
+    serve = subparsers.add_parser("serve", help="run read-only dashboard API")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8787)
+    serve.add_argument("--user", default="admin")
+    serve.add_argument("--session-ttl-seconds", type=int, default=12 * 3600)
+    serve.add_argument("--cookie-secure", action="store_true")
+    serve.add_argument("--observe-window-hours", type=float, default=24)
+    serve.add_argument("--max-requests-per-second", type=float, default=10)
+    serve.add_argument("--request-burst", type=int, default=5)
+    serve.add_argument("--max-retry-after-seconds", type=float, default=60)
+    serve.set_defaults(func=command_serve)
     return parser
 
 

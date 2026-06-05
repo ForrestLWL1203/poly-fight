@@ -7,7 +7,9 @@ from typing import Any, Iterable
 
 
 SECONDS_PER_DAY = 86400
-SCORING_VERSION = 4
+SCORING_VERSION = 7
+TRADE_BEHAVIOR_MIN_MARKETS = 4
+TRADE_BEHAVIOR_EXCLUDE_RATE = 0.5
 ESPORTS_TAGS = {
     "esports",
     "dota-2",
@@ -101,6 +103,34 @@ def is_binary_market(market: dict[str, Any]) -> bool:
     return isinstance(outcomes, list) and len(outcomes) == 2
 
 
+def is_settled_binary_prices(prices: list[float]) -> bool:
+    if len(prices) != 2:
+        return False
+    return sorted(round(price, 6) for price in prices) == [0.0, 1.0]
+
+
+def is_main_match_title(title: str) -> bool:
+    text = title.lower()
+    has_game_prefix = text.startswith(("dota 2:", "counter-strike:", "lol:", "valorant:"))
+    if has_game_prefix and " vs " in text:
+        return True
+    return " vs " in text and any(
+        marker in text
+        for marker in (
+            "bo1",
+            "bo2",
+            "bo3",
+            "bo5",
+            "best of",
+            "match",
+            "group",
+            "playoff",
+            "qualifier",
+            "final",
+        )
+    )
+
+
 def is_non_main_market(question: str) -> bool:
     q = question.lower()
     bad_fragments = [
@@ -163,12 +193,30 @@ def event_to_market_record(event: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def build_classification_set(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_classification_set(
+    events: Iterable[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+    lookback_days: int | None = None,
+) -> list[dict[str, Any]]:
+    now = now or datetime.now(timezone.utc)
     records: dict[str, dict[str, Any]] = {}
     for event in events:
         record = event_to_market_record(event)
-        if record:
-            records[record["condition_id"]] = record
+        if not record:
+            continue
+        end = parse_dt(record.get("end_date"))
+        if not end or end > now:
+            continue
+        if not is_settled_binary_prices(record.get("outcome_prices") or []):
+            continue
+        if not is_main_match_title(str(record.get("title") or record.get("question") or "")):
+            continue
+        if lookback_days is not None:
+            days_ago = (now - end).total_seconds() / SECONDS_PER_DAY
+            if days_ago < 0 or days_ago > lookback_days:
+                continue
+        records[record["condition_id"]] = record
     return sorted(records.values(), key=lambda row: row.get("end_date") or "", reverse=True)
 
 
@@ -493,24 +541,30 @@ def summarize_closed_positions(
         if realized_pnl == 0:
             neutral_market_count += 1
             continue
+        avg_price = to_float(position.get("avgPrice") or position.get("avg_price"))
+        cost_basis = total_bought * avg_price if avg_price > 0 else total_bought
         rows.append(
             {
                 "condition_id": condition_id,
                 "total_bought": total_bought,
+                "cost_basis": cost_basis,
                 "realized_pnl": realized_pnl,
-                "roi": realized_pnl / total_bought,
-                "avg_price": to_float(position.get("avgPrice") or position.get("avg_price")),
+                "profit_per_share": realized_pnl / total_bought,
+                "roi": realized_pnl / cost_basis if cost_basis > 0 else 0.0,
+                "avg_price": avg_price,
                 "timestamp": to_int(position.get("timestamp")),
             }
         )
 
     count = len(rows)
     total_bought = sum(row["total_bought"] for row in rows)
+    total_cost = sum(row["cost_basis"] for row in rows)
     realized_pnl = sum(row["realized_pnl"] for row in rows)
     positive = sum(1 for row in rows if row["realized_pnl"] > 0)
     losses = count - positive
     last_trade = max((row["timestamp"] for row in rows), default=0)
     rois = [row["roi"] for row in rows]
+    profits_per_share = [row["profit_per_share"] for row in rows]
     sizes = [row["total_bought"] for row in rows]
     entry_prices = [row["avg_price"] for row in rows if row["avg_price"] > 0]
     high_price_entries = sum(1 for row in rows if row["avg_price"] >= 0.90)
@@ -524,7 +578,10 @@ def summarize_closed_positions(
         "esports_condition_ids": condition_ids,
         "esports_realized_pnl": round(realized_pnl, 6),
         "esports_total_bought": round(total_bought, 6),
-        "esports_roi": round(realized_pnl / total_bought, 8) if total_bought else 0.0,
+        "esports_total_cost": round(total_cost, 6),
+        "avg_profit_per_share": round(realized_pnl / total_bought, 8) if total_bought else 0.0,
+        "median_profit_per_share": round(median(profits_per_share), 8) if profits_per_share else 0.0,
+        "esports_roi": round(realized_pnl / total_cost, 8) if total_cost else 0.0,
         "median_market_roi": round(median(rois), 8) if rois else 0.0,
         "positive_market_rate": round(positive / count, 8) if count else 0.0,
         "wilson_win_rate_lower_bound": round(wilson_lower_bound(positive, count), 8),
@@ -541,6 +598,60 @@ def summarize_closed_positions(
     }
 
 
+def summarize_historical_trade_behavior(
+    condition_ids: Iterable[str],
+    *,
+    historical_trades_loader,
+    material_sell_frac: float = 0.2,
+) -> dict[str, Any]:
+    sold_before_resolution_market_count = 0
+    two_sided_trade_market_count = 0
+    behavior_market_count = 0
+    for condition_id in sorted({str(value).lower() for value in condition_ids if value}):
+        trades = historical_trades_loader(condition_id)
+        behavior_market_count += 1
+        traded_outcomes = set()
+        buy_size_by_outcome: dict[int, float] = {}
+        sell_size_by_outcome: dict[int, float] = {}
+        for trade in trades or []:
+            side = str(trade.get("side") or trade.get("type") or "").upper()
+            size = to_float(trade.get("size") or trade.get("amount"))
+            if size <= 0:
+                continue
+            outcome_index = to_int(trade.get("outcomeIndex"), -1)
+            if outcome_index >= 0 and side in {"BUY", "SELL"}:
+                traded_outcomes.add(outcome_index)
+            if outcome_index >= 0 and side == "BUY":
+                buy_size_by_outcome[outcome_index] = buy_size_by_outcome.get(outcome_index, 0.0) + size
+            if outcome_index >= 0 and side == "SELL":
+                sell_size_by_outcome[outcome_index] = sell_size_by_outcome.get(outcome_index, 0.0) + size
+        has_material_sell = False
+        for outcome_index, sell_size in sell_size_by_outcome.items():
+            buy_size = buy_size_by_outcome.get(outcome_index, 0.0)
+            if buy_size > 0 and sell_size / buy_size > material_sell_frac:
+                has_material_sell = True
+                break
+        if has_material_sell:
+            sold_before_resolution_market_count += 1
+        if len(traded_outcomes) >= 2:
+            two_sided_trade_market_count += 1
+
+    return {
+        "historical_trade_behavior_market_count": behavior_market_count,
+        "sold_before_resolution_market_count": sold_before_resolution_market_count,
+        "sold_before_resolution_market_rate": round(
+            sold_before_resolution_market_count / behavior_market_count,
+            8,
+        )
+        if behavior_market_count
+        else 0.0,
+        "two_sided_trade_market_count": two_sided_trade_market_count,
+        "two_sided_trade_market_rate": round(two_sided_trade_market_count / behavior_market_count, 8)
+        if behavior_market_count
+        else 0.0,
+    }
+
+
 def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> dict[str, Any]:
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
     reasons = []
@@ -550,19 +661,75 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
     positive_rate = to_float(summary.get("positive_market_rate"))
     loss_count = to_int(summary.get("esports_loss_count"))
     total_bought = to_float(summary.get("esports_total_bought"))
+    total_cost = to_float(summary.get("esports_total_cost"))
+    historical_roi = to_float(summary.get("esports_roi"))
+    if historical_roi == 0:
+        if total_cost > 0:
+            historical_roi = pnl / total_cost
+        elif total_bought > 0:
+            historical_roi = pnl / total_bought
     median_entry = to_float(summary.get("median_entry_price"))
     wilson_lb = to_float(summary.get("wilson_win_rate_lower_bound"))
     entry_edge = wilson_lb - median_entry if median_entry > 0 else 0.0
     bot_score = to_int(summary.get("bot_like_score"))
+    sold_before_resolution = to_int(summary.get("sold_before_resolution_market_count"))
+    sold_before_resolution_rate = to_float(summary.get("sold_before_resolution_market_rate"))
+    two_sided_trades = to_int(summary.get("two_sided_trade_market_count"))
+    two_sided_trade_rate = to_float(summary.get("two_sided_trade_market_rate"))
+    trade_behavior_markets = to_int(summary.get("historical_trade_behavior_market_count"))
     last_trade = to_int(summary.get("last_esports_trade_at"))
     stale = not last_trade or (now_ts - last_trade) > 90 * SECONDS_PER_DAY
 
     if stale:
         reasons.append("stale")
+    if (
+        sold_before_resolution > 0
+        and trade_behavior_markets >= TRADE_BEHAVIOR_MIN_MARKETS
+        and sold_before_resolution_rate > TRADE_BEHAVIOR_EXCLUDE_RATE
+    ):
+        return {
+            **summary,
+            "entry_edge": round(entry_edge, 8),
+            "grade": "excluded",
+            "profile_state": "unqualified",
+            "reasons": ["sold_before_resolution"],
+        }
+    if (
+        two_sided_trades > 0
+        and trade_behavior_markets >= TRADE_BEHAVIOR_MIN_MARKETS
+        and two_sided_trade_rate > TRADE_BEHAVIOR_EXCLUDE_RATE
+    ):
+        return {
+            **summary,
+            "entry_edge": round(entry_edge, 8),
+            "grade": "excluded",
+            "profile_state": "unqualified",
+            "reasons": ["two_sided_trading"],
+        }
     if bot_score >= 70:
-        return {**summary, "grade": "excluded", "profile_state": "unqualified", "reasons": ["bot_like"]}
+        return {
+            **summary,
+            "entry_edge": round(entry_edge, 8),
+            "grade": "excluded",
+            "profile_state": "unqualified",
+            "reasons": ["bot_like"],
+        }
     if pnl <= 0:
-        return {**summary, "grade": "excluded", "profile_state": "unqualified", "reasons": ["negative_roi"]}
+        return {
+            **summary,
+            "entry_edge": round(entry_edge, 8),
+            "grade": "excluded",
+            "profile_state": "unqualified",
+            "reasons": ["negative_roi"],
+        }
+    if historical_roi < 0.30:
+        return {
+            **summary,
+            "entry_edge": round(entry_edge, 8),
+            "grade": "excluded",
+            "profile_state": "unqualified",
+            "reasons": ["low_historical_roi"],
+        }
     if count < 8:
         reasons.append("thin_sample")
     if total_bought < 1_000:
@@ -627,6 +794,7 @@ def profile_candidate_wallet(
     *,
     closed_positions_loader,
     current_positions_loader,
+    historical_trades_loader=None,
     now_ts: int | None = None,
 ) -> dict[str, Any]:
     wallet = normalize_wallet(candidate.get("wallet"))
@@ -636,6 +804,12 @@ def profile_candidate_wallet(
         current_positions = current_positions_loader(wallet)
         bot_score = max(bot_like_score_from_positions(current_positions), bot_like_score_from_candidate(candidate))
         summary = summarize_closed_positions(closed_positions, esports_condition_ids, now_ts=now_ts, bot_like_score=bot_score)
+        if historical_trades_loader:
+            trade_behavior = summarize_historical_trade_behavior(
+                summary.get("esports_condition_ids") or [],
+                historical_trades_loader=lambda condition_id: historical_trades_loader(wallet, condition_id),
+            )
+            summary = {**summary, **trade_behavior}
         return classify_wallet({**summary, "wallet": wallet, "candidate": candidate}, now_ts=now_ts)
     except Exception as exc:
         return {

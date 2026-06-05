@@ -157,6 +157,7 @@ last esports activity <= 90 days
 candidate.participated_market_count >= 3 by default
 candidate.avg_market_cash >= 1500 by default
 candidate.two_sided_market_count == 0
+max exported leaderboard wallets = 30 by default
 ```
 
 Do not re-apply old raw win-rate / median-entry / late-entry zero-tolerance
@@ -255,14 +256,18 @@ Per tick:
 
 ```text
 read A-wallet leaderboard
-filter follow-eligible wallets with 30-day recency
+filter follow-eligible wallets with 30-day recency and wallet_quarantine exclusion
 build watched esports market set from start_time within the 24h observe window
 if watched markets or open signals exist, poll latest trades?user= for follow wallets
 cold-start wallets set last_trade_cursor only
 new BUY trades in watched pre-start markets create paper legs
+new trades for already-open signal markets remain tracked even after start
 new SELL trades mirror-exit all open legs for that wallet-market-outcome
+material same-market SELL or opposite-side BUY writes wallet_quarantine
+post-start market snapshot records closing-line value (CLV) once
+same conditionId with open signals on both outcomes marks all sides contested
 settled markets move from open signals to compact results
-performance is aggregated by wallet and overall
+performance is aggregated by wallet, overall, and clean/contested groups
 ```
 
 Polymarket Data API `/trades` documents `timestamp` in the response, but does
@@ -294,18 +299,79 @@ status 2 if Polymarket/network appears unavailable for about 10 minutes.
 Follow output lives under `data/follow/`:
 
 ```text
+follow.db
 follow_state.json
-follow_signals_open.json
-follow_results.jsonl
-follow_performance.json
+active_market_cache.json
 follow_run_log.jsonl
 ```
+
+`follow.db` is the source of truth for wallet cursors, open/closed paper
+signals, legs, behavior events, results, and performance. `follow_state.json` is
+only a thin compatibility/metadata file. `active_market_cache.json` is separate
+from state and refreshes on the event cache TTL; do not put the large active
+market list back into `follow_state.json`. `follow_performance.json` is legacy
+migration input or optional export only, not a per-tick synchronized state file.
 
 Paper signals record both the smart wallet entry basis and our detected current
 price basis. `would_follow` is only a paper flag based on
 `--max-slippage-over-entry`; signals are still retained for threshold analysis.
 The first tick should normally create no signals because it only establishes the
 baseline of already-open positions.
+
+Follow v4 quality controls:
+
+```text
+contested market:
+  same conditionId has open follow signals on both outcomes
+  all signals remain recorded but get contested=True and would_follow=False
+
+closing-line value:
+  first post-start active market price snapshot
+  wallet_clv = closing_line_price - wallet_entry_price
+  our_clv = closing_line_price - our_entry_price
+
+wallet_quarantine:
+  pre/live safety net between leaderboard rebuilds
+  material SELL threshold uses --quarantine-sell-frac, default 0.2
+  cumulative split sells count toward the threshold
+  opposite-side BUY on the same conditionId quarantines as two_sided_switch
+  quarantined wallets are excluded from future follow-eligible polling
+```
+
+`--consensus-block-opposite` defaults on. `--consensus-min-same-side` exists for
+live policy tuning, but paper v4 still records single-wallet signals for
+learning. Contested signals should not be treated as live-followable.
+
+## Dashboard API
+
+`serve` runs a read-only dashboard/API process:
+
+```bash
+export POLY_FIGHT_DASH_PASSWORD='change-me'
+export POLY_FIGHT_DASH_COOKIE_SECRET='change-me-too'
+python3 -m poly_fight.cli serve --data-dir data --host 127.0.0.1 --port 8787
+```
+
+It follows the poly-monitor style: username/password login, signed HttpOnly
+cookie session, and stdlib `ThreadingHTTPServer`. For VPS + TLS deployment use
+`--host 0.0.0.0 --cookie-secure`; local HTTP debugging should leave
+`--cookie-secure` off.
+
+Dashboard SQLite access must be strictly read-only. Do not call
+`FollowStore.init_db()` or any existing write-capable `load_*` method from
+dashboard request paths. Use the dedicated read-only snapshot path, which opens
+SQLite with `mode=ro` and `PRAGMA query_only=1`; if `follow.db` does not exist
+yet, endpoints should return empty/waiting data instead of creating a DB or
+crashing.
+
+The dashboard must not mutate watchlists, signals, cursors, performance, or
+runner state. The only live external request is
+`/api/wallets/{addr}/trades`; validate the wallet address before calling the
+Data API and reuse the normal rate-limited `PolymarketClient`.
+
+Dashboard overview should expose v4 learning fields: contested count, clean
+count, average wallet CLV, clean/contested performance groups, and wallet
+quarantine status. These are read-only facts from `follow.db`, not controls.
 
 ## Follow-Signal Principle
 
@@ -364,6 +430,8 @@ Core modules:
 poly_fight/core.py  pure logic and scoring
 poly_fight/api.py   Polymarket read-only HTTP client
 poly_fight/cli.py   build-leaderboard and analyze-event commands
+poly_fight/dashboard.py read-only dashboard/API server
+poly_fight/storage.py SQLite follow-state persistence
 tests/test_core.py  standard-library unittest coverage
 ```
 
@@ -387,6 +455,10 @@ raw_market_trades/
 
 These files are generated artifacts. Avoid committing large live data dumps
 unless the user explicitly asks.
+
+Follow long-running business data lives in `data/follow/follow.db`; collection
+caches and smart-wallet leaderboard outputs remain JSON and are refreshed by the
+collector.
 
 ## Known v1 Limitations
 
