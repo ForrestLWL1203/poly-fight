@@ -61,6 +61,15 @@ python3 -m poly_fight.cli analyze-event --event-slug <slug>
 python3 -m poly_fight.cli analyze-event --condition-id <condition_id>
 ```
 
+Run one paper follow tick:
+
+```bash
+python3 -m poly_fight.cli follow --stake-usdc 25
+```
+
+The follow command is one tick, not a daemon. Use cron or an external loop every
+~3 minutes after `smart_wallet_leaderboard.json` exists.
+
 Global CLI options such as `--data-dir` must come before the subcommand:
 
 ```bash
@@ -229,6 +238,40 @@ and intersections for research only. Collection must not generate heavy-stake
 signals. Heavy-stake decisions belong in the later follow script, which should
 poll upcoming events before match start and watch whether multiple strict
 wallets buy the same side in real time.
+
+## Paper Follow
+
+The `follow` subcommand is read-only shadow mode. It never touches CLOB, private
+keys, balances, approvals, or live orders.
+
+Per tick:
+
+```text
+read A-wallet leaderboard
+filter follow-eligible wallets with 30-day recency
+check active esports event gate for starts within 12h
+if gate open, poll all follow wallets' current positions
+cold-start wallets become baseline only
+new pre-match esports positions create/update paper signals
+settled markets move from open signals to compact results
+performance is aggregated by wallet and overall
+```
+
+Follow output lives under `data/follow/`:
+
+```text
+follow_state.json
+follow_signals_open.json
+follow_results.jsonl
+follow_performance.json
+follow_run_log.jsonl
+```
+
+Paper signals record both the smart wallet entry basis and our detected current
+price basis. `would_follow` is only a paper flag based on
+`--max-slippage-over-entry`; signals are still retained for threshold analysis.
+The first tick should normally create no signals because it only establishes the
+baseline of already-open positions.
 
 ## Follow-Signal Principle
 

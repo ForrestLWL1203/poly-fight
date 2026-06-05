@@ -216,6 +216,23 @@ class PolymarketClient:
             filterAmount=min_trade_cash,
         )
 
+    def trades_for_user_market(
+        self,
+        wallet: str,
+        condition_id: str,
+        *,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict]:
+        return self.data(
+            "/trades",
+            user=wallet,
+            market=condition_id,
+            limit=limit,
+            offset=offset,
+            takerOnly="false",
+        )
+
     def closed_positions(
         self,
         wallet: str,

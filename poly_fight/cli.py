@@ -26,6 +26,22 @@ from .core import (
     summarize_closed_positions,
     to_float,
 )
+from .follow import (
+    aggregate_follow_performance,
+    current_position_keys,
+    detect_new_positions,
+    eligible_follow_wallets,
+    esports_match_imminent,
+    evaluate_slippage,
+    market_current_price,
+    position_key,
+    qualify_follow,
+    settle_open_signals,
+    should_retry_unqualified_position,
+    summarize_wallet_fills,
+    upsert_follow_signal,
+    winner_outcome_index,
+)
 
 
 def build_client(args: argparse.Namespace) -> PolymarketClient:
@@ -61,6 +77,38 @@ def write_json(path: Path, value: Any) -> None:
     finally:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    return rows
+
+
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def fetch_market_trades(
@@ -172,6 +220,140 @@ def fetch_recent_esports_closed_positions_for_wallet(
             break
         offset += limit
     return positions[:max_esports_closed_positions]
+
+
+def market_records_from_events(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    records = {}
+    for event in events:
+        record = event_to_market_record(event)
+        if record:
+            records[record["condition_id"]] = record
+    return records
+
+
+def load_active_market_cache(
+    client: PolymarketClient,
+    state: dict[str, Any],
+    *,
+    now_ts: int,
+    gamma_pages: int,
+    ttl_seconds: int,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any], str]:
+    cached = state.get("active_market_cache") or {}
+    if cached and now_ts - int(cached.get("updated_at") or 0) < ttl_seconds:
+        markets = {row["condition_id"]: row for row in cached.get("markets") or []}
+        return markets, state, "cache"
+    events = client.list_events_paginated(closed=False, active=True, max_pages=gamma_pages, order="startTime")
+    markets = market_records_from_events(events)
+    state["active_market_cache"] = {
+        "updated_at": now_ts,
+        "markets": list(markets.values()),
+    }
+    return markets, state, "api"
+
+
+def fetch_resolutions_for_open_signals(
+    client: PolymarketClient,
+    open_signals: list[dict[str, Any]],
+    *,
+    state: dict[str, Any],
+    now_ts: int,
+    gamma_pages: int,
+    ttl_seconds: int,
+) -> dict[str, int]:
+    eligible_signals = []
+    for signal in open_signals:
+        start_dt = parse_dt(signal.get("match_start_time"))
+        if start_dt and now_ts < int(start_dt.timestamp()):
+            continue
+        eligible_signals.append(signal)
+    if not eligible_signals:
+        return {}
+    needed = {str(signal.get("condition_id") or "").lower() for signal in eligible_signals}
+    cached = state.get("closed_market_cache") or {}
+    if cached and now_ts - int(cached.get("updated_at") or 0) < ttl_seconds:
+        closed_markets = {row["condition_id"]: row for row in cached.get("markets") or []}
+    else:
+        events = client.list_events_paginated(closed=True, active=None, max_pages=gamma_pages, order="endDate")
+        closed_markets = market_records_from_events(events)
+        state["closed_market_cache"] = {
+            "updated_at": now_ts,
+            "markets": list(closed_markets.values()),
+        }
+    resolutions = {}
+    for condition_id, market in closed_markets.items():
+        if condition_id in needed:
+            winner = winner_outcome_index(market)
+            if winner is not None:
+                resolutions[condition_id] = winner
+    return resolutions
+
+
+def fetch_wallet_market_trades(
+    client: PolymarketClient,
+    wallet: str,
+    condition_id: str,
+    *,
+    page_limit: int = 500,
+) -> list[dict]:
+    try:
+        return client.trades_for_user_market(wallet, condition_id, limit=page_limit)
+    except RuntimeError:
+        trades = client.trades_for_market(condition_id, limit=page_limit, min_trade_cash=0)
+        wallet = normalize_wallet(wallet)
+        return [
+            trade
+            for trade in trades
+            if normalize_wallet(trade.get("proxyWallet") or trade.get("wallet") or trade.get("user")) == wallet
+        ]
+
+
+def refresh_open_signal_fills(
+    client: PolymarketClient,
+    open_signals: list[dict[str, Any]],
+    active_markets: dict[str, dict[str, Any]],
+    *,
+    now_ts: int,
+    max_slippage: float,
+) -> tuple[list[dict[str, Any]], int]:
+    refreshed = 0
+    for signal in open_signals:
+        condition_id = str(signal.get("condition_id") or "").lower()
+        market = active_markets.get(condition_id)
+        if not market:
+            continue
+        start_dt = parse_dt(market.get("match_start_time") or market.get("market_start_time"))
+        if start_dt and now_ts >= int(start_dt.timestamp()):
+            continue
+        outcome_index = int(signal.get("outcome_index") or 0)
+        current_price = market_current_price(market, outcome_index)
+        for trigger in signal.get("triggered_by") or []:
+            wallet = normalize_wallet(trigger.get("wallet"))
+            if not wallet:
+                continue
+            trades = fetch_wallet_market_trades(client, wallet, condition_id)
+            fills_summary = summarize_wallet_fills(trades, wallet=wallet, outcome_index=outcome_index)
+            wallet_avg_price = fills_summary.get("avg_price") or trigger.get("wallet_avg_price") or signal.get("wallet_avg_price")
+            qualification = {
+                "condition_id": condition_id,
+                "outcome_index": outcome_index,
+                "outcome": signal.get("outcome"),
+                "wallet_avg_price": wallet_avg_price,
+                "position_size": trigger.get("position_size") or 0,
+            }
+            open_signals, _created = upsert_follow_signal(
+                open_signals,
+                wallet=wallet,
+                market=market,
+                qualification=qualification,
+                fills_summary=fills_summary,
+                current_price=current_price,
+                max_slippage=max_slippage,
+                stake_usdc=to_float(signal.get("stake_usdc")),
+                now_ts=now_ts,
+            )
+            refreshed += 1
+    return open_signals, refreshed
 
 
 def should_use_cached_profile(cached: dict[str, Any] | None, *, now_ts: int, ttl_seconds: int) -> bool:
@@ -756,6 +938,190 @@ def command_analyze_event(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_follow(args: argparse.Namespace) -> int:
+    if args.execution_mode != "paper":
+        raise SystemExit("Only paper execution mode is implemented.")
+    client = build_client(args)
+    data_dir = Path(args.data_dir)
+    follow_dir = data_dir / "follow"
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    leaderboard_rows = read_json(data_dir / "smart_wallet_leaderboard.json", [])
+    follow_wallets = eligible_follow_wallets(
+        leaderboard_rows,
+        now_ts=now_ts,
+        recency_days=args.follow_recency_days,
+    )
+    state_path = follow_dir / "follow_state.json"
+    open_path = follow_dir / "follow_signals_open.json"
+    perf_path = follow_dir / "follow_performance.json"
+    results_path = follow_dir / "follow_results.jsonl"
+    run_log_path = follow_dir / "follow_run_log.jsonl"
+
+    state = read_json(state_path, {"wallet_positions": {}})
+    open_signals = read_json(open_path, [])
+    performance = read_json(perf_path, {})
+
+    active_markets, state, active_source = load_active_market_cache(
+        client,
+        state,
+        now_ts=now_ts,
+        gamma_pages=args.gamma_pages,
+        ttl_seconds=args.event_cache_ttl_minutes * 60,
+    )
+    gate_open = esports_match_imminent(
+        list(active_markets.values()),
+        now_ts=now_ts,
+        horizon_hours=args.event_gate_horizon_hours,
+    )
+
+    wallet_positions_state = dict(state.get("wallet_positions") or {})
+    new_position_count = 0
+    retry_position_count = 0
+    new_signal_count = 0
+    cold_start_wallet_count = 0
+    position_request_count = 0
+
+    if gate_open and follow_wallets:
+        def fetch_positions_for_wallet(row: dict[str, Any]) -> tuple[str, list[dict]]:
+            wallet = normalize_wallet(row.get("wallet"))
+            try:
+                return wallet, client.positions(wallet, limit=args.positions_limit)
+            except Exception:
+                return wallet, []
+
+        position_results = run_ordered_io_tasks(
+            follow_wallets,
+            fetch_positions_for_wallet,
+            max_workers=args.max_workers,
+        )
+        position_request_count = len(follow_wallets)
+        for result in position_results:
+            if isinstance(result, Exception):
+                continue
+            wallet, positions = result
+            previous_keys = wallet_positions_state.get(wallet, {}).get("position_keys")
+            new_positions, snapshot_keys, cold_start = detect_new_positions(previous_keys, positions)
+            if cold_start:
+                cold_start_wallet_count += 1
+                wallet_positions_state[wallet] = {
+                    "position_keys": snapshot_keys,
+                    "last_seen_at": now_ts,
+                }
+                continue
+            seen_keys = set(previous_keys or []) & set(snapshot_keys)
+            for position in new_positions:
+                condition_id = str(position.get("conditionId") or position.get("condition_id") or "").lower()
+                key = position_key(position)
+                market = active_markets.get(condition_id)
+                qualification = qualify_follow(
+                    position,
+                    market,
+                    now_ts=now_ts,
+                    require_pre_match=args.require_pre_match,
+                )
+                if not qualification.get("qualified"):
+                    if should_retry_unqualified_position(qualification.get("reason")):
+                        retry_position_count += 1
+                    else:
+                        new_position_count += 1
+                        seen_keys.add(key)
+                    continue
+                new_position_count += 1
+                trades = fetch_wallet_market_trades(client, wallet, condition_id)
+                fills_summary = summarize_wallet_fills(
+                    trades,
+                    wallet=wallet,
+                    outcome_index=qualification.get("outcome_index"),
+                )
+                if fills_summary.get("avg_price"):
+                    qualification["wallet_avg_price"] = fills_summary["avg_price"]
+                current_price = market_current_price(
+                    market,
+                    int(qualification["outcome_index"]),
+                    position,
+                )
+                open_signals, created = upsert_follow_signal(
+                    open_signals,
+                    wallet=wallet,
+                    market=market,
+                    qualification=qualification,
+                    fills_summary=fills_summary,
+                    current_price=current_price,
+                    max_slippage=args.max_slippage_over_entry,
+                    stake_usdc=args.stake_usdc,
+                    now_ts=now_ts,
+                )
+                if created:
+                    new_signal_count += 1
+                seen_keys.add(key)
+            wallet_positions_state[wallet] = {
+                "position_keys": sorted(seen_keys),
+                "last_seen_at": now_ts,
+            }
+
+    state["wallet_positions"] = wallet_positions_state
+    state["updated_at"] = now_ts
+
+    open_signals, refreshed_signal_count = refresh_open_signal_fills(
+        client,
+        open_signals,
+        active_markets,
+        now_ts=now_ts,
+        max_slippage=args.max_slippage_over_entry,
+    )
+    resolutions = fetch_resolutions_for_open_signals(
+        client,
+        open_signals,
+        state=state,
+        now_ts=now_ts,
+        gamma_pages=args.gamma_pages,
+        ttl_seconds=args.event_cache_ttl_minutes * 60,
+    )
+    open_signals, settled = settle_open_signals(open_signals, resolutions, now_ts=now_ts)
+    if settled:
+        append_jsonl(results_path, settled)
+        performance = aggregate_follow_performance(performance, settled)
+    else:
+        performance = aggregate_follow_performance(performance, [])
+
+    run_log_row = {
+        "created_at": now_ts,
+        "follow_wallet_count": len(follow_wallets),
+        "gate_open": gate_open,
+        "active_market_source": active_source,
+        "position_request_count": position_request_count,
+        "cold_start_wallet_count": cold_start_wallet_count,
+        "new_position_count": new_position_count,
+        "retry_position_count": retry_position_count,
+        "new_signal_count": new_signal_count,
+        "refreshed_signal_count": refreshed_signal_count,
+        "open_signal_count": len(open_signals),
+        "settled_signal_count": len(settled),
+    }
+    run_log_rows = read_jsonl(run_log_path)
+    from .follow import prune_jsonl
+
+    run_log_rows = prune_jsonl([*run_log_rows, run_log_row], now_ts=now_ts, retention_days=args.run_log_retention_days)
+    result_rows = read_jsonl(results_path)
+    result_rows = prune_jsonl(result_rows, now_ts=now_ts, retention_days=args.results_retention_days)
+
+    write_json(state_path, state)
+    write_json(open_path, open_signals)
+    write_json(perf_path, performance)
+    write_jsonl(run_log_path, run_log_rows)
+    if args.results_retention_days > 0:
+        write_jsonl(results_path, result_rows)
+
+    summary = {
+        **run_log_row,
+        "settled_result_count_total": len(result_rows),
+        "output_dir": str(follow_dir),
+    }
+    print(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Polymarket esports smart-wallet analysis")
@@ -818,6 +1184,25 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--condition-id")
     analyze.add_argument("--holders-limit", type=int, default=10)
     analyze.set_defaults(func=command_analyze_event)
+
+    follow = subparsers.add_parser("follow", help="run one paper follow tick")
+    follow.add_argument("--stake-usdc", type=float, required=True)
+    follow.add_argument("--follow-recency-days", type=int, default=30)
+    follow.add_argument("--event-gate-horizon-hours", type=float, default=12)
+    follow.add_argument("--event-cache-ttl-minutes", type=int, default=15)
+    follow.add_argument("--max-slippage-over-entry", type=float, default=0.05)
+    follow.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=True)
+    follow.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
+    follow.add_argument("--execution-mode", choices=["paper", "live"], default="paper")
+    follow.add_argument("--run-log-retention-days", type=int, default=7)
+    follow.add_argument("--results-retention-days", type=int, default=0)
+    follow.add_argument("--gamma-pages", type=int, default=3)
+    follow.add_argument("--positions-limit", type=int, default=100)
+    follow.add_argument("--max-workers", type=int, default=8)
+    follow.add_argument("--max-requests-per-second", type=float, default=10)
+    follow.add_argument("--request-burst", type=int, default=5)
+    follow.add_argument("--max-retry-after-seconds", type=float, default=60)
+    follow.set_defaults(func=command_follow)
     return parser
 
 

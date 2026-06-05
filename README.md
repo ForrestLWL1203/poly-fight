@@ -43,6 +43,17 @@ python3 -m poly_fight.cli analyze-event --event-slug dota2-aur1-ty-2026-06-04
 python3 -m poly_fight.cli analyze-event --condition-id 0x...
 ```
 
+Run one paper follow tick:
+
+```bash
+python3 -m poly_fight.cli follow --stake-usdc 25
+```
+
+The first tick cold-starts wallet position baselines and should not emit old
+in-flight positions as signals. Later ticks detect new pre-match esports
+positions opened by A wallets, write paper signals, and settle them after
+resolution. Schedule this command externally, for example every 3 minutes.
+
 Outputs are written under `data/`:
 
 ```text
@@ -53,6 +64,11 @@ wallet_profiles.json
 smart_wallet_leaderboard.json
 build_summary.json
 last_event_analysis.json
+follow/follow_state.json
+follow/follow_signals_open.json
+follow/follow_results.jsonl
+follow/follow_performance.json
+follow/follow_run_log.jsonl
 ```
 
 `smart_wallet_leaderboard.json` is intentionally strict. By default it exports

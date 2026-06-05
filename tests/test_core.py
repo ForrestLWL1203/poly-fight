@@ -13,12 +13,14 @@ from poly_fight.cli import (
     build_parser,
     build_wallet_overlap_report,
     build_profile_fetch_plan,
+    fetch_resolutions_for_open_signals,
     fetch_recent_esports_closed_positions_for_wallet,
     fetch_market_trades_cached,
     filter_profile_candidates,
     merge_cached_profile_with_candidate,
     merge_profiles_with_candidates,
     prune_profile_store,
+    refresh_open_signal_fills,
     read_json,
     should_refresh_file_cache,
     should_use_cached_profile,
@@ -34,6 +36,19 @@ from poly_fight.core import (
     normalize_wallet,
     profile_candidate_wallet,
     summarize_closed_positions,
+)
+from poly_fight.follow import (
+    aggregate_follow_performance,
+    detect_new_positions,
+    eligible_follow_wallets,
+    esports_match_imminent,
+    evaluate_slippage,
+    paper_pnl,
+    qualify_follow,
+    settle_open_signals,
+    should_retry_unqualified_position,
+    summarize_wallet_fills,
+    upsert_follow_signal,
 )
 
 
@@ -1162,6 +1177,225 @@ class CoreTest(unittest.TestCase):
 
         self.assertNotIn("two_sided_holder", result["reasons"])
 
+    def test_follow_eligible_wallets_use_30_day_window(self):
+        rows = [
+            {"wallet": "0xA", "grade": "A", "last_esports_trade_at": 1000},
+            {"wallet": "0xB", "grade": "A", "last_esports_trade_at": 1000 - 31 * 86400},
+            {"wallet": "0xC", "grade": "B", "last_esports_trade_at": 1000},
+        ]
+
+        eligible = eligible_follow_wallets(rows, now_ts=1000, recency_days=30)
+
+        self.assertEqual([row["wallet"] for row in eligible], ["0xa"])
+
+    def test_follow_event_gate_detects_imminent_esports_start(self):
+        now = 1000
+        markets = [
+            {"condition_id": "m1", "match_start_time": datetime.fromtimestamp(now + 2 * 3600, timezone.utc).isoformat()},
+            {"condition_id": "m2", "match_start_time": datetime.fromtimestamp(now + 20 * 3600, timezone.utc).isoformat()},
+        ]
+
+        self.assertTrue(esports_match_imminent(markets, now_ts=now, horizon_hours=12))
+        self.assertFalse(esports_match_imminent(markets, now_ts=now + 3 * 3600, horizon_hours=12))
+        self.assertTrue(esports_match_imminent([{"condition_id": "m3"}], now_ts=now, horizon_hours=12))
+
+    def test_follow_position_diff_cold_start_then_new_position(self):
+        positions = [{"conditionId": "m1", "outcomeIndex": 0, "size": 10}]
+
+        new_positions, snapshot, cold_start = detect_new_positions(None, positions)
+
+        self.assertTrue(cold_start)
+        self.assertEqual(new_positions, [])
+        self.assertEqual(snapshot, ["m1:0"])
+
+        next_positions = [*positions, {"conditionId": "m2", "outcomeIndex": 1, "size": 5}]
+        new_positions, snapshot, cold_start = detect_new_positions(snapshot, next_positions)
+
+        self.assertFalse(cold_start)
+        self.assertEqual([row["conditionId"] for row in new_positions], ["m2"])
+        self.assertEqual(snapshot, ["m1:0", "m2:1"])
+
+    def test_follow_qualifies_only_before_match_start(self):
+        now = 1000
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "closed": False,
+        }
+        position = {"conditionId": "m1", "outcomeIndex": 1, "size": 10, "avgPrice": 0.45}
+
+        qualified = qualify_follow(position, market, now_ts=now)
+        rejected = qualify_follow(position, market, now_ts=now + 7200)
+
+        self.assertTrue(qualified["qualified"])
+        self.assertEqual(qualified["outcome"], "B")
+        self.assertFalse(rejected["qualified"])
+        self.assertEqual(rejected["reason"], "after_match_start")
+
+    def test_follow_unqualified_retry_policy_keeps_only_transient_reasons(self):
+        self.assertTrue(should_retry_unqualified_position("unknown_market"))
+        self.assertFalse(should_retry_unqualified_position("after_match_start"))
+        self.assertFalse(should_retry_unqualified_position("closed_market"))
+        self.assertFalse(should_retry_unqualified_position("unknown_outcome"))
+
+    def test_follow_fill_summary_slippage_and_signal_dedup(self):
+        trades = [
+            {"proxyWallet": "0xA", "outcomeIndex": 0, "price": 0.4, "size": 10, "timestamp": 1},
+            {"proxyWallet": "0xA", "outcomeIndex": 0, "price": 0.5, "size": 30, "timestamp": 2},
+            {"proxyWallet": "0xB", "outcomeIndex": 0, "price": 0.2, "size": 99, "timestamp": 3},
+        ]
+        fills = summarize_wallet_fills(trades, wallet="0xA", outcome_index=0)
+
+        self.assertEqual(fills["fill_count"], 2)
+        self.assertEqual(fills["avg_price"], 0.475)
+        self.assertFalse(evaluate_slippage(0.5, 0.65, max_slippage=0.05)["would_follow"])
+        self.assertTrue(evaluate_slippage(0.5, 0.53, max_slippage=0.05)["would_follow"])
+
+        market = {"condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [0.53, 0.47], "title": "M"}
+        qualification = {
+            "condition_id": "m1",
+            "outcome_index": 0,
+            "outcome": "A",
+            "wallet_avg_price": 0.475,
+            "position_size": 40,
+        }
+        signals, created = upsert_follow_signal(
+            [],
+            wallet="0xA",
+            market=market,
+            qualification=qualification,
+            fills_summary=fills,
+            current_price=0.53,
+            max_slippage=0.05,
+            stake_usdc=100,
+            now_ts=100,
+        )
+        signals, second_created = upsert_follow_signal(
+            signals,
+            wallet="0xB",
+            market=market,
+            qualification={**qualification, "wallet_avg_price": 0.49},
+            fills_summary=fills,
+            current_price=0.54,
+            max_slippage=0.05,
+            stake_usdc=100,
+            now_ts=110,
+        )
+
+        self.assertTrue(created)
+        self.assertFalse(second_created)
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(len(signals[0]["triggered_by"]), 2)
+        self.assertEqual(signals[0]["our_entry_price"], 0.53)
+        self.assertFalse(signals[0]["would_follow"])
+
+    def test_follow_open_signal_refresh_preserves_entry_and_updates_fills(self):
+        class FakeClient:
+            def trades_for_user_market(self, wallet, condition_id, *, limit=500, offset=0):
+                return [
+                    {"proxyWallet": wallet, "outcomeIndex": 0, "price": 0.4, "size": 10, "timestamp": 1},
+                    {"proxyWallet": wallet, "outcomeIndex": 0, "price": 0.6, "size": 10, "timestamp": 2},
+                ]
+
+        now = 1000
+        start = datetime.fromtimestamp(now + 3600, timezone.utc).isoformat()
+        signals = [
+            {
+                "signal_id": "m1:0",
+                "condition_id": "m1",
+                "outcome_index": 0,
+                "outcome": "A",
+                "wallet_avg_price": 0.4,
+                "our_entry_price": 0.45,
+                "current_price": 0.45,
+                "stake_usdc": 100,
+                "would_follow": True,
+                "slippage_over_wallet_entry": 0.05,
+                "triggered_by": [{"wallet": "0xA", "wallet_avg_price": 0.4, "position_size": 10}],
+            }
+        ]
+        markets = {
+            "m1": {
+                "condition_id": "m1",
+                "outcomes": ["A", "B"],
+                "outcome_prices": [0.7, 0.3],
+                "match_start_time": start,
+            }
+        }
+
+        refreshed, count = refresh_open_signal_fills(
+            FakeClient(),
+            signals,
+            markets,
+            now_ts=now,
+            max_slippage=0.05,
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(refreshed[0]["our_entry_price"], 0.45)
+        self.assertEqual(refreshed[0]["current_price"], 0.7)
+        self.assertTrue(refreshed[0]["would_follow"])
+        self.assertEqual(refreshed[0]["triggered_by"][0]["fills_summary"]["fill_count"], 2)
+
+    def test_follow_resolution_lookup_skips_pre_match_signals(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            def list_events_paginated(self, **_kwargs):
+                self.calls += 1
+                return []
+
+        now = 1000
+        signal = {
+            "condition_id": "m1",
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+        }
+        state = {}
+        client = FakeClient()
+
+        resolutions = fetch_resolutions_for_open_signals(
+            client,
+            [signal],
+            state=state,
+            now_ts=now,
+            gamma_pages=3,
+            ttl_seconds=900,
+        )
+
+        self.assertEqual(resolutions, {})
+        self.assertEqual(client.calls, 0)
+
+    def test_follow_settle_and_aggregate_dual_basis_pnl(self):
+        self.assertEqual(paper_pnl(0.5, True, 100), 100)
+        self.assertEqual(paper_pnl(0.5, False, 100), -100)
+        signals = [
+            {
+                "signal_id": "m1:0",
+                "condition_id": "m1",
+                "outcome_index": 0,
+                "our_entry_price": 0.6,
+                "stake_usdc": 100,
+                "triggered_by": [
+                    {
+                        "wallet": "0xA",
+                        "wallet_avg_price": 0.5,
+                        "fills_summary": {"fills": [{"price": 0.5, "size": 1}], "avg_price": 0.5},
+                    }
+                ],
+            }
+        ]
+
+        remaining, settled = settle_open_signals(signals, {"m1": 0}, now_ts=200)
+        perf = aggregate_follow_performance({}, settled)
+
+        self.assertEqual(remaining, [])
+        self.assertEqual(settled[0]["wallet_paper_pnl_by_wallet"]["0xa"], 100)
+        self.assertEqual(round(settled[0]["our_paper_pnl"], 8), 66.66666667)
+        self.assertNotIn("fills", settled[0]["triggered_by"][0]["fills_summary"])
+        self.assertEqual(perf["wallets"]["0xa"]["signals"], 1)
+
     def test_normalize_wallet_lowercases_keys(self):
         self.assertEqual(normalize_wallet("0xAbC"), "0xabc")
 
@@ -1222,6 +1456,22 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.discovery_lookback_days, 15)
         self.assertEqual(args.market_batch_size, 50)
         self.assertEqual(args.market_batch_index, 2)
+
+    def test_follow_command_uses_paper_defaults(self):
+        parser = build_parser()
+
+        args = parser.parse_args(["follow", "--stake-usdc", "25"])
+
+        self.assertEqual(args.command, "follow")
+        self.assertEqual(args.execution_mode, "paper")
+        self.assertEqual(args.stake_usdc, 25)
+        self.assertEqual(args.follow_recency_days, 30)
+        self.assertEqual(args.event_gate_horizon_hours, 12)
+        self.assertEqual(args.max_slippage_over_entry, 0.05)
+        self.assertTrue(args.require_pre_match)
+        self.assertEqual(args.run_log_retention_days, 7)
+        self.assertEqual(args.results_retention_days, 0)
+        self.assertEqual(args.max_workers, 8)
 
 
 if __name__ == "__main__":
