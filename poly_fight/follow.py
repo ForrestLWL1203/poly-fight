@@ -141,6 +141,311 @@ def should_retry_unqualified_position(reason: str | None) -> bool:
     return reason in {"unknown_market"}
 
 
+def bootstrap_position_trades(
+    positions: list[dict[str, Any]],
+    *,
+    wallet: str,
+    markets_by_condition: dict[str, dict[str, Any]],
+    now_ts: int,
+    max_slippage: float,
+    require_pre_match: bool = True,
+) -> list[dict[str, Any]]:
+    wallet = normalize_wallet(wallet)
+    trades: list[dict[str, Any]] = []
+    for position in positions:
+        condition_id = position_condition_id(position)
+        market = markets_by_condition.get(condition_id)
+        qualification = qualify_follow(position, market, now_ts=now_ts, require_pre_match=require_pre_match)
+        if not qualification.get("qualified"):
+            continue
+        outcome_index = int(qualification["outcome_index"])
+        current_price = market_current_price(market, outcome_index, position)
+        wallet_avg_price = to_float(qualification.get("wallet_avg_price"))
+        if not evaluate_slippage(wallet_avg_price, current_price, max_slippage=max_slippage).get("would_follow"):
+            continue
+        trades.append(
+            {
+                "id": f"bootstrap:{wallet}:{condition_id}:{outcome_index}",
+                "proxyWallet": wallet,
+                "conditionId": condition_id,
+                "outcomeIndex": outcome_index,
+                "side": "BUY",
+                "price": wallet_avg_price,
+                "size": to_float(qualification.get("position_size")),
+                "timestamp": now_ts,
+                "bootstrap_position": True,
+            }
+        )
+    return trades
+
+
+def desired_tick_interval(
+    watched_markets: list[dict[str, Any]],
+    open_signals: list[dict[str, Any]],
+    *,
+    now_ts: int,
+    observe_window_hours: float = 24,
+    min_tick_seconds: int = 180,
+    max_tick_seconds: int = 900,
+) -> int:
+    if any((signal.get("status") or "open") == "open" for signal in open_signals):
+        return int(min_tick_seconds)
+    intervals: list[int] = []
+    window = max(1.0, float(observe_window_hours)) * 3600
+    for market in watched_markets:
+        start_ts = market_start_ts(market)
+        if not start_ts:
+            intervals.append(int(max_tick_seconds))
+            continue
+        seconds_to_start = start_ts - now_ts
+        if seconds_to_start <= 2 * 3600:
+            intervals.append(int(min_tick_seconds))
+            continue
+        if seconds_to_start >= window:
+            intervals.append(int(max_tick_seconds))
+            continue
+        ratio = (seconds_to_start - 2 * 3600) / max(1.0, window - 2 * 3600)
+        intervals.append(int(round(min_tick_seconds + ratio * (max_tick_seconds - min_tick_seconds))))
+    return min(intervals) if intervals else int(max_tick_seconds)
+
+
+def trade_condition_id(trade: dict[str, Any]) -> str:
+    return str(trade.get("conditionId") or trade.get("condition_id") or trade.get("market") or "").lower()
+
+
+def trade_outcome_index(trade: dict[str, Any]) -> int:
+    return position_outcome_index(trade)
+
+
+def trade_timestamp(trade: dict[str, Any]) -> int:
+    value = trade.get("timestamp") or trade.get("createdAt") or trade.get("created_at")
+    if isinstance(value, str) and not value.isdigit():
+        parsed = parse_dt(value)
+        return int(parsed.timestamp()) if parsed else 0
+    return to_int(value)
+
+
+def trade_id(trade: dict[str, Any]) -> str:
+    return str(trade.get("id") or trade.get("transactionHash") or trade.get("transaction_hash") or "")
+
+
+def trade_side(trade: dict[str, Any]) -> str:
+    return str(trade.get("side") or trade.get("type") or "").upper()
+
+
+def trade_price(trade: dict[str, Any]) -> float:
+    return to_float(trade.get("price") or trade.get("avgPrice") or trade.get("avg_price"))
+
+
+def trade_size(trade: dict[str, Any]) -> float:
+    return to_float(trade.get("size") or trade.get("amount"))
+
+
+def _cursor_tuple(cursor: dict[str, Any] | None) -> tuple[int, str]:
+    cursor = cursor or {}
+    return to_int(cursor.get("timestamp")), str(cursor.get("id") or "")
+
+
+def _trade_tuple(trade: dict[str, Any]) -> tuple[int, str]:
+    return trade_timestamp(trade), trade_id(trade)
+
+
+def select_new_trades(
+    trades: list[dict[str, Any]],
+    previous_cursor: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, bool]:
+    ordered_desc = sorted(trades, key=lambda row: _trade_tuple(row), reverse=True)
+    latest = ordered_desc[0] if ordered_desc else None
+    latest_cursor = {"timestamp": trade_timestamp(latest), "id": trade_id(latest)} if latest else previous_cursor
+    if previous_cursor is None:
+        return [], latest_cursor, True
+    previous_key = _cursor_tuple(previous_cursor)
+    new_trades = [trade for trade in trades if _trade_tuple(trade) > previous_key]
+    new_trades.sort(key=lambda row: _trade_tuple(row))
+    return new_trades, latest_cursor, False
+
+
+def follow_signal_id(wallet: str, condition_id: str, outcome_index: int) -> str:
+    return f"{normalize_wallet(wallet)}:{condition_id.lower()}:{outcome_index}"
+
+
+def paper_exit_pnl(entry_price: float, exit_price: float, stake: float) -> float:
+    if entry_price <= 0:
+        return 0.0
+    return round(stake * (exit_price - entry_price) / entry_price, 8)
+
+
+def _behavior_event(kind: str, trade: dict[str, Any], *, note: str | None = None) -> dict[str, Any]:
+    event = {
+        "kind": kind,
+        "trade_id": trade_id(trade),
+        "condition_id": trade_condition_id(trade),
+        "outcome_index": trade_outcome_index(trade),
+        "price": round(trade_price(trade), 8),
+        "size": round(trade_size(trade), 8),
+        "timestamp": trade_timestamp(trade),
+    }
+    if note:
+        event["note"] = note
+    return event
+
+
+def wallet_behavior_summary(signal: dict[str, Any]) -> dict[str, Any]:
+    events = signal.get("behavior_events") or []
+    kinds = {event.get("kind") for event in events}
+    return {
+        "single_sided": "hedge" not in kinds,
+        "hedged": "hedge" in kinds,
+        "sold_before_resolution": "exit" in kinds,
+        "held_to_resolution": "held_to_resolution" in kinds,
+        "add_count": sum(1 for event in events if event.get("kind") == "add"),
+        "exit_count": sum(1 for event in events if event.get("kind") == "exit"),
+    }
+
+
+def _open_signal_by_id(open_signals: list[dict[str, Any]], sid: str) -> dict[str, Any] | None:
+    for signal in open_signals:
+        if signal.get("signal_id") == sid and (signal.get("status") or "open") == "open":
+            return signal
+    return None
+
+
+def _opposite_open_signals(
+    open_signals: list[dict[str, Any]],
+    *,
+    wallet: str,
+    condition_id: str,
+    outcome_index: int,
+) -> list[dict[str, Any]]:
+    wallet = normalize_wallet(wallet)
+    return [
+        signal
+        for signal in open_signals
+        if (signal.get("status") or "open") == "open"
+        and normalize_wallet(signal.get("wallet")) == wallet
+        and str(signal.get("condition_id") or "").lower() == condition_id.lower()
+        and to_int(signal.get("outcome_index"), -1) != outcome_index
+    ]
+
+
+def process_follow_trades(
+    open_signals: list[dict[str, Any]],
+    *,
+    wallet: str,
+    trades: list[dict[str, Any]],
+    markets_by_condition: dict[str, dict[str, Any]],
+    now_ts: int,
+    stake_usdc: float,
+    max_follow_legs: int,
+    max_slippage: float,
+    require_pre_match: bool = True,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    wallet = normalize_wallet(wallet)
+    stats = {"new_leg_count": 0, "exited_signal_count": 0, "hedge_event_count": 0, "ignored_trade_count": 0}
+    for trade in sorted(trades, key=lambda row: _trade_tuple(row)):
+        condition_id = trade_condition_id(trade)
+        outcome_index = trade_outcome_index(trade)
+        market = markets_by_condition.get(condition_id)
+        if not market or outcome_index < 0:
+            stats["ignored_trade_count"] += 1
+            continue
+        side = trade_side(trade)
+        current_price = market_current_price(market, outcome_index, trade)
+        sid = follow_signal_id(wallet, condition_id, outcome_index)
+        existing = _open_signal_by_id(open_signals, sid)
+
+        if side == "SELL":
+            if not existing:
+                stats["ignored_trade_count"] += 1
+                continue
+            existing["status"] = "exited"
+            existing["exit_price"] = current_price
+            existing["exit_at"] = now_ts
+            existing["updated_at"] = now_ts
+            existing.setdefault("behavior_events", []).append(_behavior_event("exit", trade))
+            existing["our_realized_pnl"] = round(
+                sum(paper_exit_pnl(to_float(leg.get("our_entry_price")), current_price, to_float(leg.get("stake"))) for leg in existing.get("legs") or []),
+                8,
+            )
+            existing["wallet_behavior"] = wallet_behavior_summary(existing)
+            stats["exited_signal_count"] += 1
+            continue
+
+        if side != "BUY":
+            stats["ignored_trade_count"] += 1
+            continue
+
+        opposite = _opposite_open_signals(
+            open_signals,
+            wallet=wallet,
+            condition_id=condition_id,
+            outcome_index=outcome_index,
+        )
+        for signal in opposite:
+            signal.setdefault("behavior_events", []).append(_behavior_event("hedge", trade))
+            signal["wallet_behavior"] = wallet_behavior_summary(signal)
+            stats["hedge_event_count"] += 1
+
+        start_ts = market_start_ts(market)
+        if require_pre_match and start_ts and now_ts >= start_ts:
+            stats["ignored_trade_count"] += 1
+            continue
+        if existing and len(existing.get("legs") or []) >= max_follow_legs:
+            stats["ignored_trade_count"] += 1
+            continue
+
+        wallet_fill_price = trade_price(trade)
+        slippage = evaluate_slippage(wallet_fill_price, current_price, max_slippage=max_slippage)
+        leg = {
+            "our_entry_price": current_price,
+            "wallet_fill_price": wallet_fill_price,
+            "slippage_over_wallet_entry": slippage["slippage_over_wallet_entry"],
+            "would_follow": slippage["would_follow"],
+            "stake": stake_usdc,
+            "trade_id": trade_id(trade),
+            "leg_at": now_ts,
+            "wallet_trade_at": trade_timestamp(trade),
+            "wallet_trade_size": round(trade_size(trade), 8),
+        }
+        if existing:
+            existing.setdefault("legs", []).append(leg)
+            existing.setdefault("behavior_events", []).append(_behavior_event("add", trade))
+            existing["updated_at"] = now_ts
+            existing["current_price"] = current_price
+            existing["wallet_behavior"] = wallet_behavior_summary(existing)
+        else:
+            outcomes = market.get("outcomes") or []
+            open_signals.append(
+                {
+                    "signal_id": sid,
+                    "wallet": wallet,
+                    "condition_id": condition_id,
+                    "outcome_index": outcome_index,
+                    "outcome": outcomes[outcome_index] if 0 <= outcome_index < len(outcomes) else None,
+                    "event_title": market.get("title"),
+                    "event_slug": market.get("event_slug"),
+                    "market_question": market.get("question"),
+                    "match_start_time": market.get("match_start_time") or market.get("market_start_time"),
+                    "status": "open",
+                    "created_at": now_ts,
+                    "updated_at": now_ts,
+                    "current_price": current_price,
+                    "legs": [leg],
+                    "behavior_events": [_behavior_event("add", trade)],
+                    "wallet_behavior": {
+                        "single_sided": True,
+                        "hedged": False,
+                        "sold_before_resolution": False,
+                        "held_to_resolution": False,
+                        "add_count": 1,
+                        "exit_count": 0,
+                    },
+                }
+            )
+        stats["new_leg_count"] += 1
+    return open_signals, stats
+
+
 def summarize_wallet_fills(
     trades: list[dict[str, Any]],
     *,
@@ -292,6 +597,28 @@ def settle_open_signals(
             remaining.append(signal)
             continue
         outcome_won = winner == to_int(signal.get("outcome_index"), -1)
+        if signal.get("legs") is not None:
+            legs = signal.get("legs") or []
+            wallet_pnl = round(
+                sum(paper_pnl(to_float(leg.get("wallet_fill_price")), outcome_won, to_float(leg.get("stake"))) for leg in legs),
+                8,
+            )
+            our_pnl = round(
+                sum(paper_pnl(to_float(leg.get("our_entry_price")), outcome_won, to_float(leg.get("stake"))) for leg in legs),
+                8,
+            )
+            compact = {
+                **signal,
+                "status": "settled",
+                "settled_at": now_ts,
+                "outcome_won": outcome_won,
+                "wallet_paper_pnl_by_wallet": {normalize_wallet(signal.get("wallet")): wallet_pnl},
+                "our_paper_pnl": our_pnl,
+            }
+            compact.setdefault("behavior_events", []).append({"kind": "held_to_resolution", "timestamp": now_ts})
+            compact["wallet_behavior"] = wallet_behavior_summary(compact)
+            settled.append(compact)
+            continue
         stake = to_float(signal.get("stake_usdc"))
         wallet_pnls = {}
         compact_triggers = []
@@ -321,12 +648,28 @@ def settle_open_signals(
 
 def aggregate_follow_performance(prev_perf: dict[str, Any], newly_settled: list[dict[str, Any]]) -> dict[str, Any]:
     wallets = dict(prev_perf.get("wallets") or {})
-    total = dict(prev_perf.get("total") or {"signals": 0, "wins": 0, "wallet_pnl": 0.0, "our_pnl": 0.0})
+    total = dict(prev_perf.get("total") or {"signals": 0, "wins": 0, "exits": 0, "wallet_pnl": 0.0, "our_pnl": 0.0, "legs": 0})
     for result in newly_settled:
+        if result.get("status") == "exited":
+            wallet = normalize_wallet(result.get("wallet"))
+            if not wallet:
+                continue
+            legs = result.get("legs") or []
+            row = wallets.setdefault(
+                wallet,
+                {"signals": 0, "wins": 0, "exits": 0, "wallet_pnl": 0.0, "our_pnl": 0.0, "legs": 0},
+            )
+            row["exits"] = to_int(row.get("exits")) + 1
+            row["legs"] = to_int(row.get("legs")) + len(legs)
+            row["our_pnl"] = round(to_float(row.get("our_pnl")) + to_float(result.get("our_realized_pnl")), 8)
+            total["exits"] = to_int(total.get("exits")) + 1
+            total["legs"] = to_int(total.get("legs")) + len(legs)
+            total["our_pnl"] = round(to_float(total.get("our_pnl")) + to_float(result.get("our_realized_pnl")), 8)
+            continue
         won = bool(result.get("outcome_won"))
         our_pnl = to_float(result.get("our_paper_pnl"))
         for wallet, wallet_pnl in (result.get("wallet_paper_pnl_by_wallet") or {}).items():
-            row = wallets.setdefault(wallet, {"signals": 0, "wins": 0, "wallet_pnl": 0.0, "our_pnl": 0.0})
+            row = wallets.setdefault(wallet, {"signals": 0, "wins": 0, "exits": 0, "wallet_pnl": 0.0, "our_pnl": 0.0, "legs": 0})
             row["signals"] += 1
             row["wins"] += 1 if won else 0
             row["wallet_pnl"] = round(to_float(row.get("wallet_pnl")) + to_float(wallet_pnl), 8)

@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 import urllib.error
 import urllib.request
 import unittest
+from unittest.mock import patch
 
 from poly_fight.api import PolymarketClient, RateLimiter, parse_retry_after
 from poly_fight.cli import (
@@ -15,6 +16,7 @@ from poly_fight.cli import (
     build_profile_fetch_plan,
     fetch_resolutions_for_open_signals,
     fetch_recent_esports_closed_positions_for_wallet,
+    fetch_user_trades_until_cursor,
     fetch_market_trades_cached,
     filter_profile_candidates,
     merge_cached_profile_with_candidate,
@@ -24,6 +26,7 @@ from poly_fight.cli import (
     read_json,
     should_refresh_file_cache,
     should_use_cached_profile,
+    watched_markets,
 )
 from poly_fight.core import (
     SCORING_VERSION,
@@ -39,16 +42,21 @@ from poly_fight.core import (
 )
 from poly_fight.follow import (
     aggregate_follow_performance,
+    bootstrap_position_trades,
+    desired_tick_interval,
     detect_new_positions,
     eligible_follow_wallets,
     esports_match_imminent,
     evaluate_slippage,
     paper_pnl,
+    process_follow_trades,
     qualify_follow,
+    select_new_trades,
     settle_open_signals,
     should_retry_unqualified_position,
     summarize_wallet_fills,
     upsert_follow_signal,
+    wallet_behavior_summary,
 )
 
 
@@ -1239,6 +1247,219 @@ class CoreTest(unittest.TestCase):
         self.assertFalse(should_retry_unqualified_position("closed_market"))
         self.assertFalse(should_retry_unqualified_position("unknown_outcome"))
 
+    def test_follow_v2_desired_tick_interval_curve(self):
+        now = 1000
+        far = {"condition_id": "m1", "match_start_time": datetime.fromtimestamp(now + 24 * 3600, timezone.utc).isoformat()}
+        near = {"condition_id": "m2", "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat()}
+        post = {"condition_id": "m3", "match_start_time": datetime.fromtimestamp(now - 3600, timezone.utc).isoformat()}
+
+        self.assertEqual(desired_tick_interval([], [], now_ts=now), 900)
+        self.assertEqual(desired_tick_interval([far], [], now_ts=now), 900)
+        self.assertEqual(desired_tick_interval([near], [], now_ts=now), 180)
+        self.assertEqual(desired_tick_interval([post], [], now_ts=now), 180)
+        self.assertEqual(desired_tick_interval([], [{"status": "open"}], now_ts=now), 180)
+
+    def test_watched_markets_only_include_future_starts(self):
+        now = 1000
+        markets = {
+            "past": {"condition_id": "past", "match_start_time": datetime.fromtimestamp(now - 60, timezone.utc).isoformat()},
+            "future": {"condition_id": "future", "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat()},
+            "far": {"condition_id": "far", "match_start_time": datetime.fromtimestamp(now + 30 * 3600, timezone.utc).isoformat()},
+        }
+
+        watched = watched_markets(markets, now_ts=now, observe_window_hours=24)
+
+        self.assertEqual(list(watched), ["future"])
+
+    def test_follow_v2_trade_cursor_cold_start_then_incremental(self):
+        trades = [
+            {"id": "t3", "timestamp": 30},
+            {"id": "t2", "timestamp": 20},
+            {"id": "t1", "timestamp": 10},
+        ]
+
+        new_trades, cursor, cold_start = select_new_trades(trades, None)
+
+        self.assertTrue(cold_start)
+        self.assertEqual(new_trades, [])
+        self.assertEqual(cursor["timestamp"], 30)
+        self.assertEqual(cursor["id"], "t3")
+
+        next_trades = [{"id": "t4", "timestamp": 40}, *trades]
+        new_trades, cursor, cold_start = select_new_trades(next_trades, cursor)
+
+        self.assertFalse(cold_start)
+        self.assertEqual([row["id"] for row in new_trades], ["t4"])
+        self.assertEqual(cursor["id"], "t4")
+
+    def test_follow_user_trades_fetch_pages_until_cursor(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def trades_for_user(self, wallet, *, limit=100, offset=0):
+                self.calls.append((wallet, limit, offset))
+                pages = {
+                    0: [{"id": "t4", "timestamp": 40}, {"id": "t3", "timestamp": 30}],
+                    2: [{"id": "t2", "timestamp": 20}, {"id": "t1", "timestamp": 10}],
+                    4: [{"id": "old", "timestamp": 1}],
+                }
+                return pages[offset]
+
+        trades = fetch_user_trades_until_cursor(
+            FakeClient(),
+            "0xA",
+            previous_cursor={"timestamp": 20, "id": "t2"},
+            limit=2,
+            max_pages=3,
+        )
+
+        self.assertEqual([row["id"] for row in trades], ["t4", "t3", "t2", "t1"])
+
+    def test_follow_user_trades_cold_start_fetches_one_page_only(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def trades_for_user(self, wallet, *, limit=100, offset=0):
+                self.calls.append(offset)
+                return [{"id": "t2", "timestamp": 20}, {"id": "t1", "timestamp": 10}]
+
+        client = FakeClient()
+        trades = fetch_user_trades_until_cursor(client, "0xA", previous_cursor=None, limit=2, max_pages=3)
+
+        self.assertEqual([row["id"] for row in trades], ["t2", "t1"])
+        self.assertEqual(client.calls, [0])
+
+    def test_follow_v2_buy_legs_sell_exit_and_behavior(self):
+        now = 1000
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.5, 0.5],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "Match",
+        }
+        trades = [
+            {"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 10, "timestamp": now},
+            {"id": "b2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.46, "size": 5, "timestamp": now + 1},
+        ]
+
+        signals, stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=trades,
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.05,
+        )
+
+        self.assertEqual(stats["new_leg_count"], 2)
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]["wallet"], "0xa")
+        self.assertEqual(len(signals[0]["legs"]), 2)
+        self.assertEqual(signals[0]["legs"][0]["wallet_fill_price"], 0.45)
+        self.assertEqual(signals[0]["behavior_events"][0]["kind"], "add")
+
+        sell_market = {**market, "outcome_prices": [0.6, 0.4]}
+        signals, stats = process_follow_trades(
+            signals,
+            wallet="0xA",
+            trades=[{"id": "s1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.61, "size": 15, "timestamp": now + 2}],
+            markets_by_condition={"m1": sell_market},
+            now_ts=now + 2,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.05,
+        )
+
+        self.assertEqual(stats["exited_signal_count"], 1)
+        self.assertEqual(signals[0]["status"], "exited")
+        self.assertEqual(signals[0]["exit_price"], 0.6)
+        self.assertGreater(signals[0]["our_realized_pnl"], 0)
+        self.assertTrue(wallet_behavior_summary(signals[0])["sold_before_resolution"])
+
+    def test_follow_v2_bootstraps_existing_position_when_price_still_acceptable(self):
+        now = 1000
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.49, 0.51],
+            "match_start_time": datetime.fromtimestamp(now + 7200, timezone.utc).isoformat(),
+        }
+        positions = [
+            {"conditionId": "m1", "outcomeIndex": 0, "size": 100, "avgPrice": 0.45},
+            {"conditionId": "m2", "outcomeIndex": 0, "size": 100, "avgPrice": 0.45},
+        ]
+
+        trades = bootstrap_position_trades(
+            positions,
+            wallet="0xA",
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            max_slippage=0.05,
+        )
+
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["side"], "BUY")
+        self.assertEqual(trades[0]["price"], 0.45)
+        self.assertTrue(trades[0]["bootstrap_position"])
+
+    def test_follow_v2_does_not_bootstrap_when_current_price_too_far(self):
+        now = 1000
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.6, 0.4],
+            "match_start_time": datetime.fromtimestamp(now + 7200, timezone.utc).isoformat(),
+        }
+        positions = [{"conditionId": "m1", "outcomeIndex": 0, "size": 100, "avgPrice": 0.45}]
+
+        trades = bootstrap_position_trades(
+            positions,
+            wallet="0xA",
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            max_slippage=0.05,
+        )
+
+        self.assertEqual(trades, [])
+
+    def test_follow_v2_hedge_records_opposite_buy(self):
+        now = 1000
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.5, 0.5],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+        }
+        signals, _stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=[{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 10, "timestamp": now}],
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.05,
+        )
+
+        signals, stats = process_follow_trades(
+            signals,
+            wallet="0xA",
+            trades=[{"id": "b2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 1, "side": "BUY", "price": 0.4, "size": 1, "timestamp": now + 1}],
+            markets_by_condition={"m1": market},
+            now_ts=now + 1,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.05,
+        )
+
+        self.assertEqual(stats["hedge_event_count"], 1)
+        self.assertTrue(wallet_behavior_summary(signals[0])["hedged"])
+
     def test_follow_fill_summary_slippage_and_signal_dedup(self):
         trades = [
             {"proxyWallet": "0xA", "outcomeIndex": 0, "price": 0.4, "size": 10, "timestamp": 1},
@@ -1396,6 +1617,26 @@ class CoreTest(unittest.TestCase):
         self.assertNotIn("fills", settled[0]["triggered_by"][0]["fills_summary"])
         self.assertEqual(perf["wallets"]["0xa"]["signals"], 1)
 
+    def test_follow_aggregate_includes_mirror_exits(self):
+        exited = {
+            "status": "exited",
+            "wallet": "0xA",
+            "our_realized_pnl": -0.2,
+            "legs": [
+                {"stake": 1, "wallet_fill_price": 0.5, "our_entry_price": 0.55},
+                {"stake": 1, "wallet_fill_price": 0.52, "our_entry_price": 0.56},
+            ],
+        }
+
+        perf = aggregate_follow_performance({}, [exited])
+
+        self.assertEqual(perf["wallets"]["0xa"]["exits"], 1)
+        self.assertEqual(perf["wallets"]["0xa"]["legs"], 2)
+        self.assertEqual(perf["wallets"]["0xa"]["our_pnl"], -0.2)
+        self.assertEqual(perf["total"]["exits"], 1)
+        self.assertEqual(perf["total"]["our_pnl"], -0.2)
+        self.assertEqual(perf["total"]["signals"], 0)
+
     def test_normalize_wallet_lowercases_keys(self):
         self.assertEqual(normalize_wallet("0xAbC"), "0xabc")
 
@@ -1466,12 +1707,106 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.execution_mode, "paper")
         self.assertEqual(args.stake_usdc, 25)
         self.assertEqual(args.follow_recency_days, 30)
-        self.assertEqual(args.event_gate_horizon_hours, 12)
+        self.assertEqual(args.event_gate_horizon_hours, 24)
+        self.assertEqual(args.observe_window_hours, 24)
         self.assertEqual(args.max_slippage_over_entry, 0.05)
         self.assertTrue(args.require_pre_match)
         self.assertEqual(args.run_log_retention_days, 7)
         self.assertEqual(args.results_retention_days, 0)
+        self.assertEqual(args.user_trades_limit, 100)
+        self.assertEqual(args.user_trades_max_pages, 3)
+        self.assertTrue(args.bootstrap_current_positions)
+        self.assertEqual(args.max_follow_legs, 10)
+        self.assertEqual(args.min_tick_seconds, 180)
+        self.assertEqual(args.max_tick_seconds, 900)
         self.assertEqual(args.max_workers, 8)
+
+    def test_run_command_uses_v2_loop_defaults(self):
+        parser = build_parser()
+
+        args = parser.parse_args(["run", "--stake-usdc", "1", "--skip-initial-build", "--max-run-ticks", "1"])
+
+        self.assertEqual(args.command, "run")
+        self.assertEqual(args.stake_usdc, 1)
+        self.assertTrue(args.skip_initial_build)
+        self.assertEqual(args.max_run_ticks, 1)
+        self.assertEqual(args.pool_refresh_hours, 24)
+        self.assertEqual(args.observe_window_hours, 24)
+        self.assertEqual(args.user_trades_limit, 100)
+        self.assertEqual(args.user_trades_max_pages, 3)
+        self.assertTrue(args.bootstrap_current_positions)
+        self.assertEqual(args.max_follow_legs, 10)
+        self.assertEqual(args.error_retry_seconds, 180)
+        self.assertEqual(args.max_consecutive_error_seconds, 600)
+        self.assertEqual(args.discovery_lookback_days, 14)
+        self.assertEqual(args.market_batch_size, 50)
+        self.assertEqual(args.market_batch_count, 2)
+
+    def test_run_skip_initial_build_does_not_build_before_first_tick(self):
+        parser = build_parser()
+        args = parser.parse_args(["run", "--stake-usdc", "1", "--skip-initial-build", "--max-run-ticks", "1"])
+
+        with patch("poly_fight.cli.build_client", return_value=object()), patch(
+            "poly_fight.cli.command_build_leaderboard"
+        ) as build, patch("poly_fight.cli.command_follow", return_value={"desired_next_interval_seconds": 900}):
+            from poly_fight.cli import command_run
+
+            self.assertEqual(command_run(args), 0)
+
+        self.assertEqual(build.call_count, 0)
+
+    def test_run_loop_survives_one_follow_exception(self):
+        parser = build_parser()
+        args = parser.parse_args(["run", "--stake-usdc", "1", "--skip-initial-build", "--max-run-ticks", "1"])
+
+        follow_results = [RuntimeError("temporary"), {"desired_next_interval_seconds": 900}]
+
+        def flaky_follow(*_args, **_kwargs):
+            result = follow_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with patch("poly_fight.cli.build_client", return_value=object()), patch(
+            "poly_fight.cli.command_build_leaderboard"
+        ) as build, patch("poly_fight.cli.command_follow", side_effect=flaky_follow) as follow, patch(
+            "poly_fight.cli.time.sleep"
+        ) as sleep:
+            from poly_fight.cli import command_run
+
+            self.assertEqual(command_run(args), 0)
+
+        self.assertEqual(build.call_count, 0)
+        self.assertEqual(follow.call_count, 2)
+        self.assertEqual(sleep.call_args_list[0].args[0], 180)
+
+    def test_run_loop_stops_after_consecutive_error_window(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "run",
+                "--stake-usdc",
+                "1",
+                "--skip-initial-build",
+                "--error-retry-seconds",
+                "1",
+                "--max-consecutive-error-seconds",
+                "2",
+            ]
+        )
+        times = [1000, 1000, 1003, 1003]
+
+        with patch("poly_fight.cli.build_client", return_value=object()), patch(
+            "poly_fight.cli.command_build_leaderboard"
+        ), patch("poly_fight.cli.command_follow", side_effect=RuntimeError("poly down")) as follow, patch(
+            "poly_fight.cli.time.sleep"
+        ) as sleep, patch("poly_fight.cli.time.time", side_effect=lambda: times.pop(0)):
+            from poly_fight.cli import command_run
+
+            self.assertEqual(command_run(args), 2)
+
+        self.assertEqual(follow.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@ import argparse
 import math
 import json
 import os
+import signal
+import time
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -28,17 +30,22 @@ from .core import (
 )
 from .follow import (
     aggregate_follow_performance,
+    bootstrap_position_trades,
     current_position_keys,
+    desired_tick_interval,
     detect_new_positions,
     eligible_follow_wallets,
     esports_match_imminent,
     evaluate_slippage,
     market_current_price,
     position_key,
+    process_follow_trades,
     qualify_follow,
+    select_new_trades,
     settle_open_signals,
     should_retry_unqualified_position,
     summarize_wallet_fills,
+    trade_condition_id,
     upsert_follow_signal,
     winner_outcome_index,
 )
@@ -252,6 +259,24 @@ def load_active_market_cache(
     return markets, state, "api"
 
 
+def watched_markets(
+    active_markets: dict[str, dict[str, Any]],
+    *,
+    now_ts: int,
+    observe_window_hours: float,
+) -> dict[str, dict[str, Any]]:
+    window_end = now_ts + int(observe_window_hours * 3600)
+    watched = {}
+    for condition_id, market in active_markets.items():
+        start_dt = parse_dt(market.get("match_start_time") or market.get("market_start_time"))
+        if not start_dt:
+            continue
+        start_ts = int(start_dt.timestamp())
+        if now_ts < start_ts <= window_end:
+            watched[condition_id] = market
+    return watched
+
+
 def fetch_resolutions_for_open_signals(
     client: PolymarketClient,
     open_signals: list[dict[str, Any]],
@@ -306,6 +331,37 @@ def fetch_wallet_market_trades(
             for trade in trades
             if normalize_wallet(trade.get("proxyWallet") or trade.get("wallet") or trade.get("user")) == wallet
         ]
+
+
+def fetch_user_trades_until_cursor(
+    client: PolymarketClient,
+    wallet: str,
+    *,
+    previous_cursor: dict[str, Any] | None,
+    limit: int,
+    max_pages: int,
+) -> list[dict]:
+    trades: list[dict] = []
+    if max_pages <= 0:
+        return trades
+    cursor_ts = int((previous_cursor or {}).get("timestamp") or 0)
+    cursor_id = str((previous_cursor or {}).get("id") or "")
+    for page in range(max_pages):
+        offset = page * limit
+        batch = client.trades_for_user(wallet, limit=limit, offset=offset)
+        trades.extend(batch)
+        if previous_cursor is None:
+            break
+        found_cursor = False
+        for trade in batch:
+            ts = int(trade.get("timestamp") or 0)
+            tid = str(trade.get("id") or trade.get("transactionHash") or "")
+            if ts < cursor_ts or (ts == cursor_ts and (not cursor_id or tid == cursor_id)):
+                found_cursor = True
+                break
+        if found_cursor or len(batch) < limit:
+            break
+    return trades
 
 
 def refresh_open_signal_fills(
@@ -628,8 +684,8 @@ def make_retryable_profile(candidate: dict[str, Any], exc: Exception, *, now_ts:
     }
 
 
-def command_build_leaderboard(args: argparse.Namespace) -> int:
-    client = build_client(args)
+def command_build_leaderboard(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
+    client = client or build_client(args)
     data_dir = Path(args.data_dir)
     now_ts = int(datetime.now(timezone.utc).timestamp())
 
@@ -938,10 +994,15 @@ def command_analyze_event(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_follow(args: argparse.Namespace) -> int:
+def command_follow(
+    args: argparse.Namespace,
+    client: PolymarketClient | None = None,
+    *,
+    emit: bool = True,
+) -> dict[str, Any]:
     if args.execution_mode != "paper":
         raise SystemExit("Only paper execution mode is implemented.")
-    client = build_client(args)
+    client = client or build_client(args)
     data_dir = Path(args.data_dir)
     follow_dir = data_dir / "follow"
     now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -958,7 +1019,7 @@ def command_follow(args: argparse.Namespace) -> int:
     results_path = follow_dir / "follow_results.jsonl"
     run_log_path = follow_dir / "follow_run_log.jsonl"
 
-    state = read_json(state_path, {"wallet_positions": {}})
+    state = read_json(state_path, {"wallet_trade_state": {}})
     open_signals = read_json(open_path, [])
     performance = read_json(perf_path, {})
 
@@ -969,107 +1030,127 @@ def command_follow(args: argparse.Namespace) -> int:
         gamma_pages=args.gamma_pages,
         ttl_seconds=args.event_cache_ttl_minutes * 60,
     )
-    gate_open = esports_match_imminent(
-        list(active_markets.values()),
+    watched = watched_markets(
+        active_markets,
         now_ts=now_ts,
-        horizon_hours=args.event_gate_horizon_hours,
+        observe_window_hours=args.observe_window_hours,
+    )
+    gate_open = bool(watched or open_signals)
+    next_interval = desired_tick_interval(
+        list(watched.values()),
+        open_signals,
+        now_ts=now_ts,
+        observe_window_hours=args.observe_window_hours,
+        min_tick_seconds=args.min_tick_seconds,
+        max_tick_seconds=args.max_tick_seconds,
     )
 
-    wallet_positions_state = dict(state.get("wallet_positions") or {})
-    new_position_count = 0
-    retry_position_count = 0
+    wallet_trade_state = dict(state.get("wallet_trade_state") or {})
+    total_new_trade_count = 0
+    watched_new_trade_count = 0
+    ignored_trade_count = 0
     new_signal_count = 0
+    exited_signal_count = 0
+    hedge_event_count = 0
     cold_start_wallet_count = 0
-    position_request_count = 0
+    bootstrap_position_count = 0
+    bootstrap_position_request_count = 0
+    trade_request_count = 0
 
     if gate_open and follow_wallets:
-        def fetch_positions_for_wallet(row: dict[str, Any]) -> tuple[str, list[dict]]:
+        def fetch_trades_for_wallet(row: dict[str, Any]) -> tuple[str, list[dict], list[dict]]:
             wallet = normalize_wallet(row.get("wallet"))
+            previous_cursor = (wallet_trade_state.get(wallet) or {}).get("last_trade_cursor")
             try:
-                return wallet, client.positions(wallet, limit=args.positions_limit)
+                trades = fetch_user_trades_until_cursor(
+                    client,
+                    wallet,
+                    previous_cursor=previous_cursor,
+                    limit=args.user_trades_limit,
+                    max_pages=args.user_trades_max_pages,
+                )
+                positions = []
+                if previous_cursor is None and args.bootstrap_current_positions:
+                    positions = client.positions(wallet, limit=args.positions_limit)
+                return wallet, trades, positions
             except Exception:
-                return wallet, []
+                return wallet, [], []
 
-        position_results = run_ordered_io_tasks(
+        trade_results = run_ordered_io_tasks(
             follow_wallets,
-            fetch_positions_for_wallet,
+            fetch_trades_for_wallet,
             max_workers=args.max_workers,
         )
-        position_request_count = len(follow_wallets)
-        for result in position_results:
+        trade_request_count = len(follow_wallets)
+        for result in trade_results:
             if isinstance(result, Exception):
                 continue
-            wallet, positions = result
-            previous_keys = wallet_positions_state.get(wallet, {}).get("position_keys")
-            new_positions, snapshot_keys, cold_start = detect_new_positions(previous_keys, positions)
+            wallet, trades, positions = result
+            previous_cursor = (wallet_trade_state.get(wallet) or {}).get("last_trade_cursor")
+            new_trades, next_cursor, cold_start = select_new_trades(trades, previous_cursor)
             if cold_start:
                 cold_start_wallet_count += 1
-                wallet_positions_state[wallet] = {
-                    "position_keys": snapshot_keys,
+                if args.bootstrap_current_positions:
+                    bootstrap_position_request_count += 1
+                if positions:
+                    bootstrap_trades = bootstrap_position_trades(
+                        positions,
+                        wallet=wallet,
+                        markets_by_condition=watched,
+                        now_ts=now_ts,
+                        max_slippage=args.max_slippage_over_entry,
+                        require_pre_match=args.require_pre_match,
+                    )
+                    before_ids = {signal.get("signal_id") for signal in open_signals}
+                    open_signals, stats = process_follow_trades(
+                        open_signals,
+                        wallet=wallet,
+                        trades=bootstrap_trades,
+                        markets_by_condition=watched,
+                        now_ts=now_ts,
+                        stake_usdc=args.stake_usdc,
+                        max_follow_legs=args.max_follow_legs,
+                        max_slippage=args.max_slippage_over_entry,
+                        require_pre_match=args.require_pre_match,
+                    )
+                    after_ids = {signal.get("signal_id") for signal in open_signals}
+                    new_signal_count += len(after_ids - before_ids)
+                    bootstrap_position_count += len(bootstrap_trades)
+                wallet_trade_state[wallet] = {
+                    "last_trade_cursor": next_cursor,
                     "last_seen_at": now_ts,
                 }
                 continue
-            seen_keys = set(previous_keys or []) & set(snapshot_keys)
-            for position in new_positions:
-                condition_id = str(position.get("conditionId") or position.get("condition_id") or "").lower()
-                key = position_key(position)
-                market = active_markets.get(condition_id)
-                qualification = qualify_follow(
-                    position,
-                    market,
-                    now_ts=now_ts,
-                    require_pre_match=args.require_pre_match,
-                )
-                if not qualification.get("qualified"):
-                    if should_retry_unqualified_position(qualification.get("reason")):
-                        retry_position_count += 1
-                    else:
-                        new_position_count += 1
-                        seen_keys.add(key)
-                    continue
-                new_position_count += 1
-                trades = fetch_wallet_market_trades(client, wallet, condition_id)
-                fills_summary = summarize_wallet_fills(
-                    trades,
-                    wallet=wallet,
-                    outcome_index=qualification.get("outcome_index"),
-                )
-                if fills_summary.get("avg_price"):
-                    qualification["wallet_avg_price"] = fills_summary["avg_price"]
-                current_price = market_current_price(
-                    market,
-                    int(qualification["outcome_index"]),
-                    position,
-                )
-                open_signals, created = upsert_follow_signal(
-                    open_signals,
-                    wallet=wallet,
-                    market=market,
-                    qualification=qualification,
-                    fills_summary=fills_summary,
-                    current_price=current_price,
-                    max_slippage=args.max_slippage_over_entry,
-                    stake_usdc=args.stake_usdc,
-                    now_ts=now_ts,
-                )
-                if created:
-                    new_signal_count += 1
-                seen_keys.add(key)
-            wallet_positions_state[wallet] = {
-                "position_keys": sorted(seen_keys),
+            watched_trades = [trade for trade in new_trades if trade_condition_id(trade) in watched]
+            before_ids = {signal.get("signal_id") for signal in open_signals}
+            open_signals, stats = process_follow_trades(
+                open_signals,
+                wallet=wallet,
+                trades=watched_trades,
+                markets_by_condition=watched,
+                now_ts=now_ts,
+                stake_usdc=args.stake_usdc,
+                max_follow_legs=args.max_follow_legs,
+                max_slippage=args.max_slippage_over_entry,
+                require_pre_match=args.require_pre_match,
+            )
+            after_ids = {signal.get("signal_id") for signal in open_signals}
+            new_signal_count += len(after_ids - before_ids)
+            total_new_trade_count += len(new_trades)
+            watched_new_trade_count += len(watched_trades)
+            ignored_trade_count += stats.get("ignored_trade_count", 0) + (len(new_trades) - len(watched_trades))
+            exited_signal_count += stats.get("exited_signal_count", 0)
+            hedge_event_count += stats.get("hedge_event_count", 0)
+            wallet_trade_state[wallet] = {
+                "last_trade_cursor": next_cursor,
                 "last_seen_at": now_ts,
             }
 
-    state["wallet_positions"] = wallet_positions_state
+    state["wallet_trade_state"] = wallet_trade_state
     state["updated_at"] = now_ts
 
-    open_signals, refreshed_signal_count = refresh_open_signal_fills(
-        client,
-        open_signals,
-        active_markets,
-        now_ts=now_ts,
-        max_slippage=args.max_slippage_over_entry,
-    )
+    exited_signals = [signal for signal in open_signals if signal.get("status") == "exited"]
+    open_signals = [signal for signal in open_signals if signal.get("status") != "exited"]
     resolutions = fetch_resolutions_for_open_signals(
         client,
         open_signals,
@@ -1079,9 +1160,11 @@ def command_follow(args: argparse.Namespace) -> int:
         ttl_seconds=args.event_cache_ttl_minutes * 60,
     )
     open_signals, settled = settle_open_signals(open_signals, resolutions, now_ts=now_ts)
-    if settled:
-        append_jsonl(results_path, settled)
-        performance = aggregate_follow_performance(performance, settled)
+    result_events = [*exited_signals, *settled]
+    if result_events:
+        append_jsonl(results_path, result_events)
+    if result_events:
+        performance = aggregate_follow_performance(performance, result_events)
     else:
         performance = aggregate_follow_performance(performance, [])
 
@@ -1090,14 +1173,21 @@ def command_follow(args: argparse.Namespace) -> int:
         "follow_wallet_count": len(follow_wallets),
         "gate_open": gate_open,
         "active_market_source": active_source,
-        "position_request_count": position_request_count,
+        "watched_market_count": len(watched),
+        "trade_request_count": trade_request_count,
+        "bootstrap_position_request_count": bootstrap_position_request_count,
         "cold_start_wallet_count": cold_start_wallet_count,
-        "new_position_count": new_position_count,
-        "retry_position_count": retry_position_count,
+        "bootstrap_position_count": bootstrap_position_count,
+        "total_new_trade_count": total_new_trade_count,
+        "watched_new_trade_count": watched_new_trade_count,
+        "new_trade_count": watched_new_trade_count,
+        "ignored_trade_count": ignored_trade_count,
         "new_signal_count": new_signal_count,
-        "refreshed_signal_count": refreshed_signal_count,
+        "exited_signal_count": exited_signal_count,
+        "hedge_event_count": hedge_event_count,
         "open_signal_count": len(open_signals),
         "settled_signal_count": len(settled),
+        "desired_next_interval_seconds": next_interval,
     }
     run_log_rows = read_jsonl(run_log_path)
     from .follow import prune_jsonl
@@ -1118,7 +1208,109 @@ def command_follow(args: argparse.Namespace) -> int:
         "settled_result_count_total": len(result_rows),
         "output_dir": str(follow_dir),
     }
-    print(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True))
+    if emit:
+        print(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True))
+    return summary
+
+
+def command_run(args: argparse.Namespace) -> int:
+    if args.execution_mode != "paper":
+        raise SystemExit("Only paper execution mode is implemented.")
+    client = build_client(args)
+    last_build_at = int(datetime.now(timezone.utc).timestamp()) if args.skip_initial_build else 0
+    tick_count = 0
+    first_error_at: float | None = None
+    stop_requested = {"value": False, "reason": ""}
+
+    def request_stop(signum, _frame) -> None:
+        stop_requested["value"] = True
+        stop_requested["reason"] = f"signal_{signum}"
+
+    previous_sigterm = None
+    try:
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, request_stop)
+    except (AttributeError, ValueError):
+        previous_sigterm = None
+
+    def maybe_build(force: bool = False) -> None:
+        nonlocal last_build_at
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        if force or now_ts - last_build_at >= int(args.pool_refresh_hours * 3600):
+            command_build_leaderboard(args, client=client)
+            last_build_at = int(datetime.now(timezone.utc).timestamp())
+
+    try:
+        if not args.skip_initial_build:
+            try:
+                maybe_build(force=True)
+            except Exception as exc:
+                first_error_at = time.time()
+                print(
+                    json.dumps(
+                        {
+                            "status": "run_iteration_error",
+                            "phase": "initial_build",
+                            "error": str(exc),
+                            "sleep_seconds": int(args.error_retry_seconds),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                time.sleep(max(1, int(args.error_retry_seconds)))
+        while not stop_requested["value"]:
+            try:
+                maybe_build(force=False)
+                summary = command_follow(args, client=client, emit=True)
+            except Exception as exc:
+                now = time.time()
+                if first_error_at is None:
+                    first_error_at = now
+                elapsed = now - first_error_at
+                if args.max_consecutive_error_seconds > 0 and elapsed >= args.max_consecutive_error_seconds:
+                    print(
+                        json.dumps(
+                            {
+                                "status": "stopped",
+                                "reason": "consecutive_errors",
+                                "error": str(exc),
+                                "elapsed_error_seconds": round(elapsed, 2),
+                                "ticks": tick_count,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    return 2
+                print(
+                    json.dumps(
+                        {
+                            "status": "run_iteration_error",
+                            "phase": "loop",
+                            "error": str(exc),
+                            "elapsed_error_seconds": round(elapsed, 2),
+                            "sleep_seconds": int(args.error_retry_seconds),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                time.sleep(max(1, int(args.error_retry_seconds)))
+                continue
+            first_error_at = None
+            tick_count += 1
+            if args.max_run_ticks and tick_count >= args.max_run_ticks:
+                break
+            sleep_seconds = int(summary.get("desired_next_interval_seconds") or args.max_tick_seconds)
+            time.sleep(max(1, sleep_seconds))
+    except KeyboardInterrupt:
+        print(json.dumps({"status": "stopped", "reason": "keyboard_interrupt", "ticks": tick_count}, ensure_ascii=False))
+    finally:
+        if stop_requested["value"]:
+            print(json.dumps({"status": "stopped", "reason": stop_requested["reason"], "ticks": tick_count}, ensure_ascii=False))
+        if previous_sigterm is not None:
+            try:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+            except (AttributeError, ValueError):
+                pass
     return 0
 
 
@@ -1172,6 +1364,32 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--profile-store-max-age-days", type=int, default=180)
         subparser.set_defaults(func=command_build_leaderboard)
 
+    def add_follow_arguments(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument("--stake-usdc", type=float, required=True)
+        subparser.add_argument("--follow-recency-days", type=int, default=30)
+        subparser.add_argument("--event-gate-horizon-hours", type=float, default=24)
+        subparser.add_argument("--observe-window-hours", type=float, default=24)
+        subparser.add_argument("--event-cache-ttl-minutes", type=int, default=15)
+        subparser.add_argument("--max-slippage-over-entry", type=float, default=0.05)
+        subparser.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=True)
+        subparser.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
+        subparser.add_argument("--execution-mode", choices=["paper", "live"], default="paper")
+        subparser.add_argument("--run-log-retention-days", type=int, default=7)
+        subparser.add_argument("--results-retention-days", type=int, default=0)
+        subparser.add_argument("--gamma-pages", type=int, default=3)
+        subparser.add_argument("--positions-limit", type=int, default=100)
+        subparser.add_argument("--user-trades-limit", type=int, default=100)
+        subparser.add_argument("--user-trades-max-pages", type=int, default=3)
+        subparser.add_argument("--bootstrap-current-positions", dest="bootstrap_current_positions", action="store_true", default=True)
+        subparser.add_argument("--no-bootstrap-current-positions", dest="bootstrap_current_positions", action="store_false")
+        subparser.add_argument("--max-follow-legs", type=int, default=10)
+        subparser.add_argument("--min-tick-seconds", type=int, default=180)
+        subparser.add_argument("--max-tick-seconds", type=int, default=900)
+        subparser.add_argument("--max-workers", type=int, default=8)
+        subparser.add_argument("--max-requests-per-second", type=float, default=10)
+        subparser.add_argument("--request-burst", type=int, default=5)
+        subparser.add_argument("--max-retry-after-seconds", type=float, default=60)
+
     build = subparsers.add_parser("build-leaderboard")
     add_build_arguments(build)
 
@@ -1186,30 +1404,44 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.set_defaults(func=command_analyze_event)
 
     follow = subparsers.add_parser("follow", help="run one paper follow tick")
-    follow.add_argument("--stake-usdc", type=float, required=True)
-    follow.add_argument("--follow-recency-days", type=int, default=30)
-    follow.add_argument("--event-gate-horizon-hours", type=float, default=12)
-    follow.add_argument("--event-cache-ttl-minutes", type=int, default=15)
-    follow.add_argument("--max-slippage-over-entry", type=float, default=0.05)
-    follow.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=True)
-    follow.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
-    follow.add_argument("--execution-mode", choices=["paper", "live"], default="paper")
-    follow.add_argument("--run-log-retention-days", type=int, default=7)
-    follow.add_argument("--results-retention-days", type=int, default=0)
-    follow.add_argument("--gamma-pages", type=int, default=3)
-    follow.add_argument("--positions-limit", type=int, default=100)
-    follow.add_argument("--max-workers", type=int, default=8)
-    follow.add_argument("--max-requests-per-second", type=float, default=10)
-    follow.add_argument("--request-burst", type=int, default=5)
-    follow.add_argument("--max-retry-after-seconds", type=float, default=60)
+    add_follow_arguments(follow)
     follow.set_defaults(func=command_follow)
+
+    run = subparsers.add_parser("run", help="run paper follow loop with scheduled pool refresh")
+    add_build_arguments(run)
+    run.add_argument("--stake-usdc", type=float, required=True)
+    run.add_argument("--follow-recency-days", type=int, default=30)
+    run.add_argument("--event-gate-horizon-hours", type=float, default=24)
+    run.add_argument("--observe-window-hours", type=float, default=24)
+    run.add_argument("--event-cache-ttl-minutes", type=int, default=15)
+    run.add_argument("--max-slippage-over-entry", type=float, default=0.05)
+    run.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=True)
+    run.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
+    run.add_argument("--execution-mode", choices=["paper", "live"], default="paper")
+    run.add_argument("--run-log-retention-days", type=int, default=7)
+    run.add_argument("--results-retention-days", type=int, default=0)
+    run.add_argument("--positions-limit", type=int, default=100)
+    run.add_argument("--user-trades-limit", type=int, default=100)
+    run.add_argument("--user-trades-max-pages", type=int, default=3)
+    run.add_argument("--bootstrap-current-positions", dest="bootstrap_current_positions", action="store_true", default=True)
+    run.add_argument("--no-bootstrap-current-positions", dest="bootstrap_current_positions", action="store_false")
+    run.add_argument("--max-follow-legs", type=int, default=10)
+    run.add_argument("--min-tick-seconds", type=int, default=180)
+    run.add_argument("--max-tick-seconds", type=int, default=900)
+    run.add_argument("--error-retry-seconds", type=int, default=180)
+    run.add_argument("--max-consecutive-error-seconds", type=int, default=600)
+    run.add_argument("--pool-refresh-hours", type=float, default=24)
+    run.add_argument("--skip-initial-build", action="store_true")
+    run.add_argument("--max-run-ticks", type=int, default=0)
+    run.set_defaults(func=command_run)
     return parser
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    return args.func(args)
+    result = args.func(args)
+    return result if isinstance(result, int) else 0
 
 
 if __name__ == "__main__":

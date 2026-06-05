@@ -64,11 +64,18 @@ python3 -m poly_fight.cli analyze-event --condition-id <condition_id>
 Run one paper follow tick:
 
 ```bash
-python3 -m poly_fight.cli follow --stake-usdc 25
+python3 -m poly_fight.cli follow --stake-usdc 1
 ```
 
-The follow command is one tick, not a daemon. Use cron or an external loop every
-~3 minutes after `smart_wallet_leaderboard.json` exists.
+Run the stage-two paper follow loop:
+
+```bash
+python3 -m poly_fight.cli run --stake-usdc 1
+```
+
+`run` is the preferred follow entrypoint. It starts with a leaderboard build
+unless `--skip-initial-build` is passed, then runs follow ticks with adaptive
+sleep. `follow` remains a one-tick debugging command.
 
 Global CLI options such as `--data-dir` must come before the subcommand:
 
@@ -249,13 +256,40 @@ Per tick:
 ```text
 read A-wallet leaderboard
 filter follow-eligible wallets with 30-day recency
-check active esports event gate for starts within 12h
-if gate open, poll all follow wallets' current positions
-cold-start wallets become baseline only
-new pre-match esports positions create/update paper signals
+build watched esports market set from start_time within the 24h observe window
+if watched markets or open signals exist, poll latest trades?user= for follow wallets
+cold-start wallets set last_trade_cursor only
+new BUY trades in watched pre-start markets create paper legs
+new SELL trades mirror-exit all open legs for that wallet-market-outcome
 settled markets move from open signals to compact results
 performance is aggregated by wallet and overall
 ```
+
+Polymarket Data API `/trades` documents `timestamp` in the response, but does
+not document a time-range query parameter. Do not rely on `since`/date filters.
+Use a per-wallet local cursor `{timestamp, id}` and fetch recent pages
+(`--user-trades-limit`, default 100; `--user-trades-max-pages`, default 3),
+reading until the cursor. First sight of a wallet is baseline only and must not
+follow old trades.
+
+Cold-start exception: also check current positions once. If an A wallet already
+holds a watched future-start esports market and the current price is still no
+more than `--max-slippage-over-entry` above the wallet average entry, create one
+bootstrap paper leg. This catches "script started after smart wallet already
+built early" cases. It is controlled by `--bootstrap-current-positions`
+(default on) / `--no-bootstrap-current-positions`.
+
+REST API failure policy:
+
+```text
+per-wallet trade/position failure -> return empty for that wallet, tick continues
+broader build/follow failure -> run logs run_iteration_error and sleeps
+error retry interval -> --error-retry-seconds, default 180
+continuous outage stop -> --max-consecutive-error-seconds, default 600
+```
+
+This strategy avoids stopping on one bad wallet/API response, but exits with
+status 2 if Polymarket/network appears unavailable for about 10 minutes.
 
 Follow output lives under `data/follow/`:
 

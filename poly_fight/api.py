@@ -233,6 +233,21 @@ class PolymarketClient:
             takerOnly="false",
         )
 
+    def trades_for_user(
+        self,
+        wallet: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        return self.data(
+            "/trades",
+            user=wallet,
+            limit=limit,
+            offset=offset,
+            takerOnly="false",
+        )
+
     def closed_positions(
         self,
         wallet: str,

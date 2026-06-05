@@ -46,13 +46,40 @@ python3 -m poly_fight.cli analyze-event --condition-id 0x...
 Run one paper follow tick:
 
 ```bash
-python3 -m poly_fight.cli follow --stake-usdc 25
+python3 -m poly_fight.cli follow --stake-usdc 1
 ```
 
-The first tick cold-starts wallet position baselines and should not emit old
-in-flight positions as signals. Later ticks detect new pre-match esports
-positions opened by A wallets, write paper signals, and settle them after
-resolution. Schedule this command externally, for example every 3 minutes.
+Run the paper follow loop:
+
+```bash
+python3 -m poly_fight.cli run --stake-usdc 1
+```
+
+`run` is the recommended stage-two entrypoint. It builds/refeshes the smart
+wallet leaderboard, then keeps running follow ticks with adaptive sleep. The
+default observation window starts 24 hours before match start and continues
+until settlement.
+
+Follow detection is trade-centric. Each tick pulls recent
+`trades?user=<wallet>` pages for A wallets, advances a local per-wallet cursor,
+and ignores historical trades on cold start. The Data API documents `timestamp`
+as a response field but does not document a time-range query parameter for
+`/trades`, so incremental behavior is implemented client-side with that cursor.
+After cold start, the client fetches up to `--user-trades-max-pages` pages
+(default 3) until it reaches the previous cursor. BUY trades in watched esports
+markets create paper legs; SELL trades mirror-exit the open paper position.
+
+On wallet cold start, the follow loop also checks current positions once. If an
+A wallet already holds a watched future-start esports market and the current
+price is still within `--max-slippage-over-entry` of that wallet's average
+entry, the paper loop opens one bootstrap leg. Disable this with
+`--no-bootstrap-current-positions`.
+
+REST API failures are isolated. Per-wallet trade/position failures do not stop
+the tick. Broader event/build/write failures are caught by `run`, logged as
+`run_iteration_error`, retried after `--error-retry-seconds` (default 180), and
+only stop the process after `--max-consecutive-error-seconds` (default 600) of
+continuous failures.
 
 Outputs are written under `data/`:
 
