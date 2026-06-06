@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
+from contextlib import nullcontext, redirect_stdout
 import http.client
 import json
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
+import sys
 from tempfile import TemporaryDirectory
 import threading
 import time
@@ -14,24 +16,31 @@ from unittest.mock import patch
 
 from poly_fight.api import PolymarketClient, RateLimiter, parse_retry_after
 from poly_fight.dashboard import (
+    build_events,
     build_follow_detail,
     build_follows,
     build_overview,
+    build_runner_status,
     build_wallet_refresh_status,
     build_wallets,
     DashboardConfig,
     create_server,
     make_session_token,
     short_addr,
+    start_runner,
+    stop_runner,
     verify_session_token,
 )
 from poly_fight.control import read_follow_control
 from poly_fight.storage import FollowStore
 from poly_fight.cli import (
+    BuildLockUnavailable,
+    acquire_build_lock,
     build_leaderboard_from_profiles,
     build_parser,
     build_wallet_overlap_report,
     build_profile_fetch_plan,
+    command_build_leaderboard,
     command_follow,
     fetch_resolutions_for_open_signals,
     fetch_recent_esports_closed_positions_for_wallet,
@@ -208,7 +217,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(sleeps, [1])
 
-    def test_closed_positions_requests_timestamp_descending_order(self):
+    def test_closed_positions_requests_timestamp_descending_order_and_market_filter(self):
         calls = []
 
         class Client(PolymarketClient):
@@ -216,11 +225,37 @@ class CoreTest(unittest.TestCase):
                 calls.append((path, params))
                 return []
 
-        Client().closed_positions("0xabc", limit=50, offset=100)
+        Client().closed_positions("0xabc", limit=50, offset=100, market=["m1", "m2"])
 
         self.assertEqual(calls[0][0], "/closed-positions")
+        self.assertEqual(calls[0][1]["market"], "m1,m2")
         self.assertEqual(calls[0][1]["sortBy"], "TIMESTAMP")
         self.assertEqual(calls[0][1]["sortDirection"], "DESC")
+
+    def test_event_pagination_stops_after_min_end_date(self):
+        calls = []
+
+        class Client(PolymarketClient):
+            def list_events(self, *, closed, active=None, limit=100, offset=0, order="endDate", tag_slug="esports"):
+                calls.append(offset)
+                batches = {
+                    0: [{"id": f"recent-{index}", "endDate": "2026-06-01T00:00:00Z"} for index in range(100)],
+                    100: [{"id": f"old-{index}", "endDate": "2026-01-01T00:00:00Z"} for index in range(100)],
+                    200: [{"id": f"older-{index}", "endDate": "2025-01-01T00:00:00Z"} for index in range(100)],
+                }
+                return batches.get(offset, [])
+
+        rows = Client().list_events_paginated(
+            closed=True,
+            max_pages=10,
+            min_end_date=datetime(2026, 3, 1, tzinfo=timezone.utc),
+            tag_slugs=("esports",),
+        )
+
+        self.assertEqual(rows[0]["id"], "recent-0")
+        self.assertEqual(rows[-1]["id"], "old-99")
+        self.assertEqual(len(rows), 200)
+        self.assertEqual(calls, [0, 100])
 
     def test_classification_set_keeps_only_settled_historical_main_matches(self):
         def esports_event(condition_id, end_date, title="Dota 2: A vs B", prices='["1","0"]'):
@@ -966,35 +1001,37 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(second_source, "error")
         self.assertEqual(client.calls, 2)
 
-    def test_recent_esports_closed_positions_are_filtered_and_capped(self):
+    def test_recent_esports_closed_positions_are_market_filtered_chunked_and_capped(self):
         class FakeClient:
             def __init__(self):
                 self.calls = []
 
-            def closed_positions(self, wallet, *, limit, offset, sort_direction="DESC"):
-                self.calls.append((limit, offset, sort_direction))
+            def closed_positions(self, wallet, *, limit, offset, sort_direction="DESC", market=None):
+                self.calls.append((limit, offset, sort_direction, tuple(market or [])))
                 rows = []
-                for index in range(offset, offset + limit):
-                    condition_id = f"m{index}" if index % 2 == 0 else f"other{index}"
+                for condition_id in market or []:
+                    index = int(condition_id[1:])
                     rows.append({"conditionId": condition_id, "timestamp": 10_000 - index})
                 return rows
 
         client = FakeClient()
-        condition_ids = {f"m{index}" for index in range(0, 200, 2)}
+        condition_ids = {f"m{index}" for index in range(120)}
 
         positions = fetch_recent_esports_closed_positions_for_wallet(
             client,
             "0xabc",
             condition_ids,
-            max_raw_closed_positions=200,
             max_esports_closed_positions=50,
-            page_limit=30,
+            market_chunk_size=25,
         )
 
         self.assertEqual(len(positions), 50)
         self.assertTrue(all(row["conditionId"] in condition_ids for row in positions))
-        self.assertLessEqual(sum(limit for limit, _offset, _direction in client.calls), 200)
-        self.assertTrue(all(direction == "DESC" for _limit, _offset, direction in client.calls))
+        self.assertTrue(all(limit == 50 for limit, _offset, _direction, _market in client.calls))
+        self.assertTrue(all(offset == 0 for _limit, offset, _direction, _market in client.calls))
+        self.assertTrue(all(len(market) <= 25 for _limit, _offset, _direction, market in client.calls))
+        self.assertTrue(all(direction == "DESC" for _limit, _offset, direction, _market in client.calls))
+        self.assertEqual(positions[0]["conditionId"], "m0")
 
     def test_write_json_uses_target_unique_atomic_temp_files(self):
         from poly_fight.cli import write_json
@@ -2706,6 +2743,193 @@ class CoreTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_dashboard_serves_bundled_index_html(self):
+        with TemporaryDirectory() as tmp:
+            server = create_server(
+                DashboardConfig(
+                    data_dir=Path(tmp),
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/")
+                response = conn.getresponse()
+                body = response.read().decode()
+                self.assertEqual(response.status, 200)
+                self.assertIn("text/html", response.getheader("Content-Type") or "")
+                self.assertIn("Poly Fight Dashboard", body)
+                self.assertIn("/app.js", body)
+                self.assertIn("/vendor/vue-3.5.13.global.prod.js", body)
+                self.assertNotIn("cdn.jsdelivr.net", body)
+                conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_wallet_refresh_post_requires_auth(self):
+        with TemporaryDirectory() as tmp:
+            server = create_server(
+                DashboardConfig(
+                    data_dir=Path(tmp),
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("POST", "/api/wallet-refresh")
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                self.assertEqual(response.status, 401)
+                self.assertFalse(payload["ok"])
+                self.assertEqual(payload["error"], "unauthorized")
+                conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_runner_detects_external_matching_process(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            config = DashboardConfig(
+                data_dir=data_dir,
+                username="admin",
+                password="pw",
+                cookie_secret="secret",
+                runner_process_lister=lambda: [
+                    {
+                        "pid": 1234,
+                        "ppid": 1,
+                        "pgid": 1234,
+                        "command": f"{sys.executable} -m poly_fight.cli --data-dir {data_dir} run --stake-usdc 1",
+                    }
+                ],
+            )
+
+            status = build_runner_status(config)
+
+            self.assertEqual(status["status"], "running")
+            self.assertEqual(status["source"], "external")
+            self.assertEqual(status["pid"], 1234)
+
+    def test_dashboard_runner_start_writes_control_and_blocks_duplicate(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            calls = []
+
+            class FakeProcess:
+                pid = 4321
+                pgid = 4321
+
+            def fake_starter(command, log_path):
+                calls.append((command, log_path))
+                return FakeProcess()
+
+            config = DashboardConfig(
+                data_dir=data_dir,
+                username="admin",
+                password="pw",
+                cookie_secret="secret",
+                runner_process_lister=lambda: [],
+                runner_process_starter=fake_starter,
+            )
+
+            status = start_runner(config)
+
+            self.assertEqual(status["status"], "running")
+            self.assertEqual(status["pid"], 4321)
+            self.assertIn("run", calls[0][0])
+            self.assertIn("--stake-usdc", calls[0][0])
+            self.assertEqual(read_follow_control(data_dir)["runner"]["pid"], 4321)
+
+    def test_dashboard_runner_stop_allows_external_process(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            stopped = []
+            config = DashboardConfig(
+                data_dir=data_dir,
+                username="admin",
+                password="pw",
+                cookie_secret="secret",
+                runner_process_lister=lambda: [
+                    {
+                        "pid": 777,
+                        "ppid": 1,
+                        "pgid": 777,
+                        "command": f"{sys.executable} -m poly_fight.cli --data-dir {data_dir} run --stake-usdc 1",
+                    }
+                ],
+                runner_process_stopper=lambda status: stopped.append(status),
+            )
+
+            status = stop_runner(config)
+
+            self.assertEqual(status["status"], "stopping")
+            self.assertEqual(status["source"], "external")
+            self.assertEqual(stopped[0]["pid"], 777)
+
+    def test_dashboard_runner_api_auth_and_conflict(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            server = create_server(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                    runner_process_lister=lambda: [
+                        {
+                            "pid": 888,
+                            "ppid": 1,
+                            "pgid": 888,
+                            "command": f"{sys.executable} -m poly_fight.cli --data-dir {data_dir} run --stake-usdc 1",
+                        }
+                    ],
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("POST", "/api/runner/start")
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                self.assertEqual(response.status, 401)
+                self.assertEqual(payload["error"], "unauthorized")
+                conn.close()
+
+                token = make_session_token("admin", "secret", now=int(datetime.now(timezone.utc).timestamp()))
+                cookie = f"poly_fight_session={token}"
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("POST", "/api/runner/start", headers={"Cookie": cookie})
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                self.assertEqual(response.status, 409)
+                self.assertFalse(payload["ok"])
+                self.assertEqual(payload["error"], "runner_already_running")
+                self.assertEqual(payload["data"]["pid"], 888)
+                conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_dashboard_wallet_refresh_api_runs_refresh_without_pausing_follow(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -2912,6 +3136,53 @@ class CoreTest(unittest.TestCase):
             self.assertTrue(wallets["wallets"][0]["quarantined"])
             self.assertEqual(wallets["wallets"][0]["quarantine"]["reason"], "material_sell")
 
+    def test_dashboard_events_marks_outcome_index_zero_contested(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now_ts = int(time.time())
+            write_json(
+                data_dir / "follow" / "active_market_cache.json",
+                {
+                    "updated_at": now_ts,
+                    "markets": [
+                        {
+                            "condition_id": "m1",
+                            "title": "A vs B",
+                            "match_start_time": now_ts + 3600,
+                        }
+                    ],
+                },
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "s0",
+                        "wallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "condition_id": "m1",
+                        "outcome_index": 0,
+                        "status": "open",
+                        "legs": [],
+                    },
+                    {
+                        "signal_id": "s1",
+                        "wallet": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "condition_id": "m1",
+                        "outcome_index": 1,
+                        "status": "open",
+                        "legs": [],
+                    },
+                ],
+                result_events=[],
+                performance={},
+            )
+
+            events = build_events(data_dir)
+
+            self.assertTrue(events["events"][0]["contested"])
+            self.assertEqual(events["events"][0]["side_counts"], {"0": 1, "1": 1})
+
     def test_dashboard_wallet_trades_rejects_invalid_addr_without_client_call(self):
         with TemporaryDirectory() as tmp:
             calls = []
@@ -3054,8 +3325,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.max_requests_per_second, 10)
         self.assertEqual(args.request_burst, 5)
         self.assertEqual(args.max_retry_after_seconds, 60)
-        self.assertEqual(args.max_closed_positions_per_wallet, 1000)
-        self.assertEqual(args.max_esports_closed_positions_per_wallet, 100)
+        self.assertEqual(args.classification_lookback_days, 14)
+        self.assertEqual(args.max_esports_closed_positions_per_wallet, 50)
+        self.assertEqual(args.closed_position_market_chunk_size, 50)
         self.assertEqual(args.min_profile_participated_markets, 3)
         self.assertEqual(args.min_profile_avg_market_cash, 1_500)
         self.assertEqual(args.market_trades_cache_ttl_days, 7)
@@ -3092,6 +3364,29 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.discovery_lookback_days, 15)
         self.assertEqual(args.market_batch_size, 50)
         self.assertEqual(args.market_batch_index, 2)
+
+    def test_build_leaderboard_lock_blocks_second_holder(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+
+            with acquire_build_lock(data_dir, blocking=False):
+                with self.assertRaises(BuildLockUnavailable):
+                    with acquire_build_lock(data_dir, blocking=False):
+                        pass
+
+    def test_command_build_leaderboard_uses_build_lock(self):
+        parser = build_parser()
+        args = parser.parse_args(["--data-dir", "data_test", "collect"])
+        client = object()
+
+        with patch("poly_fight.cli.acquire_build_lock", return_value=nullcontext()) as lock, patch(
+            "poly_fight.cli._command_build_leaderboard_unlocked", return_value=0
+        ) as inner:
+            result = command_build_leaderboard(args, client=client)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(lock.call_args.args[0], Path("data_test"))
+        inner.assert_called_once_with(args, client=client)
 
     def test_follow_command_uses_paper_defaults(self):
         parser = build_parser()
@@ -3165,7 +3460,8 @@ class CoreTest(unittest.TestCase):
         ) as build, patch("poly_fight.cli.command_follow", return_value={"desired_next_interval_seconds": 900}):
             from poly_fight.cli import command_run
 
-            self.assertEqual(command_run(args), 0)
+            with redirect_stdout(StringIO()):
+                self.assertEqual(command_run(args), 0)
 
         self.assertEqual(build.call_count, 0)
 
@@ -3188,7 +3484,8 @@ class CoreTest(unittest.TestCase):
         ) as sleep:
             from poly_fight.cli import command_run
 
-            self.assertEqual(command_run(args), 0)
+            with redirect_stdout(StringIO()):
+                self.assertEqual(command_run(args), 0)
 
         self.assertEqual(build.call_count, 0)
         self.assertEqual(follow.call_count, 2)
@@ -3217,7 +3514,8 @@ class CoreTest(unittest.TestCase):
         ) as sleep, patch("poly_fight.cli.time.time", side_effect=lambda: times.pop(0)):
             from poly_fight.cli import command_run
 
-            self.assertEqual(command_run(args), 2)
+            with redirect_stdout(StringIO()):
+                self.assertEqual(command_run(args), 2)
 
         self.assertEqual(follow.call_count, 3)
         self.assertEqual(sleep.call_count, 2)

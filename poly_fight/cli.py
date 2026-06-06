@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import math
 import json
 import os
@@ -8,7 +9,7 @@ import signal
 import time
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,40 @@ from .follow import (
     winner_outcome_index,
 )
 from .storage import FollowStore
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-Unix fallback
+    fcntl = None
+
+
+class BuildLockUnavailable(RuntimeError):
+    pass
+
+
+@contextmanager
+def acquire_build_lock(data_dir: Path, *, blocking: bool = True):
+    data_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = data_dir / ".build-leaderboard.lock"
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        if fcntl is None:
+            yield
+            return
+        flags = fcntl.LOCK_EX
+        if not blocking:
+            flags |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(handle.fileno(), flags)
+        except BlockingIOError as exc:
+            raise BuildLockUnavailable(str(lock_path)) from exc
+        try:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(str(os.getpid()))
+            handle.flush()
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def build_client(args: argparse.Namespace) -> PolymarketClient:
@@ -113,15 +148,6 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     finally:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
-
-
-def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def fetch_market_trades(
@@ -210,28 +236,42 @@ def fetch_recent_esports_closed_positions_for_wallet(
     wallet: str,
     esports_condition_ids: set[str],
     *,
-    max_raw_closed_positions: int,
     max_esports_closed_positions: int,
-    page_limit: int = 500,
+    page_limit: int = 50,
+    market_chunk_size: int = 50,
 ) -> list[dict]:
-    positions: list[dict] = []
-    fetched = 0
-    offset = 0
-    while fetched < max_raw_closed_positions and len(positions) < max_esports_closed_positions:
-        limit = min(page_limit, max_raw_closed_positions - fetched)
-        batch = client.closed_positions(wallet, limit=limit, offset=offset)
-        if not batch:
-            break
-        fetched += len(batch)
-        for position in batch:
+    condition_ids = sorted({str(value).lower() for value in esports_condition_ids if value})
+    if not condition_ids:
+        return []
+    chunk_size = max(1, int(market_chunk_size))
+    limit = max(1, min(int(page_limit), int(max_esports_closed_positions)))
+    positions_by_key: dict[str, dict] = {}
+    for index in range(0, len(condition_ids), chunk_size):
+        chunk = condition_ids[index : index + chunk_size]
+        batch = client.closed_positions(
+            wallet,
+            limit=limit,
+            offset=0,
+            market=chunk,
+            sort_direction="DESC",
+        )
+        for position in batch or []:
             condition_id = str(position.get("conditionId") or position.get("condition_id") or "").lower()
-            if condition_id in esports_condition_ids:
-                positions.append(position)
-                if len(positions) >= max_esports_closed_positions:
-                    break
-        if len(batch) < limit:
-            break
-        offset += limit
+            if condition_id not in esports_condition_ids:
+                continue
+            key = ":".join(
+                [
+                    condition_id,
+                    str(position.get("outcomeIndex") or position.get("outcome_index") or ""),
+                    str(position.get("asset") or ""),
+                ]
+            )
+            positions_by_key[key] = position
+    positions = sorted(
+        positions_by_key.values(),
+        key=lambda row: int(row.get("timestamp") or 0),
+        reverse=True,
+    )
     return positions[:max_esports_closed_positions]
 
 
@@ -743,6 +783,12 @@ def make_retryable_profile(candidate: dict[str, Any], exc: Exception, *, now_ts:
 
 
 def command_build_leaderboard(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
+    data_dir = Path(args.data_dir)
+    with acquire_build_lock(data_dir):
+        return _command_build_leaderboard_unlocked(args, client=client)
+
+
+def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
     client = client or build_client(args)
     data_dir = Path(args.data_dir)
     now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -750,7 +796,11 @@ def command_build_leaderboard(args: argparse.Namespace, client: PolymarketClient
     lookback_steps = (args.discovery_lookback_days,) if args.discovery_lookback_days else (7, 14, 30)
     classification_path = data_dir / "esports_classification_set.json"
     classification_meta_path = data_dir / "esports_classification_set.meta.json"
-    classification_meta = {"gamma_pages": args.gamma_pages}
+    classification_lookback_days = args.classification_lookback_days
+    classification_meta = {
+        "gamma_pages": args.gamma_pages,
+        "classification_lookback_days": classification_lookback_days,
+    }
     classification_source = "api"
     if (
         classification_path.exists()
@@ -765,10 +815,22 @@ def command_build_leaderboard(args: argparse.Namespace, client: PolymarketClient
         classification_set = read_json(classification_path, [])
         classification_source = "cache"
     else:
-        closed_events = client.list_events_paginated(closed=True, active=None, max_pages=args.gamma_pages)
+        now_dt = datetime.fromtimestamp(now_ts, timezone.utc)
+        min_end_date = (
+            now_dt - timedelta(days=classification_lookback_days)
+            if classification_lookback_days and classification_lookback_days > 0
+            else None
+        )
+        closed_events = client.list_events_paginated(
+            closed=True,
+            active=None,
+            max_pages=args.gamma_pages,
+            min_end_date=min_end_date,
+        )
         classification_set = build_classification_set(
             closed_events,
-            now=datetime.fromtimestamp(now_ts, timezone.utc),
+            now=now_dt,
+            lookback_days=classification_lookback_days if classification_lookback_days > 0 else None,
         )
         write_json(classification_path, classification_set)
         write_json(classification_meta_path, classification_meta)
@@ -912,8 +974,8 @@ def command_build_leaderboard(args: argparse.Namespace, client: PolymarketClient
                     client,
                     w,
                     condition_ids,
-                    max_raw_closed_positions=args.max_closed_positions_per_wallet,
                     max_esports_closed_positions=args.max_esports_closed_positions_per_wallet,
+                    market_chunk_size=args.closed_position_market_chunk_size,
                 ),
                 current_positions_loader=(
                     (lambda w: client.positions(w, limit=100))
@@ -1474,6 +1536,7 @@ def command_serve(args: argparse.Namespace) -> int:
         cookie_secure=args.cookie_secure,
         client=build_client(args),
         observe_window_hours=args.observe_window_hours,
+        runner_stake_usdc=args.runner_stake_usdc,
     )
     server = create_server(config)
     host, port = server.server_address[:2]
@@ -1498,6 +1561,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--gamma-pages", type=int, default=10)
         subparser.add_argument("--refresh-classification", action="store_true")
         subparser.add_argument("--classification-cache-ttl-hours", type=int, default=24)
+        subparser.add_argument("--classification-lookback-days", type=int, default=14)
         subparser.add_argument("--max-workers", type=int, default=8)
         subparser.add_argument("--max-requests-per-second", type=float, default=10)
         subparser.add_argument("--request-burst", type=int, default=5)
@@ -1525,8 +1589,8 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--single-market-cash-threshold", type=float, default=1_000)
         subparser.add_argument("--max-candidate-wallets", type=int, default=1000)
         subparser.add_argument("--max-profiles-per-run", type=int, default=150)
-        subparser.add_argument("--max-closed-positions-per-wallet", type=int, default=1000)
-        subparser.add_argument("--max-esports-closed-positions-per-wallet", type=int, default=100)
+        subparser.add_argument("--max-esports-closed-positions-per-wallet", type=int, default=50)
+        subparser.add_argument("--closed-position-market-chunk-size", type=int, default=50)
         subparser.add_argument("--min-profile-participated-markets", type=int, default=3)
         subparser.add_argument("--min-profile-avg-market-cash", type=float, default=1_500)
         subparser.add_argument("--leaderboard-min-participated-markets", type=int, default=3)
@@ -1627,6 +1691,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--max-requests-per-second", type=float, default=10)
     serve.add_argument("--request-burst", type=int, default=5)
     serve.add_argument("--max-retry-after-seconds", type=float, default=60)
+    serve.add_argument("--runner-stake-usdc", type=float, default=1.0)
     serve.set_defaults(func=command_serve)
     return parser
 

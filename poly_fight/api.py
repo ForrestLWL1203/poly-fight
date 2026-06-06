@@ -12,6 +12,23 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 
+def parse_gamma_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def parse_retry_after(value: str | None, *, max_seconds: float, now: datetime | None = None) -> float:
     if not value:
         return 0.0
@@ -172,11 +189,13 @@ class PolymarketClient:
         active: bool | None = None,
         max_pages: int = 10,
         order: str = "endDate",
+        min_end_date: datetime | None = None,
         tag_slugs: tuple[str, ...] = ("esports", "dota-2", "counter-strike-2", "league-of-legends", "valorant"),
     ) -> list[dict]:
         all_events: list[dict] = []
         limit = 100
         seen: set[str] = set()
+        min_end_date = min_end_date.astimezone(timezone.utc) if min_end_date else None
         for tag_slug in tag_slugs:
             for page in range(max_pages):
                 batch = self.list_events(
@@ -194,6 +213,14 @@ class PolymarketClient:
                     if key and key not in seen:
                         seen.add(key)
                         all_events.append(event)
+                if min_end_date and order == "endDate":
+                    dated_events = [
+                        parse_gamma_datetime(event.get("endDate") or event.get("end_date"))
+                        for event in batch
+                    ]
+                    dated_events = [end for end in dated_events if end is not None]
+                    if dated_events and max(dated_events) < min_end_date:
+                        break
                 if len(batch) < limit:
                     break
         return all_events
@@ -255,10 +282,13 @@ class PolymarketClient:
         limit: int = 500,
         offset: int = 0,
         sort_direction: str = "DESC",
+        market: str | list[str] | tuple[str, ...] | None = None,
     ) -> list[dict]:
+        market_value = ",".join(str(value) for value in market) if isinstance(market, (list, tuple)) else market
         return self.data(
             "/closed-positions",
             user=wallet,
+            market=market_value,
             limit=limit,
             offset=offset,
             sortBy="TIMESTAMP",

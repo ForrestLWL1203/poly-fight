@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -18,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .control import read_follow_control, update_wallet_refresh_status
+from .control import read_follow_control, update_wallet_refresh_status, write_follow_control
 from .storage import FollowStore
 
 
@@ -42,10 +43,13 @@ class DashboardConfig:
     static_dir: Path | None = None
     client: Any = None
     trades_cache_ttl_seconds: int = 30
-    status_cache_ttl_seconds: float = 2.0
     observe_window_hours: float = 24.0
     wallet_refresh_runner: Any = None
     wallet_refresh_timeout_seconds: int = 7200
+    runner_stake_usdc: float = 1.0
+    runner_process_starter: Any = None
+    runner_process_lister: Any = None
+    runner_process_stopper: Any = None
 
 
 def short_addr(addr: str | None) -> str:
@@ -107,10 +111,13 @@ def create_server(config: DashboardConfig) -> ThreadingHTTPServer:
         static_dir=static_dir,
         client=config.client,
         trades_cache_ttl_seconds=config.trades_cache_ttl_seconds,
-        status_cache_ttl_seconds=config.status_cache_ttl_seconds,
         observe_window_hours=config.observe_window_hours,
         wallet_refresh_runner=config.wallet_refresh_runner,
         wallet_refresh_timeout_seconds=config.wallet_refresh_timeout_seconds,
+        runner_stake_usdc=config.runner_stake_usdc,
+        runner_process_starter=config.runner_process_starter,
+        runner_process_lister=config.runner_process_lister,
+        runner_process_stopper=config.runner_process_stopper,
     )
 
     class Handler(DashboardHandler):
@@ -154,6 +161,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/wallet-refresh":
                 self._wallet_refresh()
                 return
+            if parsed.path == "/api/runner/start":
+                self._runner_start()
+                return
+            if parsed.path == "/api/runner/stop":
+                self._runner_stop()
+                return
         self._error("not_found", status=HTTPStatus.NOT_FOUND)
 
     def _handle_api_get(self, parsed: urllib.parse.ParseResult) -> None:
@@ -182,6 +195,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/wallet-refresh":
             self._ok(build_wallet_refresh_status(self.dashboard_config.data_dir))
             return
+        if parsed.path == "/api/runner":
+            self._ok(build_runner_status(self.dashboard_config))
+            return
         match = re.match(r"^/api/wallets/([^/]+)/trades$", parsed.path)
         if match:
             self._wallet_trades(match.group(1), urllib.parse.parse_qs(parsed.query))
@@ -199,6 +215,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "wallet_refresh_running", "data": exc.status}, status=HTTPStatus.CONFLICT)
             return
         self._json({"ok": True, "data": status, "generated_at": int(time.time())}, status=HTTPStatus.ACCEPTED)
+
+    def _runner_start(self) -> None:
+        try:
+            status = start_runner(self.dashboard_config)
+        except RunnerAlreadyRunning as exc:
+            self._json({"ok": False, "error": "runner_already_running", "data": exc.status}, status=HTTPStatus.CONFLICT)
+            return
+        self._json({"ok": True, "data": status, "generated_at": int(time.time())}, status=HTTPStatus.ACCEPTED)
+
+    def _runner_stop(self) -> None:
+        status = stop_runner(self.dashboard_config)
+        accepted = status.get("status") in {"stopping", "stopped"}
+        self._json({"ok": accepted, "data": status, "generated_at": int(time.time())}, status=HTTPStatus.ACCEPTED if accepted else HTTPStatus.CONFLICT)
 
     def _wallet_trades(self, raw_addr: str, query: dict[str, list[str]]) -> None:
         wallet = urllib.parse.unquote(raw_addr).lower()
@@ -362,6 +391,9 @@ def build_health(data_dir: Path, *, started_at: float) -> dict[str, Any]:
     rows = _read_jsonl(data_dir / "follow" / "follow_run_log.jsonl")
     db_ready = FollowStore(data_dir / "follow" / "follow.db").dashboard_db_ready()
     last_tick = rows[-1] if rows else {}
+    build_summary = _read_json(data_dir / "build_summary.json", {})
+    leaderboard_path = data_dir / "smart_wallet_leaderboard.json"
+    leaderboard_updated_at = int(leaderboard_path.stat().st_mtime) if leaderboard_path.exists() else 0
     last_tick_at = int(last_tick.get("created_at") or 0)
     interval = int(last_tick.get("desired_next_interval_seconds") or 900)
     now_ts = int(time.time())
@@ -378,6 +410,10 @@ def build_health(data_dir: Path, *, started_at: float) -> dict[str, Any]:
         "desired_next_interval_seconds": interval,
         "gate_open": bool(last_tick.get("gate_open")),
         "watched_market_count": int(last_tick.get("watched_market_count") or 0),
+        "open_signal_count": int(last_tick.get("open_signal_count") or 0),
+        "leaderboard_updated_at": leaderboard_updated_at,
+        "build_summary": build_summary if isinstance(build_summary, dict) else {},
+        "scoring_version": _latest_scoring_version(data_dir),
         "recent_error_count": len(errors),
         "last_error": errors[-1] if errors else None,
         "last_tick": last_tick,
@@ -445,6 +481,14 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
                 "entry_edge": row.get("entry_edge"),
                 "esports_roi": row.get("esports_roi"),
                 "median_entry_price": row.get("median_entry_price"),
+                "reasons": row.get("reasons") or [],
+                "scoring_version": row.get("scoring_version"),
+                "esports_win_count": row.get("esports_win_count"),
+                "esports_loss_count": row.get("esports_loss_count"),
+                "esports_closed_count": row.get("esports_closed_count"),
+                "positive_market_rate": row.get("positive_market_rate"),
+                "sold_before_resolution_market_rate": row.get("sold_before_resolution_market_rate"),
+                "two_sided_trade_market_rate": row.get("two_sided_trade_market_rate"),
                 "quarantined": wallet in quarantine,
                 "quarantine": quarantine.get(wallet),
                 "performance": performance.get(wallet, {}),
@@ -455,6 +499,10 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
         "wallets": rows,
         "count": len(rows),
         "quarantined_count": sum(1 for row in rows if row.get("quarantined")),
+        "leaderboard_updated_at": int((data_dir / "smart_wallet_leaderboard.json").stat().st_mtime)
+        if (data_dir / "smart_wallet_leaderboard.json").exists()
+        else 0,
+        "scoring_version": max([int(row.get("scoring_version") or 0) for row in rows] or [0]) or None,
         "db_ready": bool(perf_snapshot.get("db_ready") or open_snapshot.get("db_ready") or quarantine_snapshot.get("db_ready")),
     }
 
@@ -509,6 +557,7 @@ def build_events(data_dir: Path, *, observe_window_hours: float = 24.0) -> dict[
         condition_id = str(market.get("condition_id") or market.get("conditionId") or "").lower()
         start_ts = _parse_timestamp(market.get("match_start_time") or market.get("market_start_time") or market.get("startTime"))
         if start_ts and now_ts <= start_ts <= window_end:
+            open_signals = open_by_condition.get(condition_id, [])
             events.append(
                 {
                     "condition_id": condition_id,
@@ -517,7 +566,9 @@ def build_events(data_dir: Path, *, observe_window_hours: float = 24.0) -> dict[
                     "match_start_time": market.get("match_start_time") or market.get("market_start_time") or market.get("startTime"),
                     "outcomes": market.get("outcomes"),
                     "outcome_prices": market.get("outcome_prices") or market.get("outcomePrices"),
-                    "open_signals": open_by_condition.get(condition_id, []),
+                    "open_signals": open_signals,
+                    "contested": _signals_contested(open_signals),
+                    "side_counts": _signal_side_counts(open_signals),
                 }
             )
     return {
@@ -532,6 +583,217 @@ class WalletRefreshAlreadyRunning(RuntimeError):
     def __init__(self, status: dict[str, Any]) -> None:
         super().__init__("wallet refresh already running")
         self.status = status
+
+
+class RunnerAlreadyRunning(RuntimeError):
+    def __init__(self, status: dict[str, Any]) -> None:
+        super().__init__("runner already running")
+        self.status = status
+
+
+def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
+    control = read_follow_control(config.data_dir)
+    recorded = control.get("runner") if isinstance(control.get("runner"), dict) else {}
+    processes = _find_runner_processes(config)
+    recorded_pid = int(recorded.get("pid") or 0) if isinstance(recorded, dict) else 0
+    matched = next((row for row in processes if int(row.get("pid") or 0) == recorded_pid), None)
+    if matched is None and processes:
+        matched = processes[0]
+    if matched:
+        source = "dashboard" if int(matched.get("pid") or 0) == recorded_pid else "external"
+        return {
+            "status": "running",
+            "pid": int(matched.get("pid") or 0),
+            "pgid": int(matched.get("pgid") or 0),
+            "source": source,
+            "command": matched.get("command") or recorded.get("command"),
+            "started_at": recorded.get("started_at") if source == "dashboard" else None,
+            "log_path": recorded.get("log_path") if source == "dashboard" else None,
+            "data_dir": str(config.data_dir),
+        }
+    if recorded:
+        return {
+            **recorded,
+            "status": "stopped",
+            "pid": recorded_pid or None,
+            "data_dir": str(config.data_dir),
+        }
+    return {"status": "stopped", "data_dir": str(config.data_dir)}
+
+
+def start_runner(config: DashboardConfig) -> dict[str, Any]:
+    current = build_runner_status(config)
+    if current.get("status") == "running":
+        raise RunnerAlreadyRunning(current)
+    now_ts = int(time.time())
+    follow_dir = config.data_dir / "follow"
+    follow_dir.mkdir(parents=True, exist_ok=True)
+    log_path = follow_dir / f"dashboard-runner-{now_ts}.out"
+    command = [
+        sys.executable,
+        "-u",
+        "-m",
+        "poly_fight.cli",
+        "--data-dir",
+        str(config.data_dir),
+        "run",
+        "--stake-usdc",
+        str(config.runner_stake_usdc),
+    ]
+    if config.runner_process_starter is not None:
+        process = config.runner_process_starter(command, log_path)
+        pid = int(getattr(process, "pid", process if isinstance(process, int) else 0) or 0)
+        pgid = int(getattr(process, "pgid", 0) or 0)
+    else:
+        with log_path.open("ab") as log_file:
+            process = subprocess.Popen(
+                command,
+                cwd=Path(__file__).resolve().parents[1],
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        pid = int(process.pid)
+        pgid = _process_group_id(pid) or pid
+    status = {
+        "status": "running",
+        "source": "dashboard",
+        "pid": pid,
+        "pgid": pgid,
+        "started_at": now_ts,
+        "command": command,
+        "log_path": str(log_path),
+        "data_dir": str(config.data_dir),
+    }
+    _update_runner_control(config.data_dir, status)
+    return status
+
+
+def stop_runner(config: DashboardConfig) -> dict[str, Any]:
+    current = build_runner_status(config)
+    pid = int(current.get("pid") or 0)
+    if not pid:
+        return {"status": "stopped", "data_dir": str(config.data_dir)}
+    if config.runner_process_stopper is not None:
+        config.runner_process_stopper(current)
+    else:
+        _terminate_runner_process(current)
+    status = {
+        **current,
+        "status": "stopping",
+        "stop_requested_at": int(time.time()),
+    }
+    _update_runner_control(config.data_dir, status)
+    return status
+
+
+def _update_runner_control(data_dir: Path, status: dict[str, Any]) -> dict[str, Any]:
+    control = read_follow_control(data_dir)
+    control["runner"] = status
+    write_follow_control(data_dir, control)
+    return control
+
+
+def _find_runner_processes(config: DashboardConfig) -> list[dict[str, Any]]:
+    if config.runner_process_lister is not None:
+        rows = config.runner_process_lister()
+    else:
+        rows = _system_processes()
+    data_dir = config.data_dir
+    candidates = [_normalize_process_row(row) for row in rows]
+    return [row for row in candidates if _process_matches_runner(row, data_dir)]
+
+
+def _system_processes() -> list[dict[str, Any]]:
+    for command in (["ps", "-axo", "pid=,ppid=,pgid=,command="], ["ps", "-eo", "pid=,ppid=,pgid=,command="]):
+        try:
+            result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            continue
+        if result.returncode == 0:
+            return [_parse_ps_line(line) for line in result.stdout.splitlines()]
+    return []
+
+
+def _parse_ps_line(line: str) -> dict[str, Any]:
+    parts = line.strip().split(None, 3)
+    if len(parts) < 4:
+        return {}
+    return {
+        "pid": _safe_int(parts[0]),
+        "ppid": _safe_int(parts[1]),
+        "pgid": _safe_int(parts[2]),
+        "command": parts[3],
+    }
+
+
+def _normalize_process_row(row: Any) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {}
+    return {
+        "pid": _safe_int(row.get("pid")),
+        "ppid": _safe_int(row.get("ppid")),
+        "pgid": _safe_int(row.get("pgid")),
+        "command": str(row.get("command") or ""),
+    }
+
+
+def _process_matches_runner(row: dict[str, Any], data_dir: Path) -> bool:
+    command = str(row.get("command") or "")
+    pid = int(row.get("pid") or 0)
+    tokens = command.split()
+    if pid <= 0 or "poly_fight.cli" not in tokens or "run" not in tokens:
+        return False
+    if "--execution-mode live" in command:
+        return False
+    data_dir_values = _data_dir_values_from_command(tokens)
+    if not data_dir_values:
+        return False
+    expected = {str(data_dir), str(data_dir.resolve())}
+    return any(value in expected or str(Path(value).resolve()) in expected for value in data_dir_values)
+
+
+def _data_dir_values_from_command(tokens: list[str]) -> list[str]:
+    values: list[str] = []
+    for idx, token in enumerate(tokens):
+        if token == "--data-dir" and idx + 1 < len(tokens):
+            values.append(tokens[idx + 1])
+        elif token.startswith("--data-dir="):
+            values.append(token.split("=", 1)[1])
+    return values
+
+
+def _terminate_runner_process(status: dict[str, Any]) -> None:
+    pid = int(status.get("pid") or 0)
+    pgid = int(status.get("pgid") or 0)
+    source = status.get("source")
+    if source == "dashboard" and pgid:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+
+
+def _process_group_id(pid: int) -> int:
+    try:
+        return int(os.getpgid(pid))
+    except OSError:
+        return 0
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def build_wallet_refresh_status(data_dir: Path) -> dict[str, Any]:
@@ -614,11 +876,6 @@ def start_wallet_refresh(
     return status
 
 
-def _follow_groups(data_dir: Path) -> dict[str, dict[str, Any]]:
-    snapshot = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_snapshot()
-    return _follow_groups_from_signals([*snapshot.get("open_signals", []), *snapshot.get("results", [])])
-
-
 def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     groups: dict[str, dict[str, Any]] = {}
     for signal in signals:
@@ -683,6 +940,37 @@ def _read_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return default
+
+
+def _latest_scoring_version(data_dir: Path) -> int | None:
+    leaderboard = _read_json(data_dir / "smart_wallet_leaderboard.json", [])
+    versions = [int(row.get("scoring_version") or 0) for row in leaderboard if isinstance(row, dict)]
+    version = max(versions or [0])
+    return version or None
+
+
+def _signals_contested(signals: list[dict[str, Any]]) -> bool:
+    outcomes = {_signal_side(signal) for signal in signals}
+    outcomes.discard("")
+    return len(outcomes) > 1 or any(bool(signal.get("contested")) for signal in signals)
+
+
+def _signal_side_counts(signals: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for signal in signals:
+        side = _signal_side(signal) or "unknown"
+        counts[side] = counts.get(side, 0) + 1
+    return counts
+
+
+def _signal_side(signal: dict[str, Any]) -> str:
+    outcome = signal.get("outcome")
+    if outcome not in (None, ""):
+        return str(outcome)
+    outcome_index = signal.get("outcome_index")
+    if outcome_index not in (None, ""):
+        return str(outcome_index)
+    return ""
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

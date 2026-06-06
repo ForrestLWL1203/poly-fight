@@ -176,22 +176,26 @@ reuse raw_market_trades cache for 7d unless --refresh-market-trades
 max_workers = 8
 max_requests_per_second = 10
 request_burst = 5
+classification_lookback_days = 14
 target_markets = 20
 discovery_lookback_days = 14
 market_batch_size = 50
 market_batch_count = 2
 default market coverage = top100 by volume
 max_pages_per_market = 3
-max_closed_positions_per_wallet = 1000
-max_esports_closed_positions_per_wallet = 100
+max_esports_closed_positions_per_wallet = 50
+closed_position_market_chunk_size = 50
 check_current_positions = false by default
 ```
 
-Wallet profiling fetches recent closed positions sorted by timestamp, filters
-them by `conditionId in esports_classification_set`, and scores at most the
-latest 100 esports closed positions per wallet. The raw closed-position cap
-remains higher so wallets with other categories mixed into their history can
-still surface enough esports records.
+Wallet profiling fetches closed positions with a target-market scope:
+`closed-positions?user=<wallet>&market=<csv conditionIds>`. ConditionIds come
+from the recent esports classification scope (`--classification-lookback-days`,
+default 14) and are sent in chunks (`--closed-position-market-chunk-size`,
+default 50) to avoid oversized URLs. It then merges, dedupes, sorts by
+timestamp, and scores at most the latest 50 closed positions from that scoped
+market type. The old raw all-category cap is kept only as a backward-compatible
+CLI knob; the default path should not deep scan unrelated categories.
 
 Network collection is concurrent but rate-limited. Treat rps as the true
 throughput knob and workers as waiting slots. If Polymarket returns more 429/503
@@ -463,6 +467,46 @@ unless the user explicitly asks.
 Follow long-running business data lives in `data/follow/follow.db`; collection
 caches and smart-wallet leaderboard outputs remain JSON and are refreshed by the
 collector.
+
+## VPS Operations Notes
+
+Sweden VPS information was originally recorded in
+`/Users/forrestliao/workspace/poly-monitor/AGENTS.md`.
+
+Connection:
+
+```bash
+SSHPASS="$(cat /Users/forrestliao/workspace/new-poly/docs/sweden-vps-secret.txt)" \
+  sshpass -e ssh root@70.34.207.45
+```
+
+Do not write the actual password into this repository. Keep using the local
+secret file above.
+
+Current known poly-fight paths on the VPS:
+
+```text
+/opt/poly-fight/repo
+/opt/poly-fight/data
+/opt/poly-fight/data/follow
+```
+
+Known paper runner shape:
+
+```bash
+python3 -u -m poly_fight.cli --data-dir /opt/poly-fight/data run --stake-usdc 1 --max-profiles-per-run 1000 --skip-initial-build
+```
+
+Operational notes:
+
+- `data/follow/follow.db` is the long-running paper follow source of truth.
+- `data/follow/follow_run_log.jsonl` is diagnostic and should stay small after
+  log trimming.
+- `data/raw_market_trades/` is the largest collection cache. Same-market cache
+  files are reused, but new market conditionIds create new files; add cleanup if
+  VPS disk pressure becomes a problem.
+- Do not edit live code directly on the VPS unless explicitly asked. Prefer
+  local commit/push, then pull/deploy on the VPS.
 
 ## Known v1 Limitations
 
