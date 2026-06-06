@@ -25,7 +25,7 @@ from poly_fight.dashboard import (
     short_addr,
     verify_session_token,
 )
-from poly_fight.control import read_follow_control, set_follow_pause
+from poly_fight.control import read_follow_control
 from poly_fight.storage import FollowStore
 from poly_fight.cli import (
     build_leaderboard_from_profiles,
@@ -2477,6 +2477,96 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(summary["follow_wallet_count"], 0)
             self.assertEqual(calls, [])
 
+    def test_follow_tick_polls_open_signal_wallets_that_left_leaderboard(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now = datetime.now(timezone.utc)
+            start = now + timedelta(hours=2)
+            write_json(data_dir / "smart_wallet_leaderboard.json", [])
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.save_follow_snapshot(
+                wallet_trade_state={
+                    "0xold": {"last_trade_cursor": {"timestamp": 10, "id": "old"}, "last_seen_at": 10},
+                },
+                open_signals=[
+                    {
+                        "signal_id": "0xold:m1:0",
+                        "wallet": "0xold",
+                        "condition_id": "m1",
+                        "outcome_index": 0,
+                        "outcome": "A",
+                        "status": "open",
+                        "created_at": int(now.timestamp()) - 100,
+                        "updated_at": int(now.timestamp()) - 100,
+                        "match_start_time": start.isoformat(),
+                        "legs": [{"stake": 1, "our_entry_price": 0.5, "wallet_fill_price": 0.5, "wallet_trade_size": 100}],
+                        "behavior_events": [],
+                    }
+                ],
+                result_events=[],
+                performance={},
+            )
+
+            class FakeClient:
+                def __init__(self):
+                    self.wallets = []
+
+                def list_events_paginated(self, **_kwargs):
+                    return [
+                        {
+                            "id": "event1",
+                            "slug": "event1",
+                            "title": "Event 1",
+                            "tags": [{"slug": "esports"}],
+                            "startTime": start.isoformat(),
+                            "markets": [
+                                {
+                                    "conditionId": "m1",
+                                    "question": "A vs B",
+                                    "outcomes": ["A", "B"],
+                                    "outcomePrices": ["0.60", "0.40"],
+                                    "active": True,
+                                    "closed": False,
+                                    "volume": 100000,
+                                    "startTime": start.isoformat(),
+                                },
+                                {
+                                    "conditionId": "m2",
+                                    "question": "C vs D",
+                                    "outcomes": ["C", "D"],
+                                    "outcomePrices": ["0.50", "0.50"],
+                                    "active": True,
+                                    "closed": False,
+                                    "volume": 100000,
+                                    "startTime": start.isoformat(),
+                                },
+                            ],
+                        }
+                    ]
+
+                def trades_for_user(self, wallet, **_kwargs):
+                    self.wallets.append(wallet)
+                    return [
+                        {"id": "new-buy", "timestamp": 20, "market": "m2", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 100},
+                        {"id": "new-sell", "timestamp": 30, "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.6, "size": 100},
+                    ]
+
+            parser = build_parser()
+            args = parser.parse_args(["--data-dir", str(data_dir), "follow", "--stake-usdc", "1", "--max-workers", "1"])
+            client = FakeClient()
+
+            summary = command_follow(args, client=client, emit=False)
+            snapshot = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_snapshot()
+
+            self.assertEqual(client.wallets, ["0xold"])
+            self.assertEqual(summary["follow_wallet_count"], 1)
+            self.assertEqual(summary["lifecycle_follow_wallet_count"], 1)
+            self.assertEqual(summary["exited_signal_count"], 1)
+            self.assertEqual(summary["open_signal_count"], 0)
+            self.assertEqual(len(snapshot["results"]), 1)
+            self.assertEqual(snapshot["results"][0]["condition_id"], "m1")
+            self.assertNotIn("m2", {row.get("condition_id") for row in snapshot["open_signals"]})
+
     def test_follow_tick_marks_opposite_same_market_signals_contested(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -2616,7 +2706,7 @@ class CoreTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
-    def test_dashboard_wallet_refresh_api_pauses_follow_and_runs_refresh(self):
+    def test_dashboard_wallet_refresh_api_runs_refresh_without_pausing_follow(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             ran = threading.Event()
@@ -2662,8 +2752,8 @@ class CoreTest(unittest.TestCase):
                     status = build_wallet_refresh_status(data_dir)
                 self.assertEqual(status["status"]["status"], "succeeded")
                 self.assertEqual(status["status"]["returncode"], 0)
-                self.assertIsNone(status["pause_follow"])
                 self.assertEqual(read_follow_control(data_dir)["wallet_refresh"]["status"], "succeeded")
+                self.assertNotIn("pause_follow", read_follow_control(data_dir))
             finally:
                 server.shutdown()
                 server.server_close()
@@ -3078,36 +3168,6 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(command_run(args), 0)
 
         self.assertEqual(build.call_count, 0)
-
-    def test_run_loop_pauses_follow_during_wallet_refresh(self):
-        with TemporaryDirectory() as tmp:
-            parser = build_parser()
-            args = parser.parse_args(
-                [
-                    "--data-dir",
-                    tmp,
-                    "run",
-                    "--stake-usdc",
-                    "1",
-                    "--skip-initial-build",
-                    "--max-run-ticks",
-                    "1",
-                ]
-            )
-            set_follow_pause(Path(tmp), reason="wallet_refresh", now_ts=int(time.time()), ttl_seconds=3600)
-
-            with patch("poly_fight.cli.build_client", return_value=object()), patch(
-                "poly_fight.cli.command_build_leaderboard"
-            ) as build, patch("poly_fight.cli.command_follow", return_value={"desired_next_interval_seconds": 900}) as follow:
-                from poly_fight.cli import command_run
-
-                self.assertEqual(command_run(args), 0)
-
-            self.assertEqual(build.call_count, 0)
-            self.assertEqual(follow.call_count, 0)
-            rows = read_jsonl(Path(tmp) / "follow" / "follow_run_log.jsonl")
-            self.assertEqual(rows[-1]["status"], "paused")
-            self.assertEqual(rows[-1]["pause_reason"], "wallet_refresh")
 
     def test_run_loop_survives_one_follow_exception(self):
         parser = build_parser()

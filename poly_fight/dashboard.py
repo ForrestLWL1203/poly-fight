@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .control import clear_follow_pause, read_follow_control, set_follow_pause, update_wallet_refresh_status
+from .control import read_follow_control, update_wallet_refresh_status
 from .storage import FollowStore
 
 
@@ -537,10 +537,8 @@ class WalletRefreshAlreadyRunning(RuntimeError):
 def build_wallet_refresh_status(data_dir: Path) -> dict[str, Any]:
     control = read_follow_control(data_dir)
     status = control.get("wallet_refresh") if isinstance(control.get("wallet_refresh"), dict) else {}
-    pause = control.get("pause_follow") if isinstance(control.get("pause_follow"), dict) else {}
     return {
         "status": status or {"status": "idle"},
-        "pause_follow": pause or None,
     }
 
 
@@ -579,13 +577,6 @@ def start_wallet_refresh(
         "log_path": str(log_path),
     }
     update_wallet_refresh_status(data_dir, status)
-    set_follow_pause(
-        data_dir,
-        reason="wallet_refresh",
-        now_ts=now_ts,
-        ttl_seconds=timeout_seconds,
-        detail="dashboard wallet refresh",
-    )
 
     def worker() -> None:
         finished_at = int(time.time())
@@ -617,8 +608,6 @@ def start_wallet_refresh(
                     "error": str(exc),
                 },
             )
-        finally:
-            clear_follow_pause(data_dir, reason="wallet_refresh")
 
     thread = threading.Thread(target=worker, name="poly-fight-wallet-refresh", daemon=True)
     thread.start()

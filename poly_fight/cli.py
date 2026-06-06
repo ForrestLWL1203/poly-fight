@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 from .api import PolymarketClient, RateLimiter
-from .control import active_follow_pause
 from .core import (
     SCORING_VERSION,
     TRADE_BEHAVIOR_EXCLUDE_RATE,
@@ -1094,7 +1093,7 @@ def command_follow(
     leaderboard_validated_at = int(leaderboard_path.stat().st_mtime) if leaderboard_path.exists() else 0
     store.clear_revalidated_quarantine(leaderboard_wallets, validated_at=leaderboard_validated_at)
     quarantined_wallets = set(store.load_wallet_quarantine())
-    follow_wallets = eligible_follow_wallets(
+    eligible_wallet_rows = eligible_follow_wallets(
         leaderboard_rows,
         now_ts=now_ts,
         recency_days=args.follow_recency_days,
@@ -1105,6 +1104,20 @@ def command_follow(
     wallet_trade_state = store.load_wallet_trade_state()
     open_signals = store.load_open_signals()
     performance = store.load_performance()
+    open_condition_ids_by_wallet: dict[str, set[str]] = {}
+    for signal in open_signals:
+        if (signal.get("status") or "open") != "open":
+            continue
+        wallet = normalize_wallet(signal.get("wallet"))
+        condition_id = str(signal.get("condition_id") or "").lower()
+        if wallet and condition_id:
+            open_condition_ids_by_wallet.setdefault(wallet, set()).add(condition_id)
+    eligible_wallet_set = {row["wallet"] for row in eligible_wallet_rows}
+    lifecycle_wallets = sorted(set(open_condition_ids_by_wallet) - eligible_wallet_set)
+    follow_wallets = [
+        *eligible_wallet_rows,
+        *({"wallet": wallet, "follow_scope": "open_signals"} for wallet in lifecycle_wallets),
+    ]
 
     active_markets, state, active_source = load_active_market_cache(
         client,
@@ -1165,7 +1178,7 @@ def command_follow(
                     max_pages=args.user_trades_max_pages,
                 )
                 positions = []
-                if previous_cursor is None and args.bootstrap_current_positions:
+                if wallet in eligible_wallet_set and previous_cursor is None and args.bootstrap_current_positions:
                     positions = client.positions(wallet, limit=args.positions_limit)
                 return wallet, trades, positions
             except Exception:
@@ -1181,11 +1194,12 @@ def command_follow(
             if isinstance(result, Exception):
                 continue
             wallet, trades, positions = result
+            wallet_can_open_new = wallet in eligible_wallet_set
             previous_cursor = (wallet_trade_state.get(wallet) or {}).get("last_trade_cursor")
             new_trades, next_cursor, cold_start = select_new_trades(trades, previous_cursor)
             if cold_start:
                 cold_start_wallet_count += 1
-                if args.bootstrap_current_positions:
+                if wallet_can_open_new and args.bootstrap_current_positions:
                     bootstrap_position_request_count += 1
                 if positions:
                     bootstrap_trades = bootstrap_position_trades(
@@ -1227,7 +1241,11 @@ def command_follow(
                 for condition_id, market in active_markets.items()
                 if condition_id in tracked_condition_ids or condition_id in watched
             }
-            watched_trades = [trade for trade in new_trades if trade_condition_id(trade) in tracked_condition_ids]
+            if wallet_can_open_new:
+                wallet_tracked_condition_ids = tracked_condition_ids
+            else:
+                wallet_tracked_condition_ids = open_condition_ids_by_wallet.get(wallet, set())
+            watched_trades = [trade for trade in new_trades if trade_condition_id(trade) in wallet_tracked_condition_ids]
             before_ids = {signal.get("signal_id") for signal in open_signals}
             open_signals, stats = process_follow_trades(
                 open_signals,
@@ -1287,6 +1305,8 @@ def command_follow(
     run_log_row = {
         "created_at": now_ts,
         "follow_wallet_count": len(follow_wallets),
+        "eligible_follow_wallet_count": len(eligible_wallet_rows),
+        "lifecycle_follow_wallet_count": len(lifecycle_wallets),
         "gate_open": gate_open,
         "active_market_source": active_source,
         "watched_market_count": len(watched),
@@ -1364,31 +1384,6 @@ def command_run(args: argparse.Namespace) -> int:
             command_build_leaderboard(args, client=client)
             last_build_at = int(datetime.now(timezone.utc).timestamp())
 
-    def record_pause_tick(pause: dict[str, Any]) -> dict[str, Any]:
-        now_ts = int(datetime.now(timezone.utc).timestamp())
-        follow_dir = Path(args.data_dir) / "follow"
-        follow_dir.mkdir(parents=True, exist_ok=True)
-        run_log_path = follow_dir / "follow_run_log.jsonl"
-        sleep_seconds = min(60, max(1, int(args.min_tick_seconds)))
-        row = {
-            "status": "paused",
-            "phase": "wallet_refresh",
-            "created_at": now_ts,
-            "pause_reason": pause.get("reason"),
-            "pause_started_at": pause.get("started_at"),
-            "pause_expires_at": pause.get("expires_at"),
-            "desired_next_interval_seconds": sleep_seconds,
-        }
-        run_log_rows = read_jsonl(run_log_path)
-        from .follow import prune_jsonl
-
-        write_jsonl(
-            run_log_path,
-            prune_jsonl([*run_log_rows, row], now_ts=now_ts, retention_days=args.run_log_retention_days),
-        )
-        print(json.dumps(row, ensure_ascii=False, sort_keys=True), flush=True)
-        return row
-
     try:
         if not args.skip_initial_build:
             try:
@@ -1409,15 +1404,6 @@ def command_run(args: argparse.Namespace) -> int:
                 time.sleep(max(1, int(args.error_retry_seconds)))
         while not stop_requested["value"]:
             try:
-                pause = active_follow_pause(Path(args.data_dir), now_ts=int(datetime.now(timezone.utc).timestamp()))
-                if pause:
-                    summary = record_pause_tick(pause)
-                    first_error_at = None
-                    tick_count += 1
-                    if args.max_run_ticks and tick_count >= args.max_run_ticks:
-                        break
-                    time.sleep(int(summary["desired_next_interval_seconds"]))
-                    continue
                 maybe_build(force=False)
                 summary = command_follow(args, client=client, emit=True)
             except Exception as exc:

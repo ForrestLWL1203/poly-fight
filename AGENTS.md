@@ -260,8 +260,11 @@ read A-wallet leaderboard
 filter follow-eligible wallets with 30-day recency and wallet_quarantine exclusion
 build watched esports market set from start_time within the 24h observe window
 if watched markets or open signals exist, poll latest trades?user= for follow wallets
+plus wallets with still-open paper signals
 cold-start wallets set last_trade_cursor only
 new BUY trades in watched pre-start markets create paper legs
+wallets no longer eligible can only affect their already-open signal markets;
+they cannot create new paper signals
 new trades for already-open signal markets remain tracked even after start
 new SELL trades mirror-exit all open legs for that wallet-market-outcome
 material same-market SELL or opposite-side BUY writes wallet_quarantine

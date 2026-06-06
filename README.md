@@ -112,8 +112,11 @@ average CLV, and quarantine status.
 Authenticated dashboard users can trigger a smart-wallet refresh with
 `POST /api/wallet-refresh` and poll `GET /api/wallet-refresh`. The refresh runs
 `collect --max-profiles-per-run 1000` in the background, writes status to
-`data/follow/follow_control.json`, and asks the long-running paper loop to pause
-follow ticks until the refresh finishes or its safety timeout expires.
+`data/follow/follow_control.json`, and does not pause the long-running paper
+loop. During and after refresh, the follow loop polls the current eligible
+leaderboard wallets plus any wallets that still have open paper signals. Wallets
+that left the leaderboard can only manage existing open-signal markets; they
+cannot open new paper signals.
 
 Outputs are written under `data/`:
 
