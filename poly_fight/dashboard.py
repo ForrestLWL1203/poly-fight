@@ -7,6 +7,8 @@ import json
 import mimetypes
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -16,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from .control import clear_follow_pause, read_follow_control, set_follow_pause, update_wallet_refresh_status
 from .storage import FollowStore
 
 
@@ -41,6 +44,8 @@ class DashboardConfig:
     trades_cache_ttl_seconds: int = 30
     status_cache_ttl_seconds: float = 2.0
     observe_window_hours: float = 24.0
+    wallet_refresh_runner: Any = None
+    wallet_refresh_timeout_seconds: int = 7200
 
 
 def short_addr(addr: str | None) -> str:
@@ -104,6 +109,8 @@ def create_server(config: DashboardConfig) -> ThreadingHTTPServer:
         trades_cache_ttl_seconds=config.trades_cache_ttl_seconds,
         status_cache_ttl_seconds=config.status_cache_ttl_seconds,
         observe_window_hours=config.observe_window_hours,
+        wallet_refresh_runner=config.wallet_refresh_runner,
+        wallet_refresh_timeout_seconds=config.wallet_refresh_timeout_seconds,
     )
 
     class Handler(DashboardHandler):
@@ -140,6 +147,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/logout":
             self._logout()
             return
+        if parsed.path.startswith("/api/"):
+            if not self._authenticated():
+                self._error("unauthorized", status=HTTPStatus.UNAUTHORIZED)
+                return
+            if parsed.path == "/api/wallet-refresh":
+                self._wallet_refresh()
+                return
         self._error("not_found", status=HTTPStatus.NOT_FOUND)
 
     def _handle_api_get(self, parsed: urllib.parse.ParseResult) -> None:
@@ -165,11 +179,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/events":
             self._ok(build_events(self.dashboard_config.data_dir, observe_window_hours=self.dashboard_config.observe_window_hours))
             return
+        if parsed.path == "/api/wallet-refresh":
+            self._ok(build_wallet_refresh_status(self.dashboard_config.data_dir))
+            return
         match = re.match(r"^/api/wallets/([^/]+)/trades$", parsed.path)
         if match:
             self._wallet_trades(match.group(1), urllib.parse.parse_qs(parsed.query))
             return
         self._error("not_found", status=HTTPStatus.NOT_FOUND)
+
+    def _wallet_refresh(self) -> None:
+        try:
+            status = start_wallet_refresh(
+                self.dashboard_config.data_dir,
+                runner=self.dashboard_config.wallet_refresh_runner,
+                timeout_seconds=self.dashboard_config.wallet_refresh_timeout_seconds,
+            )
+        except WalletRefreshAlreadyRunning as exc:
+            self._json({"ok": False, "error": "wallet_refresh_running", "data": exc.status}, status=HTTPStatus.CONFLICT)
+            return
+        self._json({"ok": True, "data": status, "generated_at": int(time.time())}, status=HTTPStatus.ACCEPTED)
 
     def _wallet_trades(self, raw_addr: str, query: dict[str, list[str]]) -> None:
         wallet = urllib.parse.unquote(raw_addr).lower()
@@ -497,6 +526,103 @@ def build_events(data_dir: Path, *, observe_window_hours: float = 24.0) -> dict[
         "cache_updated_at": updated_at,
         "cache_stale": bool(not updated_at or now_ts - updated_at > 15 * 60),
     }
+
+
+class WalletRefreshAlreadyRunning(RuntimeError):
+    def __init__(self, status: dict[str, Any]) -> None:
+        super().__init__("wallet refresh already running")
+        self.status = status
+
+
+def build_wallet_refresh_status(data_dir: Path) -> dict[str, Any]:
+    control = read_follow_control(data_dir)
+    status = control.get("wallet_refresh") if isinstance(control.get("wallet_refresh"), dict) else {}
+    pause = control.get("pause_follow") if isinstance(control.get("pause_follow"), dict) else {}
+    return {
+        "status": status or {"status": "idle"},
+        "pause_follow": pause or None,
+    }
+
+
+def start_wallet_refresh(
+    data_dir: Path,
+    *,
+    runner: Any = None,
+    timeout_seconds: int = 7200,
+) -> dict[str, Any]:
+    now_ts = int(time.time())
+    control = read_follow_control(data_dir)
+    existing = control.get("wallet_refresh")
+    if isinstance(existing, dict) and existing.get("status") == "running":
+        started_at = int(existing.get("started_at") or 0)
+        if not started_at or now_ts - started_at < timeout_seconds:
+            raise WalletRefreshAlreadyRunning(existing)
+
+    follow_dir = data_dir / "follow"
+    follow_dir.mkdir(parents=True, exist_ok=True)
+    log_path = follow_dir / f"wallet-refresh-{now_ts}.out"
+    command = [
+        sys.executable,
+        "-u",
+        "-m",
+        "poly_fight.cli",
+        "--data-dir",
+        str(data_dir),
+        "collect",
+        "--max-profiles-per-run",
+        "1000",
+    ]
+    status = {
+        "status": "running",
+        "started_at": now_ts,
+        "command": command,
+        "log_path": str(log_path),
+    }
+    update_wallet_refresh_status(data_dir, status)
+    set_follow_pause(
+        data_dir,
+        reason="wallet_refresh",
+        now_ts=now_ts,
+        ttl_seconds=timeout_seconds,
+        detail="dashboard wallet refresh",
+    )
+
+    def worker() -> None:
+        finished_at = int(time.time())
+        try:
+            if runner is not None:
+                returncode = int(runner(data_dir, log_path) or 0)
+            else:
+                with log_path.open("ab") as log_file:
+                    result = subprocess.run(command, cwd=Path(__file__).resolve().parents[1], stdout=log_file, stderr=subprocess.STDOUT, check=False)
+                    returncode = int(result.returncode)
+            finished_at = int(time.time())
+            update_wallet_refresh_status(
+                data_dir,
+                {
+                    **status,
+                    "status": "succeeded" if returncode == 0 else "failed",
+                    "finished_at": finished_at,
+                    "returncode": returncode,
+                },
+            )
+        except Exception as exc:
+            finished_at = int(time.time())
+            update_wallet_refresh_status(
+                data_dir,
+                {
+                    **status,
+                    "status": "failed",
+                    "finished_at": finished_at,
+                    "error": str(exc),
+                },
+            )
+        finally:
+            clear_follow_pause(data_dir, reason="wallet_refresh")
+
+    thread = threading.Thread(target=worker, name="poly-fight-wallet-refresh", daemon=True)
+    thread.start()
+    return status
 
 
 def _follow_groups(data_dir: Path) -> dict[str, dict[str, Any]]:

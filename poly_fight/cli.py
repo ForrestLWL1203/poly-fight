@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .api import PolymarketClient, RateLimiter
+from .control import active_follow_pause
 from .core import (
     SCORING_VERSION,
     TRADE_BEHAVIOR_EXCLUDE_RATE,
@@ -1363,6 +1364,31 @@ def command_run(args: argparse.Namespace) -> int:
             command_build_leaderboard(args, client=client)
             last_build_at = int(datetime.now(timezone.utc).timestamp())
 
+    def record_pause_tick(pause: dict[str, Any]) -> dict[str, Any]:
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        follow_dir = Path(args.data_dir) / "follow"
+        follow_dir.mkdir(parents=True, exist_ok=True)
+        run_log_path = follow_dir / "follow_run_log.jsonl"
+        sleep_seconds = min(60, max(1, int(args.min_tick_seconds)))
+        row = {
+            "status": "paused",
+            "phase": "wallet_refresh",
+            "created_at": now_ts,
+            "pause_reason": pause.get("reason"),
+            "pause_started_at": pause.get("started_at"),
+            "pause_expires_at": pause.get("expires_at"),
+            "desired_next_interval_seconds": sleep_seconds,
+        }
+        run_log_rows = read_jsonl(run_log_path)
+        from .follow import prune_jsonl
+
+        write_jsonl(
+            run_log_path,
+            prune_jsonl([*run_log_rows, row], now_ts=now_ts, retention_days=args.run_log_retention_days),
+        )
+        print(json.dumps(row, ensure_ascii=False, sort_keys=True), flush=True)
+        return row
+
     try:
         if not args.skip_initial_build:
             try:
@@ -1383,6 +1409,15 @@ def command_run(args: argparse.Namespace) -> int:
                 time.sleep(max(1, int(args.error_retry_seconds)))
         while not stop_requested["value"]:
             try:
+                pause = active_follow_pause(Path(args.data_dir), now_ts=int(datetime.now(timezone.utc).timestamp()))
+                if pause:
+                    summary = record_pause_tick(pause)
+                    first_error_at = None
+                    tick_count += 1
+                    if args.max_run_ticks and tick_count >= args.max_run_ticks:
+                        break
+                    time.sleep(int(summary["desired_next_interval_seconds"]))
+                    continue
                 maybe_build(force=False)
                 summary = command_follow(args, client=client, emit=True)
             except Exception as exc:

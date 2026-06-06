@@ -102,12 +102,18 @@ python3 -m poly_fight.cli serve --data-dir data --host 127.0.0.1 --port 8787
 
 Open `http://127.0.0.1:8787`, then login with `admin` and the dashboard
 password. For VPS domain deployment, put the service behind nginx + TLS and run
-with `--host 0.0.0.0 --cookie-secure`. The dashboard is read-only: it reads
-`follow.db`, `smart_wallet_leaderboard.json`, `active_market_cache.json`, and
-`follow_run_log.jsonl`; only the wallet-trades endpoint proxies live Data API
-requests with the same rate-limited client. Overview and wallet APIs expose v4
-quality fields such as contested count, clean-vs-contested performance, average
-CLV, and quarantine status.
+with `--host 0.0.0.0 --cookie-secure`. The dashboard does not place trades: it
+reads `follow.db`, `smart_wallet_leaderboard.json`, `active_market_cache.json`,
+and `follow_run_log.jsonl`; only the wallet-trades endpoint proxies live Data
+API requests with the same rate-limited client. Overview and wallet APIs expose
+v4 quality fields such as contested count, clean-vs-contested performance,
+average CLV, and quarantine status.
+
+Authenticated dashboard users can trigger a smart-wallet refresh with
+`POST /api/wallet-refresh` and poll `GET /api/wallet-refresh`. The refresh runs
+`collect --max-profiles-per-run 1000` in the background, writes status to
+`data/follow/follow_control.json`, and asks the long-running paper loop to pause
+follow ticks until the refresh finishes or its safety timeout expires.
 
 Outputs are written under `data/`:
 

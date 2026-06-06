@@ -6,6 +6,7 @@ from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
+import time
 import urllib.error
 import urllib.request
 import unittest
@@ -16,6 +17,7 @@ from poly_fight.dashboard import (
     build_follow_detail,
     build_follows,
     build_overview,
+    build_wallet_refresh_status,
     build_wallets,
     DashboardConfig,
     create_server,
@@ -23,6 +25,7 @@ from poly_fight.dashboard import (
     short_addr,
     verify_session_token,
 )
+from poly_fight.control import read_follow_control, set_follow_pause
 from poly_fight.storage import FollowStore
 from poly_fight.cli import (
     build_leaderboard_from_profiles,
@@ -41,6 +44,7 @@ from poly_fight.cli import (
     prune_profile_store,
     refresh_open_signal_fills,
     read_json,
+    read_jsonl,
     should_refresh_file_cache,
     should_use_cached_profile,
     watched_markets,
@@ -2612,6 +2616,58 @@ class CoreTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_dashboard_wallet_refresh_api_pauses_follow_and_runs_refresh(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            ran = threading.Event()
+
+            def fake_runner(data_dir_arg, log_path):
+                self.assertEqual(data_dir_arg, data_dir)
+                log_path.write_text("refreshed", encoding="utf-8")
+                ran.set()
+                return 0
+
+            server = create_server(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                    wallet_refresh_runner=fake_runner,
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                token = make_session_token("admin", "secret", now=int(datetime.now(timezone.utc).timestamp()))
+                cookie = f"poly_fight_session={token}"
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("POST", "/api/wallet-refresh", headers={"Cookie": cookie})
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+
+                self.assertEqual(response.status, 202)
+                self.assertTrue(payload["ok"])
+                self.assertEqual(payload["data"]["status"], "running")
+                self.assertTrue(ran.wait(2))
+
+                status = build_wallet_refresh_status(data_dir)
+                deadline = time.time() + 2
+                while status["status"].get("status") == "running" and time.time() < deadline:
+                    time.sleep(0.01)
+                    status = build_wallet_refresh_status(data_dir)
+                self.assertEqual(status["status"]["status"], "succeeded")
+                self.assertEqual(status["status"]["returncode"], 0)
+                self.assertIsNone(status["pause_follow"])
+                self.assertEqual(read_follow_control(data_dir)["wallet_refresh"]["status"], "succeeded")
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_dashboard_overview_uses_existing_follow_pnl_fields(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -3022,6 +3078,36 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(command_run(args), 0)
 
         self.assertEqual(build.call_count, 0)
+
+    def test_run_loop_pauses_follow_during_wallet_refresh(self):
+        with TemporaryDirectory() as tmp:
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "--data-dir",
+                    tmp,
+                    "run",
+                    "--stake-usdc",
+                    "1",
+                    "--skip-initial-build",
+                    "--max-run-ticks",
+                    "1",
+                ]
+            )
+            set_follow_pause(Path(tmp), reason="wallet_refresh", now_ts=int(time.time()), ttl_seconds=3600)
+
+            with patch("poly_fight.cli.build_client", return_value=object()), patch(
+                "poly_fight.cli.command_build_leaderboard"
+            ) as build, patch("poly_fight.cli.command_follow", return_value={"desired_next_interval_seconds": 900}) as follow:
+                from poly_fight.cli import command_run
+
+                self.assertEqual(command_run(args), 0)
+
+            self.assertEqual(build.call_count, 0)
+            self.assertEqual(follow.call_count, 0)
+            rows = read_jsonl(Path(tmp) / "follow" / "follow_run_log.jsonl")
+            self.assertEqual(rows[-1]["status"], "paused")
+            self.assertEqual(rows[-1]["pause_reason"], "wallet_refresh")
 
     def test_run_loop_survives_one_follow_exception(self):
         parser = build_parser()
