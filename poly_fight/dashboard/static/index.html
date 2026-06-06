@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
-    <title>Poly Fight Dashboard</title>
+    <title>Poly Fight 跟单控制台</title>
     <link rel="stylesheet" href="/vendor/daisyui-5.0.43.css" />
     <link rel="stylesheet" href="/vendor/daisyui-5.0.43-themes.css" />
     <link rel="stylesheet" href="/styles.css" />
@@ -20,11 +20,11 @@
           </div>
           <form class="login-form" @submit.prevent="login">
             <label class="login-field">
-              <span class="login-label">Username</span>
+              <span class="login-label">用户名</span>
               <input v-model.trim="loginForm.username" class="login-input" autocomplete="username" required />
             </label>
             <label class="login-field">
-              <span class="login-label">Password</span>
+              <span class="login-label">密码</span>
               <input v-model="loginForm.password" class="login-input" type="password" autocomplete="current-password" required />
             </label>
             <p v-if="loginError" class="text-sm text-error" role="alert">{{ loginError }}</p>
@@ -40,107 +40,131 @@
         <header class="topbar">
           <div>
             <p class="eyebrow">Poly Fight</p>
-            <h1 class="topbar-title">Paper Follow Dashboard</h1>
+            <h1 class="topbar-title">Paper 跟单控制台</h1>
           </div>
           <div class="topbar-actions">
-            <div class="status-pill live-pill" :class="`live-${liveStatus}`">
+            <div class="status-pill" :class="runnerStatusClass">
               <span class="status-dot"></span>
-              {{ liveStatus }}
+              {{ runnerPillText }}
             </div>
             <div class="status-pill" :class="statusClass(health.status)">
               <span class="status-dot"></span>
-              {{ health.status || "loading" }}
+              {{ healthPillText }}
             </div>
-            <button class="btn btn-sm btn-outline min-h-10" @click="refreshAll" :disabled="loading.any">刷新页面数据</button>
+            <button
+              class="btn btn-sm btn-circle min-h-10"
+              :class="runner.status === 'running' ? 'btn-error btn-outline' : 'btn-success'"
+              :aria-label="runnerControlTitle"
+              :title="runnerControlTitle"
+              @click="toggleRunner"
+              :disabled="loading.runner"
+            >
+              <span v-if="loading.runner" class="loading loading-spinner loading-xs"></span>
+              <span v-else aria-hidden="true">{{ runnerControlLabel }}</span>
+            </button>
             <button class="btn btn-sm btn-ghost min-h-10" @click="logout">退出</button>
           </div>
         </header>
 
         <section class="status-grid">
           <article class="metric-card">
-            <span class="metric-label">Last tick</span>
+            <span class="metric-label">最近 tick</span>
             <strong>{{ formatTime(health.last_tick_at) }}</strong>
             <small>{{ timeAgo(health.last_tick_at) }}</small>
           </article>
           <article class="metric-card">
-            <span class="metric-label">Watched markets</span>
+            <span class="metric-label">监控赛事</span>
             <strong>{{ numberOrDash(health.watched_market_count) }}</strong>
-            <small>next {{ duration(health.desired_next_interval_seconds) }}</small>
+            <small>下次约 {{ duration(health.desired_next_interval_seconds) }}</small>
           </article>
           <article class="metric-card">
-            <span class="metric-label">Open signals</span>
+            <span class="metric-label">进行中跟单</span>
             <strong>{{ numberOrDash(overview.open_signal_count ?? health.open_signal_count) }}</strong>
-            <small>exposure {{ money(overview.open_exposure) }}</small>
+            <small>敞口 {{ money(overview.open_exposure) }}</small>
           </article>
           <article class="metric-card">
-            <span class="metric-label">Wallet refresh</span>
-            <strong>{{ refreshStatus.status || "idle" }}</strong>
+            <span class="metric-label">钱包刷新</span>
+            <strong>{{ statusText(refreshStatus.status || "idle") }}</strong>
             <small>{{ refreshStatusText }}</small>
           </article>
         </section>
 
-        <section class="runner-band">
-          <div>
-            <p class="eyebrow">Runner</p>
-            <div class="runner-status">
-              <span class="status-pill" :class="runnerStatusClass">
-                <span class="status-dot"></span>
-                {{ runner.status || "checking" }}
-              </span>
-              <span v-if="runner.pid" class="font-mono subtle">pid {{ runner.pid }} · {{ runner.source }}</span>
-              <span v-else class="subtle">paper follow loop is not running</span>
-            </div>
-          </div>
-          <div class="toolbar-actions">
-            <span v-if="runner.log_path" class="log-chip font-mono">log {{ runner.log_path }}</span>
-            <button
-              v-if="runner.status === 'running'"
-              class="btn btn-error btn-outline min-h-11"
-              @click="stopRunner"
-              :disabled="loading.runner"
-            >
-              <span v-if="loading.runner" class="loading loading-spinner loading-sm"></span>
-              停止跟单脚本
-            </button>
-            <button
-              v-else
-              class="btn btn-success min-h-11"
-              @click="startRunner"
-              :disabled="loading.runner"
-            >
-              <span v-if="loading.runner" class="loading loading-spinner loading-sm"></span>
-              启动跟单脚本
-            </button>
-          </div>
-        </section>
-
         <section v-if="pauseFollowActive" class="pause-band" role="status" aria-live="polite">
           <div>
-            <p class="eyebrow">Follow paused</p>
+            <p class="eyebrow">跟单暂停</p>
             <strong>{{ pauseFollowTitle }}</strong>
           </div>
           <span>{{ pauseFollowText }}</span>
         </section>
 
         <section v-if="health.status === 'waiting_for_runner'" class="notice-band">
-          <strong>Runner waiting</strong>
+          <strong>等待跟单脚本</strong>
           <span>还没有可读的 follow.db。paper 进程启动并写入第一轮快照后，这里会自动填充。</span>
         </section>
 
         <section class="toolbar-band">
-          <div>
-            <p class="eyebrow">Leaderboard</p>
-            <p class="toolbar-copy">
-              updated {{ formatTime(wallets.leaderboard_updated_at || health.leaderboard_updated_at) }}
-              <span v-if="wallets.scoring_version || health.scoring_version"> · scoring v{{ wallets.scoring_version || health.scoring_version }}</span>
-            </p>
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Leaderboard</p>
+              <h2>聪明钱包</h2>
+              <p class="toolbar-copy">
+                更新时间 {{ formatTime(wallets.leaderboard_updated_at || health.leaderboard_updated_at) }}
+                <span v-if="wallets.scoring_version || health.scoring_version"> · scoring v{{ wallets.scoring_version || health.scoring_version }}</span>
+              </p>
+            </div>
+            <div class="toolbar-actions">
+              <div v-if="wallets.quarantined_count" class="badge badge-error badge-outline">{{ wallets.quarantined_count }} 个隔离钱包</div>
+              <button class="btn btn-warning min-h-11" @click="startWalletRefresh" :disabled="refreshStatus.status === 'running' || loading.walletRefresh">
+                <span v-if="refreshStatus.status === 'running' || loading.walletRefresh" class="loading loading-spinner loading-sm"></span>
+                刷新候选钱包
+              </button>
+            </div>
           </div>
-          <div class="toolbar-actions">
-            <div v-if="wallets.quarantined_count" class="badge badge-error badge-outline">{{ wallets.quarantined_count }} quarantined</div>
-            <button class="btn btn-warning min-h-11" @click="startWalletRefresh" :disabled="refreshStatus.status === 'running' || loading.walletRefresh">
-              <span v-if="refreshStatus.status === 'running' || loading.walletRefresh" class="loading loading-spinner loading-sm"></span>
-              立即刷新候选钱包
-            </button>
+          <div class="table-wrap leaderboard-table">
+            <table class="table table-sm dense-table">
+              <thead>
+                <tr>
+                  <th>钱包</th>
+                  <th>评级</th>
+                  <th>ROI</th>
+                  <th>胜率下界</th>
+                  <th>入场优势</th>
+                  <th>进行中</th>
+                  <th>状态</th>
+                  <th>查看</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="wallet in walletPageRows" :key="wallet.wallet">
+                  <td>
+                    <div class="font-mono">{{ wallet.short_addr }}</div>
+                    <div class="subtle">{{ wallet.esports_win_count ?? "-" }}W / {{ wallet.esports_loss_count ?? "-" }}L</div>
+                  </td>
+                  <td><span class="badge" :class="gradeClass(wallet.grade)">{{ wallet.grade || "-" }}</span></td>
+                  <td>{{ percent(wallet.esports_roi) }}</td>
+                  <td>{{ percent(wallet.wilson_win_rate_lower_bound) }}</td>
+                  <td :class="pnlClass(wallet.entry_edge)">{{ signedPctPoints(wallet.entry_edge) }}</td>
+                  <td>{{ (wallet.open_signals || []).length }}</td>
+                  <td>
+                    <span v-if="wallet.quarantined" class="badge badge-error badge-outline">隔离</span>
+                    <span v-else-if="wallet.reasons && wallet.reasons.length" class="badge badge-warning badge-outline">{{ wallet.reasons[0] }}</span>
+                    <span v-else class="badge badge-success badge-outline">正常</span>
+                  </td>
+                  <td>
+                    <a class="btn btn-xs btn-outline min-h-8" :href="profileUrl(wallet.wallet)" target="_blank" rel="noreferrer">Polymarket</a>
+                  </td>
+                </tr>
+                <tr v-if="!walletPageRows.length">
+                  <td colspan="8" class="empty-cell">暂无候选钱包</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="pagination-actions leaderboard-pagination">
+            <span>共 {{ wallets.count || 0 }} 个钱包</span>
+            <button class="btn btn-xs" :disabled="walletPage <= 1" @click="setWalletPage(walletPage - 1)">上一页</button>
+            <span>第 {{ walletPage }} / {{ walletPageCount }} 页</span>
+            <button class="btn btn-xs" :disabled="walletPage >= walletPageCount" @click="setWalletPage(walletPage + 1)">下一页</button>
           </div>
         </section>
 
@@ -153,140 +177,81 @@
         <transition name="fade" mode="out-in">
           <section v-if="activeTab === 'overview'" key="overview" class="panel-grid">
             <article class="stat-tile">
-              <span>Our PnL</span>
+              <span>已结算盈亏</span>
               <strong :class="pnlClass(overview.our_realized_pnl)">{{ money(overview.our_realized_pnl) }}</strong>
-              <small>Wallet basis {{ money(overview.wallet_basis_realized_pnl) }}</small>
+              <small>按钱包成交价 {{ money(overview.wallet_basis_realized_pnl) }}</small>
             </article>
             <article class="stat-tile">
-              <span>Delay cost</span>
+              <span>跟单延迟成本</span>
               <strong :class="pnlClass(-overview.delay_cost)">{{ money(overview.delay_cost) }}</strong>
               <small>入口延迟成本</small>
             </article>
             <article class="stat-tile">
-              <span>Capture rate</span>
+              <span>可跟腿占比</span>
               <strong>{{ percent(overview.would_follow_capture_rate) }}</strong>
-              <small>would_follow legs</small>
-            </article>
-            <article class="stat-tile">
-              <span>Avg CLV</span>
-              <strong :class="pnlClass(overview.avg_wallet_clv)">{{ signedPctPoints(overview.avg_wallet_clv) }}</strong>
-              <small>follow side closing-line value</small>
+              <small>排除分歧/拦截后的比例</small>
             </article>
             <article class="wide-tile">
               <div class="section-head">
-                <h2>Signal quality</h2>
-                <span class="badge badge-error badge-outline" v-if="overview.contested_signal_count">{{ overview.contested_signal_count }} contested</span>
+                <h2>信号质量</h2>
+                <span class="badge badge-error badge-outline" v-if="overview.contested_signal_count">{{ overview.contested_signal_count }} 个分歧盘</span>
               </div>
               <div class="quality-row">
-                <div><span>Clean</span><strong>{{ numberOrDash(overview.clean_signal_count) }}</strong></div>
-                <div><span>Contested</span><strong>{{ numberOrDash(overview.contested_signal_count) }}</strong></div>
-                <div><span>Settled</span><strong>{{ numberOrDash(overview.settled_count) }}</strong></div>
-                <div><span>Exited</span><strong>{{ numberOrDash(overview.exited_count) }}</strong></div>
+                <div><span>干净信号</span><strong>{{ numberOrDash(overview.clean_signal_count) }}</strong></div>
+                <div><span>分歧盘</span><strong>{{ numberOrDash(overview.contested_signal_count) }}</strong></div>
+                <div><span>已结算</span><strong>{{ numberOrDash(overview.settled_count) }}</strong></div>
+                <div><span>已退出</span><strong>{{ numberOrDash(overview.exited_count) }}</strong></div>
               </div>
             </article>
             <article class="wide-tile">
               <div class="section-head">
-                <h2>Behavior</h2>
-                <span>{{ numberOrDash(overview.result_count) }} results</span>
+                <h2>钱包行为</h2>
+                <span>{{ numberOrDash(overview.result_count) }} 条结果</span>
               </div>
               <div class="behavior-list">
                 <span v-for="(value, key) in overview.behavior_counts || {}" :key="key" class="badge badge-neutral">{{ key }}: {{ value }}</span>
-                <span v-if="!Object.keys(overview.behavior_counts || {}).length" class="empty-text">No behavior events yet</span>
+                <span v-if="!Object.keys(overview.behavior_counts || {}).length" class="empty-text">暂无行为事件</span>
               </div>
             </article>
-          </section>
-
-          <section v-else-if="activeTab === 'wallets'" key="wallets" class="data-panel">
-            <div class="section-head">
-              <h2>Smart wallets</h2>
-              <span>{{ wallets.count || 0 }} wallets</span>
-            </div>
-            <div class="table-wrap">
-              <table class="table table-sm dense-table">
-                <thead>
-                  <tr>
-                    <th>Wallet</th>
-                    <th>Grade</th>
-                    <th>ROI</th>
-                    <th>Wilson</th>
-                    <th>Entry edge</th>
-                    <th>CLV</th>
-                    <th>Open</th>
-                    <th>State</th>
-                    <th>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="wallet in wallets.wallets" :key="wallet.wallet">
-                    <td>
-                      <div class="font-mono">{{ wallet.short_addr }}</div>
-                      <div class="subtle">{{ wallet.esports_win_count ?? "-" }}W / {{ wallet.esports_loss_count ?? "-" }}L</div>
-                    </td>
-                    <td><span class="badge" :class="gradeClass(wallet.grade)">{{ wallet.grade || "-" }}</span></td>
-                    <td>{{ percent(wallet.esports_roi) }}</td>
-                    <td>{{ percent(wallet.wilson_win_rate_lower_bound) }}</td>
-                    <td :class="pnlClass(wallet.entry_edge)">{{ signedPctPoints(wallet.entry_edge) }}</td>
-                    <td :class="pnlClass(wallet.performance && wallet.performance.avg_wallet_clv)">{{ signedPctPoints(wallet.performance && wallet.performance.avg_wallet_clv) }}</td>
-                    <td>{{ (wallet.open_signals || []).length }}</td>
-                    <td>
-                      <span v-if="wallet.quarantined" class="badge badge-error badge-outline">quarantine</span>
-                      <span v-else-if="wallet.reasons && wallet.reasons.length" class="badge badge-warning badge-outline">{{ wallet.reasons[0] }}</span>
-                      <span v-else class="badge badge-success badge-outline">clean</span>
-                    </td>
-                    <td>
-                      <div class="row-actions">
-                        <a class="btn btn-xs btn-outline min-h-8" :href="profileUrl(wallet.wallet)" target="_blank" rel="noreferrer">Profile</a>
-                        <button class="btn btn-xs btn-ghost min-h-8" @click="openWalletTrades(wallet)">Trades</button>
-                      </div>
-                    </td>
-                  </tr>
-                  <tr v-if="!(wallets.wallets || []).length">
-                    <td colspan="9" class="empty-cell">No leaderboard wallets yet</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
           </section>
 
           <section v-else-if="activeTab === 'follows'" key="follows" class="data-panel">
             <div class="section-head">
-              <h2>Follows</h2>
+              <h2>跟单记录</h2>
               <div class="pagination-actions">
-                <button class="btn btn-xs" :disabled="followPage <= 1" @click="setFollowPage(followPage - 1)">Prev</button>
-                <span>Page {{ followPage }}</span>
-                <button class="btn btn-xs" :disabled="followPage * followSize >= follows.total" @click="setFollowPage(followPage + 1)">Next</button>
+                <button class="btn btn-xs" :disabled="followPage <= 1" @click="setFollowPage(followPage - 1)">上一页</button>
+                <span>第 {{ followPage }} 页</span>
+                <button class="btn btn-xs" :disabled="followPage * followSize >= follows.total" @click="setFollowPage(followPage + 1)">下一页</button>
               </div>
             </div>
             <div class="table-wrap">
               <table class="table table-sm dense-table">
                 <thead>
                   <tr>
-                    <th>Market</th>
-                    <th>Status</th>
-                    <th>Wallets</th>
-                    <th>Legs</th>
-                    <th>Stake</th>
-                    <th>PnL</th>
-                    <th>CLV</th>
-                    <th>Quality</th>
+                    <th>赛事</th>
+                    <th>状态</th>
+                    <th>钱包数</th>
+                    <th>腿数</th>
+                    <th>投入</th>
+                    <th>盈亏</th>
+                    <th>质量</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr v-for="follow in follows.follows" :key="follow.condition_id" class="click-row" @click="openFollowDetail(follow.condition_id)" tabindex="0" @keydown.enter="openFollowDetail(follow.condition_id)">
                     <td>
-                      <div class="market-title">{{ follow.title || follow.question || shortId(follow.condition_id) }}</div>
-                      <div class="subtle font-mono">{{ shortId(follow.condition_id) }}</div>
+                      <div class="market-title">{{ followTitle(follow) }}</div>
+                      <div class="subtle">{{ formatTime(follow.match_start_time) }} · {{ timeAgo(follow.match_start_time) }}</div>
                     </td>
-                    <td><span class="badge badge-outline">{{ follow.status }}</span></td>
+                    <td><span class="badge badge-outline">{{ statusText(follow.status) }}</span></td>
                     <td>{{ follow.wallet_count }}</td>
                     <td>{{ follow.leg_count }}</td>
                     <td>{{ money(follow.stake) }}</td>
                     <td :class="pnlClass(follow.our_realized_pnl)">{{ money(follow.our_realized_pnl) }}</td>
-                    <td :class="pnlClass(follow.avg_wallet_clv)">{{ signedPctPoints(follow.avg_wallet_clv) }}</td>
-                    <td><span class="badge" :class="follow.contested_signal_count ? 'badge-error badge-outline' : 'badge-success badge-outline'">{{ follow.contested_signal_count ? "contested" : "clean" }}</span></td>
+                    <td><span class="badge" :class="follow.contested_signal_count ? 'badge-error badge-outline' : 'badge-success badge-outline'">{{ follow.contested_signal_count ? "分歧" : "干净" }}</span></td>
                   </tr>
                   <tr v-if="!(follows.follows || []).length">
-                    <td colspan="8" class="empty-cell">No follow records yet</td>
+                    <td colspan="7" class="empty-cell">暂无跟单记录</td>
                   </tr>
                 </tbody>
               </table>
@@ -295,8 +260,8 @@
 
           <section v-else key="events" class="data-panel">
             <div class="section-head">
-              <h2>Watched events</h2>
-              <span>{{ events.count || 0 }} markets</span>
+              <h2>监控赛事</h2>
+              <span>{{ events.count || 0 }} 场</span>
             </div>
             <div class="event-grid">
               <article v-for="event in events.events" :key="event.condition_id" class="event-row">
@@ -305,14 +270,14 @@
                   <div class="subtle">{{ formatTime(event.match_start_time) }} · {{ timeAgo(event.match_start_time) }}</div>
                 </div>
                 <div class="event-meta">
-                  <span class="badge" :class="event.contested ? 'badge-error badge-outline' : 'badge-success badge-outline'">{{ event.contested ? "contested" : "clean" }}</span>
-                  <span class="badge badge-neutral">{{ (event.open_signals || []).length }} open</span>
+                  <span class="badge" :class="event.contested ? 'badge-error badge-outline' : 'badge-success badge-outline'">{{ event.contested ? "分歧" : "干净" }}</span>
+                  <span class="badge badge-neutral">{{ (event.open_signals || []).length }} 进行中</span>
                 </div>
                 <div class="side-strip">
                   <span v-for="(count, side) in event.side_counts || {}" :key="side">{{ side }} · {{ count }}</span>
                 </div>
               </article>
-              <p v-if="!(events.events || []).length" class="empty-text">No watched markets in the current window</p>
+              <p v-if="!(events.events || []).length" class="empty-text">当前窗口暂无监控赛事</p>
             </div>
           </section>
         </transition>
@@ -320,69 +285,40 @@
 
       <dialog class="modal" :open="detailModal.open">
         <div class="modal-box detail-modal">
-          <button class="btn btn-sm btn-circle btn-ghost absolute right-3 top-3" aria-label="Close detail" @click="closeDetail">×</button>
-          <h3 class="text-lg font-semibold">Follow detail</h3>
-          <p class="subtle font-mono break-all">{{ detailModal.conditionId }}</p>
+          <button class="btn btn-sm btn-circle btn-ghost absolute right-3 top-3" aria-label="关闭详情" @click="closeDetail">×</button>
+          <h3 class="text-lg font-semibold">{{ detailTitle() }}</h3>
+          <p class="subtle">{{ formatTime(followDetail.match_start_time) }} · {{ timeAgo(followDetail.match_start_time) }}</p>
           <div v-if="detailModal.loading" class="modal-loading"><span class="loading loading-spinner"></span></div>
           <div v-else class="detail-stack">
             <section v-for="wallet in followDetail.wallets" :key="wallet.wallet" class="detail-block">
               <div class="section-head">
                 <h4 class="font-mono">{{ wallet.short_addr }}</h4>
-                <span class="badge badge-neutral">{{ wallet.leg_count }} legs</span>
+                <span class="badge badge-neutral">{{ wallet.leg_count }} 腿</span>
               </div>
               <div v-for="signal in wallet.signals" :key="signal.signal_id || signal.condition_id + signal.outcome" class="signal-block">
                 <div class="signal-meta">
                   <span>{{ signal.outcome || signal.outcome_index }}</span>
-                  <span class="badge" :class="signal.contested ? 'badge-error badge-outline' : 'badge-success badge-outline'">{{ signal.contested ? "contested" : "clean" }}</span>
-                  <span :class="pnlClass(signal.wallet_clv)">{{ signedPctPoints(signal.wallet_clv) }} CLV</span>
+                  <span class="badge" :class="signal.contested ? 'badge-error badge-outline' : 'badge-success badge-outline'">{{ signal.contested ? "分歧" : "干净" }}</span>
                 </div>
                 <div class="legs-grid">
                   <div v-for="leg in signal.legs || []" :key="leg.trade_id || leg.created_at || leg.leg_at" class="leg-row">
                     <span>{{ formatTime(leg.leg_at || leg.created_at) }}</span>
                     <span>{{ money(leg.stake) }}</span>
-                    <span>our {{ price(leg.our_entry_price) }}</span>
-                    <span>wallet {{ price(leg.wallet_fill_price || leg.wallet_avg_price) }}</span>
-                    <span :class="pnlClass(-(leg.slippage || 0))">slip {{ signedPctPoints(leg.slippage) }}</span>
-                    <span class="badge badge-xs" :class="leg.would_follow === false ? 'badge-warning' : 'badge-success'">{{ leg.would_follow === false ? "blocked" : "follow" }}</span>
+                    <span>我方 {{ price(leg.our_entry_price) }}</span>
+                    <span>钱包 {{ price(leg.wallet_fill_price || leg.wallet_avg_price) }}</span>
+                    <span :class="pnlClass(-(leg.slippage || 0))">滑点 {{ legSlippageText(leg) }}</span>
+                    <span class="badge badge-xs" :class="leg.would_follow === false ? 'badge-warning' : 'badge-success'">{{ leg.would_follow === false ? "拦截" : "跟单" }}</span>
                   </div>
                 </div>
-                <div class="behavior-list mt-2">
-                  <span v-for="event in signal.behavior_events || []" :key="event.ts + event.type" class="badge badge-outline">{{ event.type }} · {{ formatTime(event.ts) }}</span>
+                <div v-if="signalBehaviorEvents(signal).length" class="behavior-list mt-2">
+                  <span v-for="event in signalBehaviorEvents(signal)" :key="event.ts + event.type" class="badge badge-outline">{{ event.type || "行为" }} · {{ formatTime(event.ts) }}</span>
                 </div>
               </div>
             </section>
-            <p v-if="!(followDetail.wallets || []).length" class="empty-text">No detail rows</p>
+            <p v-if="!(followDetail.wallets || []).length" class="empty-text">暂无详情</p>
           </div>
         </div>
-        <form class="modal-backdrop" method="dialog"><button @click.prevent="closeDetail">close</button></form>
-      </dialog>
-
-      <dialog class="modal" :open="tradesModal.open">
-        <div class="modal-box detail-modal">
-          <button class="btn btn-sm btn-circle btn-ghost absolute right-3 top-3" aria-label="Close trades" @click="closeTrades">×</button>
-          <h3 class="text-lg font-semibold">Recent wallet trades</h3>
-          <p class="subtle font-mono break-all">{{ tradesModal.wallet && tradesModal.wallet.wallet }}</p>
-          <div v-if="tradesModal.loading" class="modal-loading"><span class="loading loading-spinner"></span></div>
-          <div v-else class="table-wrap mt-4">
-            <table class="table table-xs dense-table">
-              <thead><tr><th>Time</th><th>Side</th><th>Outcome</th><th>Price</th><th>Flags</th></tr></thead>
-              <tbody>
-                <tr v-for="trade in tradesModal.trades" :key="trade.id || trade.transactionHash || trade.timestamp">
-                  <td>{{ formatTime(trade.timestamp) }}</td>
-                  <td>{{ trade.side || trade.action || "-" }}</td>
-                  <td>{{ trade.outcome || trade.outcomeName || "-" }}</td>
-                  <td>{{ price(trade.price) }}</td>
-                  <td>
-                    <span v-if="trade.watched" class="badge badge-info badge-xs">watched</span>
-                    <span v-if="trade.followed" class="badge badge-success badge-xs">followed</span>
-                  </td>
-                </tr>
-                <tr v-if="!tradesModal.trades.length"><td colspan="5" class="empty-cell">No cached trades</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-        <form class="modal-backdrop" method="dialog"><button @click.prevent="closeTrades">close</button></form>
+        <form class="modal-backdrop" method="dialog"><button @click.prevent="closeDetail">关闭</button></form>
       </dialog>
 
       <div class="toast toast-end toast-bottom">

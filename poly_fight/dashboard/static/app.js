@@ -6,10 +6,9 @@ createApp({
       authenticated: false,
       activeTab: "overview",
       tabs: [
-        { id: "overview", label: "Overview" },
-        { id: "wallets", label: "Wallets" },
-        { id: "follows", label: "Follows" },
-        { id: "events", label: "Events" },
+        { id: "overview", label: "总览" },
+        { id: "follows", label: "跟单" },
+        { id: "events", label: "赛事" },
       ],
       loginForm: { username: "admin", password: "" },
       loginError: "",
@@ -22,11 +21,12 @@ createApp({
       refreshStatus: { status: "idle" },
       runner: { status: "checking" },
       pauseFollow: null,
+      walletPage: 1,
+      walletSize: 10,
       followPage: 1,
       followSize: 25,
       followDetail: { wallets: [] },
       detailModal: { open: false, loading: false, conditionId: "" },
-      tradesModal: { open: false, loading: false, wallet: null, trades: [] },
       toasts: [],
       intervals: [],
       eventSource: null,
@@ -43,15 +43,40 @@ createApp({
       if (this.runner.status === "stopping") return "status-stale";
       return "status-error";
     },
+    runnerPillText() {
+      return this.runner.status === "running" ? "脚本运行中" : "脚本未运行";
+    },
+    runnerControlLabel() {
+      return this.runner.status === "running" ? "■" : "▶";
+    },
+    runnerControlTitle() {
+      return this.runner.status === "running" ? "停止跟单脚本" : "启动跟单脚本";
+    },
+    healthPillText() {
+      if (this.health.status === "healthy") return "tick 正常";
+      if (this.health.status === "stale") return "tick 延迟";
+      if (this.health.status === "waiting_for_runner") return "等待首个 tick";
+      return this.statusText(this.health.status) || "检查中";
+    },
+    walletPageCount() {
+      const count = Number(this.wallets.count || (this.wallets.wallets || []).length || 0);
+      return Math.max(1, Math.ceil(count / this.walletSize));
+    },
+    walletPageRows() {
+      const rows = this.wallets.wallets || [];
+      const page = Math.min(Math.max(1, this.walletPage), this.walletPageCount);
+      const start = (page - 1) * this.walletSize;
+      return rows.slice(start, start + this.walletSize);
+    },
     refreshStatusText() {
       const status = this.refreshStatus || {};
-      if (status.status === "running") return `started ${this.formatTime(status.started_at)}`;
-      if (status.status === "succeeded") return `finished ${this.formatTime(status.finished_at)}`;
+      if (status.status === "running") return `${this.formatTime(status.started_at)} 开始`;
+      if (status.status === "succeeded") return `${this.formatTime(status.finished_at)} 完成`;
       if (status.status === "failed") {
         const rc = status.returncode != null ? ` rc=${status.returncode}` : "";
-        return `failed ${this.formatTime(status.finished_at)}${rc}`;
+        return `${this.formatTime(status.finished_at)} 失败${rc}`;
       }
-      return "ready";
+      return "可用";
     },
     pauseFollowActive() {
       const pause = this.pauseFollow;
@@ -64,16 +89,16 @@ createApp({
     pauseFollowTitle() {
       const pause = this.pauseFollow;
       if (pause && typeof pause === "object") {
-        return pause.phase || pause.reason || "follow paused";
+        return pause.phase || pause.reason || "跟单暂停";
       }
-      return "follow paused";
+      return "跟单暂停";
     },
     pauseFollowText() {
       const pause = this.pauseFollow;
       if (pause && typeof pause === "object" && pause.started_at) {
-        return `since ${this.formatTime(pause.started_at)} · open signals stay tracked; new follow ticks resume after refresh.`;
+        return `${this.formatTime(pause.started_at)} 开始暂停；已开的跟单继续跟踪，刷新结束后恢复新 tick。`;
       }
-      return "open signals stay tracked; new follow ticks resume after refresh.";
+      return "已开的跟单继续跟踪，刷新结束后恢复新 tick。";
     },
   },
   mounted() {
@@ -257,15 +282,6 @@ createApp({
         if (this.authenticated && this.pollingFallback) this.startRealtime();
       }, delay);
     },
-    async refreshAll() {
-      this.loading.any = true;
-      try {
-        await this.loadDashboard();
-        this.showToast("页面数据已刷新");
-      } finally {
-        this.loading.any = false;
-      }
-    },
     async loadHealth() {
       this.health = await this.request("/api/health");
     },
@@ -274,12 +290,15 @@ createApp({
     },
     async loadWallets() {
       this.wallets = await this.request("/api/wallets");
+      if (this.walletPage > this.walletPageCount) this.walletPage = this.walletPageCount;
     },
     async loadFollows() {
       this.follows = await this.request(`/api/follows?page=${this.followPage}&size=${this.followSize}`);
     },
     async loadEvents() {
-      this.events = await this.request("/api/events");
+      const result = await this.request("/api/events");
+      result.events = (result.events || []).slice().sort((a, b) => this.normalizeTs(a.match_start_time) - this.normalizeTs(b.match_start_time));
+      this.events = result;
     },
     async loadWalletRefreshStatus() {
       const result = await this.request("/api/wallet-refresh");
@@ -339,6 +358,16 @@ createApp({
       this.followPage = Math.max(1, page);
       await this.loadFollows();
     },
+    setWalletPage(page) {
+      this.walletPage = Math.min(Math.max(1, page), this.walletPageCount);
+    },
+    async toggleRunner() {
+      if (this.runner.status === "running") {
+        await this.stopRunner();
+      } else {
+        await this.startRunner();
+      }
+    },
     async openFollowDetail(conditionId) {
       this.detailModal = { open: true, loading: true, conditionId };
       this.followDetail = { wallets: [] };
@@ -353,20 +382,6 @@ createApp({
     closeDetail() {
       this.detailModal.open = false;
     },
-    async openWalletTrades(wallet) {
-      this.tradesModal = { open: true, loading: true, wallet, trades: [] };
-      try {
-        const data = await this.request(`/api/wallets/${encodeURIComponent(wallet.wallet)}/trades?page=1&size=10`);
-        this.tradesModal.trades = data.trades || [];
-      } catch (error) {
-        this.showToast(`最近交易加载失败: ${error.message}`, "error");
-      } finally {
-        this.tradesModal.loading = false;
-      }
-    },
-    closeTrades() {
-      this.tradesModal.open = false;
-    },
     showToast(message, kind = "info") {
       const id = Date.now() + Math.random();
       this.toasts.push({ id, message, kind });
@@ -379,6 +394,26 @@ createApp({
     },
     statusClass(status) {
       return `status-${status || "error"}`;
+    },
+    statusText(status) {
+      const map = {
+        running: "运行中",
+        stopping: "停止中",
+        stopped: "已停止",
+        checking: "检查中",
+        healthy: "正常",
+        stale: "延迟",
+        error: "异常",
+        waiting_for_runner: "等待脚本",
+        open: "进行中",
+        settled: "已结算",
+        exited: "已退出",
+        mixed: "混合",
+        idle: "空闲",
+        succeeded: "已完成",
+        failed: "失败",
+      };
+      return map[status] || status || "-";
     },
     gradeClass(grade) {
       if (grade === "A") return "badge-success";
@@ -445,6 +480,24 @@ createApp({
     shortId(value) {
       const text = String(value || "");
       return text.length > 18 ? `${text.slice(0, 10)}...${text.slice(-6)}` : text;
+    },
+    followTitle(follow) {
+      return follow.title || follow.question || "未命名赛事";
+    },
+    detailTitle() {
+      return this.followDetail.title || this.followDetail.question || "跟单详情";
+    },
+    signalBehaviorEvents(signal) {
+      return (signal.behavior_events || [])
+        .map((event) => ({
+          type: event.type || event.kind || event.event_type || "",
+          ts: event.ts || event.timestamp || event.created_at || 0,
+        }))
+        .filter((event) => event.type || event.ts);
+    },
+    legSlippageText(leg) {
+      if (leg.slippage == null || !Number.isFinite(Number(leg.slippage))) return "-";
+      return this.signedPctPoints(leg.slippage);
     },
   },
 }).mount("#app");

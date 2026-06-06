@@ -326,6 +326,23 @@ body {
   margin-top: 0.9rem;
 }
 
+.toolbar-band {
+  display: grid;
+  align-items: stretch;
+  justify-content: stretch;
+  gap: 0.85rem;
+}
+
+.leaderboard-table {
+  margin-top: 0.15rem;
+}
+
+.leaderboard-pagination {
+  justify-content: flex-end;
+  color: var(--pf-muted);
+  font-size: 0.82rem;
+}
+
 .panel-grid,
 .data-panel {
   margin-top: 0.85rem;

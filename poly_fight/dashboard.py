@@ -644,13 +644,22 @@ def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
     result = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_follow_detail(condition_id)
     signals = result.get("signals", [])
     by_wallet: dict[str, dict[str, Any]] = {}
+    title = ""
+    question = ""
+    match_start_time = None
     for signal in signals:
+        title = title or str(signal.get("event_title") or signal.get("title") or signal.get("market_title") or "")
+        question = question or str(signal.get("market_question") or signal.get("question") or "")
+        match_start_time = match_start_time or signal.get("match_start_time") or signal.get("market_start_time")
         wallet = str(signal.get("wallet") or "").lower()
         bucket = by_wallet.setdefault(wallet, {"wallet": wallet, "short_addr": short_addr(wallet), "signals": [], "leg_count": 0})
         bucket["signals"].append(signal)
         bucket["leg_count"] += len(signal.get("legs") or [])
     return {
         "condition_id": condition_id,
+        "title": title,
+        "question": question,
+        "match_start_time": match_start_time,
         "wallets": list(by_wallet.values()),
         "signal_count": len(signals),
         "db_ready": bool(result.get("db_ready")),
@@ -695,6 +704,7 @@ def build_events(data_dir: Path, *, observe_window_hours: float = 24.0) -> dict[
                     "side_counts": _signal_side_counts(open_signals),
                 }
             )
+    events.sort(key=lambda row: _parse_timestamp(row.get("match_start_time")) or 0)
     return {
         "events": events,
         "count": len(events),
@@ -1010,8 +1020,9 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
             condition_id,
             {
                 "condition_id": condition_id,
-                "title": signal.get("title") or signal.get("market_title"),
-                "question": signal.get("question"),
+                "title": signal.get("event_title") or signal.get("title") or signal.get("market_title"),
+                "question": signal.get("market_question") or signal.get("question"),
+                "match_start_time": signal.get("match_start_time") or signal.get("market_start_time"),
                 "wallets": set(),
                 "leg_count": 0,
                 "stake": 0.0,

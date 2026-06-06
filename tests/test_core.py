@@ -2768,7 +2768,7 @@ class CoreTest(unittest.TestCase):
                 body = response.read().decode()
                 self.assertEqual(response.status, 200)
                 self.assertIn("text/html", response.getheader("Content-Type") or "")
-                self.assertIn("Poly Fight Dashboard", body)
+                self.assertIn("Poly Fight 跟单控制台", body)
                 self.assertIn("/app.js", body)
                 self.assertIn("/vendor/vue-3.5.13.global.prod.js", body)
                 self.assertNotIn("cdn.jsdelivr.net", body)
@@ -3220,6 +3220,38 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(len(page["follows"]), 1)
             self.assertEqual(page["follows"][0]["condition_id"], "m1")
 
+    def test_dashboard_follows_expose_readable_market_fields(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "sig-open",
+                        "wallet": "0xabc",
+                        "condition_id": "m1",
+                        "status": "open",
+                        "event_title": "Counter-Strike: A vs B",
+                        "market_question": "A vs B",
+                        "match_start_time": "2026-06-06T12:00:00Z",
+                        "created_at": 100,
+                        "legs": [{"stake": 1}],
+                    }
+                ],
+                result_events=[],
+                performance={"wallets": {}, "total": {}},
+            )
+
+            page = build_follows(data_dir, page=1, size=10)
+            detail = build_follow_detail(data_dir, "m1")
+
+            self.assertEqual(page["follows"][0]["title"], "Counter-Strike: A vs B")
+            self.assertEqual(page["follows"][0]["question"], "A vs B")
+            self.assertEqual(page["follows"][0]["match_start_time"], "2026-06-06T12:00:00Z")
+            self.assertEqual(detail["title"], "Counter-Strike: A vs B")
+            self.assertEqual(detail["match_start_time"], "2026-06-06T12:00:00Z")
+
     def test_dashboard_follow_detail_uses_condition_sql_not_full_snapshot(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -3315,6 +3347,33 @@ class CoreTest(unittest.TestCase):
 
             self.assertTrue(events["events"][0]["contested"])
             self.assertEqual(events["events"][0]["side_counts"], {"0": 1, "1": 1})
+
+    def test_dashboard_events_sort_by_start_time_ascending(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now_ts = int(time.time())
+            write_json(
+                data_dir / "follow" / "active_market_cache.json",
+                {
+                    "updated_at": now_ts,
+                    "markets": [
+                        {
+                            "condition_id": "late",
+                            "title": "Late",
+                            "match_start_time": datetime.fromtimestamp(now_ts + 7200, timezone.utc).isoformat(),
+                        },
+                        {
+                            "condition_id": "early",
+                            "title": "Early",
+                            "match_start_time": datetime.fromtimestamp(now_ts + 3600, timezone.utc).isoformat(),
+                        },
+                    ],
+                },
+            )
+
+            events = build_events(data_dir)
+
+            self.assertEqual([row["condition_id"] for row in events["events"]], ["early", "late"])
 
     def test_dashboard_wallet_trades_rejects_invalid_addr_without_client_call(self):
         with TemporaryDirectory() as tmp:
