@@ -1354,8 +1354,8 @@ def command_follow(
         state=state,
         store=store,
         now_ts=now_ts,
-        gamma_pages=args.gamma_pages,
-        ttl_seconds=args.event_cache_ttl_minutes * 60,
+        gamma_pages=args.resolution_gamma_pages,
+        ttl_seconds=args.resolution_cache_ttl_seconds,
     )
     open_signals, settled = settle_open_signals(open_signals, resolutions, now_ts=now_ts)
     result_events = [*exited_signals, *settled]
@@ -1537,6 +1537,9 @@ def command_serve(args: argparse.Namespace) -> int:
         client=build_client(args),
         observe_window_hours=args.observe_window_hours,
         runner_stake_usdc=args.runner_stake_usdc,
+        stream_poll_seconds=args.stream_poll_seconds,
+        stream_heartbeat_seconds=args.stream_heartbeat_seconds,
+        max_stream_clients=args.max_stream_clients,
     )
     server = create_server(config)
     host, port = server.server_address[:2]
@@ -1608,6 +1611,8 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--event-gate-horizon-hours", type=float, default=24)
         subparser.add_argument("--observe-window-hours", type=float, default=24)
         subparser.add_argument("--event-cache-ttl-minutes", type=int, default=15)
+        subparser.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
+        subparser.add_argument("--resolution-gamma-pages", type=int, default=2)
         subparser.add_argument("--max-slippage-over-entry", type=float, default=0.05)
         subparser.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=True)
         subparser.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
@@ -1656,6 +1661,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--event-gate-horizon-hours", type=float, default=24)
     run.add_argument("--observe-window-hours", type=float, default=24)
     run.add_argument("--event-cache-ttl-minutes", type=int, default=15)
+    run.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
+    run.add_argument("--resolution-gamma-pages", type=int, default=2)
     run.add_argument("--max-slippage-over-entry", type=float, default=0.05)
     run.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=True)
     run.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
@@ -1692,6 +1699,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--request-burst", type=int, default=5)
     serve.add_argument("--max-retry-after-seconds", type=float, default=60)
     serve.add_argument("--runner-stake-usdc", type=float, default=1.0)
+    serve.add_argument("--stream-poll-seconds", type=float, default=2.0)
+    serve.add_argument("--stream-heartbeat-seconds", type=float, default=15.0)
+    serve.add_argument("--max-stream-clients", type=int, default=8)
     serve.set_defaults(func=command_serve)
     return parser
 

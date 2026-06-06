@@ -45,6 +45,10 @@
             <h1 class="topbar-title">Paper Follow Dashboard</h1>
           </div>
           <div class="topbar-actions">
+            <div class="status-pill live-pill" :class="`live-${liveStatus}`">
+              <span class="status-dot"></span>
+              {{ liveStatus }}
+            </div>
             <div class="status-pill" :class="statusClass(health.status)">
               <span class="status-dot"></span>
               {{ health.status || "loading" }}
@@ -110,6 +114,14 @@
               启动跟单脚本
             </button>
           </div>
+        </section>
+
+        <section v-if="pauseFollowActive" class="pause-band" role="status" aria-live="polite">
+          <div>
+            <p class="eyebrow">Follow paused</p>
+            <strong>{{ pauseFollowTitle }}</strong>
+          </div>
+          <span>{{ pauseFollowText }}</span>
         </section>
 
         <section v-if="health.status === 'waiting_for_runner'" class="notice-band">

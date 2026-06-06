@@ -21,6 +21,7 @@ createApp({
       events: { events: [] },
       refreshStatus: { status: "idle" },
       runner: { status: "checking" },
+      pauseFollow: null,
       followPage: 1,
       followSize: 25,
       followDetail: { wallets: [] },
@@ -28,6 +29,12 @@ createApp({
       tradesModal: { open: false, loading: false, wallet: null, trades: [] },
       toasts: [],
       intervals: [],
+      eventSource: null,
+      pollingFallback: false,
+      liveStatus: "starting",
+      streamRetryMs: 2000,
+      streamRetryTimer: null,
+      streamProbeRunning: false,
     };
   },
   computed: {
@@ -46,12 +53,34 @@ createApp({
       }
       return "ready";
     },
+    pauseFollowActive() {
+      const pause = this.pauseFollow;
+      if (!pause) return false;
+      if (pause === true) return true;
+      if (typeof pause !== "object") return false;
+      if (pause.active === false || pause.enabled === false) return false;
+      return Boolean(pause.active || pause.enabled || pause.phase || pause.reason || pause.started_at);
+    },
+    pauseFollowTitle() {
+      const pause = this.pauseFollow;
+      if (pause && typeof pause === "object") {
+        return pause.phase || pause.reason || "follow paused";
+      }
+      return "follow paused";
+    },
+    pauseFollowText() {
+      const pause = this.pauseFollow;
+      if (pause && typeof pause === "object" && pause.started_at) {
+        return `since ${this.formatTime(pause.started_at)} · open signals stay tracked; new follow ticks resume after refresh.`;
+      }
+      return "open signals stay tracked; new follow ticks resume after refresh.";
+    },
   },
   mounted() {
     this.bootstrap();
   },
   beforeUnmount() {
-    this.intervals.forEach((id) => clearInterval(id));
+    this.stopRealtime();
   },
   methods: {
     async request(path, options = {}) {
@@ -78,7 +107,7 @@ createApp({
         this.health = await this.request("/api/health");
         this.authenticated = true;
         await this.loadDashboard();
-        this.startPolling();
+        this.startRealtime();
       } catch (error) {
         if (error.message !== "unauthorized") this.showToast(`Health failed: ${error.message}`, "error");
       }
@@ -94,7 +123,7 @@ createApp({
         });
         this.authenticated = true;
         await this.loadDashboard();
-        this.startPolling();
+        this.startRealtime();
       } catch (_error) {
         this.loginError = "登录失败，请检查用户名和密码。";
       } finally {
@@ -104,8 +133,7 @@ createApp({
     async logout() {
       await this.request("/api/logout", { method: "POST" }).catch(() => null);
       this.authenticated = false;
-      this.intervals.forEach((id) => clearInterval(id));
-      this.intervals = [];
+      this.stopRealtime();
     },
     async loadDashboard() {
       await Promise.allSettled([
@@ -136,6 +164,98 @@ createApp({
           if (this.runner.status === "stopping") this.loadRunner();
         }, 5000),
       ];
+    },
+    stopPolling() {
+      this.intervals.forEach((id) => clearInterval(id));
+      this.intervals = [];
+      this.pollingFallback = false;
+    },
+    startRealtime() {
+      this.stopRealtime();
+      if (!this.authenticated || typeof EventSource === "undefined") {
+        this.liveStatus = "polling";
+        this.pollingFallback = true;
+        this.startPolling();
+        return;
+      }
+      this.liveStatus = "connecting";
+      const source = new EventSource("/api/stream");
+      this.eventSource = source;
+      source.onmessage = (event) => {
+        this.streamRetryMs = 2000;
+        try {
+          this.applyStreamPayload(JSON.parse(event.data || "{}"));
+        } catch (_error) {
+          this.showToast("Live stream payload parse failed", "error");
+        }
+      };
+      source.onerror = () => {
+        this.handleStreamError(source);
+      };
+    },
+    stopRealtime() {
+      if (this.eventSource) {
+        this.eventSource.close();
+        this.eventSource = null;
+      }
+      if (this.streamRetryTimer) {
+        clearTimeout(this.streamRetryTimer);
+        this.streamRetryTimer = null;
+      }
+      this.stopPolling();
+      this.liveStatus = "stopped";
+      this.streamProbeRunning = false;
+    },
+    applyStreamPayload(payload) {
+      this.liveStatus = "live";
+      this.pollingFallback = false;
+      this.stopPolling();
+      if (payload.health) this.health = payload.health;
+      if (payload.overview) this.overview = payload.overview;
+      if (payload.runner) this.runner = payload.runner;
+      if (payload.refresh) this.refreshStatus = payload.refresh;
+      if (Object.prototype.hasOwnProperty.call(payload, "pause_follow")) this.pauseFollow = payload.pause_follow;
+      if (payload.follows_dirty) this.loadFollows().catch(() => null);
+      if (payload.events_dirty) this.loadEvents().catch(() => null);
+      if (payload.wallets_dirty) this.loadWallets().catch(() => null);
+    },
+    async handleStreamError(source) {
+      if (this.streamProbeRunning) return;
+      this.streamProbeRunning = true;
+      source.close();
+      if (this.eventSource === source) this.eventSource = null;
+      try {
+        const response = await fetch("/api/health", {
+          credentials: "same-origin",
+          headers: { Accept: "application/json" },
+        });
+        if (response.status === 401) {
+          this.stopRealtime();
+          this.authenticated = false;
+          this.liveStatus = "auth_expired";
+          return;
+        }
+        this.enterPollingFallback();
+      } catch (_error) {
+        this.enterPollingFallback();
+      } finally {
+        this.streamProbeRunning = false;
+      }
+    },
+    enterPollingFallback() {
+      if (!this.authenticated) return;
+      this.liveStatus = "polling";
+      if (!this.pollingFallback) {
+        this.pollingFallback = true;
+        this.startPolling();
+      }
+      const delay = this.streamRetryMs;
+      this.streamRetryMs = Math.min(this.streamRetryMs * 2, 30000);
+      if (this.streamRetryTimer) clearTimeout(this.streamRetryTimer);
+      this.streamRetryTimer = setTimeout(() => {
+        this.streamRetryTimer = null;
+        if (this.authenticated && this.pollingFallback) this.startRealtime();
+      }, delay);
     },
     async refreshAll() {
       this.loading.any = true;

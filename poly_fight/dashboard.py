@@ -8,6 +8,7 @@ import mimetypes
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -47,6 +48,9 @@ class DashboardConfig:
     wallet_refresh_runner: Any = None
     wallet_refresh_timeout_seconds: int = 7200
     runner_stake_usdc: float = 1.0
+    stream_poll_seconds: float = 2.0
+    stream_heartbeat_seconds: float = 15.0
+    max_stream_clients: int = 8
     runner_process_starter: Any = None
     runner_process_lister: Any = None
     runner_process_stopper: Any = None
@@ -115,6 +119,9 @@ def create_server(config: DashboardConfig) -> ThreadingHTTPServer:
         wallet_refresh_runner=config.wallet_refresh_runner,
         wallet_refresh_timeout_seconds=config.wallet_refresh_timeout_seconds,
         runner_stake_usdc=config.runner_stake_usdc,
+        stream_poll_seconds=config.stream_poll_seconds,
+        stream_heartbeat_seconds=config.stream_heartbeat_seconds,
+        max_stream_clients=config.max_stream_clients,
         runner_process_starter=config.runner_process_starter,
         runner_process_lister=config.runner_process_lister,
         runner_process_stopper=config.runner_process_stopper,
@@ -124,7 +131,10 @@ def create_server(config: DashboardConfig) -> ThreadingHTTPServer:
         dashboard_config = resolved
         started_at = time.time()
 
-    return ThreadingHTTPServer((resolved.host, resolved.port), Handler)
+    server = ThreadingHTTPServer((resolved.host, resolved.port), Handler)
+    server.active_stream_clients = 0  # type: ignore[attr-defined]
+    server.stream_clients_lock = threading.Lock()  # type: ignore[attr-defined]
+    return server
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -132,6 +142,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
     started_at: float
 
     server_version = "PolyFightDashboard/0.1"
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError):
+            return
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
@@ -170,6 +186,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._error("not_found", status=HTTPStatus.NOT_FOUND)
 
     def _handle_api_get(self, parsed: urllib.parse.ParseResult) -> None:
+        if parsed.path == "/api/stream":
+            self._serve_stream()
+            return
         if parsed.path == "/api/health":
             self._ok(build_health(self.dashboard_config.data_dir, started_at=self.started_at))
             return
@@ -368,6 +387,62 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _serve_stream(self) -> None:
+        config = self.dashboard_config
+        lock = getattr(self.server, "stream_clients_lock")
+        with lock:
+            active = int(getattr(self.server, "active_stream_clients", 0))
+            if active >= config.max_stream_clients:
+                self._error("too_many_stream_clients", status=HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            setattr(self.server, "active_stream_clients", active + 1)
+        conn: sqlite3.Connection | None = None
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            store = FollowStore(config.data_dir / "follow" / "follow.db")
+            previous: StreamSignal | None = None
+            last_heartbeat = 0.0
+            while True:
+                if conn is None:
+                    conn = store.connect_readonly()
+                signal = read_stream_signal(config.data_dir, store=store, conn=conn)
+                if conn is not None and signal.snapshot_updated_at == 0 and not (config.data_dir / "follow" / "follow.db").exists():
+                    conn.close()
+                    conn = None
+                now = time.time()
+                dirty = stream_dirty_flags(previous, signal)
+                if previous is None or signal != previous:
+                    payload = {
+                        **build_stream_header(config, started_at=self.started_at),
+                        **dirty,
+                    }
+                    self._write_sse_data(payload)
+                    previous = signal
+                    last_heartbeat = now
+                elif now - last_heartbeat >= config.stream_heartbeat_seconds:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    last_heartbeat = now
+                time.sleep(max(0.25, float(config.stream_poll_seconds)))
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            return
+        finally:
+            if conn is not None:
+                conn.close()
+            with lock:
+                current = int(getattr(self.server, "active_stream_clients", 0))
+                setattr(self.server, "active_stream_clients", max(0, current - 1))
+
+    def _write_sse_data(self, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        self.wfile.write(b"data: " + body + b"\n\n")
+        self.wfile.flush()
+
     def _ok(self, data: Any) -> None:
         self._json({"ok": True, "data": data, "generated_at": int(time.time())})
 
@@ -418,6 +493,55 @@ def build_health(data_dir: Path, *, started_at: float) -> dict[str, Any]:
         "last_error": errors[-1] if errors else None,
         "last_tick": last_tick,
         "uptime_seconds": int(time.time() - started_at),
+    }
+
+
+@dataclass(frozen=True)
+class StreamSignal:
+    snapshot_updated_at: int
+    run_log_mtime: int
+    control_mtime: int
+    leaderboard_mtime: int
+
+
+def read_stream_signal(
+    data_dir: Path,
+    *,
+    store: FollowStore | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> StreamSignal:
+    store = store or FollowStore(data_dir / "follow" / "follow.db")
+    return StreamSignal(
+        snapshot_updated_at=store.read_meta_int("follow_snapshot_updated_at", conn=conn),
+        run_log_mtime=_file_mtime(data_dir / "follow" / "follow_run_log.jsonl"),
+        control_mtime=_file_mtime(data_dir / "follow" / "follow_control.json"),
+        leaderboard_mtime=_file_mtime(data_dir / "smart_wallet_leaderboard.json"),
+    )
+
+
+def stream_dirty_flags(previous: StreamSignal | None, current: StreamSignal) -> dict[str, bool]:
+    if previous is None:
+        return {"follows_dirty": True, "events_dirty": True, "wallets_dirty": True}
+    snapshot_dirty = current.snapshot_updated_at != previous.snapshot_updated_at
+    return {
+        "follows_dirty": snapshot_dirty,
+        "events_dirty": snapshot_dirty,
+        "wallets_dirty": current.leaderboard_mtime != previous.leaderboard_mtime,
+    }
+
+
+def build_stream_header(config: DashboardConfig, *, started_at: float) -> dict[str, Any]:
+    control = read_follow_control(config.data_dir)
+    return {
+        "health": build_health(config.data_dir, started_at=started_at),
+        "overview": build_overview(config.data_dir),
+        "runner": build_runner_status(config),
+        "refresh": build_wallet_refresh_status(config.data_dir).get("status") or {"status": "idle"},
+        "pause_follow": control.get("pause_follow") if isinstance(control, dict) else None,
+        "live": {
+            "status": "connected",
+            "generated_at": int(time.time()),
+        },
     }
 
 
@@ -940,6 +1064,13 @@ def _read_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return default
+
+
+def _file_mtime(path: Path) -> int:
+    try:
+        return int(path.stat().st_mtime)
+    except OSError:
+        return 0
 
 
 def _latest_scoring_version(data_dir: Path) -> int | None:

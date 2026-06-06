@@ -21,6 +21,7 @@ from poly_fight.dashboard import (
     build_follows,
     build_overview,
     build_runner_status,
+    read_stream_signal,
     build_wallet_refresh_status,
     build_wallets,
     DashboardConfig,
@@ -29,6 +30,8 @@ from poly_fight.dashboard import (
     short_addr,
     start_runner,
     stop_runner,
+    stream_dirty_flags,
+    StreamSignal,
     verify_session_token,
 )
 from poly_fight.control import read_follow_control
@@ -2802,6 +2805,136 @@ class CoreTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_dashboard_stream_requires_auth(self):
+        with TemporaryDirectory() as tmp:
+            server = create_server(
+                DashboardConfig(
+                    data_dir=Path(tmp),
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/api/stream")
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                self.assertEqual(response.status, 401)
+                self.assertEqual(payload["error"], "unauthorized")
+                conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_stream_sends_initial_frame_and_releases_slot(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[],
+                result_events=[],
+                performance={"wallets": {}, "total": {}},
+            )
+            server = create_server(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                    stream_poll_seconds=0.05,
+                    stream_heartbeat_seconds=1,
+                    max_stream_clients=1,
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            conn = None
+            try:
+                host, port = server.server_address[:2]
+                token = make_session_token("admin", "secret", now=int(datetime.now(timezone.utc).timestamp()))
+                cookie = f"poly_fight_session={token}"
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/api/stream", headers={"Cookie": cookie})
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200)
+                line = response.fp.readline().decode()
+                self.assertTrue(line.startswith("data: "))
+                payload = json.loads(line.removeprefix("data: "))
+                self.assertIn("health", payload)
+                self.assertIn("overview", payload)
+                self.assertIn("runner", payload)
+                self.assertIn("refresh", payload)
+                self.assertTrue(payload["follows_dirty"])
+                self.assertTrue(payload["events_dirty"])
+                self.assertTrue(payload["wallets_dirty"])
+
+                blocked = http.client.HTTPConnection(host, port, timeout=5)
+                blocked.request("GET", "/api/stream", headers={"Cookie": cookie})
+                blocked_response = blocked.getresponse()
+                blocked_payload = json.loads(blocked_response.read().decode())
+                self.assertEqual(blocked_response.status, 503)
+                self.assertEqual(blocked_payload["error"], "too_many_stream_clients")
+                blocked.close()
+
+                response.close()
+                conn.close()
+                conn = None
+                deadline = time.time() + 5
+                while getattr(server, "active_stream_clients", 0) != 0 and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(getattr(server, "active_stream_clients", 0), 0)
+            finally:
+                if conn is not None:
+                    conn.close()
+                server.shutdown()
+                server.server_close()
+
+    def test_stream_dirty_flags_and_snapshot_meta(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            before = read_stream_signal(data_dir)
+            self.assertEqual(before.snapshot_updated_at, 0)
+
+            store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[],
+                result_events=[],
+                performance={"wallets": {}, "total": {}},
+            )
+            after = read_stream_signal(data_dir)
+            self.assertGreater(after.snapshot_updated_at, 0)
+            flags = stream_dirty_flags(before, after)
+            self.assertTrue(flags["follows_dirty"])
+            self.assertTrue(flags["events_dirty"])
+            self.assertFalse(flags["wallets_dirty"])
+
+            leader_before = StreamSignal(
+                snapshot_updated_at=after.snapshot_updated_at,
+                run_log_mtime=after.run_log_mtime,
+                control_mtime=after.control_mtime,
+                leaderboard_mtime=1,
+            )
+            leader_after = StreamSignal(
+                snapshot_updated_at=after.snapshot_updated_at,
+                run_log_mtime=after.run_log_mtime,
+                control_mtime=after.control_mtime,
+                leaderboard_mtime=2,
+            )
+            flags = stream_dirty_flags(leader_before, leader_after)
+            self.assertFalse(flags["follows_dirty"])
+            self.assertFalse(flags["events_dirty"])
+            self.assertTrue(flags["wallets_dirty"])
+
     def test_dashboard_runner_detects_external_matching_process(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -3403,6 +3536,8 @@ class CoreTest(unittest.TestCase):
         self.assertTrue(args.require_pre_match)
         self.assertEqual(args.run_log_retention_days, 7)
         self.assertEqual(args.results_retention_days, 0)
+        self.assertEqual(args.resolution_cache_ttl_seconds, 60)
+        self.assertEqual(args.resolution_gamma_pages, 2)
         self.assertEqual(args.user_trades_limit, 100)
         self.assertEqual(args.user_trades_max_pages, 3)
         self.assertTrue(args.bootstrap_current_positions)
@@ -3431,6 +3566,8 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.max_follow_legs, 10)
         self.assertEqual(args.error_retry_seconds, 180)
         self.assertEqual(args.max_consecutive_error_seconds, 600)
+        self.assertEqual(args.resolution_cache_ttl_seconds, 60)
+        self.assertEqual(args.resolution_gamma_pages, 2)
         self.assertEqual(args.discovery_lookback_days, 14)
         self.assertEqual(args.market_batch_size, 50)
         self.assertEqual(args.market_batch_count, 2)
@@ -3450,6 +3587,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.session_ttl_seconds, 12 * 3600)
         self.assertFalse(args.cookie_secure)
         self.assertEqual(args.max_requests_per_second, 10)
+        self.assertEqual(args.stream_poll_seconds, 2.0)
+        self.assertEqual(args.stream_heartbeat_seconds, 15.0)
+        self.assertEqual(args.max_stream_clients, 8)
 
     def test_run_skip_initial_build_does_not_build_before_first_tick(self):
         parser = build_parser()

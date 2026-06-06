@@ -304,6 +304,11 @@ continuous outage stop -> --max-consecutive-error-seconds, default 600
 This strategy avoids stopping on one bad wallet/API response, but exits with
 status 2 if Polymarket/network appears unavailable for about 10 minutes.
 
+Resolution lookup uses a separate short cache from active event discovery:
+`--resolution-cache-ttl-seconds` defaults to 60 and
+`--resolution-gamma-pages` defaults to 2. Do not reuse the 15-minute active event
+cache TTL or broader discovery page budget for settlement checks.
+
 Follow output lives under `data/follow/`:
 
 ```text
@@ -311,6 +316,7 @@ follow.db
 follow_state.json
 active_market_cache.json
 follow_run_log.jsonl
+follow_control.json
 ```
 
 `follow.db` is the source of truth for wallet cursors, open/closed paper
@@ -319,6 +325,8 @@ only a thin compatibility/metadata file. `active_market_cache.json` is separate
 from state and refreshes on the event cache TTL; do not put the large active
 market list back into `follow_state.json`. `follow_performance.json` is legacy
 migration input or optional export only, not a per-tick synchronized state file.
+`follow_control.json` stores dashboard-visible operational status such as wallet
+refresh, runner state, and follow pause flags; it is not signal state.
 
 Paper signals record both the smart wallet entry basis and our detected current
 price basis. `would_follow` is only a paper flag based on
@@ -372,14 +380,31 @@ SQLite with `mode=ro` and `PRAGMA query_only=1`; if `follow.db` does not exist
 yet, endpoints should return empty/waiting data instead of creating a DB or
 crashing.
 
-The dashboard must not mutate watchlists, signals, cursors, performance, or
-runner state. The only live external request is
-`/api/wallets/{addr}/trades`; validate the wallet address before calling the
-Data API and reuse the normal rate-limited `PolymarketClient`.
+The dashboard must not mutate watchlists, signals, cursors, performance, open
+positions, or results. It may perform the limited operational controls exposed
+by the current UI:
+
+```text
+POST /api/wallet-refresh   start a one-shot collector refresh
+POST /api/runner/start     start the paper run loop
+POST /api/runner/stop      stop the paper run loop
+```
+
+These controls write `follow_control.json` / process state only; they must not
+edit follow signal state. The only live external Data API request from the
+dashboard is `/api/wallets/{addr}/trades`; validate the wallet address before
+calling the Data API and reuse the normal rate-limited `PolymarketClient`.
 
 Dashboard overview should expose v4 learning fields: contested count, clean
 count, average wallet CLV, clean/contested performance groups, and wallet
 quarantine status. These are read-only facts from `follow.db`, not controls.
+
+`GET /api/stream` is a lightweight Server-Sent Events endpoint for the static
+dashboard. It must stay same-origin/cookie-authenticated, send an immediate
+header frame, heartbeat with `: ping`, cap active clients, and release the count
+in `finally`. Use `follow_snapshot_updated_at` from SQLite meta plus run log,
+control file, and leaderboard mtimes for dirty flags. Do not switch this to
+WebSocket unless the project explicitly changes the zero-dependency design.
 
 ## Follow-Signal Principle
 
@@ -507,6 +532,12 @@ Operational notes:
   VPS disk pressure becomes a problem.
 - Do not edit live code directly on the VPS unless explicitly asked. Prefer
   local commit/push, then pull/deploy on the VPS.
+
+## Git Workflow Preference
+
+When the user asks to submit or push code for this repository, commit locally and
+push directly to the configured GitHub branch. Do not try to create a GitHub PR
+unless the user explicitly asks for a PR.
 
 ## Known v1 Limitations
 

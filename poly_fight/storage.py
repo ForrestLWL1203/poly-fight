@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -268,6 +269,29 @@ class FollowStore:
         if updated:
             performance["updated_at"] = int(updated["value"] or 0)
         return performance
+
+    def read_meta_int(self, key: str, conn: sqlite3.Connection | None = None) -> int:
+        def read_from(active: sqlite3.Connection) -> int:
+            try:
+                row = active.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+            except sqlite3.Error:
+                return 0
+            if not row:
+                return 0
+            try:
+                return int(row["value"] or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        if conn is not None:
+            return read_from(conn)
+        readonly = self.connect_readonly()
+        if readonly is None:
+            return 0
+        try:
+            return read_from(readonly)
+        finally:
+            readonly.close()
 
     def load_dashboard_snapshot(self) -> dict[str, Any]:
         snapshot = {
@@ -549,6 +573,10 @@ class FollowStore:
                 self._upsert_result(conn, event)
 
             self._save_performance(conn, performance)
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('follow_snapshot_updated_at', ?)",
+                (str(int(time.time())),),
+            )
             conn.commit()
 
     def _upsert_signal(self, conn: sqlite3.Connection, signal: dict[str, Any]) -> None:
