@@ -17,17 +17,15 @@
         <section class="login-panel">
           <div>
             <p class="eyebrow">Poly Fight</p>
-            <h1 class="login-title">Paper follow console</h1>
-            <p class="login-copy">只读观测台。登录后查看 paper 跟单、聪明钱包刷新和信号质量。</p>
           </div>
-          <form class="grid gap-4" @submit.prevent="login">
-            <label class="form-control">
-              <span class="label-text">Username</span>
-              <input v-model.trim="loginForm.username" class="input input-bordered min-h-12" autocomplete="username" required />
+          <form class="login-form" @submit.prevent="login">
+            <label class="login-field">
+              <span class="login-label">Username</span>
+              <input v-model.trim="loginForm.username" class="login-input" autocomplete="username" required />
             </label>
-            <label class="form-control">
-              <span class="label-text">Password</span>
-              <input v-model="loginForm.password" class="input input-bordered min-h-12" type="password" autocomplete="current-password" required />
+            <label class="login-field">
+              <span class="login-label">Password</span>
+              <input v-model="loginForm.password" class="login-input" type="password" autocomplete="current-password" required />
             </label>
             <p v-if="loginError" class="text-sm text-error" role="alert">{{ loginError }}</p>
             <button class="btn btn-primary min-h-12" type="submit" :disabled="loading.login">

@@ -45,12 +45,46 @@ body {
 .login-panel {
   width: min(100%, 28rem);
   display: grid;
-  gap: 1.75rem;
+  gap: 1.5rem;
   border: 1px solid var(--pf-border);
   border-radius: 8px;
   background: rgba(17, 24, 29, 0.96);
   padding: 1.5rem;
   box-shadow: 0 24px 60px rgba(0, 0, 0, 0.34);
+}
+
+.login-form {
+  display: grid;
+  gap: 1rem;
+}
+
+.login-field {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.login-label {
+  color: var(--pf-text);
+  font-size: 0.9rem;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.login-input {
+  width: 100%;
+  min-height: 3rem;
+  border: 1px solid rgba(141, 160, 169, 0.38);
+  border-radius: 6px;
+  background: #1d1d1d;
+  color: var(--pf-text);
+  padding: 0 0.9rem;
+  font: inherit;
+}
+
+.login-input:focus {
+  outline: 2px solid rgba(86, 214, 201, 0.72);
+  outline-offset: 2px;
+  border-color: rgba(86, 214, 201, 0.82);
 }
 
 .eyebrow {
@@ -62,17 +96,11 @@ body {
   text-transform: uppercase;
 }
 
-.login-title,
 .topbar-title {
   margin: 0;
   line-height: 1.05;
 }
 
-.login-title {
-  font-size: 1.75rem;
-}
-
-.login-copy,
 .toolbar-copy,
 .subtle,
 .empty-text {
