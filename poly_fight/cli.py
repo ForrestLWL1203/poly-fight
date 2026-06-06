@@ -15,6 +15,7 @@ from typing import Any
 
 from .api import PolymarketClient, RateLimiter
 from .core import (
+    MIN_A_POSITIVE_MARKET_RATE,
     SCORING_VERSION,
     TRADE_BEHAVIOR_EXCLUDE_RATE,
     TRADE_BEHAVIOR_MIN_MARKETS,
@@ -25,6 +26,7 @@ from .core import (
     build_discovery_slate,
     classify_wallet,
     event_to_market_record,
+    event_to_market_records,
     normalize_wallet,
     parse_dt,
     profile_candidate_wallet,
@@ -278,8 +280,7 @@ def fetch_recent_esports_closed_positions_for_wallet(
 def market_records_from_events(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     records = {}
     for event in events:
-        record = event_to_market_record(event)
-        if record:
+        for record in event_to_market_records(event):
             records[record["condition_id"]] = record
     return records
 
@@ -519,6 +520,7 @@ def filter_profile_candidates(
     min_participated_markets: int = 1,
     min_avg_market_cash: float = 1_500,
     require_clean_discovery: bool = True,
+    max_tail_entry_rate: float = 0.34,
 ) -> list[dict[str, Any]]:
     rows = []
     for candidate in candidates:
@@ -531,8 +533,10 @@ def filter_profile_candidates(
         if require_clean_discovery:
             if int(candidate.get("two_sided_market_count") or 0) > 0:
                 continue
+            # Gate on tail-entry rate, not any-occurrence, so a single tail entry among
+            # many clean markets doesn't block an otherwise elite wallet pre-profiling.
             tail_entry_count = int(candidate.get("tail_entry_market_count") or 0)
-            if tail_entry_count > 0:
+            if participated > 0 and tail_entry_count / participated > max_tail_entry_rate:
                 continue
         rows.append(candidate)
     return rows
@@ -548,6 +552,7 @@ def build_leaderboard_from_profiles(
     require_tail_entry_field: bool = False,
     require_current_scoring_version: bool = False,
     max_leaderboard_wallets: int = 30,
+    max_tail_entry_rate: float = 0.34,
 ) -> list[dict[str, Any]]:
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
     max_inactive_seconds = max_inactive_days * 86400
@@ -555,9 +560,22 @@ def build_leaderboard_from_profiles(
     for profile in profiles_by_wallet.values():
         if require_current_scoring_version and int(profile.get("scoring_version") or 0) != SCORING_VERSION:
             continue
-        if profile.get("grade") != "A":
+        eligible_market_types = profile.get("eligible_market_types") or []
+        if profile.get("per_type_grades") is not None and not eligible_market_types:
             continue
-        if to_float(profile.get("esports_roi")) < 0.30:
+        if profile.get("grade") != "A" and not eligible_market_types:
+            continue
+        if not eligible_market_types and to_float(profile.get("esports_roi")) < 0.30:
+            continue
+        # Grading is per market_type: an eligible bucket already cleared the positive-rate
+        # floor on its own type, so only apply the blended-overall floor to legacy/overall
+        # grades. Otherwise a real sub-specialist (strong on its type, weak overall) is
+        # wrongly dropped here even though it qualified.
+        if (
+            not eligible_market_types
+            and "positive_market_rate" in profile
+            and to_float(profile.get("positive_market_rate")) < MIN_A_POSITIVE_MARKET_RATE
+        ):
             continue
         behavior_market_count = int(profile.get("historical_trade_behavior_market_count") or 0)
         sold_rate = to_float(profile.get("sold_before_resolution_market_rate"))
@@ -587,13 +605,31 @@ def build_leaderboard_from_profiles(
             continue
         if require_tail_entry_field and "tail_entry_market_count" not in candidate:
             continue
-        if int(candidate.get("tail_entry_market_count") or 0) > 0:
+        # A single tail entry among many markets shouldn't disqualify an otherwise elite
+        # wallet; gate on the rate of tail entries instead of any-occurrence.
+        tail_entry_count = int(candidate.get("tail_entry_market_count") or 0)
+        participated_count = int(candidate.get("participated_market_count") or 0)
+        if participated_count > 0 and tail_entry_count / participated_count > max_tail_entry_rate:
             continue
         leaderboard.append(profile)
-    ranked = sorted(leaderboard, key=lambda row: (row.get("grade", ""), -to_float(row.get("esports_roi"))))
+    ranked = sorted(leaderboard, key=leaderboard_rank_key)
     if max_leaderboard_wallets > 0:
         return ranked[:max_leaderboard_wallets]
     return ranked
+
+
+def leaderboard_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    loss_count = int(row.get("esports_loss_count") or 0)
+    return (
+        0 if row.get("grade") == "A" or row.get("eligible_market_types") else 1,
+        loss_count > 0,
+        loss_count,
+        -to_float(row.get("positive_market_rate")),
+        -to_float(row.get("wilson_win_rate_lower_bound")),
+        -to_float(row.get("entry_edge")),
+        -to_float(row.get("median_market_roi") or row.get("esports_roi")),
+        normalize_wallet(row.get("wallet")),
+    )
 
 
 def build_wallet_overlap_report(wallets: list[dict[str, Any]]) -> dict[str, Any]:
@@ -800,6 +836,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
     classification_meta = {
         "gamma_pages": args.gamma_pages,
         "classification_lookback_days": classification_lookback_days,
+        "market_scope": "cs-dota-lol-main-game-map-winner-v1",
     }
     classification_source = "api"
     if (
@@ -846,8 +883,12 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         lookback_steps=lookback_steps,
         min_market_volume=args.min_market_volume,
         fallback_min_market_volume=args.fallback_min_market_volume,
+        submarket_min_market_volume=args.submarket_min_market_volume,
+        submarket_fallback_min_market_volume=args.submarket_fallback_min_market_volume,
         target_markets=args.target_markets,
+        submarket_target_markets=args.submarket_target_markets,
         max_markets_per_run=market_count,
+        submarket_max_markets_per_run=args.submarket_max_markets_per_run,
         market_offset=market_offset,
     )
     write_json(data_dir / "discovery_slate.json", discovery_slate)
@@ -957,6 +998,11 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         normalize_wallet(row.get("wallet")): row for row in read_json(data_dir / "wallet_profiles.json", [])
     }
     condition_ids = {row["condition_id"] for row in discovery_slate}
+    condition_type_by_id = {
+        str(row.get("condition_id") or "").lower(): str(row.get("market_type") or "main_match")
+        for row in discovery_slate
+        if row.get("condition_id")
+    }
     profile_fetch_plan = build_profile_fetch_plan(
         profile_candidates,
         existing_profiles,
@@ -970,6 +1016,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
             return profile_candidate_wallet(
                 candidate,
                 condition_ids,
+                condition_type_by_id=condition_type_by_id,
                 closed_positions_loader=lambda w: fetch_recent_esports_closed_positions_for_wallet(
                     client,
                     w,
@@ -1051,7 +1098,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
     print(json.dumps(summary, indent=2, sort_keys=True))
     print()
     print("搜集完成")
-    print(f"- 历史 esports 主市场: {summary['classification_market_count']}")
+    print(f"- 历史 esports 胜负市场: {summary['classification_market_count']}")
     print(f"- 本轮发现市场: {summary['discovery_market_count']}")
     print(f"- 候选钱包: {summary['candidate_wallet_count']}")
     print(f"- 通过快速过滤的钱包: {summary['profile_candidate_wallet_count']}")
@@ -1163,6 +1210,10 @@ def command_follow(
     )
 
     state = read_json(state_path, {"wallet_trade_state": {}})
+    eligible_market_types_by_wallet = {
+        row["wallet"]: {str(value) for value in (row.get("eligible_market_types") or []) if value}
+        for row in eligible_wallet_rows
+    }
     wallet_trade_state = store.load_wallet_trade_state()
     open_signals = store.load_open_signals()
     performance = store.load_performance()
@@ -1212,6 +1263,8 @@ def command_follow(
     exited_signal_count = 0
     hedge_event_count = 0
     quarantine_event_count = 0
+    market_type_not_eligible_count = 0
+    opposite_blocked_count = 0
     contested_signal_count = 0
     closing_line_snapshot_count = 0
     cold_start_wallet_count = 0
@@ -1270,6 +1323,7 @@ def command_follow(
                         markets_by_condition=watched,
                         now_ts=now_ts,
                         max_slippage=args.max_slippage_over_entry,
+                        eligible_market_types=eligible_market_types_by_wallet.get(wallet),
                         require_pre_match=args.require_pre_match,
                     )
                     before_ids = {signal.get("signal_id") for signal in open_signals}
@@ -1284,6 +1338,7 @@ def command_follow(
                         max_slippage=args.max_slippage_over_entry,
                         require_pre_match=args.require_pre_match,
                         quarantine_sell_frac=args.quarantine_sell_frac,
+                        eligible_market_types=eligible_market_types_by_wallet.get(wallet),
                     )
                     after_ids = {signal.get("signal_id") for signal in open_signals}
                     new_signal_count += len(after_ids - before_ids)
@@ -1291,6 +1346,11 @@ def command_follow(
                     for event in stats.get("quarantine_events") or []:
                         store.upsert_wallet_quarantine(event.get("wallet"), reason=str(event.get("reason") or ""), ts=int(event.get("timestamp") or now_ts))
                         quarantine_event_count += 1
+                    market_type_not_eligible_count += stats.get("market_type_not_eligible_count", 0)
+                    ignored_trade_count += stats.get("ignored_trade_count", 0)
+                    exited_signal_count += stats.get("exited_signal_count", 0)
+                    hedge_event_count += stats.get("hedge_event_count", 0)
+                    opposite_blocked_count += stats.get("opposite_blocked_count", 0)
                 wallet_trade_state[wallet] = {
                     "last_trade_cursor": next_cursor,
                     "last_seen_at": now_ts,
@@ -1320,14 +1380,17 @@ def command_follow(
                 max_slippage=args.max_slippage_over_entry,
                 require_pre_match=args.require_pre_match,
                 quarantine_sell_frac=args.quarantine_sell_frac,
+                eligible_market_types=eligible_market_types_by_wallet.get(wallet) if wallet_can_open_new else None,
             )
             after_ids = {signal.get("signal_id") for signal in open_signals}
             new_signal_count += len(after_ids - before_ids)
             total_new_trade_count += len(new_trades)
             watched_new_trade_count += len(watched_trades)
             ignored_trade_count += stats.get("ignored_trade_count", 0) + (len(new_trades) - len(watched_trades))
+            market_type_not_eligible_count += stats.get("market_type_not_eligible_count", 0)
             exited_signal_count += stats.get("exited_signal_count", 0)
             hedge_event_count += stats.get("hedge_event_count", 0)
+            opposite_blocked_count += stats.get("opposite_blocked_count", 0)
             for event in stats.get("quarantine_events") or []:
                 store.upsert_wallet_quarantine(event.get("wallet"), reason=str(event.get("reason") or ""), ts=int(event.get("timestamp") or now_ts))
                 quarantine_event_count += 1
@@ -1380,6 +1443,8 @@ def command_follow(
         "watched_new_trade_count": watched_new_trade_count,
         "new_trade_count": watched_new_trade_count,
         "ignored_trade_count": ignored_trade_count,
+        "market_type_not_eligible_count": market_type_not_eligible_count,
+        "opposite_blocked_count": opposite_blocked_count,
         "new_signal_count": new_signal_count,
         "exited_signal_count": exited_signal_count,
         "hedge_event_count": hedge_event_count,
@@ -1439,6 +1504,10 @@ def command_run(args: argparse.Namespace) -> int:
     except (AttributeError, ValueError):
         previous_sigterm = None
 
+    def sleep_or_stop(seconds: int) -> None:
+        if not stop_requested["value"]:
+            time.sleep(max(1, int(seconds)))
+
     def maybe_build(force: bool = False) -> None:
         nonlocal last_build_at
         now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -1463,7 +1532,7 @@ def command_run(args: argparse.Namespace) -> int:
                         ensure_ascii=False,
                     )
                 )
-                time.sleep(max(1, int(args.error_retry_seconds)))
+                sleep_or_stop(int(args.error_retry_seconds))
         while not stop_requested["value"]:
             try:
                 maybe_build(force=False)
@@ -1499,14 +1568,14 @@ def command_run(args: argparse.Namespace) -> int:
                         ensure_ascii=False,
                     )
                 )
-                time.sleep(max(1, int(args.error_retry_seconds)))
+                sleep_or_stop(int(args.error_retry_seconds))
                 continue
             first_error_at = None
             tick_count += 1
             if args.max_run_ticks and tick_count >= args.max_run_ticks:
                 break
             sleep_seconds = int(summary.get("desired_next_interval_seconds") or args.max_tick_seconds)
-            time.sleep(max(1, sleep_seconds))
+            sleep_or_stop(sleep_seconds)
     except KeyboardInterrupt:
         print(json.dumps({"status": "stopped", "reason": "keyboard_interrupt", "ticks": tick_count}, ensure_ascii=False))
     finally:
@@ -1571,9 +1640,13 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--max-retry-after-seconds", type=float, default=60)
         subparser.add_argument("--min-market-volume", type=float, default=25_000)
         subparser.add_argument("--fallback-min-market-volume", type=float, default=10_000)
+        subparser.add_argument("--submarket-min-market-volume", type=float, default=5_000)
+        subparser.add_argument("--submarket-fallback-min-market-volume", type=float, default=1_000)
         subparser.add_argument("--discovery-lookback-days", type=int, default=14)
         subparser.add_argument("--target-markets", type=int, default=20)
+        subparser.add_argument("--submarket-target-markets", type=int, default=60)
         subparser.add_argument("--max-markets-per-run", type=int)
+        subparser.add_argument("--submarket-max-markets-per-run", type=int, default=60)
         subparser.add_argument("--market-batch-size", type=int, default=50)
         subparser.add_argument("--market-batch-count", type=int, default=2)
         subparser.add_argument("--market-batch-index", type=int)

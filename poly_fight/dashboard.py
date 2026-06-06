@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .control import read_follow_control, update_wallet_refresh_status, write_follow_control
+from .core import MIN_A_POSITIVE_MARKET_RATE, parse_jsonish, to_float
 from .storage import FollowStore
 
 
@@ -216,6 +217,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/runner":
             self._ok(build_runner_status(self.dashboard_config))
+            return
+        match = re.match(r"^/api/markets/([^/]+)/prices$", parsed.path)
+        if match:
+            condition_id = urllib.parse.unquote(match.group(1)).lower()
+            try:
+                self._ok(fetch_market_prices(self.dashboard_config.data_dir, self.dashboard_config.client, condition_id))
+            except Exception as exc:
+                self._error(str(exc) or "price_refresh_failed", status=HTTPStatus.BAD_GATEWAY)
             return
         match = re.match(r"^/api/wallets/([^/]+)/trades$", parsed.path)
         if match:
@@ -580,6 +589,22 @@ def build_overview(data_dir: Path) -> dict[str, Any]:
     }
 
 
+def _eligible_display_metrics(row: dict[str, Any]) -> dict[str, Any]:
+    """Stats to show for a leaderboard row.
+
+    When a wallet qualifies via per-type buckets, return the eligible bucket with the
+    most evidence (largest sample) so the displayed win rate / ROI / edge align with the
+    grade and market-type label. Falls back to the overall row for legacy profiles that
+    predate per-type grading.
+    """
+    eligible = row.get("eligible_market_types") or []
+    per_type = row.get("per_type_grades") or {}
+    buckets = [per_type[market_type] for market_type in eligible if isinstance(per_type.get(market_type), dict)]
+    if not buckets:
+        return row
+    return max(buckets, key=lambda bucket: int(bucket.get("esports_closed_count") or 0))
+
+
 def build_wallets(data_dir: Path) -> dict[str, Any]:
     leaderboard = _read_json(data_dir / "smart_wallet_leaderboard.json", [])
     store = FollowStore(data_dir / "follow" / "follow.db")
@@ -594,6 +619,12 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
         open_by_wallet.setdefault(wallet, []).append(signal)
     rows = []
     for row in leaderboard if isinstance(leaderboard, list) else []:
+        # Grading is per market_type, so a wallet may qualify only on a sub-bucket
+        # (e.g. game_winner) while its blended overall record looks weak. Display the
+        # eligible bucket's own stats so the shown numbers match the grade + type label.
+        metrics = _eligible_display_metrics(row)
+        if "positive_market_rate" in metrics and to_float(metrics.get("positive_market_rate")) < MIN_A_POSITIVE_MARKET_RATE:
+            continue
         wallet = str(row.get("wallet") or "").lower()
         rows.append(
             {
@@ -601,24 +632,29 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
                 "short_addr": short_addr(wallet),
                 "grade": row.get("grade"),
                 "last_esports_trade_at": row.get("last_esports_trade_at"),
-                "wilson_win_rate_lower_bound": row.get("wilson_win_rate_lower_bound"),
-                "entry_edge": row.get("entry_edge"),
-                "esports_roi": row.get("esports_roi"),
-                "median_entry_price": row.get("median_entry_price"),
-                "reasons": row.get("reasons") or [],
+                "wilson_win_rate_lower_bound": metrics.get("wilson_win_rate_lower_bound"),
+                "entry_edge": metrics.get("entry_edge"),
+                "esports_roi": metrics.get("esports_roi"),
+                "median_market_roi": metrics.get("median_market_roi"),
+                "median_entry_price": metrics.get("median_entry_price"),
+                "reasons": metrics.get("reasons") or row.get("reasons") or [],
                 "scoring_version": row.get("scoring_version"),
-                "esports_win_count": row.get("esports_win_count"),
-                "esports_loss_count": row.get("esports_loss_count"),
-                "esports_closed_count": row.get("esports_closed_count"),
-                "positive_market_rate": row.get("positive_market_rate"),
+                "esports_win_count": metrics.get("esports_win_count"),
+                "esports_loss_count": metrics.get("esports_loss_count"),
+                "esports_closed_count": metrics.get("esports_closed_count"),
+                "positive_market_rate": metrics.get("positive_market_rate"),
                 "sold_before_resolution_market_rate": row.get("sold_before_resolution_market_rate"),
                 "two_sided_trade_market_rate": row.get("two_sided_trade_market_rate"),
+                "eligible_market_types": row.get("eligible_market_types") or [],
+                "eligible_market_type_labels": row.get("eligible_market_type_labels") or [],
+                "per_type_grades": row.get("per_type_grades") or {},
                 "quarantined": wallet in quarantine,
                 "quarantine": quarantine.get(wallet),
                 "performance": performance.get(wallet, {}),
                 "open_signals": open_by_wallet.get(wallet, []),
             }
         )
+    rows.sort(key=wallet_leaderboard_rank_key)
     return {
         "wallets": rows,
         "count": len(rows),
@@ -629,6 +665,19 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
         "scoring_version": max([int(row.get("scoring_version") or 0) for row in rows] or [0]) or None,
         "db_ready": bool(perf_snapshot.get("db_ready") or open_snapshot.get("db_ready") or quarantine_snapshot.get("db_ready")),
     }
+
+
+def wallet_leaderboard_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    loss_count = int(row.get("esports_loss_count") or 0)
+    return (
+        loss_count > 0,
+        loss_count,
+        -to_float(row.get("positive_market_rate")),
+        -to_float(row.get("wilson_win_rate_lower_bound")),
+        -to_float(row.get("entry_edge")),
+        -to_float(row.get("median_market_roi") or row.get("esports_roi")),
+        str(row.get("wallet") or ""),
+    )
 
 
 def build_follows(data_dir: Path, *, page: int = 1, size: int = 25) -> dict[str, Any]:
@@ -643,23 +692,46 @@ def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
     condition_id = condition_id.lower()
     result = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_follow_detail(condition_id)
     signals = result.get("signals", [])
+    market = _active_market_by_condition(data_dir, condition_id)
     by_wallet: dict[str, dict[str, Any]] = {}
     title = ""
     question = ""
     match_start_time = None
+    end_date = None
+    event_slug = ""
+    market_type = ""
+    market_type_label = ""
     for signal in signals:
         title = title or str(signal.get("event_title") or signal.get("title") or signal.get("market_title") or "")
         question = question or str(signal.get("market_question") or signal.get("question") or "")
         match_start_time = match_start_time or signal.get("match_start_time") or signal.get("market_start_time")
+        end_date = end_date or signal.get("end_date")
+        event_slug = event_slug or str(signal.get("event_slug") or "")
+        market_type = market_type or str(signal.get("market_type") or "")
+        market_type_label = market_type_label or str(signal.get("market_type_label") or "")
         wallet = str(signal.get("wallet") or "").lower()
         bucket = by_wallet.setdefault(wallet, {"wallet": wallet, "short_addr": short_addr(wallet), "signals": [], "leg_count": 0})
         bucket["signals"].append(signal)
         bucket["leg_count"] += len(signal.get("legs") or [])
+    title = title or str(market.get("title") or "")
+    question = question or str(market.get("question") or "")
+    match_start_time = match_start_time or market.get("match_start_time") or market.get("market_start_time")
+    end_date = end_date or market.get("end_date")
+    event_slug = event_slug or str(market.get("event_slug") or "")
+    market_type = market_type or str(market.get("market_type") or "")
+    market_type_label = market_type_label or str(market.get("market_type_label") or "")
     return {
         "condition_id": condition_id,
         "title": title,
         "question": question,
         "match_start_time": match_start_time,
+        "end_date": end_date,
+        "event_slug": event_slug,
+        "event_url": f"https://polymarket.com/event/{event_slug}" if event_slug else "",
+        "market_type": market_type,
+        "market_type_label": market_type_label,
+        "outcomes": market.get("outcomes"),
+        "outcome_prices": market.get("outcome_prices") or market.get("outcomePrices"),
         "wallets": list(by_wallet.values()),
         "signal_count": len(signals),
         "db_ready": bool(result.get("db_ready")),
@@ -699,6 +771,8 @@ def build_events(data_dir: Path, *, observe_window_hours: float = 24.0) -> dict[
                     "match_start_time": market.get("match_start_time") or market.get("market_start_time") or market.get("startTime"),
                     "outcomes": market.get("outcomes"),
                     "outcome_prices": market.get("outcome_prices") or market.get("outcomePrices"),
+                    "market_type": market.get("market_type"),
+                    "market_type_label": market.get("market_type_label"),
                     "open_signals": open_signals,
                     "contested": _signals_contested(open_signals),
                     "side_counts": _signal_side_counts(open_signals),
@@ -711,6 +785,89 @@ def build_events(data_dir: Path, *, observe_window_hours: float = 24.0) -> dict[
         "cache_updated_at": updated_at,
         "cache_stale": bool(not updated_at or now_ts - updated_at > 15 * 60),
     }
+
+
+def _active_market_by_condition(data_dir: Path, condition_id: str) -> dict[str, Any]:
+    cached = _read_json(data_dir / "follow" / "active_market_cache.json", {})
+    markets = cached.get("markets") if isinstance(cached, dict) else []
+    if isinstance(markets, dict):
+        rows = markets.values()
+    elif isinstance(markets, list):
+        rows = markets
+    else:
+        rows = []
+    for market in rows:
+        if not isinstance(market, dict):
+            continue
+        current = str(market.get("condition_id") or market.get("conditionId") or "").lower()
+        if current == condition_id:
+            return market
+    return {}
+
+
+def fetch_market_prices(data_dir: Path, client: Any, condition_id: str) -> dict[str, Any]:
+    if client is None:
+        raise RuntimeError("polymarket client unavailable")
+    condition_id = condition_id.lower()
+    markets = client.gamma("/markets", condition_ids=condition_id, limit=1)
+    if not isinstance(markets, list) or not markets:
+        raise RuntimeError("market_not_found")
+    market = markets[0]
+    record = _market_price_record(market)
+    if not record.get("outcomes") or not record.get("outcome_prices"):
+        raise RuntimeError("market_prices_unavailable")
+    _update_active_market_price_cache(data_dir, condition_id, record)
+    return record
+
+
+def _market_price_record(market: dict[str, Any]) -> dict[str, Any]:
+    condition_id = str(market.get("conditionId") or market.get("condition_id") or "").lower()
+    return {
+        "condition_id": condition_id,
+        "title": market.get("question") or market.get("title"),
+        "question": market.get("question"),
+        "event_slug": market.get("slug"),
+        "outcomes": parse_jsonish(market.get("outcomes"), []),
+        "outcome_prices": [to_float(value) for value in parse_jsonish(market.get("outcomePrices") or market.get("outcome_prices"), [])],
+        "updated_at": int(time.time()),
+    }
+
+
+def _update_active_market_price_cache(data_dir: Path, condition_id: str, record: dict[str, Any]) -> None:
+    cache_path = data_dir / "follow" / "active_market_cache.json"
+    cached = _read_json(cache_path, {})
+    markets = cached.get("markets") if isinstance(cached, dict) else []
+    if isinstance(markets, dict):
+        rows = list(markets.values())
+    elif isinstance(markets, list):
+        rows = list(markets)
+    else:
+        rows = []
+    updated = False
+    for market in rows:
+        if not isinstance(market, dict):
+            continue
+        current = str(market.get("condition_id") or market.get("conditionId") or "").lower()
+        if current != condition_id:
+            continue
+        market["outcomes"] = record.get("outcomes")
+        market["outcome_prices"] = record.get("outcome_prices")
+        market["price_refreshed_at"] = record.get("updated_at")
+        updated = True
+        break
+    if not updated:
+        rows.append(
+            {
+                "condition_id": condition_id,
+                "title": record.get("title"),
+                "question": record.get("question"),
+                "event_slug": record.get("event_slug"),
+                "outcomes": record.get("outcomes"),
+                "outcome_prices": record.get("outcome_prices"),
+                "price_refreshed_at": record.get("updated_at"),
+            }
+        )
+    _write_json(cache_path, {"updated_at": int(cached.get("updated_at") or time.time()) if isinstance(cached, dict) else int(time.time()), "markets": rows})
 
 
 class WalletRefreshAlreadyRunning(RuntimeError):
@@ -1023,6 +1180,8 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                 "title": signal.get("event_title") or signal.get("title") or signal.get("market_title"),
                 "question": signal.get("market_question") or signal.get("question"),
                 "match_start_time": signal.get("match_start_time") or signal.get("market_start_time"),
+                "market_type": signal.get("market_type"),
+                "market_type_label": signal.get("market_type_label"),
                 "wallets": set(),
                 "leg_count": 0,
                 "stake": 0.0,
@@ -1075,6 +1234,11 @@ def _read_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return default
+
+
+def _write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _file_mtime(path: Path) -> int:

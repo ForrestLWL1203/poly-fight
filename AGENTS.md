@@ -89,7 +89,8 @@ Keep two market sets separate:
 
 ```text
 esports_classification_set:
-  Historical esports main-match conditionIds.
+  Historical LOL/CS2/Dota2 winner-market conditionIds.
+  Includes main_match plus allowed Game/Map Winner submarkets.
   Used only to decide whether a closed position belongs to esports.
 
 discovery_slate:
@@ -99,6 +100,25 @@ discovery_slate:
 
 Do not collapse these into one table. A short discovery window cannot support
 the A/B wallet sample thresholds.
+
+Allowed esports markets are deliberately narrow:
+
+```text
+main_match:
+  Full match winner for LOL, CS2, Dota2.
+
+game_winner:
+  Dota2/LOL Game N Winner only.
+
+map_winner:
+  CS2 Map N Winner only.
+```
+
+Do not include Valorant or other games in the current scoring/follow universe.
+Do not include prop markets such as kills, first blood, Roshan, handicap,
+spread, total, over/under, correct score, barracks, towers, or similar derived
+plays. Market selection must use the semantic `market_type` classifier, not a
+raw substring blacklist.
 
 Candidate discovery uses frequency OR size:
 
@@ -435,7 +455,9 @@ same-side buys from multiple strict wallets, and then decide stake sizing.
 
 - Normalize all wallet keys to lowercase before joining, caching, or deduping.
 - Closed positions are filtered by `conditionId in esports_classification_set`,
-  never by title keyword matching.
+  never by title keyword matching. Pass the `condition_id -> market_type`
+  mapping into wallet profiling so main-match and submarket performance are
+  scored separately.
 - Compare holder conviction in USD, not token amount:
 
 ```text

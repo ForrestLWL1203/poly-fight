@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from statistics import median
 from typing import Any
 
-from .core import SECONDS_PER_DAY, normalize_wallet, parse_dt, to_float, to_int
+from .core import MIN_A_POSITIVE_MARKET_RATE, SECONDS_PER_DAY, normalize_wallet, parse_dt, to_float, to_int
 
 
 def eligible_follow_wallets(
@@ -18,14 +18,19 @@ def eligible_follow_wallets(
     quarantined_wallets = {normalize_wallet(wallet) for wallet in (quarantined_wallets or set())}
     rows = []
     for row in leaderboard:
-        if row.get("grade") != "A":
+        eligible_market_types = [str(value) for value in (row.get("eligible_market_types") or []) if value]
+        if row.get("grade") == "A" and not eligible_market_types:
+            eligible_market_types = ["main_match"]
+        if row.get("grade") != "A" and not eligible_market_types:
+            continue
+        if "positive_market_rate" in row and to_float(row.get("positive_market_rate")) < MIN_A_POSITIVE_MARKET_RATE:
             continue
         wallet = normalize_wallet(row.get("wallet"))
         if wallet in quarantined_wallets:
             continue
         last_trade = to_int(row.get("last_esports_trade_at"))
         if wallet and last_trade >= cutoff:
-            rows.append({**row, "wallet": wallet})
+            rows.append({**row, "wallet": wallet, "eligible_market_types": eligible_market_types})
     return rows
 
 
@@ -152,6 +157,7 @@ def bootstrap_position_trades(
     markets_by_condition: dict[str, dict[str, Any]],
     now_ts: int,
     max_slippage: float,
+    eligible_market_types: set[str] | None = None,
     require_pre_match: bool = True,
 ) -> list[dict[str, Any]]:
     wallet = normalize_wallet(wallet)
@@ -159,6 +165,9 @@ def bootstrap_position_trades(
     for position in positions:
         condition_id = position_condition_id(position)
         market = markets_by_condition.get(condition_id)
+        market_type = str((market or {}).get("market_type") or "main_match")
+        if eligible_market_types is not None and market_type not in eligible_market_types:
+            continue
         qualification = qualify_follow(position, market, now_ts=now_ts, require_pre_match=require_pre_match)
         if not qualification.get("qualified"):
             continue
@@ -339,6 +348,48 @@ def _opposite_open_signals(
     ]
 
 
+def _open_market_signals(open_signals: list[dict[str, Any]], condition_id: str) -> list[dict[str, Any]]:
+    condition_id = condition_id.lower()
+    return [
+        signal
+        for signal in open_signals
+        if (signal.get("status") or "open") == "open"
+        and str(signal.get("condition_id") or "").lower() == condition_id
+    ]
+
+
+def _exit_signal_for_opposite_buy(
+    signal: dict[str, Any],
+    *,
+    market: dict[str, Any],
+    trade: dict[str, Any],
+    now_ts: int,
+) -> None:
+    outcome_index = to_int(signal.get("outcome_index"), -1)
+    exit_price = market_current_price(market, outcome_index, trade if outcome_index == trade_outcome_index(trade) else None)
+    if exit_price <= 0 and outcome_index != trade_outcome_index(trade) and len(market.get("outcomes") or []) == 2:
+        exit_price = round(max(0.0, min(1.0, 1.0 - trade_price(trade))), 8)
+    signal["status"] = "exited"
+    signal["exit_price"] = exit_price
+    signal["exit_at"] = now_ts
+    signal["exit_reason"] = "opposite_wallet_buy"
+    signal["contested"] = True
+    signal["would_follow"] = False
+    signal["updated_at"] = now_ts
+    signal.setdefault("behavior_events", []).append(
+        _behavior_event(
+            "exit",
+            trade,
+            note=f"opposite_wallet_buy:{normalize_wallet(trade.get('proxyWallet') or trade.get('wallet') or trade.get('user'))}",
+        )
+    )
+    signal["our_realized_pnl"] = round(
+        sum(paper_exit_pnl(to_float(leg.get("our_entry_price")), exit_price, to_float(leg.get("stake"))) for leg in signal.get("legs") or []),
+        8,
+    )
+    signal["wallet_behavior"] = wallet_behavior_summary(signal)
+
+
 def process_follow_trades(
     open_signals: list[dict[str, Any]],
     *,
@@ -351,6 +402,7 @@ def process_follow_trades(
     max_slippage: float,
     require_pre_match: bool = True,
     quarantine_sell_frac: float = 0.2,
+    eligible_market_types: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     wallet = normalize_wallet(wallet)
     stats: dict[str, Any] = {
@@ -358,6 +410,8 @@ def process_follow_trades(
         "exited_signal_count": 0,
         "hedge_event_count": 0,
         "ignored_trade_count": 0,
+        "market_type_not_eligible_count": 0,
+        "opposite_blocked_count": 0,
         "quarantine_events": [],
     }
     for trade in sorted(trades, key=lambda row: _trade_tuple(row)):
@@ -418,12 +472,29 @@ def process_follow_trades(
                     {"wallet": wallet, "reason": reason, "timestamp": now_ts, "condition_id": condition_id}
                 )
 
+        market_open_signals = _open_market_signals(open_signals, condition_id)
+        opposite_market_signals = [
+            signal for signal in market_open_signals if to_int(signal.get("outcome_index"), -1) != outcome_index
+        ]
+        if opposite_market_signals:
+            for signal in market_open_signals:
+                _exit_signal_for_opposite_buy(signal, market=market, trade=trade, now_ts=now_ts)
+            stats["exited_signal_count"] += len(market_open_signals)
+            stats["opposite_blocked_count"] += 1
+            stats["ignored_trade_count"] += 1
+            continue
+
         start_ts = market_start_ts(market)
         if require_pre_match and start_ts and now_ts >= start_ts:
             stats["ignored_trade_count"] += 1
             continue
         if existing and len(existing.get("legs") or []) >= max_follow_legs:
             stats["ignored_trade_count"] += 1
+            continue
+        market_type = str(market.get("market_type") or "main_match")
+        if not existing and eligible_market_types is not None and market_type not in eligible_market_types:
+            stats["ignored_trade_count"] += 1
+            stats["market_type_not_eligible_count"] += 1
             continue
 
         wallet_fill_price = trade_price(trade)
@@ -457,6 +528,9 @@ def process_follow_trades(
                     "event_title": market.get("title"),
                     "event_slug": market.get("event_slug"),
                     "market_question": market.get("question"),
+                    "market_type": market_type,
+                    "market_type_label": market.get("market_type_label"),
+                    "end_date": market.get("end_date"),
                     "match_start_time": market.get("match_start_time") or market.get("market_start_time"),
                     "status": "open",
                     "created_at": now_ts,
@@ -709,6 +783,7 @@ def upsert_follow_signal(
             "event_title": market.get("title"),
             "event_slug": market.get("event_slug"),
             "market_question": market.get("question"),
+            "end_date": market.get("end_date"),
             "match_start_time": market.get("match_start_time") or market.get("market_start_time"),
             "wallet_avg_price": qualification["wallet_avg_price"],
             "our_entry_price": current_price,

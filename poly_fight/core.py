@@ -2,15 +2,32 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from math import sqrt
+import re
 from statistics import median
 from typing import Any, Iterable
 
 
 SECONDS_PER_DAY = 86400
-SCORING_VERSION = 8
+SCORING_VERSION = 9
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 TRADE_BEHAVIOR_EXCLUDE_RATE = 0.5
+MIN_A_POSITIVE_MARKET_RATE = 0.75
+MIN_B_POSITIVE_MARKET_RATE = 0.65
+MAIN_MATCH = "main_match"
+GAME_WINNER = "game_winner"
+MAP_WINNER = "map_winner"
+ALLOWED_GAME_FAMILIES = {"cs2", "dota2", "lol"}
+MARKET_TYPE_LABELS = {
+    MAIN_MATCH: "主盘",
+    GAME_WINNER: "单局",
+    MAP_WINNER: "地图",
+}
+MARKET_TYPE_ORDER = {
+    MAIN_MATCH: 0,
+    GAME_WINNER: 1,
+    MAP_WINNER: 2,
+}
 ESPORTS_TAGS = {
     "esports",
     "dota-2",
@@ -94,8 +111,6 @@ def game_family_from_event(event: dict[str, Any]) -> str:
         return "dota2"
     if "league-of-legends" in tags or title.startswith("lol:"):
         return "lol"
-    if "valorant" in tags or title.startswith("valorant:"):
-        return "valorant"
     return "other"
 
 
@@ -112,7 +127,7 @@ def is_settled_binary_prices(prices: list[float]) -> bool:
 
 def is_main_match_title(title: str) -> bool:
     text = title.lower()
-    has_game_prefix = text.startswith(("dota 2:", "counter-strike:", "lol:", "valorant:"))
+    has_game_prefix = text.startswith(("dota 2:", "counter-strike:", "lol:"))
     if has_game_prefix and " vs " in text:
         return True
     return " vs " in text and any(
@@ -153,6 +168,99 @@ def is_non_main_market(question: str) -> bool:
     return any(fragment in q for fragment in bad_fragments)
 
 
+def normalize_market_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def normalized_team_names_from_event(event: dict[str, Any]) -> list[str]:
+    title = str(event.get("title") or "")
+    title = re.sub(r"^[^:]+:\s*", "", title)
+    title = re.split(r"\s+-\s+", title, maxsplit=1)[0]
+    title = re.sub(r"\s*\([^)]*\)\s*", " ", title)
+    parts = re.split(r"\s+vs\.?\s+", title, flags=re.IGNORECASE)
+    if len(parts) != 2:
+        return []
+    return [normalize_market_text(part) for part in parts if normalize_market_text(part)]
+
+
+def market_outcomes_match_event_teams(event: dict[str, Any], market: dict[str, Any]) -> bool:
+    event_teams = sorted(normalized_team_names_from_event(event))
+    outcomes = parse_jsonish(market.get("outcomes"), [])
+    market_teams = sorted(normalize_market_text(outcome) for outcome in outcomes if normalize_market_text(outcome))
+    return len(event_teams) == 2 and event_teams == market_teams
+
+
+def has_prop_like_outcomes(market: dict[str, Any]) -> bool:
+    outcomes = parse_jsonish(market.get("outcomes"), [])
+    normalized = {normalize_market_text(outcome) for outcome in outcomes if normalize_market_text(outcome)}
+    prop_outcomes = {
+        "over",
+        "under",
+        "yes",
+        "no",
+        "odd",
+        "even",
+        "higher",
+        "lower",
+    }
+    return bool(normalized & prop_outcomes)
+
+
+def is_prop_market_question(question: str) -> bool:
+    text = normalize_market_text(question)
+    prop_patterns = [
+        r"\btotal\b",
+        r"\bover\b",
+        r"\bunder\b",
+        r"\bo u\b",
+        r"\bhandicap\b",
+        r"\bspread\b",
+        r"\bcorrect score\b",
+        r"\bkill\b",
+        r"\bkills\b",
+        r"\bfirst blood\b",
+        r"\broshan\b",
+        r"\bbarracks\b",
+        r"\btower\b",
+        r"\brampage\b",
+        r"\bultra kill\b",
+        r"\bdaytime\b",
+    ]
+    return any(re.search(pattern, text) for pattern in prop_patterns)
+
+
+def is_numbered_winner_question(question_norm: str, prefix: str) -> bool:
+    return bool(
+        re.search(rf"\b{prefix}\s+[1-5]\b.*\bwinner\b", question_norm)
+        or re.search(rf"\bwinner\b.*\b{prefix}\s+[1-5]\b", question_norm)
+    )
+
+
+def classify_market_type(event: dict[str, Any], market: dict[str, Any]) -> str | None:
+    if not is_esports_event(event):
+        return None
+    game_family = game_family_from_event(event)
+    if game_family not in ALLOWED_GAME_FAMILIES:
+        return None
+    if not market.get("conditionId") or not is_binary_market(market):
+        return None
+    question = str(market.get("question") or "")
+    question_norm = normalize_market_text(question)
+    event_title_norm = normalize_market_text(event.get("title"))
+    if not question_norm or is_prop_market_question(question) or has_prop_like_outcomes(market):
+        return None
+    if (question_norm == event_title_norm and is_main_match_title(str(event.get("title") or ""))) or (
+        is_main_match_title(question or str(event.get("title") or ""))
+        and not re.search(r"\b(game|map)\s+[1-5]\b", question_norm)
+    ):
+        return MAIN_MATCH
+    if game_family in {"dota2", "lol"} and is_numbered_winner_question(question_norm, "game"):
+        return GAME_WINNER
+    if game_family == "cs2" and is_numbered_winner_question(question_norm, "map"):
+        return MAP_WINNER
+    return None
+
+
 def choose_main_market(event: dict[str, Any]) -> dict[str, Any] | None:
     markets = [m for m in event.get("markets") or [] if m.get("conditionId") and is_binary_market(m)]
     if not markets:
@@ -167,31 +275,57 @@ def choose_main_market(event: dict[str, Any]) -> dict[str, Any] | None:
     return max(candidates, key=lambda m: to_float(m.get("volume")) + to_float(m.get("liquidity")))
 
 
-def event_to_market_record(event: dict[str, Any]) -> dict[str, Any] | None:
+def event_to_market_records(
+    event: dict[str, Any],
+    *,
+    allowed_market_types: set[str] | None = None,
+) -> list[dict[str, Any]]:
     if not is_esports_event(event):
-        return None
+        return []
+    records: dict[str, dict[str, Any]] = {}
+    for market in event.get("markets") or []:
+        market_type = classify_market_type(event, market)
+        if not market_type or (allowed_market_types is not None and market_type not in allowed_market_types):
+            continue
+        match_start_time = market.get("eventStartTime") or event.get("startTime") or market.get("gameStartTime")
+        condition_id = str(market.get("conditionId")).lower()
+        records[condition_id] = {
+            "condition_id": condition_id,
+            "event_id": str(event.get("id") or ""),
+            "event_slug": event.get("slug"),
+            "title": event.get("title"),
+            "question": market.get("question"),
+            "outcomes": parse_jsonish(market.get("outcomes"), []),
+            "outcome_prices": [to_float(v) for v in parse_jsonish(market.get("outcomePrices"), [])],
+            "end_date": event.get("endDate") or market.get("endDate"),
+            "match_start_time": match_start_time,
+            "market_start_time": market.get("gameStartTime") or market.get("eventStartTime") or event.get("startTime"),
+            "volume": to_float(market.get("volume") or event.get("volume")),
+            "volume24hr": to_float(market.get("volume24hr") or event.get("volume24hr")),
+            "liquidity": to_float(market.get("liquidity") or event.get("liquidity")),
+            "closed": bool(event.get("closed")),
+            "game_family": game_family_from_event(event),
+            "market_type": market_type,
+            "market_type_label": MARKET_TYPE_LABELS.get(market_type, market_type),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    return sorted(
+        records.values(),
+        key=lambda row: (MARKET_TYPE_ORDER.get(str(row.get("market_type")), 99), -to_float(row.get("volume"))),
+    )
+
+
+def event_to_market_record(event: dict[str, Any]) -> dict[str, Any] | None:
+    records = event_to_market_records(event, allowed_market_types={MAIN_MATCH})
+    if records:
+        return records[0]
     market = choose_main_market(event)
     if not market:
         return None
-    match_start_time = market.get("eventStartTime") or event.get("startTime") or market.get("gameStartTime")
-    return {
-        "condition_id": str(market.get("conditionId")).lower(),
-        "event_id": str(event.get("id") or ""),
-        "event_slug": event.get("slug"),
-        "title": event.get("title"),
-        "question": market.get("question"),
-        "outcomes": parse_jsonish(market.get("outcomes"), []),
-        "outcome_prices": [to_float(v) for v in parse_jsonish(market.get("outcomePrices"), [])],
-        "end_date": event.get("endDate") or market.get("endDate"),
-        "match_start_time": match_start_time,
-        "market_start_time": market.get("gameStartTime") or market.get("eventStartTime") or event.get("startTime"),
-        "volume": to_float(event.get("volume") or market.get("volume")),
-        "volume24hr": to_float(event.get("volume24hr")),
-        "liquidity": to_float(event.get("liquidity") or market.get("liquidity")),
-        "closed": bool(event.get("closed")),
-        "game_family": game_family_from_event(event),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    market_type = classify_market_type(event, market)
+    if market_type != MAIN_MATCH:
+        return None
+    return event_to_market_records(event, allowed_market_types={MAIN_MATCH})[0]
 
 
 def build_classification_set(
@@ -203,22 +337,25 @@ def build_classification_set(
     now = now or datetime.now(timezone.utc)
     records: dict[str, dict[str, Any]] = {}
     for event in events:
-        record = event_to_market_record(event)
-        if not record:
-            continue
-        end = parse_dt(record.get("end_date"))
-        if not end or end > now:
-            continue
-        if not is_settled_binary_prices(record.get("outcome_prices") or []):
-            continue
-        if not is_main_match_title(str(record.get("title") or record.get("question") or "")):
-            continue
-        if lookback_days is not None:
-            days_ago = (now - end).total_seconds() / SECONDS_PER_DAY
-            if days_ago < 0 or days_ago > lookback_days:
+        for record in event_to_market_records(event):
+            end = parse_dt(record.get("end_date"))
+            if not end or end > now:
                 continue
-        records[record["condition_id"]] = record
-    return sorted(records.values(), key=lambda row: row.get("end_date") or "", reverse=True)
+            if not is_settled_binary_prices(record.get("outcome_prices") or []):
+                continue
+            if lookback_days is not None:
+                days_ago = (now - end).total_seconds() / SECONDS_PER_DAY
+                if days_ago < 0 or days_ago > lookback_days:
+                    continue
+            records[record["condition_id"]] = record
+    return sorted(
+        records.values(),
+        key=lambda row: (
+            row.get("end_date") or "",
+            -MARKET_TYPE_ORDER.get(str(row.get("market_type")), 99),
+        ),
+        reverse=True,
+    )
 
 
 def build_discovery_slate(
@@ -228,45 +365,110 @@ def build_discovery_slate(
     lookback_steps: tuple[int, ...] = (7, 14, 30),
     min_market_volume: float = 25_000,
     fallback_min_market_volume: float = 10_000,
+    submarket_min_market_volume: float = 5_000,
+    submarket_fallback_min_market_volume: float = 1_000,
     target_markets: int = 30,
+    submarket_target_markets: int = 60,
     max_markets_per_run: int = 50,
+    submarket_max_markets_per_run: int = 60,
     market_offset: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     now = now or datetime.now(timezone.utc)
 
-    def select(days: int, min_volume: float) -> list[dict[str, Any]]:
+    def select(days: int, min_volume: float, market_types: set[str]) -> list[dict[str, Any]]:
         selected = []
         for market in classification_set:
+            market_type = str(market.get("market_type") or MAIN_MATCH)
+            if market_type not in market_types:
+                continue
             end = parse_dt(market.get("end_date"))
             if not end:
                 continue
             days_ago = (now - end).total_seconds() / SECONDS_PER_DAY
             if 0 <= days_ago <= days and to_float(market.get("volume")) >= min_volume:
                 selected.append(market)
-        return sorted(selected, key=lambda row: to_float(row.get("volume")), reverse=True)
+        return sorted(
+            selected,
+            key=lambda row: (to_float(row.get("volume")), row.get("end_date") or ""),
+            reverse=True,
+        )
 
-    selected: list[dict[str, Any]] = []
-    selected_days = lookback_steps[-1]
-    selected_min_volume = min_market_volume
-    for days in lookback_steps:
-        selected = select(days, min_market_volume)
-        selected_days = days
-        if len(selected) >= target_markets:
-            break
-    if len(selected) < target_markets:
-        selected = select(lookback_steps[-1], fallback_min_market_volume)
-        selected_min_volume = fallback_min_market_volume
+    def select_bucket(
+        *,
+        market_types: set[str],
+        primary_min_volume: float,
+        fallback_min_volume: float,
+        target: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        selected: list[dict[str, Any]] = []
+        selected_days = lookback_steps[-1]
+        selected_min_volume = primary_min_volume
+        for days in lookback_steps:
+            selected = select(days, primary_min_volume, market_types)
+            selected_days = days
+            if len(selected) >= target:
+                break
+        if len(selected) < target:
+            selected = select(lookback_steps[-1], fallback_min_volume, market_types)
+            selected_min_volume = fallback_min_volume
+        return selected, {
+            "selected_lookback_days": selected_days,
+            "selected_min_market_volume": selected_min_volume,
+            "target_markets": target,
+            "total_selected_market_count": len(selected),
+        }
 
-    total_selected_market_count = len(selected)
-    selected = selected[market_offset : market_offset + max_markets_per_run]
+    main_selected, main_meta = select_bucket(
+        market_types={MAIN_MATCH},
+        primary_min_volume=min_market_volume,
+        fallback_min_volume=fallback_min_market_volume,
+        target=target_markets,
+    )
+    sub_selected, sub_meta = select_bucket(
+        market_types={GAME_WINNER, MAP_WINNER},
+        primary_min_volume=submarket_min_market_volume,
+        fallback_min_volume=submarket_fallback_min_market_volume,
+        target=submarket_target_markets,
+    )
+
+    main_slice = main_selected[market_offset : market_offset + max_markets_per_run]
+    sub_slice = sub_selected[:submarket_max_markets_per_run]
+    merged: dict[str, dict[str, Any]] = {}
+    for market in [*main_slice, *sub_slice]:
+        merged[str(market.get("condition_id") or "").lower()] = market
+    selected = sorted(
+        merged.values(),
+        key=lambda row: (
+            MARKET_TYPE_ORDER.get(str(row.get("market_type") or MAIN_MATCH), 99),
+            -to_float(row.get("volume")),
+        ),
+    )
+
+    type_counts: dict[str, int] = {}
+    selected_type_counts: dict[str, int] = {}
+    for market in classification_set:
+        market_type = str(market.get("market_type") or MAIN_MATCH)
+        type_counts[market_type] = type_counts.get(market_type, 0) + 1
+    for market in selected:
+        market_type = str(market.get("market_type") or MAIN_MATCH)
+        selected_type_counts[market_type] = selected_type_counts.get(market_type, 0) + 1
+
     return selected, {
-        "selected_lookback_days": selected_days,
-        "selected_min_market_volume": selected_min_volume,
+        "selected_lookback_days": main_meta["selected_lookback_days"],
+        "selected_min_market_volume": main_meta["selected_min_market_volume"],
         "target_markets": target_markets,
         "market_offset": market_offset,
         "max_markets_per_run": max_markets_per_run,
-        "total_selected_market_count": total_selected_market_count,
+        "total_selected_market_count": main_meta["total_selected_market_count"] + sub_meta["total_selected_market_count"],
         "market_count": len(selected),
+        "market_type_counts": type_counts,
+        "selected_by_market_type": selected_type_counts,
+        "main_match": main_meta,
+        "submarkets": {
+            **sub_meta,
+            "target_markets": submarket_target_markets,
+            "max_markets_per_run": submarket_max_markets_per_run,
+        },
     }
 
 
@@ -526,27 +728,31 @@ def summarize_closed_positions(
     positions: list[dict[str, Any]],
     esports_condition_ids: set[str],
     *,
+    condition_type_by_id: dict[str, str] | None = None,
     now_ts: int | None = None,
     bot_like_score: int = 0,
 ) -> dict[str, Any]:
+    condition_type_by_id = {str(key).lower(): value for key, value in (condition_type_by_id or {}).items()}
     rows = []
-    neutral_market_count = 0
+    neutral_market_count_by_type: dict[str, int] = {}
     for position in positions:
         condition_id = str(position.get("conditionId") or position.get("condition_id") or "").lower()
         if condition_id not in esports_condition_ids:
             continue
+        market_type = condition_type_by_id.get(condition_id, MAIN_MATCH)
         total_bought = to_float(position.get("totalBought") or position.get("total_bought"))
         realized_pnl = to_float(position.get("realizedPnl") or position.get("realized_pnl"))
         if total_bought <= 0:
             continue
         if realized_pnl == 0:
-            neutral_market_count += 1
+            neutral_market_count_by_type[market_type] = neutral_market_count_by_type.get(market_type, 0) + 1
             continue
         avg_price = to_float(position.get("avgPrice") or position.get("avg_price"))
         cost_basis = total_bought * avg_price if avg_price > 0 else total_bought
         rows.append(
             {
                 "condition_id": condition_id,
+                "market_type": market_type,
                 "total_bought": total_bought,
                 "cost_basis": cost_basis,
                 "realized_pnl": realized_pnl,
@@ -557,21 +763,22 @@ def summarize_closed_positions(
             }
         )
 
-    count = len(rows)
-    total_bought = sum(row["total_bought"] for row in rows)
-    total_cost = sum(row["cost_basis"] for row in rows)
-    realized_pnl = sum(row["realized_pnl"] for row in rows)
-    positive = sum(1 for row in rows if row["realized_pnl"] > 0)
-    losses = count - positive
-    last_trade = max((row["timestamp"] for row in rows), default=0)
-    rois = [row["roi"] for row in rows]
-    profits_per_share = [row["profit_per_share"] for row in rows]
-    sizes = [row["total_bought"] for row in rows]
-    entry_prices = [row["avg_price"] for row in rows if row["avg_price"] > 0]
-    high_price_entries = sum(1 for row in rows if row["avg_price"] >= 0.90)
-    low_edge_profits = sum(1 for row in rows if 0 < row["roi"] <= 0.03)
-    condition_ids = sorted({row["condition_id"] for row in rows})
-    return {
+    def summarize_bucket(bucket_rows: list[dict[str, Any]], *, neutral_market_count: int) -> dict[str, Any]:
+        count = len(bucket_rows)
+        total_bought = sum(row["total_bought"] for row in bucket_rows)
+        total_cost = sum(row["cost_basis"] for row in bucket_rows)
+        realized_pnl = sum(row["realized_pnl"] for row in bucket_rows)
+        positive = sum(1 for row in bucket_rows if row["realized_pnl"] > 0)
+        losses = count - positive
+        last_trade = max((row["timestamp"] for row in bucket_rows), default=0)
+        rois = [row["roi"] for row in bucket_rows]
+        profits_per_share = [row["profit_per_share"] for row in bucket_rows]
+        sizes = [row["total_bought"] for row in bucket_rows]
+        entry_prices = [row["avg_price"] for row in bucket_rows if row["avg_price"] > 0]
+        high_price_entries = sum(1 for row in bucket_rows if row["avg_price"] >= 0.90)
+        low_edge_profits = sum(1 for row in bucket_rows if 0 < row["roi"] <= 0.03)
+        condition_ids = sorted({row["condition_id"] for row in bucket_rows})
+        return {
         "esports_closed_count": count,
         "neutral_market_count": neutral_market_count,
         "esports_win_count": positive,
@@ -597,21 +804,48 @@ def summarize_closed_positions(
         "bot_like_score": bot_like_score,
         "profiled_at": now_ts or int(datetime.now(timezone.utc).timestamp()),
         "scoring_version": SCORING_VERSION,
-    }
+        }
+
+    per_type: dict[str, dict[str, Any]] = {}
+    for market_type in sorted({row["market_type"] for row in rows} | set(neutral_market_count_by_type)):
+        bucket_rows = [row for row in rows if row["market_type"] == market_type]
+        per_type[market_type] = {
+            **summarize_bucket(
+                bucket_rows,
+                neutral_market_count=neutral_market_count_by_type.get(market_type, 0),
+            ),
+            "market_type": market_type,
+            "market_type_label": MARKET_TYPE_LABELS.get(market_type, market_type),
+        }
+    summary = summarize_bucket(rows, neutral_market_count=sum(neutral_market_count_by_type.values()))
+    return {**summary, "per_type": per_type}
 
 
 def summarize_historical_trade_behavior(
     condition_ids: Iterable[str],
     *,
     historical_trades_loader,
+    condition_type_by_id: dict[str, str] | None = None,
     material_sell_frac: float = 0.2,
 ) -> dict[str, Any]:
+    condition_type_by_id = {str(key).lower(): value for key, value in (condition_type_by_id or {}).items()}
     sold_before_resolution_market_count = 0
     two_sided_trade_market_count = 0
     behavior_market_count = 0
+    per_type_counts: dict[str, dict[str, int]] = {}
     for condition_id in sorted({str(value).lower() for value in condition_ids if value}):
         trades = historical_trades_loader(condition_id)
+        market_type = condition_type_by_id.get(condition_id, MAIN_MATCH)
+        bucket = per_type_counts.setdefault(
+            market_type,
+            {
+                "historical_trade_behavior_market_count": 0,
+                "sold_before_resolution_market_count": 0,
+                "two_sided_trade_market_count": 0,
+            },
+        )
         behavior_market_count += 1
+        bucket["historical_trade_behavior_market_count"] += 1
         traded_outcomes = set()
         buy_size_by_outcome: dict[int, float] = {}
         sell_size_by_outcome: dict[int, float] = {}
@@ -635,8 +869,26 @@ def summarize_historical_trade_behavior(
                 break
         if has_material_sell:
             sold_before_resolution_market_count += 1
+            bucket["sold_before_resolution_market_count"] += 1
         if len(traded_outcomes) >= 2:
             two_sided_trade_market_count += 1
+            bucket["two_sided_trade_market_count"] += 1
+
+    per_type = {}
+    for market_type, counts in per_type_counts.items():
+        count = counts["historical_trade_behavior_market_count"]
+        per_type[market_type] = {
+            **counts,
+            "sold_before_resolution_market_rate": round(
+                counts["sold_before_resolution_market_count"] / count,
+                8,
+            )
+            if count
+            else 0.0,
+            "two_sided_trade_market_rate": round(counts["two_sided_trade_market_count"] / count, 8)
+            if count
+            else 0.0,
+        }
 
     return {
         "historical_trade_behavior_market_count": behavior_market_count,
@@ -651,10 +903,16 @@ def summarize_historical_trade_behavior(
         "two_sided_trade_market_rate": round(two_sided_trade_market_count / behavior_market_count, 8)
         if behavior_market_count
         else 0.0,
+        "per_type_trade_behavior": per_type,
     }
 
 
-def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> dict[str, Any]:
+def classify_wallet_bucket(
+    summary: dict[str, Any],
+    *,
+    now_ts: int,
+    min_sample: int = 8,
+) -> dict[str, Any]:
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
     reasons = []
     count = to_int(summary.get("esports_closed_count"))
@@ -732,7 +990,7 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
             "profile_state": "unqualified",
             "reasons": ["low_historical_roi"],
         }
-    if count < 8:
+    if count < min_sample:
         reasons.append("thin_sample")
     if total_bought < 1_000:
         reasons.append("low_volume")
@@ -744,14 +1002,17 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
         reasons.append("weak_wilson")
     if entry_edge < 0.05:
         reasons.append("weak_entry_edge")
+    if positive_rate < MIN_A_POSITIVE_MARKET_RATE:
+        reasons.append("low_positive_market_rate")
     if median_roi < 0 or positive_rate < 0.5:
         reasons.append("unstable_returns")
 
     if (
-        count >= 8
+        count >= min_sample
         and wilson_lb >= 0.65
         and entry_edge >= 0.10
         and pnl > 0
+        and positive_rate >= MIN_A_POSITIVE_MARKET_RATE
         and total_bought >= 5_000
         and 0 < median_entry <= 0.65
         and not stale
@@ -759,10 +1020,11 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
     ):
         grade = "A"
     elif (
-        count >= 8
+        count >= min_sample
         and wilson_lb >= 0.55
         and entry_edge >= 0.05
         and pnl > 0
+        and positive_rate >= MIN_B_POSITIVE_MARKET_RATE
         and total_bought >= 1_000
         and 0 < median_entry <= 0.65
         and not stale
@@ -775,6 +1037,79 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
         grade = "C"
     state = "qualified" if grade in {"A", "B"} else "stale" if grade == "stale" else "unqualified"
     return {**summary, "entry_edge": round(entry_edge, 8), "grade": grade, "profile_state": state, "reasons": reasons}
+
+
+def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> dict[str, Any]:
+    now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
+    classified = classify_wallet_bucket(summary, now_ts=now_ts, min_sample=8)
+    per_type = summary.get("per_type") or {}
+    if not isinstance(per_type, dict):
+        return classified
+
+    per_type_grades: dict[str, dict[str, Any]] = {}
+    eligible_market_types: list[str] = []
+    grade_rank = {"A": 5, "B": 4, "C": 3, "stale": 2, "excluded": 1, "unknown": 0}
+    best_grade = classified.get("grade") or "unknown"
+    best_rank = grade_rank.get(str(best_grade), 0)
+    for market_type, bucket_summary in sorted(
+        per_type.items(),
+        key=lambda item: MARKET_TYPE_ORDER.get(str(item[0]), 99),
+    ):
+        min_sample = 8 if market_type == MAIN_MATCH else 10
+        bucket_input = {
+            **bucket_summary,
+            "bot_like_score": summary.get("bot_like_score", bucket_summary.get("bot_like_score", 0)),
+            "sold_before_resolution_market_count": bucket_summary.get(
+                "sold_before_resolution_market_count",
+                summary.get("sold_before_resolution_market_count", 0),
+            ),
+            "sold_before_resolution_market_rate": bucket_summary.get(
+                "sold_before_resolution_market_rate",
+                summary.get("sold_before_resolution_market_rate", 0.0),
+            ),
+            "two_sided_trade_market_count": bucket_summary.get(
+                "two_sided_trade_market_count",
+                summary.get("two_sided_trade_market_count", 0),
+            ),
+            "two_sided_trade_market_rate": bucket_summary.get(
+                "two_sided_trade_market_rate",
+                summary.get("two_sided_trade_market_rate", 0.0),
+            ),
+            "historical_trade_behavior_market_count": bucket_summary.get(
+                "historical_trade_behavior_market_count",
+                summary.get("historical_trade_behavior_market_count", 0),
+            ),
+        }
+        bucket_classified = classify_wallet_bucket(bucket_input, now_ts=now_ts, min_sample=min_sample)
+        bucket_classified["min_sample"] = min_sample
+        per_type_grades[market_type] = bucket_classified
+        if bucket_classified.get("grade") == "A":
+            eligible_market_types.append(market_type)
+        bucket_rank = grade_rank.get(str(bucket_classified.get("grade")), 0)
+        if bucket_rank > best_rank:
+            best_grade = bucket_classified.get("grade")
+            best_rank = bucket_rank
+
+    if eligible_market_types:
+        eligible_market_types = sorted(
+            set(eligible_market_types),
+            key=lambda value: MARKET_TYPE_ORDER.get(value, 99),
+        )
+        classified = {
+            **classified,
+            "grade": "A",
+            "profile_state": "qualified",
+            "reasons": [reason for reason in classified.get("reasons", []) if reason != "thin_sample"],
+        }
+    else:
+        classified = {**classified, "grade": best_grade}
+    return {
+        **classified,
+        "per_type": per_type,
+        "per_type_grades": per_type_grades,
+        "eligible_market_types": eligible_market_types,
+        "eligible_market_type_labels": [MARKET_TYPE_LABELS.get(value, value) for value in eligible_market_types],
+    }
 
 
 def bot_like_score_from_candidate(candidate: dict[str, Any]) -> int:
@@ -794,6 +1129,7 @@ def profile_candidate_wallet(
     candidate: dict[str, Any],
     esports_condition_ids: set[str],
     *,
+    condition_type_by_id: dict[str, str] | None = None,
     closed_positions_loader,
     current_positions_loader,
     historical_trades_loader=None,
@@ -805,13 +1141,25 @@ def profile_candidate_wallet(
         closed_positions = closed_positions_loader(wallet)
         current_positions = current_positions_loader(wallet)
         bot_score = max(bot_like_score_from_positions(current_positions), bot_like_score_from_candidate(candidate))
-        summary = summarize_closed_positions(closed_positions, esports_condition_ids, now_ts=now_ts, bot_like_score=bot_score)
+        summary = summarize_closed_positions(
+            closed_positions,
+            esports_condition_ids,
+            condition_type_by_id=condition_type_by_id,
+            now_ts=now_ts,
+            bot_like_score=bot_score,
+        )
         if historical_trades_loader:
             trade_behavior = summarize_historical_trade_behavior(
                 summary.get("esports_condition_ids") or [],
                 historical_trades_loader=lambda condition_id: historical_trades_loader(wallet, condition_id),
+                condition_type_by_id=condition_type_by_id,
             )
+            per_type_behavior = trade_behavior.pop("per_type_trade_behavior", {}) or {}
             summary = {**summary, **trade_behavior}
+            per_type = dict(summary.get("per_type") or {})
+            for market_type, behavior in per_type_behavior.items():
+                per_type[market_type] = {**(per_type.get(market_type) or {}), **behavior}
+            summary["per_type"] = per_type
         return classify_wallet({**summary, "wallet": wallet, "candidate": candidate}, now_ts=now_ts)
     except Exception as exc:
         return {
