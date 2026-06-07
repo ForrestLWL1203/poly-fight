@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import hashlib
 import math
 import json
 import os
@@ -13,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from .api import PolymarketClient, RateLimiter
@@ -791,6 +792,7 @@ def refresh_team_logo_cache_from_active_markets(
     observe_window_hours: float = 24.0,
     now_ts: int | None = None,
     fetch_html: Any = None,
+    fetch_logo_bytes: Any = None,
 ) -> dict[str, Any]:
     active_cache = read_json(data_dir / "follow" / "active_market_cache.json", {})
     markets = active_cache.get("markets") if isinstance(active_cache, dict) else []
@@ -810,16 +812,34 @@ def refresh_team_logo_cache_from_active_markets(
         slug = str(market.get("event_slug") or "").strip()
         if slug:
             by_slug.setdefault(slug, market)
-    slugs = list(by_slug)
-    if max_events and max_events > 0:
-        slugs = slugs[:max_events]
-
-    logo_path = data_dir / "team_logos.json"
+    logo_dir = Path(__file__).with_name("dashboard") / "static" / "team_logos"
+    logo_path = logo_dir / "team_logos.json"
     cache = read_json(logo_path, {})
     if not isinstance(cache, dict):
         cache = {}
     teams = cache.get("teams") if isinstance(cache.get("teams"), dict) else {}
     teams = dict(teams)
+
+    def cached_logo_exists(value: str) -> bool:
+        url = str(value or "")
+        if not url.startswith("/team_logos/"):
+            return False
+        return (logo_dir / url.rsplit("/", 1)[-1]).exists()
+
+    slugs = []
+    for slug, market in by_slug.items():
+        game, team_a, team_b = _match_title_teams(str(market.get("title") or market.get("question") or ""))
+        game_key = _normalize_team_logo_key(game)
+        keys = []
+        for team in (team_a, team_b):
+            team_key = _normalize_team_logo_key(team)
+            keys.append(team_key)
+            if game_key:
+                keys.append(_normalize_team_logo_key(f"{game_key}:{team_key}"))
+        if not keys or not all(any(cached_logo_exists(teams.get(key, "")) for key in pair) for pair in (keys[0:2], keys[2:4])):
+            slugs.append(slug)
+    if max_events and max_events > 0:
+        slugs = slugs[:max_events]
 
     def default_fetch_html(slug: str) -> str:
         url = f"https://polymarket.com/zh/event/{slug}"
@@ -827,22 +847,37 @@ def refresh_team_logo_cache_from_active_markets(
         return urlopen(request, timeout=timeout_seconds).read().decode("utf-8", "ignore")
 
     fetcher = fetch_html or default_fetch_html
+    logo_fetcher = fetch_logo_bytes or _fetch_team_logo_bytes
 
-    def worker(slug: str) -> tuple[int, list[tuple[str, str]]]:
+    def local_logo_url(remote_url: str) -> str:
+        suffix = Path(remote_url.split("?", 1)[0]).suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+            suffix = ".png"
+        digest = hashlib.sha1(remote_url.encode("utf-8")).hexdigest()[:20]
+        return f"/team_logos/{digest}{suffix}"
+
+    def worker(slug: str) -> tuple[int, list[tuple[str, str, str, bytes]]]:
         market = by_slug[slug]
         html = fetcher(slug)
         game, team_a, team_b = _match_title_teams(str(market.get("title") or market.get("question") or ""))
         title_teams = [team_a, team_b]
-        rows: list[tuple[str, str]] = []
+        rows: list[tuple[str, str, str, bytes]] = []
         for encoded_url in sorted(set(TEAM_LOGO_URL_RE.findall(html))):
             logo_url = unquote(encoded_url)
             team_key = _team_logo_key_from_url(logo_url, game=game, title_teams=title_teams)
             if not team_key:
                 continue
-            rows.append((team_key, logo_url))
+            local_url = local_logo_url(logo_url)
+            logo_bytes = b""
+            if not (logo_dir / local_url.rsplit("/", 1)[-1]).exists():
+                try:
+                    logo_bytes = logo_fetcher(logo_url, timeout_seconds)
+                except Exception:
+                    continue
+            rows.append((team_key, logo_url, local_url, logo_bytes))
             game_key = _normalize_team_logo_key(game)
             if game_key:
-                rows.append((_normalize_team_logo_key(f"{game_key}:{team_key}"), logo_url))
+                rows.append((_normalize_team_logo_key(f"{game_key}:{team_key}"), logo_url, local_url, logo_bytes))
         return len(rows), rows
 
     fetched = 0
@@ -859,9 +894,12 @@ def refresh_team_logo_cache_from_active_markets(
                     continue
                 if count:
                     fetched += 1
-                for key, logo_url in rows:
-                    if key and teams.get(key) != logo_url:
-                        teams[key] = logo_url
+                for key, _remote_url, local_url, logo_bytes in rows:
+                    if logo_bytes:
+                        logo_dir.mkdir(parents=True, exist_ok=True)
+                        (logo_dir / local_url.rsplit("/", 1)[-1]).write_bytes(logo_bytes)
+                    if key and teams.get(key) != local_url:
+                        teams[key] = local_url
                         updated += 1
 
     payload = {
@@ -878,6 +916,13 @@ def refresh_team_logo_cache_from_active_markets(
         "total_logo_key_count": len(teams),
         "path": str(logo_path),
     }
+
+
+def _fetch_team_logo_bytes(url: str, timeout_seconds: int) -> bytes:
+    parts = urlsplit(url)
+    safe_url = urlunsplit((parts.scheme, parts.netloc, quote(parts.path), parts.query, parts.fragment))
+    request = Request(safe_url, headers={"User-Agent": "Mozilla/5.0"})
+    return urlopen(request, timeout=timeout_seconds).read()
 
 
 def _match_title_teams(title: str) -> tuple[str, str, str]:
@@ -1797,6 +1842,174 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
     return 0
 
 
+def command_rescore_wallets(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
+    data_dir = Path(args.data_dir)
+    with acquire_build_lock(data_dir):
+        return _rescore_tracked_wallets_unlocked(args, client=client)
+
+
+def _rescore_tracked_wallets_unlocked(args: argparse.Namespace, client: PolymarketClient | None = None) -> dict[str, Any]:
+    """Lightweight incremental re-score of the wallets currently on the leaderboard.
+
+    Skips the expensive discovery/candidate phase: re-fetches each tracked wallet's
+    trades (force refresh), backfills newly-settled markets, re-reconstructs the hold
+    summary, re-classifies, and rewrites the leaderboard. Used between the 24h full
+    rebuilds so followed wallets' records stay near-real-time.
+    """
+    data_dir = Path(args.data_dir)
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    leaderboard_in = read_json(data_dir / "smart_wallet_leaderboard.json", [])
+    existing_profiles = {
+        normalize_wallet(row.get("wallet")): row for row in read_json(data_dir / "wallet_profiles.json", [])
+    }
+    tracked: list[str] = []
+    seen: set[str] = set()
+    for row in leaderboard_in if isinstance(leaderboard_in, list) else []:
+        if row.get("grade") != "A":
+            continue
+        wallet = normalize_wallet(row.get("wallet"))
+        if wallet and wallet not in seen:
+            seen.add(wallet)
+            tracked.append(wallet)
+
+    summary = {"rescored_wallet_count": 0, "tracked_wallet_count": len(tracked), "leaderboard_wallet_count": len(leaderboard_in or [])}
+    if not tracked:
+        print(json.dumps({"status": "rescore_skipped", "reason": "empty_leaderboard", **summary}, ensure_ascii=False))
+        return summary
+
+    client = client or build_client(args)
+
+    classification_set = read_json(data_dir / "esports_classification_set.json", [])
+    market_records_by_id = {
+        str(row.get("condition_id") or "").lower(): row
+        for row in classification_set
+        if row.get("condition_id")
+    }
+    condition_type_by_id = {
+        str(row.get("condition_id") or "").lower(): str(row.get("market_type") or "main_match")
+        for row in classification_set
+        if row.get("condition_id")
+    }
+    condition_ids = set(market_records_by_id)
+
+    rescore_candidates: list[dict[str, Any]] = []
+    for wallet in tracked:
+        candidate = dict((existing_profiles.get(wallet) or {}).get("candidate") or {})
+        candidate["wallet"] = wallet
+        rescore_candidates.append(candidate)
+
+    def fetch_raw(candidate: dict[str, Any]) -> tuple[str, list[dict]]:
+        wallet = normalize_wallet(candidate.get("wallet"))
+        trades = fetch_recent_user_trades_for_wallet(
+            client,
+            wallet,
+            page_limit=args.user_history_trades_limit,
+            max_pages=args.user_history_trades_max_pages,
+            data_dir=data_dir,
+            now_ts=now_ts,
+            cache_ttl_days=args.market_trades_cache_ttl_days,
+            force_refresh=True,  # incremental pass must see new trades, not the cache
+            use_cache=not args.no_market_trades_cache,
+        )
+        return wallet, trades
+
+    raw_results = run_ordered_io_tasks(rescore_candidates, fetch_raw, max_workers=args.max_workers)
+    raw_user_trades_by_wallet: dict[str, list[dict]] = {}
+    for index, result in enumerate(raw_results):
+        fallback_wallet = normalize_wallet(rescore_candidates[index].get("wallet"))
+        if isinstance(result, Exception):
+            raw_user_trades_by_wallet[fallback_wallet] = []
+            continue
+        wallet, trades = result
+        raw_user_trades_by_wallet[normalize_wallet(wallet)] = trades
+
+    backfilled_market_records, backfill_summary = backfill_user_trade_submarkets(
+        client,
+        raw_user_trades_by_wallet,
+        market_records_by_id,
+        data_dir=data_dir,
+        now_ts=now_ts,
+        cache_ttl_days=args.market_trades_cache_ttl_days,
+        force_refresh=True,  # newly-settled markets won't be in the (possibly stale) cache
+        use_cache=not args.no_market_trades_cache,
+        max_workers=args.max_workers,
+    )
+    if backfilled_market_records:
+        market_records_by_id = {**market_records_by_id, **backfilled_market_records}
+        condition_type_by_id = {
+            **condition_type_by_id,
+            **{
+                condition_id: str(record.get("market_type") or "main_match")
+                for condition_id, record in backfilled_market_records.items()
+            },
+        }
+        condition_ids = set(market_records_by_id)
+
+    def load_user_trades(wallet: str) -> list[dict]:
+        return _filter_esports_user_trades(
+            raw_user_trades_by_wallet.get(normalize_wallet(wallet), []),
+            condition_ids,
+            max_esports_markets=args.max_esports_closed_positions_per_wallet,
+        )
+
+    def profile_one(candidate: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return profile_candidate_wallet(
+                candidate,
+                condition_ids,
+                market_records_by_id=market_records_by_id,
+                condition_type_by_id=condition_type_by_id,
+                user_trades_loader=load_user_trades,
+                current_positions_loader=(
+                    (lambda w: client.positions(w, limit=100))
+                    if args.check_current_positions
+                    else (lambda w: [])
+                ),
+                now_ts=now_ts,
+            )
+        except Exception as exc:
+            return make_retryable_profile(candidate, exc, now_ts=now_ts)
+
+    profile_results = run_ordered_io_tasks(rescore_candidates, profile_one, max_workers=args.max_workers)
+    rescored = [
+        make_retryable_profile(rescore_candidates[index], result, now_ts=now_ts)
+        if isinstance(result, Exception)
+        else result
+        for index, result in enumerate(profile_results)
+    ]
+
+    profiles_by_wallet = dict(existing_profiles)
+    for profile in rescored:
+        wallet = normalize_wallet(profile.get("wallet"))
+        if wallet:
+            profiles_by_wallet[wallet] = profile
+    profiles_by_wallet = merge_profiles_with_candidates(profiles_by_wallet, rescore_candidates)
+
+    leaderboard = build_leaderboard_from_profiles(
+        profiles_by_wallet,
+        now_ts=now_ts,
+        min_participated_markets=args.leaderboard_min_participated_markets,
+        min_avg_market_cash=args.leaderboard_min_avg_market_cash,
+        require_tail_entry_field=True,
+        require_current_scoring_version=True,
+        max_leaderboard_wallets=args.max_leaderboard_wallets,
+    )
+    overlap_report = build_wallet_overlap_report(leaderboard)
+    write_json(data_dir / "wallet_profiles.json", list(profiles_by_wallet.values()))
+    write_json(data_dir / "smart_wallet_leaderboard.json", leaderboard)
+    write_json(data_dir / "leaderboard_wallet_overlap.json", overlap_report)
+
+    summary = {
+        "rescored_wallet_count": len(rescored),
+        "tracked_wallet_count": len(tracked),
+        "leaderboard_wallet_count": len(leaderboard),
+        **backfill_summary,
+    }
+    print(json.dumps({"status": "rescore_complete", **summary}, ensure_ascii=False))
+    return summary
+
+
 def find_active_market(client: PolymarketClient, args: argparse.Namespace) -> dict[str, Any] | None:
     active_events = client.list_events_paginated(
         closed=False,
@@ -1929,6 +2142,17 @@ def command_follow(
         gamma_pages=args.gamma_pages,
         ttl_seconds=args.event_cache_ttl_minutes * 60,
     )
+    try:
+        refresh_team_logo_cache_from_active_markets(
+            data_dir,
+            timeout_seconds=4,
+            max_workers=min(max(1, int(args.max_workers)), 4),
+            max_events=40,
+            observe_window_hours=args.observe_window_hours,
+            now_ts=now_ts,
+        )
+    except Exception:
+        pass
     watched = watched_markets(
         active_markets,
         now_ts=now_ts,
@@ -2188,7 +2412,9 @@ def command_run(args: argparse.Namespace) -> int:
     if args.execution_mode != "paper":
         raise SystemExit("Only paper execution mode is implemented.")
     client = build_client(args)
-    last_build_at = int(datetime.now(timezone.utc).timestamp()) if args.skip_initial_build else 0
+    now_init = int(datetime.now(timezone.utc).timestamp())
+    last_build_at = now_init if args.skip_initial_build else 0
+    last_rescore_at = now_init
     tick_count = 0
     first_error_at: float | None = None
     stop_requested = {"value": False, "reason": ""}
@@ -2208,12 +2434,26 @@ def command_run(args: argparse.Namespace) -> int:
         if not stop_requested["value"]:
             time.sleep(max(1, int(seconds)))
 
-    def maybe_build(force: bool = False) -> None:
-        nonlocal last_build_at
+    def maybe_build(force: bool = False) -> bool:
+        nonlocal last_build_at, last_rescore_at
         now_ts = int(datetime.now(timezone.utc).timestamp())
         if force or now_ts - last_build_at >= int(args.pool_refresh_hours * 3600):
             command_build_leaderboard(args, client=client)
-            last_build_at = int(datetime.now(timezone.utc).timestamp())
+            now_done = int(datetime.now(timezone.utc).timestamp())
+            last_build_at = now_done
+            last_rescore_at = now_done  # full build already re-scored everyone
+            return True
+        return False
+
+    def maybe_rescore() -> None:
+        nonlocal last_rescore_at
+        interval = int(getattr(args, "wallet_rescore_hours", 0) * 3600)
+        if interval <= 0:
+            return
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        if now_ts - last_rescore_at >= interval:
+            command_rescore_wallets(args, client=client)
+            last_rescore_at = int(datetime.now(timezone.utc).timestamp())
 
     try:
         if not args.skip_initial_build:
@@ -2236,6 +2476,7 @@ def command_run(args: argparse.Namespace) -> int:
         while not stop_requested["value"]:
             try:
                 maybe_build(force=False)
+                maybe_rescore()  # no-op right after a full build (last_rescore_at was reset)
                 summary = command_follow(args, client=client, emit=True)
             except Exception as exc:
                 now = time.time()
@@ -2426,6 +2667,13 @@ def build_parser() -> argparse.ArgumentParser:
     collect = subparsers.add_parser("collect", help="one-shot wallet collection and leaderboard build")
     add_build_arguments(collect)
 
+    rescore = subparsers.add_parser(
+        "rescore-wallets",
+        help="lightweight re-score of current leaderboard wallets (no discovery)",
+    )
+    add_build_arguments(rescore)
+    rescore.set_defaults(func=command_rescore_wallets)
+
     analyze = subparsers.add_parser("analyze-event")
     analyze.add_argument("--gamma-pages", type=int, default=3)
     analyze.add_argument("--event-slug")
@@ -2476,6 +2724,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--error-retry-seconds", type=int, default=180)
     run.add_argument("--max-consecutive-error-seconds", type=int, default=600)
     run.add_argument("--pool-refresh-hours", type=float, default=24)
+    run.add_argument("--wallet-rescore-hours", type=float, default=2)
     run.add_argument("--skip-initial-build", action="store_true")
     run.add_argument("--max-run-ticks", type=int, default=0)
     run.set_defaults(func=command_run)

@@ -217,7 +217,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             page = _int_param(query.get("page", ["1"])[0], default=1, minimum=1, maximum=10_000)
             size = _int_param(query.get("size", ["25"])[0], default=25, minimum=1, maximum=200)
-            self._ok(build_follows(self.dashboard_config.data_dir, page=page, size=size))
+            status = str(query.get("status", [""])[0] or "").lower()
+            self._ok(build_follows(self.dashboard_config.data_dir, page=page, size=size, status=status))
             return
         if parsed.path.startswith("/api/follows/"):
             condition_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1]).lower()
@@ -549,7 +550,7 @@ def stream_dirty_flags(previous: StreamSignal | None, current: StreamSignal) -> 
     return {
         "follows_dirty": snapshot_dirty,
         "events_dirty": snapshot_dirty,
-        "wallets_dirty": current.leaderboard_mtime != previous.leaderboard_mtime,
+        "wallets_dirty": snapshot_dirty or current.leaderboard_mtime != previous.leaderboard_mtime,
     }
 
 
@@ -696,6 +697,8 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
             }
         )
     rows.sort(key=wallet_leaderboard_rank_key)
+    for index, row in enumerate(rows, start=1):
+        row["rank"] = index
     return {
         "wallets": rows,
         "count": len(rows),
@@ -748,15 +751,31 @@ def wallet_leaderboard_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def build_follows(data_dir: Path, *, page: int = 1, size: int = 25) -> dict[str, Any]:
+def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str = "") -> dict[str, Any]:
     store = FollowStore(data_dir / "follow" / "follow.db")
-    result = store.load_dashboard_follow_rows(page=page, size=size)
+    result = store.load_dashboard_follow_rows(page=1, size=10_000)
     logo_cache = _load_team_logo_cache(data_dir)
+    allowed_statuses = {"open", "settled", "exited", "mixed"}
+    status_filter = status if status in allowed_statuses else ""
     groups = _follow_groups_from_signals(result.get("signals", []))
     rows = sorted(groups.values(), key=lambda row: row.get("last_activity_at") or 0, reverse=True)
+    if status_filter:
+        rows = [row for row in rows if str(row.get("status") or "") == status_filter]
+    total = len(rows)
+    page = max(1, int(page or 1))
+    size = max(1, int(size or 25))
+    start = (page - 1) * size
+    rows = rows[start : start + size]
     for row in rows:
         row["team_logos"] = _team_logos_for_title(str(row.get("title") or row.get("question") or ""), logo_cache)
-    return {"page": page, "size": size, "total": int(result.get("total") or 0), "follows": rows, "db_ready": bool(result.get("db_ready"))}
+    return {
+        "page": page,
+        "size": size,
+        "total": total,
+        "status": status_filter,
+        "follows": rows,
+        "db_ready": bool(result.get("db_ready")),
+    }
 
 
 def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
@@ -946,7 +965,8 @@ def build_events(data_dir: Path, *, observe_window_hours: float = 24.0) -> dict[
 
 
 def _load_team_logo_cache(data_dir: Path) -> dict[str, str]:
-    raw = _read_json(data_dir / "team_logos.json", {})
+    static_path = Path(__file__).with_name("dashboard") / "static" / "team_logos" / "team_logos.json"
+    raw = _read_json(static_path, {})
     if not isinstance(raw, dict):
         return {}
     teams = raw.get("teams") if isinstance(raw.get("teams"), dict) else raw

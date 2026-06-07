@@ -25,8 +25,24 @@ createApp({
       walletSize: 10,
       followPage: 1,
       followSize: 10,
+      followStatusFilter: "",
+      followStatusOptions: [
+        { value: "", label: "全部状态" },
+        { value: "open", label: "进行中" },
+        { value: "settled", label: "已结算" },
+        { value: "exited", label: "已退出" },
+        { value: "mixed", label: "混合" },
+      ],
       eventPage: 1,
       eventSize: 10,
+      eventStatusFilter: "",
+      eventStatusOptions: [
+        { value: "", label: "全部状态" },
+        { value: "open", label: "监控中" },
+        { value: "settled", label: "已结算" },
+        { value: "exited", label: "已退出" },
+        { value: "unfollowed", label: "未跟单" },
+      ],
       followDetail: { wallets: [] },
       detailModal: { open: false, loading: false, conditionId: "" },
       walletFollowDetail: { signals: [] },
@@ -35,6 +51,9 @@ createApp({
       detailPriceRefreshing: false,
       detailPriceCooldown: 0,
       detailPriceCooldownTimer: null,
+      clockNow: Math.floor(Date.now() / 1000),
+      clockTimer: null,
+      walletRefreshStartedLocal: 0,
       toasts: [],
       intervals: [],
       eventSource: null,
@@ -58,9 +77,19 @@ createApp({
       return "停止";
     },
     runnerControlLabel() {
+      return this.runner.status === "running" ? "停止跟单" : "启动跟单";
+    },
+    runnerControlIcon() {
       return this.runner.status === "running" ? "■" : "▶";
     },
+    hasFollowWallets() {
+      return Number(this.wallets?.count || (this.wallets?.wallets || []).length || 0) > 0;
+    },
+    runnerStartBlocked() {
+      return this.runner.status !== "running" && !this.hasFollowWallets;
+    },
     runnerControlTitle() {
+      if (this.runnerStartBlocked) return "需先采集目标跟单钱包";
       return this.runner.status === "running" ? "停止跟单脚本" : "启动跟单脚本";
     },
     healthPillText() {
@@ -89,17 +118,28 @@ createApp({
       return Math.max(1, Math.ceil(count / this.followSize));
     },
     eventPageCount() {
-      const count = Number(this.events.count || (this.events.events || []).length || 0);
+      const count = this.eventFilteredRows.length;
       return Math.max(1, Math.ceil(count / this.eventSize));
     },
-    eventPageRows() {
+    eventFilteredRows() {
       const rows = this.events.events || [];
+      if (!this.eventStatusFilter) return rows;
+      return rows.filter((event) => this.eventStatus(event) === this.eventStatusFilter);
+    },
+    eventPageRows() {
+      const rows = this.eventFilteredRows;
       const page = Math.min(Math.max(1, this.eventPage), this.eventPageCount);
       const start = (page - 1) * this.eventSize;
       return rows.slice(start, start + this.eventSize);
     },
     walletRefreshBusy() {
       return this.loading.walletRefresh || (this.refreshStatus && this.refreshStatus.status === "running");
+    },
+    walletRefreshElapsedText() {
+      if (!this.walletRefreshBusy) return "已用时 -";
+      const startedAt = this.normalizeTs(this.refreshStatus?.started_at) || this.walletRefreshStartedLocal;
+      if (!startedAt) return "已用时 0s";
+      return `已用时 ${this.elapsedDuration(Math.max(0, this.clockNow - startedAt))}`;
     },
     pauseFollowActive() {
       const pause = this.pauseFollow;
@@ -125,11 +165,15 @@ createApp({
     },
   },
   mounted() {
+    this.clockTimer = setInterval(() => {
+      this.clockNow = Math.floor(Date.now() / 1000);
+    }, 1000);
     this.bootstrap();
   },
   beforeUnmount() {
     this.stopRealtime();
     this.clearDetailPriceCooldown();
+    if (this.clockTimer) clearInterval(this.clockTimer);
   },
   methods: {
     async request(path, options = {}) {
@@ -263,6 +307,7 @@ createApp({
       if (payload.overview) this.overview = payload.overview;
       if (payload.runner) this.runner = payload.runner;
       if (payload.refresh) this.refreshStatus = payload.refresh;
+      if (this.refreshStatus?.status !== "running") this.walletRefreshStartedLocal = 0;
       if (Object.prototype.hasOwnProperty.call(payload, "pause_follow")) this.pauseFollow = payload.pause_follow;
       if (payload.follows_dirty) this.loadFollows().catch(() => null);
       if (payload.events_dirty) this.loadEvents().catch(() => null);
@@ -317,7 +362,13 @@ createApp({
       if (this.walletPage > this.walletPageCount) this.walletPage = this.walletPageCount;
     },
     async loadFollows() {
-      this.follows = await this.request(`/api/follows?page=${this.followPage}&size=${this.followSize}`);
+      const params = new URLSearchParams({
+        page: String(this.followPage),
+        size: String(this.followSize),
+      });
+      if (this.followStatusFilter) params.set("status", this.followStatusFilter);
+      this.follows = await this.request(`/api/follows?${params.toString()}`);
+      if (this.followPage > this.followPageCount) this.followPage = this.followPageCount;
     },
     async loadEvents() {
       const result = await this.request("/api/events");
@@ -333,6 +384,7 @@ createApp({
     async loadWalletRefreshStatus() {
       const result = await this.request("/api/wallet-refresh");
       this.refreshStatus = result.status || { status: "idle" };
+      if (this.refreshStatus.status !== "running") this.walletRefreshStartedLocal = 0;
     },
     async loadRunner() {
       this.runner = await this.request("/api/runner");
@@ -348,6 +400,10 @@ createApp({
       ]);
     },
     async startRunner() {
+      if (this.runnerStartBlocked) {
+        this.showToast("需先采集目标跟单钱包", "error");
+        return;
+      }
       this.loading.runner = true;
       this.runnerActionText = "正在启动跟单脚本并刷新数据";
       try {
@@ -383,16 +439,20 @@ createApp({
     },
     async startWalletRefresh() {
       this.loading.walletRefresh = true;
+      this.walletRefreshStartedLocal = Math.floor(Date.now() / 1000);
       try {
         const result = await this.request("/api/wallet-refresh", { method: "POST" });
         this.refreshStatus = result;
+        this.walletRefreshStartedLocal = this.normalizeTs(result?.started_at) || this.walletRefreshStartedLocal;
         this.showToast("候选钱包采样已启动");
       } catch (error) {
         if (error.status === 409) {
           this.refreshStatus = error.payload && error.payload.data ? error.payload.data : this.refreshStatus;
+          this.walletRefreshStartedLocal = this.normalizeTs(this.refreshStatus?.started_at) || this.walletRefreshStartedLocal;
           this.showToast("已有采样任务在运行", "error");
         } else {
           this.showToast(`采样启动失败: ${error.message}`, "error");
+          this.walletRefreshStartedLocal = 0;
         }
       } finally {
         this.loading.walletRefresh = false;
@@ -403,13 +463,24 @@ createApp({
       this.followPage = Math.max(1, page);
       await this.loadFollows();
     },
+    async setFollowStatusFilter() {
+      this.followPage = 1;
+      await this.loadFollows();
+    },
     setWalletPage(page) {
       this.walletPage = Math.min(Math.max(1, page), this.walletPageCount);
     },
     setEventPage(page) {
       this.eventPage = Math.min(Math.max(1, page), this.eventPageCount);
     },
+    setEventStatusFilter() {
+      this.eventPage = 1;
+    },
     async toggleRunner() {
+      if (this.runnerStartBlocked) {
+        this.showToast("需先采集目标跟单钱包", "error");
+        return;
+      }
       if (this.runner.status === "running") {
         await this.stopRunner();
       } else {
@@ -524,6 +595,12 @@ createApp({
       };
       return map[status] || status || "-";
     },
+    eventStatus(event) {
+      if ((event?.open_signals || []).length) return "open";
+      if (Number(event?.settled_count || 0) > 0) return "settled";
+      if (Number(event?.exited_count || 0) > 0) return "exited";
+      return "unfollowed";
+    },
     reasonText(reason) {
       const map = {
         has_losses: "有亏损",
@@ -583,6 +660,15 @@ createApp({
       if (num < 60) return `${Math.round(num)}s`;
       return `${Math.round(num / 60)}m`;
     },
+    elapsedDuration(seconds) {
+      const num = Math.max(0, Math.floor(Number(seconds) || 0));
+      const hours = Math.floor(num / 3600);
+      const minutes = Math.floor((num % 3600) / 60);
+      const secs = num % 60;
+      if (hours > 0) return `${hours}h ${minutes}m`;
+      if (minutes > 0) return `${minutes}m ${secs}s`;
+      return `${secs}s`;
+    },
     formatTime(value) {
       const ts = this.normalizeTs(value);
       if (!ts) return "-";
@@ -640,11 +726,29 @@ createApp({
       const types = row?.observed_market_types || [];
       return Array.isArray(types) ? types.map((type) => map[type] || type).filter(Boolean) : [];
     },
+    rankIcon(wallet) {
+      const rank = Number(wallet?.rank);
+      if (rank === 1) return "/icons/medal-gold.png";
+      if (rank === 2) return "/icons/medal-silver.png";
+      if (rank === 3) return "/icons/medal-bronze.png";
+      return "";
+    },
+    rankTitle(wallet) {
+      const rank = Number(wallet?.rank);
+      if (rank === 1) return "Rank 1";
+      if (rank === 2) return "Rank 2";
+      if (rank === 3) return "Rank 3";
+      return `Rank ${rank || "-"}`;
+    },
     walletHistoryText(wallet) {
       const wins = Number(wallet?.esports_win_count);
       const losses = Number(wallet?.esports_loss_count);
       if (!Number.isFinite(wins) && !Number.isFinite(losses)) return "-";
-      return `${Number.isFinite(wins) ? wins : 0}W / ${Number.isFinite(losses) ? losses : 0}L`;
+      const safeWins = Number.isFinite(wins) ? wins : 0;
+      const safeLosses = Number.isFinite(losses) ? losses : 0;
+      const total = safeWins + safeLosses;
+      const winRate = total > 0 ? ` (${this.percent(safeWins / total)})` : "";
+      return `${safeWins}W / ${safeLosses}L${winRate}`;
     },
     walletObservedSettled(wallet) {
       const observed = wallet?.observed || {};

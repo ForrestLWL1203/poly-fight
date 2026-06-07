@@ -47,6 +47,7 @@ from poly_fight.cli import (
     build_profile_fetch_plan,
     backfill_user_trade_submarkets,
     command_build_leaderboard,
+    _rescore_tracked_wallets_unlocked,
     command_follow,
     fetch_resolutions_for_open_signals,
     fetch_recent_esports_closed_positions_for_wallet,
@@ -1644,6 +1645,117 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(summary["user_trade_backfill_candidate_count"], 41)
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(len(client.calls[0]), 41)
+
+    def _rescore_fixture(self, tmp, *, wins, losses):
+        """Write classification + leaderboard + profiles for one tracked wallet and
+        return (args, FakeClient) whose trades reconstruct to `wins`/`losses` markets."""
+        data_dir = Path(tmp)
+        total = wins + losses
+        classification = []
+        trades = []
+        now_ts = int(time.time())
+        for index in range(total):
+            cid = f"0x{index:064x}"
+            classification.append(
+                {
+                    "condition_id": cid,
+                    "market_type": "main_match",
+                    "title": "Dota 2: A vs B (BO3)",
+                    "question": "Dota 2: A vs B (BO3)",
+                    "outcomes": ["A", "B"],
+                    "outcome_prices": [1.0, 0.0],  # outcome 0 wins
+                    "end_date": "2020-01-01T00:00:00Z",
+                    "match_start_time": "2020-01-01T00:00:00Z",
+                }
+            )
+            bought = 0 if index < wins else 1  # buy winner for wins, loser for losses
+            trades.append(
+                {
+                    "conditionId": cid,
+                    "outcomeIndex": bought,
+                    "side": "BUY",
+                    "size": 1000,
+                    "price": 0.5,
+                    "timestamp": now_ts,
+                    "title": "Dota 2: A vs B (BO3)",
+                }
+            )
+        write_json(data_dir / "esports_classification_set.json", classification)
+        candidate = {
+            "wallet": "0xa",
+            "participated_market_count": total,
+            "avg_market_cash": 5000,
+            "two_sided_market_count": 0,
+            "tail_entry_market_count": 0,
+        }
+        write_json(
+            data_dir / "wallet_profiles.json",
+            [
+                {"wallet": "0xa", "grade": "A", "scoring_version": 1, "candidate": candidate},
+                {"wallet": "0xz", "grade": "C", "scoring_version": 1, "candidate": {"wallet": "0xz"}},
+            ],
+        )
+        write_json(
+            data_dir / "smart_wallet_leaderboard.json",
+            [{"wallet": "0xa", "grade": "A", "eligible_market_types": ["main_match"]}],
+        )
+
+        class FakeClient:
+            def trades_for_user(self, wallet, *, limit=500, offset=0):
+                return trades[offset : offset + limit] if normalize_wallet(wallet) == "0xa" else []
+
+            def markets_by_condition_ids(self, condition_ids, *, limit=500):
+                return []
+
+            def positions(self, wallet, *, limit=100):
+                return []
+
+        args = build_parser().parse_args(["--data-dir", str(data_dir), "rescore-wallets"])
+        return args, FakeClient()
+
+    def test_rescore_refreshes_tracked_wallet_and_keeps_others(self):
+        with TemporaryDirectory() as tmp:
+            args, client = self._rescore_fixture(tmp, wins=9, losses=1)
+
+            summary = _rescore_tracked_wallets_unlocked(args, client=client)
+
+            self.assertEqual(summary["rescored_wallet_count"], 1)
+            leaderboard = read_json(Path(tmp) / "smart_wallet_leaderboard.json", [])
+            board = {row["wallet"]: row for row in leaderboard}
+            self.assertIn("0xa", board)
+            self.assertEqual(board["0xa"]["grade"], "A")
+            self.assertEqual(board["0xa"]["esports_closed_count"], 10)
+            self.assertEqual(board["0xa"]["esports_win_count"], 9)
+            self.assertEqual(board["0xa"]["esports_loss_count"], 1)
+            # non-tracked profile is preserved untouched
+            profiles = {row["wallet"]: row for row in read_json(Path(tmp) / "wallet_profiles.json", [])}
+            self.assertIn("0xz", profiles)
+            self.assertEqual(profiles["0xa"]["scoring_version"], SCORING_VERSION)
+
+    def test_rescore_demotes_wallet_that_now_loses(self):
+        with TemporaryDirectory() as tmp:
+            args, client = self._rescore_fixture(tmp, wins=2, losses=8)
+
+            _rescore_tracked_wallets_unlocked(args, client=client)
+
+            leaderboard = read_json(Path(tmp) / "smart_wallet_leaderboard.json", [])
+            self.assertNotIn("0xa", {row["wallet"] for row in leaderboard})
+
+    def test_rescore_skips_empty_leaderboard(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_json(data_dir / "smart_wallet_leaderboard.json", [])
+            write_json(data_dir / "wallet_profiles.json", [])
+
+            class FakeClient:
+                def trades_for_user(self, *a, **k):
+                    raise AssertionError("should not fetch on empty leaderboard")
+
+            args = build_parser().parse_args(["--data-dir", str(data_dir), "rescore-wallets"])
+            summary = _rescore_tracked_wallets_unlocked(args, client=FakeClient())
+
+            self.assertEqual(summary["rescored_wallet_count"], 0)
+            self.assertEqual(summary["tracked_wallet_count"], 0)
 
     def test_recent_esports_user_trades_cache_avoids_repeat_fetches(self):
         class FakeClient:
@@ -3443,6 +3555,67 @@ class CoreTest(unittest.TestCase):
             self.assertFalse((data_dir / "follow" / "follow_performance.json").exists())
             self.assertTrue((data_dir / "follow" / "follow.db").exists())
 
+    def test_follow_tick_preloads_team_logos_from_watched_events(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now = datetime.now(timezone.utc)
+            start = now + timedelta(hours=2)
+            write_json(data_dir / "smart_wallet_leaderboard.json", [])
+
+            class FakeClient:
+                def list_events_paginated(self, **_kwargs):
+                    return [
+                        {
+                            "id": "event1",
+                            "slug": "cs2-lgc-mibr-2026-06-06",
+                            "title": "Counter-Strike: Legacy vs MIBR (BO1)",
+                            "tags": [{"slug": "cs2"}],
+                            "startTime": start.isoformat(),
+                            "markets": [
+                                {
+                                    "conditionId": "m1",
+                                    "question": "Counter-Strike: Legacy vs MIBR (BO1)",
+                                    "outcomes": ["Legacy", "MIBR"],
+                                    "outcomePrices": ["0.50", "0.50"],
+                                    "active": True,
+                                    "closed": False,
+                                    "volume": 100000,
+                                    "startTime": start.isoformat(),
+                                }
+                            ],
+                        }
+                    ]
+
+            calls = []
+
+            def fake_logo_refresh(path, **kwargs):
+                calls.append((path, kwargs))
+                return {"watched_event_count": 1}
+
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "--data-dir",
+                    str(data_dir),
+                    "follow",
+                    "--stake-usdc",
+                    "1",
+                    "--gamma-pages",
+                    "1",
+                    "--max-workers",
+                    "3",
+                ]
+            )
+
+            with patch("poly_fight.cli.refresh_team_logo_cache_from_active_markets", side_effect=fake_logo_refresh):
+                summary = command_follow(args, client=FakeClient(), emit=False)
+
+            self.assertEqual(summary["follow_wallet_count"], 0)
+            self.assertEqual(summary["watched_market_count"], 1)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], data_dir)
+            self.assertEqual(calls[0][1]["max_workers"], 3)
+
     def test_follow_tick_excludes_quarantined_wallets_before_fetching(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -3727,7 +3900,7 @@ class CoreTest(unittest.TestCase):
                 body = response.read().decode()
                 self.assertEqual(response.status, 200)
                 self.assertIn("text/html", response.getheader("Content-Type") or "")
-                self.assertIn("Poly Fight 跟单控制台", body)
+                self.assertIn("Aegis Alpha", body)
                 self.assertIn("/app.js", body)
                 self.assertIn("/vendor/vue-3.5.13.global.prod.js", body)
                 self.assertNotIn("cdn.jsdelivr.net", body)
@@ -3875,7 +4048,7 @@ class CoreTest(unittest.TestCase):
             flags = stream_dirty_flags(before, after)
             self.assertTrue(flags["follows_dirty"])
             self.assertTrue(flags["events_dirty"])
-            self.assertFalse(flags["wallets_dirty"])
+            self.assertTrue(flags["wallets_dirty"])
 
             leader_before = StreamSignal(
                 snapshot_updated_at=after.snapshot_updated_at,
@@ -4191,6 +4364,16 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(len(page["follows"]), 1)
             self.assertEqual(page["follows"][0]["condition_id"], "m1")
 
+            open_page = build_follows(data_dir, page=1, size=10, status="open")
+            settled_page = build_follows(data_dir, page=1, size=10, status="settled")
+
+            self.assertEqual(open_page["total"], 1)
+            self.assertEqual(open_page["status"], "open")
+            self.assertEqual(open_page["follows"][0]["condition_id"], "m2")
+            self.assertEqual(settled_page["total"], 1)
+            self.assertEqual(settled_page["status"], "settled")
+            self.assertEqual(settled_page["follows"][0]["condition_id"], "m1")
+
     def test_dashboard_follows_expose_readable_market_fields(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -4226,8 +4409,11 @@ class CoreTest(unittest.TestCase):
     def test_dashboard_rows_include_cached_team_logos(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
+            static_logo_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "team_logos" / "team_logos.json"
+            old_static_logos = read_json(static_logo_path, None) if static_logo_path.exists() else None
+            self.addCleanup(lambda: write_json(static_logo_path, old_static_logos) if old_static_logos is not None else static_logo_path.unlink(missing_ok=True))
             write_json(
-                data_dir / "team_logos.json",
+                static_logo_path,
                 {
                     "teams": {
                         "counter strike:faze": "https://img.example/faze.png",
@@ -4278,6 +4464,28 @@ class CoreTest(unittest.TestCase):
     def test_refresh_team_logo_cache_scans_watched_event_slugs(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
+            static_logo_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "team_logos" / "team_logos.json"
+            static_logo_dir = static_logo_path.parent
+            old_static_logos = read_json(static_logo_path, None) if static_logo_path.exists() else None
+            old_static_files = {path.name: path.read_bytes() for path in static_logo_dir.glob("*") if path.is_file()} if static_logo_dir.exists() else {}
+
+            def restore_static_logos():
+                if static_logo_dir.exists():
+                    for path in static_logo_dir.glob("*"):
+                        if path.is_file():
+                            path.unlink()
+                static_logo_dir.mkdir(parents=True, exist_ok=True)
+                for name, content in old_static_files.items():
+                    (static_logo_dir / name).write_bytes(content)
+                if old_static_logos is not None:
+                    write_json(static_logo_path, old_static_logos)
+
+            self.addCleanup(restore_static_logos)
+            if static_logo_dir.exists():
+                for path in static_logo_dir.glob("*"):
+                    if path.is_file():
+                        path.unlink()
+            static_logo_dir.mkdir(parents=True, exist_ok=True)
             write_json(
                 data_dir / "follow" / "active_market_cache.json",
                 {
@@ -4307,17 +4515,36 @@ class CoreTest(unittest.TestCase):
                     'url=https%3A%2F%2Fpolymarket-upload.s3.us-east-2.amazonaws.com%2Fteam_logos%2Fesports%2Fcs2%2FMIBR-HcOUoxRfudPA.png'
                 )
 
+            fetched_urls = []
+
+            def fake_fetch_logo_bytes(url, timeout_seconds):
+                fetched_urls.append(url)
+                return f"png:{url}".encode()
+
             summary = refresh_team_logo_cache_from_active_markets(
                 data_dir,
                 observe_window_hours=24,
                 now_ts=int(datetime(2026, 6, 7, 0, 0, tzinfo=timezone.utc).timestamp()),
                 fetch_html=fake_fetch_html,
+                fetch_logo_bytes=fake_fetch_logo_bytes,
             )
-            logos = read_json(data_dir / "team_logos.json", {})
+            logos = read_json(static_logo_path, {})
 
             self.assertEqual(summary["watched_event_count"], 1)
-            self.assertEqual(logos["teams"]["legacy"], "https://polymarket-upload.s3.us-east-2.amazonaws.com/team_logos/esports/cs2/cs-go_legacy_133708.png")
-            self.assertEqual(logos["teams"]["mibr"], "https://polymarket-upload.s3.us-east-2.amazonaws.com/team_logos/esports/cs2/MIBR-HcOUoxRfudPA.png")
+            self.assertEqual(len(fetched_urls), 2)
+            self.assertTrue(logos["teams"]["legacy"].startswith("/team_logos/"))
+            self.assertTrue(logos["teams"]["mibr"].startswith("/team_logos/"))
+            self.assertTrue((static_logo_dir / logos["teams"]["legacy"].rsplit("/", 1)[-1]).exists())
+            self.assertTrue((static_logo_dir / logos["teams"]["mibr"].rsplit("/", 1)[-1]).exists())
+
+            summary = refresh_team_logo_cache_from_active_markets(
+                data_dir,
+                observe_window_hours=24,
+                now_ts=int(datetime(2026, 6, 7, 0, 0, tzinfo=timezone.utc).timestamp()),
+                fetch_html=lambda _slug: (_ for _ in ()).throw(AssertionError("cached logos should skip HTML fetch")),
+                fetch_logo_bytes=fake_fetch_logo_bytes,
+            )
+            self.assertEqual(summary["watched_event_count"], 0)
 
     def test_dashboard_follow_detail_backfills_event_link_and_end_time(self):
         with TemporaryDirectory() as tmp:
@@ -4504,6 +4731,7 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(wallets["count"], 1)
             row = wallets["wallets"][0]
             self.assertEqual(row["grade"], "A")
+            self.assertEqual(row["rank"], 1)
             self.assertEqual(row["esports_win_count"], 11)
             self.assertEqual(row["esports_loss_count"], 1)
             self.assertEqual(row["wilson_win_rate_lower_bound"], 0.72)
@@ -4556,6 +4784,7 @@ class CoreTest(unittest.TestCase):
             wallets = build_wallets(data_dir)
 
             self.assertEqual([row["wallet"] for row in wallets["wallets"]], ["0xclean", "0xloser"])
+            self.assertEqual([row["rank"] for row in wallets["wallets"]], [1, 2])
             loser = wallets["wallets"][1]
             self.assertEqual(loser["esports_win_count"], 8)
             self.assertEqual(loser["esports_loss_count"], 0)

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
-    <title>Poly Fight 跟单控制台</title>
+    <title>Aegis Alpha | Poly Fight</title>
     <link rel="stylesheet" href="/vendor/daisyui-5.0.43.css" />
     <link rel="stylesheet" href="/vendor/daisyui-5.0.43-themes.css" />
     <link rel="stylesheet" href="/styles.css" />
@@ -38,31 +38,46 @@
 
       <div v-else class="app-shell">
         <header class="topbar">
-          <div>
-            <p class="eyebrow">Poly Fight</p>
-            <h1 class="topbar-title">Paper 跟单控制台</h1>
+          <div class="brand-lockup">
+            <p class="eyebrow">Poly Fight · Signal OS</p>
+            <h1 class="topbar-title">
+              <span>Aegis</span>
+              <span>Alpha</span>
+            </h1>
+            <p class="topbar-subtitle">智能跟单中枢</p>
           </div>
           <div class="topbar-actions">
             <div class="status-pill" :class="runnerStatusClass">
               <span class="status-dot"></span>
               {{ runnerPillText }}
             </div>
-            <div class="status-pill" :class="healthPillClass">
-              <span class="status-dot"></span>
-              {{ healthPillText }}
+            <div class="tick-pill" :title="formatTime(health.last_tick_at)">
+              最后 tick {{ timeAgo(health.last_tick_at) }}
             </div>
-            <button
-              class="runner-control-btn"
-              :class="runner.status === 'running' ? 'runner-control-stop' : 'runner-control-start'"
-              :aria-label="runnerControlTitle"
-              :title="runnerControlTitle"
-              @click="toggleRunner"
-              :disabled="loading.runner"
-            >
-              <span v-if="loading.runner" class="loading loading-spinner loading-xs"></span>
-              <span v-else aria-hidden="true">{{ runnerControlLabel }}</span>
-            </button>
-            <button class="btn btn-sm btn-ghost min-h-10" @click="logout">退出</button>
+            <div class="runner-control-group">
+              <button
+                class="runner-control-btn"
+                :class="runner.status === 'running' ? 'runner-control-stop' : 'runner-control-start'"
+                :aria-label="runnerControlTitle"
+                :title="runnerControlTitle"
+                @click="toggleRunner"
+                :disabled="loading.runner || runnerStartBlocked"
+              >
+                <span v-if="loading.runner" class="loading loading-spinner loading-xs"></span>
+                <template v-else>
+                  <span class="runner-control-icon" aria-hidden="true">{{ runnerControlIcon }}</span>
+                  <span>{{ runnerControlLabel }}</span>
+                </template>
+              </button>
+              <button
+                v-if="runnerStartBlocked"
+                class="runner-start-warning"
+                type="button"
+                title="需先采集目标跟单钱包"
+                aria-label="需先采集目标跟单钱包"
+                @click="showToast('需先采集目标跟单钱包', 'error')"
+              >!</button>
+            </div>
           </div>
         </header>
 
@@ -74,9 +89,12 @@
           <span>{{ pauseFollowText }}</span>
         </section>
 
-        <section v-if="health.status === 'waiting_for_runner'" class="notice-band">
-          <strong>等待跟单脚本</strong>
-          <span>还没有可读的 follow.db。paper 进程启动并写入第一轮快照后，这里会自动填充。</span>
+        <section v-if="health.status === 'waiting_for_runner'" class="notice-band" role="status" aria-live="polite">
+          <span class="notice-dot" aria-hidden="true"></span>
+          <div class="notice-copy">
+            <strong>等待跟单脚本</strong>
+            <span>还没有可读的 follow.db。跟单进程启动并写入第一轮快照后，这里会自动填充。</span>
+          </div>
         </section>
 
         <section class="overview-console" aria-label="总览">
@@ -93,27 +111,15 @@
               <div class="pnl-metrics">
                 <div><span>累计投入</span><b>{{ money(overview.total_stake) }}</b></div>
                 <div><span>已结算 ROI</span><b :class="pnlClass(overview.realized_roi)">{{ percent(overview.realized_roi) }}</b></div>
+                <div><span>结算场次</span><b>{{ numberOrDash(overview.settled_count) }}</b></div>
                 <div><span>钱包价盈亏</span><b>{{ money(overview.wallet_basis_realized_pnl) }}</b></div>
               </div>
             </article>
             <article class="overview-analysis-card">
-              <div><span>最近 tick</span><strong>{{ formatTime(health.last_tick_at) }}</strong><small>{{ timeAgo(health.last_tick_at) }}</small></div>
               <div><span>监控赛事</span><strong>{{ numberOrDash(health.watched_market_count) }}</strong><small>下次约 {{ duration(health.desired_next_interval_seconds) }}</small></div>
               <div><span>进行中跟单</span><strong>{{ numberOrDash(overview.open_signal_count ?? health.open_signal_count) }}</strong><small>敞口 {{ money(overview.open_exposure) }}</small></div>
-              <div>
-                <span>延迟成本</span>
-                <strong :class="pnlClass(-overview.delay_cost)">{{ money(overview.delay_cost) }}</strong>
-                <small>我方价格相对钱包成交价</small>
-              </div>
-              <div>
-                <span>可跟腿占比</span>
-                <strong>{{ percent(overview.would_follow_capture_rate) }}</strong>
-                <small>排除分歧/拦截后</small>
-              </div>
               <div><span>干净信号</span><strong>{{ numberOrDash(overview.clean_signal_count) }}</strong><small>未出现对手盘冲突</small></div>
               <div><span>分歧盘</span><strong>{{ numberOrDash(overview.contested_signal_count) }}</strong><small>同市场出现反向钱包</small></div>
-              <div><span>已结算</span><strong>{{ numberOrDash(overview.settled_count) }}</strong><small>已有最终赛果</small></div>
-              <div><span>已退出</span><strong>{{ numberOrDash(overview.exited_count) }}</strong><small>目标钱包提前卖出</small></div>
             </article>
           </div>
         </section>
@@ -135,14 +141,11 @@
               </button>
             </div>
           </div>
-          <div v-if="walletRefreshBusy" class="leaderboard-loading" role="status" aria-live="polite">
-            <span class="loading loading-spinner loading-md"></span>
-            <strong>正在采样候选钱包</strong>
-          </div>
           <div class="table-wrap leaderboard-table">
             <table class="table table-sm dense-table">
               <thead>
                 <tr>
+                  <th>Rank</th>
                   <th>钱包</th>
                   <th>评级</th>
                   <th>ROI</th>
@@ -153,11 +156,15 @@
                   <th>已退出</th>
                   <th>跟单胜负</th>
                   <th>跟单 PnL</th>
-                  <th>状态</th>
+                  <th>最后交易时间</th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="wallet in walletPageRows" :key="wallet.wallet">
+                  <td class="rank-cell">
+                    <img v-if="rankIcon(wallet)" class="rank-medal" :src="rankIcon(wallet)" :alt="rankTitle(wallet)" :title="rankTitle(wallet)" loading="lazy">
+                    <span v-else class="rank-number">{{ wallet.rank || "-" }}</span>
+                  </td>
                   <td>
                     <a class="wallet-link font-mono" :href="profileUrl(wallet.wallet)" target="_blank" rel="noreferrer">
                       {{ wallet.short_addr }}
@@ -207,15 +214,13 @@
                   </td>
                   <td>{{ walletObservedRecord(wallet) }}</td>
                   <td :class="pnlClass((wallet.observed || {}).our_pnl)">{{ walletObservedPnl(wallet) }}</td>
-                  <td>
-                    <span v-if="wallet.quarantined" class="badge badge-error badge-outline">隔离</span>
-                    <span v-else-if="wallet.observed && wallet.observed.has_loss" class="badge badge-warning badge-outline">本地亏损</span>
-                    <span v-else-if="wallet.reasons && wallet.reasons.length" class="badge badge-warning badge-outline">{{ reasonText(wallet.reasons[0]) }}</span>
-                    <span v-else class="badge badge-success badge-outline">正常</span>
+                  <td class="trade-time-cell">
+                    <span>{{ formatTime(wallet.last_esports_trade_at) }}</span>
+                    <small>{{ timeAgo(wallet.last_esports_trade_at) }}</small>
                   </td>
                 </tr>
                 <tr v-if="!walletPageRows.length">
-                  <td colspan="11" class="empty-cell">暂无候选钱包</td>
+                  <td colspan="12" class="empty-cell">暂无候选钱包</td>
                 </tr>
               </tbody>
             </table>
@@ -238,11 +243,11 @@
           <section v-if="activeTab === 'follows'" key="follows" class="data-panel console-panel">
             <div class="section-head">
               <h2>跟单记录</h2>
-              <div class="pagination-actions">
-                <span>共 {{ follows.total || 0 }} 条</span>
-                <button class="btn btn-xs" :disabled="followPage <= 1" @click="setFollowPage(followPage - 1)">上一页</button>
-                <span>第 {{ followPage }} / {{ followPageCount }} 页</span>
-                <button class="btn btn-xs" :disabled="followPage >= followPageCount" @click="setFollowPage(followPage + 1)">下一页</button>
+              <div class="table-filter">
+                <label for="follow-status-filter">状态</label>
+                <select id="follow-status-filter" v-model="followStatusFilter" @change="setFollowStatusFilter">
+                  <option v-for="option in followStatusOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+                </select>
               </div>
             </div>
             <div class="table-wrap">
@@ -306,11 +311,11 @@
           <section v-else key="events" class="data-panel console-panel">
             <div class="section-head">
               <h2>监控赛事</h2>
-              <div class="pagination-actions">
-                <span>共 {{ events.count || 0 }} 场</span>
-                <button class="btn btn-xs" :disabled="eventPage <= 1" @click="setEventPage(eventPage - 1)">上一页</button>
-                <span>第 {{ eventPage }} / {{ eventPageCount }} 页</span>
-                <button class="btn btn-xs" :disabled="eventPage >= eventPageCount" @click="setEventPage(eventPage + 1)">下一页</button>
+              <div class="table-filter">
+                <label for="event-status-filter">状态</label>
+                <select id="event-status-filter" v-model="eventStatusFilter" @change="setEventStatusFilter">
+                  <option v-for="option in eventStatusOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+                </select>
               </div>
             </div>
             <div class="event-grid">
@@ -348,10 +353,10 @@
                   <span v-for="(count, side) in event.side_counts || {}" :key="side">{{ side }} · {{ count }}</span>
                 </div>
               </article>
-              <p v-if="!(events.events || []).length" class="empty-text">当前窗口暂无监控赛事</p>
+              <p v-if="!eventFilteredRows.length" class="empty-text">当前窗口暂无监控赛事</p>
             </div>
             <div class="pagination-actions panel-pagination">
-              <span>共 {{ events.count || 0 }} 场</span>
+              <span>共 {{ eventFilteredRows.length }} 场</span>
               <button class="btn btn-xs" :disabled="eventPage <= 1" @click="setEventPage(eventPage - 1)">上一页</button>
               <span>第 {{ eventPage }} / {{ eventPageCount }} 页</span>
               <button class="btn btn-xs" :disabled="eventPage >= eventPageCount" @click="setEventPage(eventPage + 1)">下一页</button>
@@ -551,6 +556,15 @@
           <span class="loading loading-spinner loading-lg"></span>
           <strong>{{ runnerActionText || "正在处理跟单脚本" }}</strong>
           <small>完成刷新后页面会自动恢复</small>
+        </div>
+      </div>
+
+      <div v-if="walletRefreshBusy && !loading.runner" class="global-loading" role="status" aria-live="polite">
+        <div class="global-loading-panel">
+          <span class="loading loading-spinner loading-lg"></span>
+          <strong>正在采样候选钱包</strong>
+          <small class="elapsed-text">{{ walletRefreshElapsedText }}</small>
+          <small>钱包数据刷新完成后页面会自动恢复</small>
         </div>
       </div>
 
