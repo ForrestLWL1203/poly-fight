@@ -36,6 +36,7 @@ _MATCH_TITLE_RE = re.compile(r"^([^:]+):\s+(.+?)\s+vs\s+(.+?)(\s+\([^)]+\))?\s+-
 @dataclass(frozen=True)
 class DashboardConfig:
     data_dir: Path
+    log_dir: Path | None = None
     host: str = "127.0.0.1"
     port: int = 8787
     username: str = "admin"
@@ -115,6 +116,7 @@ def create_server(config: DashboardConfig) -> ThreadingHTTPServer:
         session_ttl_seconds=config.session_ttl_seconds,
         cookie_secure=config.cookie_secure,
         static_dir=static_dir,
+        log_dir=config.log_dir,
         client=config.client,
         trades_cache_ttl_seconds=config.trades_cache_ttl_seconds,
         observe_window_hours=config.observe_window_hours,
@@ -434,7 +436,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             while True:
                 if conn is None:
                     conn = store.connect_readonly()
-                signal = read_stream_signal(config.data_dir, store=store, conn=conn)
+                signal = read_stream_signal(config.data_dir, log_dir=config.log_dir, store=store, conn=conn)
                 if conn is not None and signal.snapshot_updated_at == 0 and not (config.data_dir / "follow" / "follow.db").exists():
                     conn.close()
                     conn = None
@@ -486,8 +488,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def build_health(data_dir: Path, *, started_at: float) -> dict[str, Any]:
-    rows = _read_jsonl(data_dir / "follow" / "follow_run_log.jsonl")
+def build_health(data_dir: Path, *, started_at: float, log_dir: Path | None = None) -> dict[str, Any]:
+    rows = _read_follow_run_logs(data_dir, log_dir=log_dir)
     db_ready = FollowStore(data_dir / "follow" / "follow.db").dashboard_db_ready()
     last_tick = rows[-1] if rows else {}
     build_summary = _read_json(data_dir / "build_summary.json", {})
@@ -531,13 +533,17 @@ class StreamSignal:
 def read_stream_signal(
     data_dir: Path,
     *,
+    log_dir: Path | None = None,
     store: FollowStore | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> StreamSignal:
     store = store or FollowStore(data_dir / "follow" / "follow.db")
     return StreamSignal(
         snapshot_updated_at=store.read_meta_int("follow_snapshot_updated_at", conn=conn),
-        run_log_mtime=_file_mtime(data_dir / "follow" / "follow_run_log.jsonl"),
+        run_log_mtime=max(
+            _file_mtime(_follow_run_log_path(data_dir, log_dir=log_dir)),
+            _file_mtime(_legacy_follow_run_log_path(data_dir)),
+        ),
         control_mtime=_file_mtime(data_dir / "follow" / "follow_control.json"),
         leaderboard_mtime=_file_mtime(data_dir / "smart_wallet_leaderboard.json"),
     )
@@ -557,7 +563,7 @@ def stream_dirty_flags(previous: StreamSignal | None, current: StreamSignal) -> 
 def build_stream_header(config: DashboardConfig, *, started_at: float) -> dict[str, Any]:
     control = read_follow_control(config.data_dir)
     return {
-        "health": build_health(config.data_dir, started_at=started_at),
+        "health": build_health(config.data_dir, started_at=started_at, log_dir=config.log_dir),
         "overview": build_overview(config.data_dir),
         "runner": build_runner_status(config),
         "refresh": build_wallet_refresh_status(config.data_dir).get("status") or {"status": "idle"},
@@ -1153,7 +1159,9 @@ def start_runner(config: DashboardConfig) -> dict[str, Any]:
     now_ts = int(time.time())
     follow_dir = config.data_dir / "follow"
     follow_dir.mkdir(parents=True, exist_ok=True)
-    log_path = follow_dir / f"dashboard-runner-{now_ts}.out"
+    log_dir = _follow_log_dir(config.data_dir, log_dir=config.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"dashboard-runner-{now_ts}.out"
     command = [
         sys.executable,
         "-u",
@@ -1161,6 +1169,8 @@ def start_runner(config: DashboardConfig) -> dict[str, Any]:
         "poly_fight.cli",
         "--data-dir",
         str(config.data_dir),
+        "--log-dir",
+        str(log_dir.parent),
         "run",
         "--stake-usdc",
         str(config.runner_stake_usdc),
@@ -1511,6 +1521,31 @@ def _signal_side(signal: dict[str, Any]) -> str:
     if outcome_index not in (None, ""):
         return str(outcome_index)
     return ""
+
+
+def _default_log_dir(data_dir: Path) -> Path:
+    data_dir = Path(data_dir)
+    if data_dir.name == "data":
+        return data_dir.parent / "logs"
+    return data_dir / "logs"
+
+
+def _follow_log_dir(data_dir: Path, *, log_dir: Path | None = None) -> Path:
+    return (Path(log_dir) if log_dir else _default_log_dir(data_dir)) / "follow"
+
+
+def _follow_run_log_path(data_dir: Path, *, log_dir: Path | None = None) -> Path:
+    return _follow_log_dir(data_dir, log_dir=log_dir) / "follow_run_log.jsonl"
+
+
+def _legacy_follow_run_log_path(data_dir: Path) -> Path:
+    return data_dir / "follow" / "follow_run_log.jsonl"
+
+
+def _read_follow_run_logs(data_dir: Path, *, log_dir: Path | None = None) -> list[dict[str, Any]]:
+    rows = _read_jsonl(_legacy_follow_run_log_path(data_dir))
+    rows.extend(_read_jsonl(_follow_run_log_path(data_dir, log_dir=log_dir)))
+    return sorted(rows, key=lambda row: int(row.get("created_at") or 0))
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

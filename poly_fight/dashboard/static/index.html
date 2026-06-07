@@ -311,19 +311,27 @@
           <section v-else key="events" class="data-panel console-panel">
             <div class="section-head">
               <h2>监控赛事</h2>
-              <div class="table-filter">
-                <label for="event-status-filter">状态</label>
-                <select id="event-status-filter" v-model="eventStatusFilter" @change="setEventStatusFilter">
-                  <option v-for="option in eventStatusOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
-                </select>
+              <div class="event-filters">
+                <div class="table-filter">
+                  <label for="event-game-filter">游戏</label>
+                  <select id="event-game-filter" v-model="eventGameFilter" @change="setEventGameFilter">
+                    <option v-for="option in eventGameOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+                  </select>
+                </div>
+                <div class="table-filter">
+                  <label for="event-status-filter">状态</label>
+                  <select id="event-status-filter" v-model="eventStatusFilter" @change="setEventStatusFilter">
+                    <option v-for="option in eventStatusOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+                  </select>
+                </div>
               </div>
             </div>
             <div class="event-grid">
               <article v-for="event in eventPageRows" :key="event.condition_id" class="event-row">
-                <div>
-                  <div class="match-title" v-if="matchParts(event.title || event.question || shortId(event.condition_id))">
-                    <span class="match-game">{{ matchParts(event.title || event.question || shortId(event.condition_id)).game }}</span>
-                    <div class="match-line">
+                <div class="event-main">
+                  <div class="event-match-title" v-if="matchParts(event.title || event.question || shortId(event.condition_id))">
+                    <span class="event-game-line">{{ matchParts(event.title || event.question || shortId(event.condition_id)).game }}</span>
+                    <div class="event-title-row">
                       <span class="team team-a">
                         <img v-if="teamLogo(event, 'teamA')" class="team-logo" :src="teamLogo(event, 'teamA')" :alt="matchParts(event.title || event.question || shortId(event.condition_id)).teamA" loading="lazy">
                         <span>{{ matchParts(event.title || event.question || shortId(event.condition_id)).teamA }}</span>
@@ -333,24 +341,22 @@
                         <img v-if="teamLogo(event, 'teamB')" class="team-logo" :src="teamLogo(event, 'teamB')" :alt="matchParts(event.title || event.question || shortId(event.condition_id)).teamB" loading="lazy">
                         <span>{{ matchParts(event.title || event.question || shortId(event.condition_id)).teamB }}</span>
                       </span>
+                      <span class="match-meta">{{ matchParts(event.title || event.question || shortId(event.condition_id)).meta }}</span>
+                      <span v-if="event.market_type_label" class="event-type-chip">{{ event.market_type_label }}</span>
                     </div>
-                    <span class="match-meta">{{ matchParts(event.title || event.question || shortId(event.condition_id)).meta }}</span>
                   </div>
                   <div v-else class="market-title">{{ event.title || event.question || shortId(event.condition_id) }}</div>
-                  <div class="subtle">
-                    <span v-if="event.market_type_label" class="badge badge-neutral badge-xs mr-1">{{ event.market_type_label }}</span>
+                  <div class="subtle event-time-row">
+                    <span v-if="event.market_type_label && !matchParts(event.title || event.question || shortId(event.condition_id))" class="event-type-chip">{{ event.market_type_label }}</span>
                     {{ formatTime(event.match_start_time) }} · {{ timeAgo(event.match_start_time) }}
                   </div>
                 </div>
                 <div class="event-meta">
                   <span class="badge" :class="event.contested ? 'badge-error badge-outline' : 'badge-success badge-outline'">{{ event.contested ? "分歧" : "干净" }}</span>
-                  <span v-if="(event.open_signals || []).length" class="badge badge-neutral">{{ (event.open_signals || []).length }} 进行中</span>
+                  <span v-if="(event.open_signals || []).length" class="badge badge-neutral event-follow-badge">{{ eventFollowText(event) }}</span>
                   <span v-if="event.settled_count" class="badge badge-success badge-outline">{{ event.settled_count }} 已结算</span>
                   <span v-if="event.exited_count" class="badge badge-warning badge-outline">{{ event.exited_count }} 已退出</span>
                   <span v-if="!(event.open_signals || []).length && !event.settled_count && !event.exited_count" class="badge badge-neutral">未跟单</span>
-                </div>
-                <div class="side-strip">
-                  <span v-for="(count, side) in event.side_counts || {}" :key="side">{{ side }} · {{ count }}</span>
                 </div>
               </article>
               <p v-if="!eventFilteredRows.length" class="empty-text">当前窗口暂无监控赛事</p>

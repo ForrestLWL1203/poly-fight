@@ -1,10 +1,18 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+.playwright-cli/
+output/
 
 # Generated live analysis data and raw API caches.
 data/
 data*/
+
+# Long-running local logs.
+logs/
+
+# Runtime-downloaded team logo cache.
+poly_fight/dashboard/static/team_logos/
 
 # Local review scratch files.
 review/

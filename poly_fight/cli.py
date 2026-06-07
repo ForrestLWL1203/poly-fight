@@ -121,6 +121,18 @@ def build_client(args: argparse.Namespace) -> PolymarketClient:
 DATA_DIR = Path("data")
 
 
+def default_log_dir(data_dir: Path) -> Path:
+    data_dir = Path(data_dir)
+    if data_dir.name == "data":
+        return data_dir.parent / "logs"
+    return data_dir / "logs"
+
+
+def follow_run_log_path(data_dir: Path, log_dir: str | Path | None = None) -> Path:
+    base = Path(log_dir) if log_dir else default_log_dir(data_dir)
+    return base / "follow" / "follow_run_log.jsonl"
+
+
 def read_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
@@ -902,12 +914,13 @@ def refresh_team_logo_cache_from_active_markets(
                         teams[key] = local_url
                         updated += 1
 
-    payload = {
-        "updated_at": int(time.time()),
-        "source": "polymarket watched event preload images",
-        "teams": teams,
-    }
-    write_json(logo_path, payload)
+    if updated or not logo_path.exists():
+        payload = {
+            "updated_at": int(time.time()),
+            "source": "polymarket watched event preload images",
+            "teams": teams,
+        }
+        write_json(logo_path, payload)
     return {
         "watched_event_count": len(slugs),
         "fetched_event_count": fetched,
@@ -2089,7 +2102,7 @@ def command_follow(
     open_path = follow_dir / "follow_signals_open.json"
     perf_path = follow_dir / "follow_performance.json"
     results_path = follow_dir / "follow_results.jsonl"
-    run_log_path = follow_dir / "follow_run_log.jsonl"
+    run_log_path = follow_run_log_path(data_dir, getattr(args, "log_dir", None))
     active_cache_path = follow_dir / "active_market_cache.json"
     store = FollowStore(follow_dir / "follow.db")
     store.import_legacy_json(
@@ -2537,6 +2550,7 @@ def command_serve(args: argparse.Namespace) -> int:
     cookie_secret = os.environ.get("POLY_FIGHT_DASH_COOKIE_SECRET", "")
     config = DashboardConfig(
         data_dir=Path(args.data_dir),
+        log_dir=Path(args.log_dir) if args.log_dir else None,
         host=args.host,
         port=args.port,
         username=args.user,
@@ -2567,6 +2581,7 @@ def command_serve(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Polymarket esports smart-wallet analysis")
     parser.add_argument("--data-dir", default=str(DATA_DIR))
+    parser.add_argument("--log-dir")
     parser.add_argument("--timeout", type=int, default=30)
     subparsers = parser.add_subparsers(dest="command", required=True)
 

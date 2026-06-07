@@ -104,10 +104,10 @@ Open `http://127.0.0.1:8787`, then login with `admin` and the dashboard
 password. For VPS domain deployment, put the service behind nginx + TLS and run
 with `--host 0.0.0.0 --cookie-secure`. The dashboard does not place trades: it
 reads `follow.db`, `smart_wallet_leaderboard.json`, `active_market_cache.json`,
-and `follow_run_log.jsonl`; only the wallet-trades endpoint proxies live Data
-API requests with the same rate-limited client. Overview and wallet APIs expose
-v4 quality fields such as contested count, clean-vs-contested performance,
-average CLV, and quarantine status.
+and `logs/follow/follow_run_log.jsonl`; only the wallet-trades endpoint proxies
+live Data API requests with the same rate-limited client. Overview and wallet
+APIs expose v4 quality fields such as contested count, clean-vs-contested
+performance, average CLV, and quarantine status.
 
 Authenticated dashboard users can trigger a smart-wallet refresh with
 `POST /api/wallet-refresh` and poll `GET /api/wallet-refresh`. The refresh runs
@@ -131,7 +131,6 @@ last_event_analysis.json
 follow/follow_state.json
 follow/follow.db
 follow/active_market_cache.json
-follow/follow_run_log.jsonl
 ```
 
 `follow.db` is the primary long-running follow state. It stores wallet cursors,
@@ -143,6 +142,12 @@ rewritten inside state every tick. `follow_performance.json` is treated as a
 legacy migration input or optional export, not a per-tick synchronized state
 file. Collection caches and
 `smart_wallet_leaderboard.json` remain JSON files.
+
+Long-running diagnostic logs are kept outside `data/` under `logs/follow/` by
+default, for example `logs/follow/follow_run_log.jsonl` and
+`logs/follow/dashboard-runner-*.out`. Runtime-downloaded team logos are cached
+locally under `poly_fight/dashboard/static/team_logos/`. Both directories are
+ignored by git: they persist locally but are not part of commits.
 
 `smart_wallet_leaderboard.json` is intentionally strict. By default it exports
 only core A-grade wallets for follow-signal research, capped at the top 30

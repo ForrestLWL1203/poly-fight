@@ -19,6 +19,7 @@ from poly_fight.dashboard import (
     build_events,
     build_follow_detail,
     build_follows,
+    build_health,
     build_overview,
     build_runner_status,
     build_wallet_follow_detail,
@@ -55,6 +56,7 @@ from poly_fight.cli import (
     fetch_user_trades_until_cursor,
     fetch_market_trades_cached,
     filter_profile_candidates,
+    follow_run_log_path,
     load_active_market_cache,
     merge_cached_profile_with_candidate,
     merge_profiles_with_candidates,
@@ -3554,6 +3556,27 @@ class CoreTest(unittest.TestCase):
 
             self.assertFalse((data_dir / "follow" / "follow_performance.json").exists())
             self.assertTrue((data_dir / "follow" / "follow.db").exists())
+            self.assertFalse((data_dir / "follow" / "follow_run_log.jsonl").exists())
+            self.assertTrue(follow_run_log_path(data_dir).exists())
+
+    def test_dashboard_health_reads_new_and_legacy_follow_logs(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            custom_log_dir = Path(tmp) / "local_logs"
+            write_jsonl(data_dir / "follow" / "follow_run_log.jsonl", [{"created_at": 100, "desired_next_interval_seconds": 10}])
+            write_jsonl(custom_log_dir / "follow" / "follow_run_log.jsonl", [{"created_at": 200, "desired_next_interval_seconds": 20}])
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[],
+                result_events=[],
+                performance={},
+            )
+
+            health = build_health(data_dir, started_at=time.time(), log_dir=custom_log_dir)
+            signal = read_stream_signal(data_dir, log_dir=custom_log_dir)
+
+            self.assertEqual(health["last_tick_at"], 200)
+            self.assertGreater(signal.run_log_mtime, 0)
 
     def test_follow_tick_preloads_team_logos_from_watched_events(self):
         with TemporaryDirectory() as tmp:
@@ -4119,6 +4142,8 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(status["pid"], 4321)
             self.assertIn("run", calls[0][0])
             self.assertIn("--stake-usdc", calls[0][0])
+            self.assertIn("--log-dir", calls[0][0])
+            self.assertEqual(calls[0][1].parent, data_dir / "logs" / "follow")
             self.assertEqual(read_follow_control(data_dir)["runner"]["pid"], 4321)
 
     def test_dashboard_runner_stop_allows_external_process(self):

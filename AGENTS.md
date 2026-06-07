@@ -335,7 +335,6 @@ Follow output lives under `data/follow/`:
 follow.db
 follow_state.json
 active_market_cache.json
-follow_run_log.jsonl
 follow_control.json
 ```
 
@@ -347,6 +346,9 @@ market list back into `follow_state.json`. `follow_performance.json` is legacy
 migration input or optional export only, not a per-tick synchronized state file.
 `follow_control.json` stores dashboard-visible operational status such as wallet
 refresh, runner state, and follow pause flags; it is not signal state.
+Long-running diagnostic logs live outside `data/` under `logs/follow/` by
+default, for example `logs/follow/follow_run_log.jsonl` and
+`logs/follow/dashboard-runner-*.out`.
 
 Paper signals record both the smart wallet entry basis and our detected current
 price basis. `would_follow` is only a paper flag based on
@@ -556,8 +558,8 @@ python3 -u -m poly_fight.cli --data-dir /opt/poly-fight/data run --stake-usdc 1 
 Operational notes:
 
 - `data/follow/follow.db` is the long-running paper follow source of truth.
-- `data/follow/follow_run_log.jsonl` is diagnostic and should stay small after
-  log trimming.
+- `logs/follow/follow_run_log.jsonl` is diagnostic and should stay small after
+  log trimming. Keep logs out of git.
 - `data/raw_market_trades/` is the largest collection cache. Same-market cache
   files are reused, but new market conditionIds create new files; add cleanup if
   VPS disk pressure becomes a problem.

@@ -35,6 +35,7 @@ createApp({
       ],
       eventPage: 1,
       eventSize: 10,
+      eventGameFilter: "",
       eventStatusFilter: "",
       eventStatusOptions: [
         { value: "", label: "全部状态" },
@@ -121,10 +122,24 @@ createApp({
       const count = this.eventFilteredRows.length;
       return Math.max(1, Math.ceil(count / this.eventSize));
     },
+    eventGameOptions() {
+      const games = new Set();
+      for (const event of this.events.events || []) {
+        const game = this.eventGame(event);
+        if (game) games.add(game);
+      }
+      return [
+        { value: "", label: "全部游戏" },
+        ...Array.from(games).sort((a, b) => a.localeCompare(b)).map((game) => ({ value: game, label: game })),
+      ];
+    },
     eventFilteredRows() {
       const rows = this.events.events || [];
-      if (!this.eventStatusFilter) return rows;
-      return rows.filter((event) => this.eventStatus(event) === this.eventStatusFilter);
+      return rows.filter((event) => {
+        if (this.eventStatusFilter && this.eventStatus(event) !== this.eventStatusFilter) return false;
+        if (this.eventGameFilter && this.eventGame(event) !== this.eventGameFilter) return false;
+        return true;
+      });
     },
     eventPageRows() {
       const rows = this.eventFilteredRows;
@@ -476,6 +491,9 @@ createApp({
     setEventStatusFilter() {
       this.eventPage = 1;
     },
+    setEventGameFilter() {
+      this.eventPage = 1;
+    },
     async toggleRunner() {
       if (this.runnerStartBlocked) {
         this.showToast("需先采集目标跟单钱包", "error");
@@ -600,6 +618,35 @@ createApp({
       if (Number(event?.settled_count || 0) > 0) return "settled";
       if (Number(event?.exited_count || 0) > 0) return "exited";
       return "unfollowed";
+    },
+    eventGame(event) {
+      const title = event?.title || event?.question || this.shortId(event?.condition_id);
+      return this.matchParts(title)?.game || "";
+    },
+    eventFollowText(event) {
+      const total = (event?.open_signals || []).length;
+      const title = event?.title || event?.question || this.shortId(event?.condition_id);
+      const parts = this.matchParts(title);
+      const counts = event?.side_counts || {};
+      const countFor = (label, index) => {
+        const keys = [label, String(index), String(label || "").trim().toLowerCase()];
+        for (const key of keys) {
+          if (Object.prototype.hasOwnProperty.call(counts, key)) return Number(counts[key]) || 0;
+        }
+        for (const [key, value] of Object.entries(counts)) {
+          if (String(key).trim().toLowerCase() === String(label || "").trim().toLowerCase()) return Number(value) || 0;
+        }
+        return 0;
+      };
+      if (parts) {
+        const teamA = parts.teamA || "A";
+        const teamB = parts.teamB || "B";
+        return `${total}笔跟单中 · ${teamA}: ${countFor(teamA, 0)}单 ${teamB}: ${countFor(teamB, 1)}单`;
+      }
+      const sideText = Object.entries(counts)
+        .map(([side, count]) => `${side}: ${Number(count) || 0}单`)
+        .join(" ");
+      return sideText ? `${total}笔跟单中 · ${sideText}` : `${total}笔跟单中`;
     },
     reasonText(reason) {
       const map = {
