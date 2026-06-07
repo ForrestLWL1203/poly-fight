@@ -13,7 +13,13 @@
   </head>
   <body>
     <div id="app" v-cloak>
-      <main v-if="!authenticated" class="login-shell">
+      <main v-if="authChecking" class="login-shell boot-shell" aria-label="正在恢复会话">
+        <section class="boot-panel">
+          <span class="loading loading-spinner loading-lg"></span>
+        </section>
+      </main>
+
+      <main v-else-if="!authenticated" class="login-shell">
         <section class="login-panel">
           <div>
             <p class="eyebrow">Poly Fight</p>

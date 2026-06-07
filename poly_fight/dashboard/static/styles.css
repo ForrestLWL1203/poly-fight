@@ -42,6 +42,16 @@ body {
   padding: 1rem;
 }
 
+.boot-shell {
+  color: var(--pf-accent);
+}
+
+.boot-panel {
+  display: grid;
+  place-items: center;
+  min-height: 5rem;
+}
+
 .login-panel {
   width: min(100%, 28rem);
   display: grid;

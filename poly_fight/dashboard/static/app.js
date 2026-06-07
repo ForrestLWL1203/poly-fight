@@ -4,6 +4,7 @@ createApp({
   data() {
     return {
       authenticated: false,
+      authChecking: true,
       activeTab: "follows",
       activeCategory: "esports",
       tabs: [
@@ -228,6 +229,7 @@ createApp({
       const payload = await response.json().catch(() => ({}));
       if (response.status === 401) {
         this.authenticated = false;
+        this.authChecking = false;
         throw new Error("unauthorized");
       }
       if (!response.ok || payload.ok === false) {
@@ -246,6 +248,8 @@ createApp({
         this.startRealtime();
       } catch (error) {
         if (error.message !== "unauthorized") this.showToast(`Health failed: ${error.message}`, "error");
+      } finally {
+        this.authChecking = false;
       }
     },
     async login() {
@@ -258,6 +262,7 @@ createApp({
           body: JSON.stringify(this.loginForm),
         });
         this.authenticated = true;
+        this.authChecking = false;
         await this.loadDashboard();
         this.startRealtime();
       } catch (_error) {
@@ -269,6 +274,7 @@ createApp({
     async logout() {
       await this.request("/api/logout", { method: "POST" }).catch(() => null);
       this.authenticated = false;
+      this.authChecking = false;
       this.stopRealtime();
     },
     async loadDashboard() {
