@@ -22,8 +22,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .control import read_follow_control, update_wallet_refresh_status, write_follow_control
+from .control import read_follow_control, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
 from .core import MIN_A_POSITIVE_MARKET_RATE, parse_jsonish, to_float
+from .cli import prepare_category_refresh_dir
 from .storage import FollowStore
 
 
@@ -806,9 +807,16 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
                 "open_signals": open_by_wallet.get(wallet, []),
             }
         )
-    rows.sort(key=wallet_leaderboard_rank_key)
-    for index, row in enumerate(rows, start=1):
-        row["rank"] = index
+    for category in CATEGORIES:
+        category_rows = [row for row in rows if row.get("category") == category]
+        category_rows.sort(key=wallet_leaderboard_rank_key)
+        for index, row in enumerate(category_rows, start=1):
+            row["rank"] = index
+    rows.sort(key=lambda row: (CATEGORIES.index(row.get("category")) if row.get("category") in CATEGORIES else len(CATEGORIES), row.get("rank") or 999999))
+    rows_by_category = {
+        category: [row for row in rows if row.get("category") == category]
+        for category in CATEGORIES
+    }
     return {
         "wallets": rows,
         "count": len(rows),
@@ -816,12 +824,12 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
         "leaderboard_updated_at": max([mtime for *_rest, mtime in leaderboard_sources] or [0]),
         "by_category": {
             category: {
-                "count": sum(1 for row in rows if isinstance(row, dict)),
+                "count": len(rows_by_category.get(category, [])),
                 "leaderboard_updated_at": mtime,
-                "scoring_version": max([int(row.get("scoring_version") or 0) for row in rows] or [0]) or None,
+                "scoring_version": max([int(row.get("scoring_version") or 0) for row in rows_by_category.get(category, [])] or [0]) or None,
                 "quarantined_count": sum(
                     1
-                    for row in rows
+                    for row in rows_by_category.get(category, [])
                     if f"{category}:{str(row.get('wallet') or '').lower()}" in quarantine
                     or str(row.get("wallet") or "").lower() in quarantine
                 ),
@@ -932,14 +940,15 @@ def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
         event_slug = event_slug or str(signal.get("event_slug") or "")
         market_type = market_type or str(signal.get("market_type") or "")
         market_type_label = market_type_label or str(signal.get("market_type_label") or "")
-        category = category or normalize_category(str(signal.get("category") or ""))
+        signal_category = normalize_category(str(signal.get("category") or ""))
+        category = category or signal_category
         wallet = str(signal.get("wallet") or "").lower()
         bucket = by_wallet.setdefault(
             wallet,
             {
                 "wallet": wallet,
                 "short_addr": short_addr(wallet),
-                "leaderboard_rank": leaderboard_ranks.get(wallet),
+                "leaderboard_rank": leaderboard_ranks.get(f"{signal_category}:{wallet}") or leaderboard_ranks.get(wallet),
                 "signals": [],
                 "leg_count": 0,
             },
@@ -975,19 +984,26 @@ def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
 
 
 def _leaderboard_rank_by_wallet(data_dir: Path) -> dict[str, int]:
-    leaderboard = [row for _category, _dir, rows, _mtime in _category_leaderboards(data_dir) for row in rows]
-    rows: list[dict[str, Any]] = []
-    for row in leaderboard if isinstance(leaderboard, list) else []:
-        if not isinstance(row, dict):
-            continue
-        wallet = str(row.get("wallet") or "").lower()
-        if not wallet:
-            continue
-        metrics = _eligible_display_metrics(row)
-        merged = {**row, **metrics, "wallet": wallet}
-        rows.append(merged)
-    rows.sort(key=wallet_leaderboard_rank_key)
-    return {str(row.get("wallet") or "").lower(): index for index, row in enumerate(rows, start=1)}
+    rows_by_category: dict[str, list[dict[str, Any]]] = {category: [] for category in CATEGORIES}
+    for source_category, _dir, leaderboard, _mtime in _category_leaderboards(data_dir):
+        for row in leaderboard if isinstance(leaderboard, list) else []:
+            if not isinstance(row, dict):
+                continue
+            wallet = str(row.get("wallet") or "").lower()
+            if not wallet:
+                continue
+            category = normalize_category(str(row.get("category") or source_category or "")) or "esports"
+            metrics = _eligible_display_metrics(row)
+            merged = {**row, **metrics, "wallet": wallet, "category": category}
+            rows_by_category.setdefault(category, []).append(merged)
+    ranks: dict[str, int] = {}
+    for category, rows in rows_by_category.items():
+        rows.sort(key=wallet_leaderboard_rank_key)
+        for index, row in enumerate(rows, start=1):
+            wallet = str(row.get("wallet") or "").lower()
+            ranks[f"{category}:{wallet}"] = index
+            ranks.setdefault(wallet, index)
+    return ranks
 
 
 def build_wallet_follow_detail(data_dir: Path, wallet: str, *, status: str = "") -> dict[str, Any]:
@@ -1680,11 +1696,17 @@ def start_wallet_refresh(
         "command": command,
         "log_path": str(log_path),
     }
+    set_pause_new_signals(
+        follow_dir,
+        category,
+        {"status": "paused", "reason": "wallet_refresh", "started_at": now_ts},
+    )
     update_wallet_refresh_status(follow_dir, {**wallet_refresh, category: status})
 
     def worker() -> None:
         finished_at = int(time.time())
         try:
+            prepare_category_refresh_dir(category_dir, max_lookback_days=30, now_ts=int(time.time()))
             if runner is not None:
                 try:
                     returncode = int(runner(category, category_dir, log_path) or 0)
@@ -1709,6 +1731,8 @@ def start_wallet_refresh(
                 follow_dir,
                 {**current, category: {**status, "status": "failed", "finished_at": finished_at, "error": str(exc)}},
             )
+        finally:
+            set_pause_new_signals(follow_dir, category, None)
 
     thread = threading.Thread(target=worker, name="poly-fight-wallet-refresh", daemon=True)
     thread.start()

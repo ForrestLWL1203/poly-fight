@@ -40,3 +40,20 @@ def update_wallet_refresh_status(data_dir: Path, status: dict[str, Any]) -> dict
     control["wallet_refresh"] = status
     write_follow_control(data_dir, control)
     return control
+
+
+def set_pause_new_signals(data_dir: Path, category: str, status: dict[str, Any] | None) -> dict[str, Any]:
+    category = str(category or "").lower()
+    control = read_follow_control(data_dir)
+    pauses = control.get("pause_new_signals") if isinstance(control.get("pause_new_signals"), dict) else {}
+    pauses = dict(pauses)
+    if status:
+        pauses[category] = {**status, "category": category}
+    else:
+        pauses.pop(category, None)
+    if pauses:
+        control["pause_new_signals"] = pauses
+    else:
+        control.pop("pause_new_signals", None)
+    write_follow_control(data_dir, control)
+    return control

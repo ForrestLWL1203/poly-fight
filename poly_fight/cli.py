@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 
 from .api import PolymarketClient, RateLimiter
 from .core import (
+    MARKET_TYPE_LABELS,
     MIN_A_POSITIVE_MARKET_RATE,
     SCORING_VERSION,
     TRADE_BEHAVIOR_EXCLUDE_RATE,
@@ -70,6 +71,7 @@ from .follow import (
     winner_outcome_index,
 )
 from .storage import FollowStore
+from .control import read_follow_control, set_pause_new_signals
 
 try:
     import fcntl
@@ -79,6 +81,27 @@ except ImportError:  # pragma: no cover - non-Unix fallback
 
 class BuildLockUnavailable(RuntimeError):
     pass
+
+
+ESPORTS_LEADERBOARD_MIN_TYPE_ROI = 0.12
+ESPORTS_LEADERBOARD_MIN_TYPE_ENTRY_EDGE = 0.0
+ESPORTS_LEADERBOARD_MIN_TYPE_PRE_MATCH_RATE = 0.20
+SPORTS_LEADERBOARD_MIN_ENTRY_EDGE = 0.0
+CATEGORY_REFRESH_OUTPUT_FILES = {
+    "smart_wallet_leaderboard.json",
+    "wallet_profiles.json",
+    "candidate_wallets.json",
+    "profile_candidate_wallets.json",
+    "discovery_slate.json",
+    "leaderboard_wallet_overlap.json",
+    "build_summary.json",
+    "last_event_analysis.json",
+}
+CATEGORY_REFRESH_CACHE_DIRS = {
+    "raw_market_trades",
+    "raw_user_trades",
+    "clob_market_metadata",
+}
 
 
 @contextmanager
@@ -104,6 +127,39 @@ def acquire_build_lock(data_dir: Path, *, blocking: bool = True):
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def prepare_category_refresh_dir(category_dir: Path, *, max_lookback_days: int = 30, now_ts: int | None = None) -> None:
+    """Clear rebuild outputs while keeping reusable API caches bounded."""
+    category_dir.mkdir(parents=True, exist_ok=True)
+    for name in CATEGORY_REFRESH_OUTPUT_FILES:
+        path = category_dir / name
+        if path.exists() or path.is_symlink():
+            path.unlink()
+    now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
+    cutoff_ts = now_ts - max(0, int(max_lookback_days)) * 86400
+    for dirname in CATEGORY_REFRESH_CACHE_DIRS:
+        cache_dir = category_dir / dirname
+        if not cache_dir.exists():
+            continue
+        for path in cache_dir.rglob("*"):
+            if (path.is_file() or path.is_symlink()) and int(path.stat().st_mtime) < cutoff_ts:
+                path.unlink()
+        for path in sorted((p for p in cache_dir.rglob("*") if p.is_dir()), key=lambda value: len(value.parts), reverse=True):
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+
+
+def category_refresh_cache_retention_days(args: argparse.Namespace) -> int:
+    return max(
+        1,
+        int(getattr(args, "classification_lookback_days", 0) or 0),
+        int(getattr(args, "discovery_lookback_days", 0) or 0),
+        int(getattr(args, "market_trades_cache_ttl_days", 0) or 0),
+        30,  # CLOB condition metadata cache default.
+    )
 
 
 def build_client(args: argparse.Namespace) -> PolymarketClient:
@@ -1487,6 +1543,7 @@ def build_leaderboard_from_profiles(
     max_inactive_seconds = max_inactive_days * 86400
     leaderboard = []
     for profile in profiles_by_wallet.values():
+        profile = dict(profile)
         if require_current_scoring_version and int(profile.get("scoring_version") or 0) != SCORING_VERSION:
             continue
         # Optional followability filter: drop wallets that mostly buy in-game (their alpha
@@ -1532,6 +1589,16 @@ def build_leaderboard_from_profiles(
             continue
         candidate = profile.get("candidate") or {}
         is_sports_profile = str(profile.get("category") or "").lower() == "sports"
+        if is_sports_profile:
+            profile = _with_sports_followable_market_types(profile)
+            if profile is None:
+                continue
+            eligible_market_types = profile.get("eligible_market_types") or []
+        else:
+            profile = _with_esports_followable_market_types(profile)
+            if profile is None:
+                continue
+            eligible_market_types = profile.get("eligible_market_types") or []
         effective_min_participated = 1 if is_sports_profile else min_participated_markets
         if int(candidate.get("participated_market_count") or 0) < effective_min_participated:
             continue
@@ -1554,6 +1621,90 @@ def build_leaderboard_from_profiles(
     if max_leaderboard_wallets > 0:
         return ranked[:max_leaderboard_wallets]
     return ranked
+
+
+def _with_esports_followable_market_types(profile: dict[str, Any]) -> dict[str, Any] | None:
+    eligible_market_types = [str(value) for value in profile.get("eligible_market_types") or [] if value]
+    if not eligible_market_types:
+        if _esports_followable_roi(profile) < ESPORTS_LEADERBOARD_MIN_TYPE_ROI:
+            return None
+        if _followable_capital_edge(profile) < ESPORTS_LEADERBOARD_MIN_TYPE_ENTRY_EDGE:
+            return None
+        pre_match_rate = profile.get("pre_match_entry_rate")
+        if pre_match_rate is not None and to_float(pre_match_rate) < ESPORTS_LEADERBOARD_MIN_TYPE_PRE_MATCH_RATE:
+            return None
+        return profile
+
+    per_type = profile.get("per_type") if isinstance(profile.get("per_type"), dict) else {}
+    per_type_grades = profile.get("per_type_grades") if isinstance(profile.get("per_type_grades"), dict) else {}
+    followable_types = []
+    for market_type in eligible_market_types:
+        metrics = dict(profile)
+        if isinstance(per_type.get(market_type), dict):
+            metrics.update(per_type[market_type])
+        if isinstance(per_type_grades.get(market_type), dict):
+            metrics.update(per_type_grades[market_type])
+        if _esports_followable_roi(metrics) < ESPORTS_LEADERBOARD_MIN_TYPE_ROI:
+            continue
+        if _followable_capital_edge(metrics) < ESPORTS_LEADERBOARD_MIN_TYPE_ENTRY_EDGE:
+            continue
+        pre_match_rate = metrics.get("pre_match_entry_rate")
+        if pre_match_rate is not None and to_float(pre_match_rate) < ESPORTS_LEADERBOARD_MIN_TYPE_PRE_MATCH_RATE:
+            continue
+        followable_types.append(market_type)
+    if not followable_types:
+        return None
+    if followable_types == eligible_market_types:
+        return profile
+    filtered = dict(profile)
+    filtered["eligible_market_types"] = followable_types
+    filtered["eligible_market_type_labels"] = [MARKET_TYPE_LABELS.get(value, value) for value in followable_types]
+    if isinstance(per_type_grades, dict):
+        filtered["per_type_grades"] = {key: value for key, value in per_type_grades.items() if key in followable_types}
+    return filtered
+
+
+def _with_sports_followable_market_types(profile: dict[str, Any]) -> dict[str, Any] | None:
+    eligible_market_types = [str(value) for value in profile.get("eligible_market_types") or [] if value]
+    if not eligible_market_types:
+        if to_float(profile.get("entry_edge")) < SPORTS_LEADERBOARD_MIN_ENTRY_EDGE:
+            return None
+        return profile
+
+    per_type = profile.get("per_type") if isinstance(profile.get("per_type"), dict) else {}
+    per_type_grades = profile.get("per_type_grades") if isinstance(profile.get("per_type_grades"), dict) else {}
+    followable_types = []
+    for market_type in eligible_market_types:
+        metrics = dict(profile)
+        if isinstance(per_type.get(market_type), dict):
+            metrics.update(per_type[market_type])
+        if isinstance(per_type_grades.get(market_type), dict):
+            metrics.update(per_type_grades[market_type])
+        if to_float(metrics.get("entry_edge")) < SPORTS_LEADERBOARD_MIN_ENTRY_EDGE:
+            continue
+        followable_types.append(market_type)
+    if not followable_types:
+        return None
+    if followable_types == eligible_market_types:
+        return profile
+    filtered = dict(profile)
+    filtered["eligible_market_types"] = followable_types
+    filtered["eligible_market_type_labels"] = [MARKET_TYPE_LABELS.get(value, value) for value in followable_types]
+    if isinstance(per_type_grades, dict):
+        filtered["per_type_grades"] = {key: value for key, value in per_type_grades.items() if key in followable_types}
+    return filtered
+
+
+def _esports_followable_roi(metrics: dict[str, Any]) -> float:
+    if metrics.get("esports_roi") is not None:
+        return to_float(metrics.get("esports_roi"))
+    return to_float(metrics.get("median_market_roi"))
+
+
+def _followable_capital_edge(metrics: dict[str, Any]) -> float:
+    if metrics.get("capital_weighted_edge") is not None:
+        return to_float(metrics.get("capital_weighted_edge"))
+    return to_float(metrics.get("entry_edge"))
 
 
 def leaderboard_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
@@ -2415,6 +2566,13 @@ def command_follow(
     wallet_trade_state = store.load_wallet_trade_state()
     open_signals = store.load_open_signals()
     performance = store.load_performance()
+    control = read_follow_control(follow_dir)
+    pause_new_signals = control.get("pause_new_signals") if isinstance(control.get("pause_new_signals"), dict) else {}
+    paused_new_signal_categories = {
+        str(category).lower()
+        for category, status in pause_new_signals.items()
+        if isinstance(status, dict) and status.get("status") == "paused"
+    }
     open_condition_ids_by_wallet: dict[str, set[str]] = {}
     for signal in open_signals:
         if (signal.get("status") or "open") != "open":
@@ -2531,7 +2689,7 @@ def command_follow(
                 continue
             scope_key, trades, positions = result
             category, wallet = scope_key.split(":", 1)
-            wallet_can_open_new = scope_key in eligible_wallet_set
+            wallet_can_open_new = scope_key in eligible_wallet_set and category not in paused_new_signal_categories
             previous_cursor = (wallet_trade_state.get(scope_key) or wallet_trade_state.get(wallet) or {}).get("last_trade_cursor")
             new_trades, next_cursor, cold_start = select_new_trades(trades, previous_cursor)
             if cold_start:
@@ -2748,6 +2906,7 @@ def command_run(args: argparse.Namespace) -> int:
     first_error_at: float | None = None
     stop_requested = {"value": False, "reason": ""}
     collection_root = resolve_dashboard_root(args)
+    follow_dir = resolve_follow_dir(args, collection_root)
 
     def category_args(category: str) -> argparse.Namespace:
         return argparse.Namespace(
@@ -2778,7 +2937,21 @@ def command_run(args: argparse.Namespace) -> int:
         now_ts = int(datetime.now(timezone.utc).timestamp())
         if force or now_ts - last_build_at >= int(args.pool_refresh_hours * 3600):
             for category in category_data_dirs(collection_root):
-                command_build_leaderboard(category_args(category), client=client)
+                set_pause_new_signals(
+                    follow_dir,
+                    category,
+                    {"status": "paused", "reason": "pool_refresh", "started_at": now_ts},
+                )
+                try:
+                    category_dir = category_data_dirs(collection_root)[category]
+                    prepare_category_refresh_dir(
+                        category_dir,
+                        max_lookback_days=category_refresh_cache_retention_days(args),
+                        now_ts=now_ts,
+                    )
+                    command_build_leaderboard(category_args(category), client=client)
+                finally:
+                    set_pause_new_signals(follow_dir, category, None)
             now_done = int(datetime.now(timezone.utc).timestamp())
             last_build_at = now_done
             last_rescore_at = now_done  # full build already re-scored everyone
