@@ -174,26 +174,42 @@ class FollowStore:
             rows = conn.execute("SELECT raw_json FROM follow_results ORDER BY resolved_at, signal_id").fetchall()
         return [_loads(row["raw_json"], {}) for row in rows]
 
-    def upsert_wallet_quarantine(self, wallet: str, *, reason: str, ts: int) -> None:
+    def upsert_wallet_quarantine(self, wallet: str, *, reason: str, ts: int, category: str | None = None) -> None:
         self.init_db()
         wallet = str(wallet or "").lower()
         if not wallet:
             return
+        category = str(category or "").lower()
+        key = f"{category}:{wallet}" if category else wallet
         row = {"wallet": wallet, "reason": reason, "quarantined_at": int(ts)}
+        if category:
+            row["category"] = category
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO wallet_quarantine(wallet, reason, quarantined_at, raw_json)
                 VALUES (?, ?, ?, ?)
                 """,
-                (wallet, reason, int(ts), _dumps(row)),
+                (key, reason, int(ts), _dumps(row)),
             )
 
-    def load_wallet_quarantine(self) -> dict[str, dict[str, Any]]:
+    def load_wallet_quarantine(self, *, category: str | None = None) -> dict[str, dict[str, Any]]:
         self.init_db()
+        category = str(category or "").lower()
         with self.connect() as conn:
             rows = conn.execute("SELECT wallet, raw_json FROM wallet_quarantine ORDER BY quarantined_at DESC").fetchall()
-        return {str(row["wallet"]).lower(): _loads(row["raw_json"], {}) for row in rows}
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            key = str(row["wallet"]).lower()
+            value = _loads(row["raw_json"], {})
+            value_category = str(value.get("category") or "").lower()
+            if category and value_category and value_category != category:
+                continue
+            if category and not value_category and category != "esports":
+                continue
+            result_key = str(value.get("wallet") or key).lower() if category else key
+            result[result_key] = value
+        return result
 
     def clear_wallet_quarantine_except(self, wallets: set[str]) -> None:
         self.init_db()
@@ -210,7 +226,9 @@ class FollowStore:
         wallets = {str(wallet).lower() for wallet in wallets if wallet}
         if not wallets or validated_at <= 0:
             return
-        placeholders = ",".join("?" for _ in wallets)
+        expanded_wallets = set(wallets)
+        expanded_wallets.update(f"esports:{wallet}" for wallet in wallets)
+        placeholders = ",".join("?" for _ in expanded_wallets)
         with self.connect() as conn:
             conn.execute(
                 f"""
@@ -218,7 +236,7 @@ class FollowStore:
                 WHERE wallet IN ({placeholders})
                   AND quarantined_at < ?
                 """,
-                (*tuple(sorted(wallets)), int(validated_at)),
+                (*tuple(sorted(expanded_wallets)), int(validated_at)),
             )
 
     def save_market_cache(self, markets: dict[str, dict[str, Any]], *, cache_kind: str, updated_at: int) -> None:

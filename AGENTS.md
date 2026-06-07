@@ -395,6 +395,10 @@ cookie session, and stdlib `ThreadingHTTPServer`. For VPS + TLS deployment use
 `--host 0.0.0.0 --cookie-secure`; local HTTP debugging should leave
 `--cookie-secure` off.
 
+Do not change the dashboard login password unless the user explicitly asks for
+that exact change. When restarting the local dashboard for this workspace, keep
+the user's configured password instead of substituting a default.
+
 Dashboard SQLite access must be strictly read-only. Do not call
 `FollowStore.init_db()` or any existing write-capable `load_*` method from
 dashboard request paths. Use the dedicated read-only snapshot path, which opens

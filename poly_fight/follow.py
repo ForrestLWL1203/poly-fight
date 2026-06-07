@@ -18,17 +18,18 @@ def eligible_follow_wallets(
     quarantined_wallets = {normalize_wallet(wallet) for wallet in (quarantined_wallets or set())}
     rows = []
     for row in leaderboard:
+        category = str(row.get("category") or "esports").lower()
         eligible_market_types = [str(value) for value in (row.get("eligible_market_types") or []) if value]
         if row.get("grade") == "A" and not eligible_market_types:
             eligible_market_types = ["main_match"]
         if row.get("grade") != "A" and not eligible_market_types:
             continue
         wallet = normalize_wallet(row.get("wallet"))
-        if wallet in quarantined_wallets:
+        if wallet in quarantined_wallets or f"{category}:{wallet}" in quarantined_wallets:
             continue
         last_trade = to_int(row.get("last_esports_trade_at"))
         if wallet and last_trade >= cutoff:
-            rows.append({**row, "wallet": wallet, "eligible_market_types": eligible_market_types})
+            rows.append({**row, "wallet": wallet, "category": category, "eligible_market_types": eligible_market_types})
     return rows
 
 
@@ -156,6 +157,7 @@ def bootstrap_position_trades(
     now_ts: int,
     max_slippage: float,
     eligible_market_types: set[str] | None = None,
+    eligible_category: str | None = None,
     require_pre_match: bool = True,
 ) -> list[dict[str, Any]]:
     wallet = normalize_wallet(wallet)
@@ -163,6 +165,8 @@ def bootstrap_position_trades(
     for position in positions:
         condition_id = position_condition_id(position)
         market = markets_by_condition.get(condition_id)
+        if eligible_category and str((market or {}).get("category") or "esports").lower() != str(eligible_category).lower():
+            continue
         market_type = str((market or {}).get("market_type") or "main_match")
         if eligible_market_types is not None and market_type not in eligible_market_types:
             continue
@@ -402,8 +406,10 @@ def process_follow_trades(
     max_follow_legs: int,
     max_slippage: float,
     require_pre_match: bool = True,
+    post_start_grace_seconds: int = 0,
     quarantine_sell_frac: float = 0.2,
     eligible_market_types: set[str] | None = None,
+    eligible_category: str | None = None,
     conflict_policy: str = "dual_follow",
     mirror_wallet_sells: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
@@ -424,6 +430,10 @@ def process_follow_trades(
         if not market or outcome_index < 0:
             stats["ignored_trade_count"] += 1
             continue
+        market_category = str(market.get("category") or "esports").lower()
+        if eligible_category and market_category != str(eligible_category).lower():
+            stats["ignored_trade_count"] += 1
+            continue
         side = trade_side(trade)
         current_price = market_current_price(market, outcome_index, trade)
         sid = follow_signal_id(wallet, condition_id, outcome_index)
@@ -440,7 +450,7 @@ def process_follow_trades(
             signal_for_sell["wallet_behavior"] = wallet_behavior_summary(signal_for_sell)
             if reason:
                 stats["quarantine_events"].append(
-                    {"wallet": wallet, "reason": reason, "timestamp": now_ts, "condition_id": condition_id}
+                    {"wallet": wallet, "category": market_category, "reason": reason, "timestamp": now_ts, "condition_id": condition_id}
                 )
             if not existing or reason != "material_sell" or not mirror_wallet_sells:
                 continue
@@ -474,7 +484,7 @@ def process_follow_trades(
             reason = quarantine_reason(signal, trade, sell_frac=quarantine_sell_frac)
             if reason:
                 stats["quarantine_events"].append(
-                    {"wallet": wallet, "reason": reason, "timestamp": now_ts, "condition_id": condition_id}
+                    {"wallet": wallet, "category": market_category, "reason": reason, "timestamp": now_ts, "condition_id": condition_id}
                 )
 
         market_open_signals = _open_market_signals(open_signals, condition_id)
@@ -491,9 +501,14 @@ def process_follow_trades(
                 continue
 
         start_ts = market_start_ts(market)
+        trade_ts = trade_timestamp(trade)
+        detected_after_start = False
         if require_pre_match and start_ts and now_ts >= start_ts:
-            stats["ignored_trade_count"] += 1
-            continue
+            grace_seconds = max(0, int(post_start_grace_seconds))
+            detected_after_start = bool(trade_ts and trade_ts < start_ts and now_ts <= start_ts + grace_seconds)
+            if not detected_after_start:
+                stats["ignored_trade_count"] += 1
+                continue
         if existing and len(existing.get("legs") or []) >= max_follow_legs:
             stats["ignored_trade_count"] += 1
             continue
@@ -506,6 +521,7 @@ def process_follow_trades(
         wallet_fill_price = trade_price(trade)
         slippage = evaluate_slippage(wallet_fill_price, current_price, max_slippage=max_slippage)
         leg = {
+            "category": market_category,
             "our_entry_price": current_price,
             "wallet_fill_price": wallet_fill_price,
             "slippage_over_wallet_entry": slippage["slippage_over_wallet_entry"],
@@ -513,47 +529,54 @@ def process_follow_trades(
             "stake": stake_usdc,
             "trade_id": trade_id(trade),
             "leg_at": now_ts,
-            "wallet_trade_at": trade_timestamp(trade),
+            "wallet_trade_at": trade_ts,
             "wallet_trade_size": round(trade_size(trade), 8),
         }
+        if detected_after_start:
+            leg["detected_after_start"] = True
         if existing:
             existing.setdefault("legs", []).append(leg)
             existing.setdefault("behavior_events", []).append(_behavior_event("add", trade))
             existing["updated_at"] = now_ts
             existing["current_price"] = current_price
+            if detected_after_start:
+                existing["detected_after_start"] = True
             existing["wallet_behavior"] = wallet_behavior_summary(existing)
         else:
             outcomes = market.get("outcomes") or []
-            open_signals.append(
-                {
-                    "signal_id": sid,
-                    "wallet": wallet,
-                    "condition_id": condition_id,
-                    "outcome_index": outcome_index,
-                    "outcome": outcomes[outcome_index] if 0 <= outcome_index < len(outcomes) else None,
-                    "event_title": market.get("title"),
-                    "event_slug": market.get("event_slug"),
-                    "market_question": market.get("question"),
-                    "market_type": market_type,
-                    "market_type_label": market.get("market_type_label"),
-                    "end_date": market.get("end_date"),
-                    "match_start_time": market.get("match_start_time") or market.get("market_start_time"),
-                    "status": "open",
-                    "created_at": now_ts,
-                    "updated_at": now_ts,
-                    "current_price": current_price,
-                    "legs": [leg],
-                    "behavior_events": [_behavior_event("add", trade)],
-                    "wallet_behavior": {
-                        "single_sided": True,
-                        "hedged": False,
-                        "sold_before_resolution": False,
-                        "held_to_resolution": False,
-                        "add_count": 1,
-                        "exit_count": 0,
-                    },
-                }
-            )
+            signal = {
+                "signal_id": sid,
+                "wallet": wallet,
+                "condition_id": condition_id,
+                "outcome_index": outcome_index,
+                "outcome": outcomes[outcome_index] if 0 <= outcome_index < len(outcomes) else None,
+                "event_title": market.get("title"),
+                "category": market_category,
+                "league": market.get("league"),
+                "event_slug": market.get("event_slug"),
+                "market_question": market.get("question"),
+                "market_type": market_type,
+                "market_type_label": market.get("market_type_label"),
+                "end_date": market.get("end_date"),
+                "match_start_time": market.get("match_start_time") or market.get("market_start_time"),
+                "status": "open",
+                "created_at": now_ts,
+                "updated_at": now_ts,
+                "current_price": current_price,
+                "legs": [leg],
+                "behavior_events": [_behavior_event("add", trade)],
+                "wallet_behavior": {
+                    "single_sided": True,
+                    "hedged": False,
+                    "sold_before_resolution": False,
+                    "held_to_resolution": False,
+                    "add_count": 1,
+                    "exit_count": 0,
+                },
+            }
+            if detected_after_start:
+                signal["detected_after_start"] = True
+            open_signals.append(signal)
         stats["new_leg_count"] += 1
     return open_signals, stats
 
@@ -758,6 +781,7 @@ def upsert_follow_signal(
     slippage = evaluate_slippage(qualification["wallet_avg_price"], current_price, max_slippage=max_slippage)
     trigger = {
         "wallet": normalize_wallet(wallet),
+        "category": str(market.get("category") or "esports").lower(),
         "wallet_avg_price": qualification["wallet_avg_price"],
         "position_size": qualification["position_size"],
         "fills_summary": fills_summary,
@@ -784,8 +808,12 @@ def upsert_follow_signal(
             "outcome_index": outcome_index,
             "outcome": qualification.get("outcome"),
             "event_title": market.get("title"),
+            "category": str(market.get("category") or "esports").lower(),
+            "league": market.get("league"),
             "event_slug": market.get("event_slug"),
             "market_question": market.get("question"),
+            "market_type": market.get("market_type"),
+            "market_type_label": market.get("market_type_label"),
             "end_date": market.get("end_date"),
             "match_start_time": market.get("match_start_time") or market.get("market_start_time"),
             "wallet_avg_price": qualification["wallet_avg_price"],
@@ -877,6 +905,25 @@ def aggregate_follow_performance(prev_perf: dict[str, Any], newly_settled: list[
     wallets = dict(prev_perf.get("wallets") or {})
     total = dict(prev_perf.get("total") or {"signals": 0, "wins": 0, "exits": 0, "wallet_pnl": 0.0, "our_pnl": 0.0, "legs": 0})
     groups = dict(prev_perf.get("groups") or {})
+    by_category = {
+        str(category): dict(row)
+        for category, row in (prev_perf.get("by_category") or {}).items()
+        if isinstance(row, dict)
+    }
+
+    def update_category(category: str, result: dict[str, Any], *, won: bool = False, wallet_pnl: float = 0.0, our_pnl: float = 0.0, exited: bool = False) -> None:
+        category = str(category or "esports").lower()
+        row = by_category.setdefault(category, {"signals": 0, "wins": 0, "exits": 0, "wallet_pnl": 0.0, "our_pnl": 0.0, "legs": 0})
+        legs = result.get("legs") or []
+        row["legs"] = to_int(row.get("legs")) + len(legs)
+        row["our_pnl"] = round(to_float(row.get("our_pnl")) + our_pnl, 8)
+        row["wallet_pnl"] = round(to_float(row.get("wallet_pnl")) + wallet_pnl, 8)
+        if exited:
+            row["exits"] = to_int(row.get("exits")) + 1
+        else:
+            row["signals"] = to_int(row.get("signals")) + 1
+            row["wins"] = to_int(row.get("wins")) + (1 if won else 0)
+            row["win_rate"] = round(row["wins"] / row["signals"], 8) if row["signals"] else 0.0
 
     def update_group(name: str, result: dict[str, Any], *, won: bool = False, wallet_pnl: float = 0.0, our_pnl: float = 0.0, exited: bool = False) -> None:
         group = groups.setdefault(
@@ -900,6 +947,7 @@ def aggregate_follow_performance(prev_perf: dict[str, Any], newly_settled: list[
 
     for result in newly_settled:
         group_name = "contested" if result.get("contested") else "clean"
+        category = str(result.get("category") or "esports").lower()
         if result.get("status") == "exited":
             wallet = normalize_wallet(result.get("wallet"))
             if not wallet:
@@ -916,6 +964,7 @@ def aggregate_follow_performance(prev_perf: dict[str, Any], newly_settled: list[
             total["legs"] = to_int(total.get("legs")) + len(legs)
             total["our_pnl"] = round(to_float(total.get("our_pnl")) + to_float(result.get("our_realized_pnl")), 8)
             update_group(group_name, result, our_pnl=to_float(result.get("our_realized_pnl")), exited=True)
+            update_category(category, result, our_pnl=to_float(result.get("our_realized_pnl")), exited=True)
             continue
         won = bool(result.get("outcome_won"))
         our_pnl = to_float(result.get("our_paper_pnl"))
@@ -938,9 +987,17 @@ def aggregate_follow_performance(prev_perf: dict[str, Any], newly_settled: list[
             wallet_pnl=sum(to_float(v) for v in (result.get("wallet_paper_pnl_by_wallet") or {}).values()),
             our_pnl=our_pnl,
         )
+        update_category(
+            category,
+            result,
+            won=won,
+            wallet_pnl=sum(to_float(v) for v in (result.get("wallet_paper_pnl_by_wallet") or {}).values()),
+            our_pnl=our_pnl,
+        )
     return {
         "wallets": wallets,
         "total": total,
+        "by_category": by_category,
         "groups": groups,
         "updated_at": int(datetime.now(timezone.utc).timestamp()),
     }

@@ -10,6 +10,9 @@ CONTROL_FILENAME = "follow_control.json"
 
 
 def follow_control_path(data_dir: Path) -> Path:
+    data_dir = Path(data_dir)
+    if data_dir.name == "follow":
+        return data_dir / CONTROL_FILENAME
     return data_dir / "follow" / CONTROL_FILENAME
 
 

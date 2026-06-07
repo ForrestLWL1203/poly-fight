@@ -8,7 +8,7 @@ from typing import Any, Iterable
 
 
 SECONDS_PER_DAY = 86400
-SCORING_VERSION = 12
+SCORING_VERSION = 13
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 TRADE_BEHAVIOR_EXCLUDE_RATE = 0.5
@@ -17,10 +17,29 @@ TRADE_BEHAVIOR_EXCLUDE_RATE = 0.5
 # closed_positions floors assumed. See review/scoring analysis.
 MIN_A_POSITIVE_MARKET_RATE = 0.63
 MIN_B_POSITIVE_MARKET_RATE = 0.55
+# 技能轴 = capital_weighted_edge（赢钱占比 − 入场价，按资金加权）+ 正 hold PnL。
+# roi 不再硬切（它是赔率结构副产品，会冤枉高胜率买热门的钱包），仅作软 reason。
+ESPORTS_MIN_ROI = 0.20  # 软信号 low_roi 的提示线，不再硬排除
+SPORTS_MIN_ROI = 0.15
+ESPORTS_MIN_A_WILSON = 0.57
+SPORTS_MIN_A_WILSON = 0.50
+ESPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE = 0.08
+SPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE = 0.10
+# actual_minus_hold_pnl_rate 超过此值 = 利润主要靠盘中卖出（我们复制不了）→ 软标记
+SWING_DEPENDENT_RATE = 0.2
 MAIN_MATCH = "main_match"
 GAME_WINNER = "game_winner"
 MAP_WINNER = "map_winner"
 ALLOWED_GAME_FAMILIES = {"cs2", "dota2", "lol"}
+ESPORTS_CATEGORY_TAGS = {
+    "dota-2",
+    "counter-strike-2",
+    "cs2",
+    "league-of-legends",
+}
+SPORTS_LEAGUE_TAGS = {
+    "mlb": "mlb",
+}
 MARKET_TYPE_LABELS = {
     MAIN_MATCH: "主盘",
     GAME_WINNER: "单局",
@@ -31,15 +50,6 @@ MARKET_TYPE_ORDER = {
     GAME_WINNER: 1,
     MAP_WINNER: 2,
 }
-ESPORTS_TAGS = {
-    "esports",
-    "dota-2",
-    "counter-strike-2",
-    "cs2",
-    "league-of-legends",
-    "valorant",
-}
-
 
 def normalize_wallet(wallet: str | None) -> str:
     return (wallet or "").strip().lower()
@@ -102,7 +112,24 @@ def event_tags(event: dict[str, Any]) -> set[str]:
 
 
 def is_esports_event(event: dict[str, Any]) -> bool:
-    return bool(event_tags(event) & ESPORTS_TAGS)
+    return event_category(event) == "esports"
+
+
+def event_category(event: dict[str, Any]) -> str | None:
+    tags = event_tags(event)
+    if tags & ESPORTS_CATEGORY_TAGS:
+        return "esports"
+    if tags & set(SPORTS_LEAGUE_TAGS):
+        return "sports"
+    return None
+
+
+def event_league(event: dict[str, Any]) -> str:
+    tags = event_tags(event)
+    for tag, league in SPORTS_LEAGUE_TAGS.items():
+        if tag in tags:
+            return league
+    return game_family_from_event(event)
 
 
 def game_family_from_event(event: dict[str, Any]) -> str:
@@ -228,6 +255,17 @@ def is_prop_market_question(question: str) -> bool:
         r"\brampage\b",
         r"\bultra kill\b",
         r"\bdaytime\b",
+        r"\binning\b",
+        r"\brun line\b",
+        r"\brunline\b",
+        r"\bfirst to score\b",
+        r"\bstrikeout\b",
+        r"\bstrikeouts\b",
+        r"\bhome run\b",
+        r"\brbi\b",
+        r"\bhit\b",
+        r"\bhits\b",
+        r"\btotal bases\b",
     ]
     return any(re.search(pattern, text) for pattern in prop_patterns)
 
@@ -240,18 +278,26 @@ def is_numbered_winner_question(question_norm: str, prefix: str) -> bool:
 
 
 def classify_market_type(event: dict[str, Any], market: dict[str, Any]) -> str | None:
-    if not is_esports_event(event):
-        return None
-    game_family = game_family_from_event(event)
-    if game_family not in ALLOWED_GAME_FAMILIES:
+    category = event_category(event)
+    if category is None:
         return None
     if not market.get("conditionId") or not is_binary_market(market):
         return None
     question = str(market.get("question") or "")
     question_norm = normalize_market_text(question)
-    event_title_norm = normalize_market_text(event.get("title"))
     if not question_norm or is_prop_market_question(question) or has_prop_like_outcomes(market):
         return None
+    if category == "sports":
+        if event_league(event) != "mlb":
+            return None
+        if not market_outcomes_match_event_teams(event, market):
+            return None
+        return MAIN_MATCH
+
+    game_family = game_family_from_event(event)
+    if game_family not in ALLOWED_GAME_FAMILIES:
+        return None
+    event_title_norm = normalize_market_text(event.get("title"))
     if (question_norm == event_title_norm and is_main_match_title(str(event.get("title") or ""))) or (
         is_main_match_title(question or str(event.get("title") or ""))
         and not re.search(r"\b(game|map)\s+[1-5]\b", question_norm)
@@ -283,8 +329,10 @@ def event_to_market_records(
     *,
     allowed_market_types: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    if not is_esports_event(event):
+    category = event_category(event)
+    if category is None:
         return []
+    league = event_league(event)
     records: dict[str, dict[str, Any]] = {}
     for market in event.get("markets") or []:
         market_type = classify_market_type(event, market)
@@ -308,6 +356,8 @@ def event_to_market_records(
             "liquidity": to_float(market.get("liquidity") or event.get("liquidity")),
             "closed": bool(event.get("closed")),
             "game_family": game_family_from_event(event),
+            "category": category,
+            "league": league,
             "market_type": market_type,
             "market_type_label": MARKET_TYPE_LABELS.get(market_type, market_type),
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -790,6 +840,7 @@ def summarize_closed_positions(
             {
                 "condition_id": condition_id,
                 "market_type": market_type,
+                "pre_match_entry": position.get("preMatchEntry"),
                 "total_bought": total_bought,
                 "cost_basis": cost_basis,
                 "realized_pnl": realized_pnl,
@@ -820,6 +871,8 @@ def summarize_closed_positions(
         low_edge_profits = sum(1 for row in bucket_rows if 0 < row["roi"] <= 0.03)
         condition_ids = sorted({row["condition_id"] for row in bucket_rows})
         winning_cost = sum(row["cost_basis"] for row in bucket_rows if row["realized_pnl"] > 0)
+        pre_match_rows = [row for row in bucket_rows if row.get("pre_match_entry") is not None]
+        pre_match_entry_count = sum(1 for row in pre_match_rows if row.get("pre_match_entry"))
         capital_weighted_entry_price = total_cost / total_bought if total_bought else 0.0
         capital_weighted_win_rate = winning_cost / total_cost if total_cost else 0.0
         entry_price_buckets = {
@@ -881,6 +934,9 @@ def summarize_closed_positions(
         "capital_weighted_entry_price": round(capital_weighted_entry_price, 8),
         "capital_weighted_win_rate": round(capital_weighted_win_rate, 8),
         "capital_weighted_edge": round(capital_weighted_win_rate - capital_weighted_entry_price, 8),
+        "pre_match_entry_count": pre_match_entry_count,
+        "pre_match_entry_market_count": len(pre_match_rows),
+        "pre_match_entry_rate": round(pre_match_entry_count / len(pre_match_rows), 8) if pre_match_rows else None,
         "entry_price_buckets": formatted_buckets,
         "high_price_entry_rate": round(high_price_entries / count, 8) if count else 0.0,
         "low_edge_profit_rate": round(low_edge_profits / count, 8) if count else 0.0,
@@ -939,6 +995,7 @@ def reconstruct_closed_positions(
         sell_size_by_outcome: dict[int, float] = {}
         sell_proceeds_by_outcome: dict[int, float] = {}
         last_ts = 0
+        last_buy_ts = 0
         for trade in market_trades:
             side = str(trade.get("side") or trade.get("type") or "").upper()
             if side not in {"BUY", "SELL"}:
@@ -954,8 +1011,10 @@ def reconstruct_closed_positions(
                 outcome_index = outcomes.index(outcome) if outcome in outcomes else -1
             if outcome_index < 0:
                 continue
-            last_ts = max(last_ts, to_int(trade.get("timestamp")))
+            trade_ts = to_int(trade.get("timestamp"))
+            last_ts = max(last_ts, trade_ts)
             if side == "BUY":
+                last_buy_ts = max(last_buy_ts, trade_ts)
                 buy_size_by_outcome[outcome_index] = buy_size_by_outcome.get(outcome_index, 0.0) + size
                 buy_cost_by_outcome[outcome_index] = buy_cost_by_outcome.get(outcome_index, 0.0) + cash
             elif side == "SELL":
@@ -992,10 +1051,17 @@ def reconstruct_closed_positions(
         actual_minus_hold_pnl = actual_pnl - hold_pnl
         avg_price = buy_cost / total_bought if total_bought > 0 else 0.0
         dominant_outcome = max(buy_size_by_outcome, key=lambda outcome: buy_size_by_outcome[outcome])
+        # Followability: was the wallet's last BUY placed before the match started? None when
+        # the market has no known start time (excluded from the pre_match_entry_rate denom).
+        match_start_dt = parse_dt(record.get("match_start_time") or record.get("market_start_time"))
+        pre_match_entry: bool | None = None
+        if match_start_dt and last_buy_ts > 0:
+            pre_match_entry = last_buy_ts < int(match_start_dt.timestamp())
         positions.append(
             {
                 "conditionId": condition_id,
                 "outcomeIndex": dominant_outcome,
+                "preMatchEntry": pre_match_entry,
                 "totalBought": round(total_bought, 8),
                 "avgPrice": round(avg_price, 8),
                 "realizedPnl": round(hold_pnl, 8),
@@ -1038,6 +1104,8 @@ def summarize_trade_reconstructed_positions(
     material_sell_frac: float = 0.2,
 ) -> dict[str, Any]:
     markets = {str(key).lower(): value for key, value in market_records_by_id.items()}
+    categories = {str(record.get("category") or "") for record in markets.values() if record.get("category")}
+    category = next(iter(categories)) if len(categories) == 1 else None
     positions, behavior_by_market = reconstruct_closed_positions(
         trades,
         markets,
@@ -1097,6 +1165,7 @@ def summarize_trade_reconstructed_positions(
         }
     return {
         **summary,
+        **({"category": category} if category else {}),
         "data_quality": {"source": "trade_reconstruction", "reliable_losses": True},
         "trade_reconstructed_sample_count": summary.get("esports_closed_count", 0),
         "per_type": per_type,
@@ -1222,6 +1291,18 @@ def classify_wallet_bucket(
     median_entry = to_float(summary.get("median_entry_price"))
     wilson_lb = to_float(summary.get("wilson_win_rate_lower_bound"))
     entry_edge = wilson_lb - median_entry if median_entry > 0 else 0.0
+    category = str(summary.get("category") or "").lower()
+    is_sports = category == "sports"
+    min_roi = SPORTS_MIN_ROI if is_sports else ESPORTS_MIN_ROI
+    min_a_wilson = SPORTS_MIN_A_WILSON if is_sports else ESPORTS_MIN_A_WILSON
+    min_a_edge = SPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE if is_sports else ESPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE
+    # capital_weighted_edge is the skill axis for both categories: it credits wallets that
+    # win more (capital-weighted) than their entry price implied, so high-win-rate
+    # favorite-buyers (low roi, negative entry_edge) are no longer wrongly cut.
+    capital_weighted_edge = to_float(summary.get("capital_weighted_edge"))
+    edge_value = capital_weighted_edge
+    weak_edge_reason = "weak_capital_weighted_edge"
+    actual_minus_hold_rate = to_float(summary.get("actual_minus_hold_pnl_rate"))
     bot_score = to_int(summary.get("bot_like_score"))
     sold_before_resolution = to_int(summary.get("sold_before_resolution_market_count"))
     sold_before_resolution_rate = to_float(summary.get("sold_before_resolution_market_rate"))
@@ -1233,18 +1314,11 @@ def classify_wallet_bucket(
 
     if stale:
         reasons.append("stale")
-    if (
-        sold_before_resolution > 0
-        and trade_behavior_markets >= TRADE_BEHAVIOR_MIN_MARKETS
-        and sold_before_resolution_rate > TRADE_BEHAVIOR_EXCLUDE_RATE
-    ):
-        return {
-            **summary,
-            "entry_edge": round(entry_edge, 8),
-            "grade": "excluded",
-            "profile_state": "unqualified",
-            "reasons": ["sold_before_resolution"],
-        }
+    # NOTE: sold_before_resolution is NOT a hard exclude anymore. Under hold-to-settlement
+    # scoring, selling is already handled (profit-takers scored on their hold win,
+    # loss-cutters scored on the full hold loss). A high sold rate alone — e.g. a wallet
+    # that frees capital by selling winners at ~0.99 — is fine. We only soft-flag wallets
+    # whose profit genuinely depends on in-game selling (actual >> hold). See below.
     if (
         two_sided_trades > 0
         and trade_behavior_markets >= TRADE_BEHAVIOR_MIN_MARKETS
@@ -1273,13 +1347,16 @@ def classify_wallet_bucket(
             "profile_state": "unqualified",
             "reasons": ["negative_roi"],
         }
-    if historical_roi < 0.20:
+    # Skill axis: exclude only wallets with no real edge (won no more capital than the
+    # entry price implied). roi is NOT a hard gate — it's a payoff-structure artifact that
+    # penalizes favorite-buyers (high win rate, thin payoff). roi only soft-flags below.
+    if capital_weighted_edge <= 0:
         return {
             **summary,
             "entry_edge": round(entry_edge, 8),
             "grade": "excluded",
             "profile_state": "unqualified",
-            "reasons": ["low_historical_roi"],
+            "reasons": ["no_capital_edge"],
         }
     if count < min_sample:
         reasons.append("thin_sample")
@@ -1289,19 +1366,23 @@ def classify_wallet_bucket(
         reasons.append("weak_entry_price")
     if loss_count > 0:
         reasons.append("has_losses")
-    if wilson_lb < 0.57:
+    if wilson_lb < min_a_wilson:
         reasons.append("weak_wilson")
-    if entry_edge < 0.01:
-        reasons.append("weak_entry_edge")
+    if edge_value < min_a_edge:
+        reasons.append(weak_edge_reason)
     if positive_rate < MIN_A_POSITIVE_MARKET_RATE:
         reasons.append("low_positive_market_rate")
     if median_roi < 0 or positive_rate < 0.5:
         reasons.append("unstable_returns")
+    if historical_roi < min_roi:
+        reasons.append("low_roi")  # soft/informational only — not an exclusion
+    if actual_minus_hold_rate > SWING_DEPENDENT_RATE:
+        reasons.append("swing_dependent")  # profit leans on in-game selling we can't copy
 
     if (
         count >= min_sample
-        and wilson_lb >= 0.57
-        and entry_edge >= 0.01
+        and wilson_lb >= min_a_wilson
+        and edge_value >= min_a_edge
         and pnl > 0
         and positive_rate >= MIN_A_POSITIVE_MARKET_RATE
         and total_bought >= 5_000
@@ -1313,7 +1394,7 @@ def classify_wallet_bucket(
     elif (
         count >= min_sample
         and wilson_lb >= 0.50
-        and entry_edge >= 0.0
+        and edge_value >= 0.0
         and pnl > 0
         and positive_rate >= MIN_B_POSITIVE_MARKET_RATE
         and total_bought >= 1_000
@@ -1349,6 +1430,7 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
         min_sample = 8 if market_type == MAIN_MATCH else 10
         bucket_input = {
             **bucket_summary,
+            "category": summary.get("category", bucket_summary.get("category")),
             "bot_like_score": summary.get("bot_like_score", bucket_summary.get("bot_like_score", 0)),
             "sold_before_resolution_market_count": bucket_summary.get(
                 "sold_before_resolution_market_count",

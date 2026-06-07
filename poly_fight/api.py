@@ -29,6 +29,12 @@ def parse_gamma_datetime(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def format_gamma_datetime(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def parse_retry_after(value: str | None, *, max_seconds: float, now: datetime | None = None) -> float:
     if not value:
         return 0.0
@@ -169,6 +175,7 @@ class PolymarketClient:
         offset: int = 0,
         order: str = "endDate",
         tag_slug: str = "esports",
+        max_end_date: datetime | None = None,
     ) -> list[dict]:
         return self.gamma(
             "/events",
@@ -180,6 +187,7 @@ class PolymarketClient:
             tag_slug=tag_slug,
             order=order,
             ascending="false",
+            end_date_max=format_gamma_datetime(max_end_date),
         )
 
     def list_events_paginated(
@@ -190,7 +198,11 @@ class PolymarketClient:
         max_pages: int = 10,
         order: str = "endDate",
         min_end_date: datetime | None = None,
-        tag_slugs: tuple[str, ...] = ("esports", "dota-2", "counter-strike-2", "league-of-legends", "valorant"),
+        max_end_date: datetime | None = None,
+        # Only the three in-scope games. The broad "esports" umbrella tag also returns
+        # Valorant/MLBB/Overwatch/CoD/etc. (~40% of its pages), so querying the specific
+        # game tags keeps the fetch matched to scope and gives deeper per-game history.
+        tag_slugs: tuple[str, ...] = ("counter-strike-2", "league-of-legends", "dota-2"),
     ) -> list[dict]:
         all_events: list[dict] = []
         limit = 100
@@ -198,14 +210,17 @@ class PolymarketClient:
         min_end_date = min_end_date.astimezone(timezone.utc) if min_end_date else None
         for tag_slug in tag_slugs:
             for page in range(max_pages):
-                batch = self.list_events(
-                    closed=closed,
-                    active=active,
-                    limit=limit,
-                    offset=page * limit,
-                    order=order,
-                    tag_slug=tag_slug,
-                )
+                event_params = {
+                    "closed": closed,
+                    "active": active,
+                    "limit": limit,
+                    "offset": page * limit,
+                    "order": order,
+                    "tag_slug": tag_slug,
+                }
+                if max_end_date is not None:
+                    event_params["max_end_date"] = max_end_date
+                batch = self.list_events(**event_params)
                 if not batch:
                     break
                 for event in batch:

@@ -8,6 +8,8 @@ import json
 import os
 import re
 import signal
+import shutil
+import sqlite3
 import time
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -119,6 +121,215 @@ def build_client(args: argparse.Namespace) -> PolymarketClient:
 
 
 DATA_DIR = Path("data")
+CATEGORY_TAG_SLUGS = {
+    "esports": ("counter-strike-2", "league-of-legends", "dota-2"),
+    "sports": ("mlb",),
+}
+CATEGORY_MARKET_SCOPES = {
+    "esports": "cs-dota-lol-main-game-map-winner-v1",
+    "sports": "mlb-moneyline-v1",
+}
+
+
+def resolve_data_dir(args: argparse.Namespace) -> Path:
+    # Each category lives under its own subdir (data/esports, data/sports) so the two
+    # lines can be integrated later without colliding. Explicit --data-dir always wins.
+    explicit = getattr(args, "data_dir", None)
+    if explicit:
+        return Path(explicit)
+    if getattr(args, "category", None) == "sports":
+        return DATA_DIR / "sports"
+    return DATA_DIR / "esports"
+
+
+def resolve_dashboard_root(args: argparse.Namespace) -> Path:
+    explicit = getattr(args, "data_dir", None)
+    return Path(explicit) if explicit else DATA_DIR
+
+
+def resolve_follow_dir(args: argparse.Namespace, root: Path | None = None) -> Path:
+    explicit = getattr(args, "follow_dir", None)
+    if explicit:
+        return Path(explicit)
+    return (root or DATA_DIR) / "follow"
+
+
+def category_data_dirs(root: Path) -> dict[str, Path]:
+    root = Path(root)
+    return {"esports": root / "esports", "sports": root / "sports"}
+
+
+def read_category_leaderboards(root: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    rows: list[dict[str, Any]] = []
+    mtimes: dict[str, int] = {}
+    for category, data_dir in category_data_dirs(root).items():
+        path = data_dir / "smart_wallet_leaderboard.json"
+        leaderboard = read_json(path, [])
+        mtimes[category] = int(path.stat().st_mtime) if path.exists() else 0
+        for row in leaderboard if isinstance(leaderboard, list) else []:
+            if isinstance(row, dict):
+                rows.append({**row, "category": category})
+    legacy_path = root / "smart_wallet_leaderboard.json"
+    if not rows and legacy_path.exists():
+        legacy = read_json(legacy_path, [])
+        mtimes["esports"] = int(legacy_path.stat().st_mtime)
+        rows.extend({**row, "category": "esports"} for row in legacy if isinstance(row, dict))
+    return rows, mtimes
+
+
+def migrate_category_follow_dbs(root: Path, follow_dir: Path, *, now_ts: int | None = None) -> dict[str, Any]:
+    now_ts = int(now_ts or time.time())
+    follow_dir.mkdir(parents=True, exist_ok=True)
+    target_path = follow_dir / "follow.db"
+    imported: dict[str, int] = {"esports": 0, "sports": 0}
+    sources = {
+        category: data_dir / "follow" / "follow.db"
+        for category, data_dir in category_data_dirs(root).items()
+        if (data_dir / "follow" / "follow.db").exists()
+    }
+    if not sources:
+        return {"migrated": False, "imported": imported, "target": str(target_path)}
+    marker_path = follow_dir / "follow_migration_state.json"
+    source_signature = _follow_migration_source_signature(sources)
+    marker = read_json(marker_path, {})
+    if target_path.exists() and marker.get("sources") == source_signature:
+        return {"migrated": False, "imported": imported, "target": str(target_path), "source": "migration_guard"}
+    target_store = FollowStore(target_path)
+    target_store.init_db()
+    backup_dir = follow_dir / "migration_backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    if target_path.exists():
+        backup = backup_dir / f"follow-{now_ts}.db"
+        if not backup.exists():
+            shutil.copy2(target_path, backup)
+    for category, source_path in sources.items():
+        if source_path.resolve() == target_path.resolve():
+            continue
+        backup = backup_dir / f"{category}-follow-{now_ts}.db"
+        if not backup.exists():
+            shutil.copy2(source_path, backup)
+        imported[category] += _import_follow_db(source_path, target_path, category=category)
+    write_json(marker_path, {"updated_at": now_ts, "sources": source_signature, "imported": imported, "target": str(target_path)})
+    return {"migrated": any(imported.values()), "imported": imported, "target": str(target_path)}
+
+
+def _follow_migration_source_signature(sources: dict[str, Path]) -> dict[str, dict[str, Any]]:
+    signature: dict[str, dict[str, Any]] = {}
+    for category, path in sorted(sources.items()):
+        stat = path.stat()
+        signature[category] = {
+            "path": str(path.resolve()),
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+    return signature
+
+
+def _json_with_category(raw: str | None, category: str, *, wallet: str | None = None) -> str:
+    try:
+        value = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    value.setdefault("category", category)
+    if wallet:
+        value.setdefault("wallet", wallet)
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _import_follow_db(source_path: Path, target_path: Path, *, category: str) -> int:
+    imported = 0
+    source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+    source.row_factory = sqlite3.Row
+    target = sqlite3.connect(target_path)
+    target.row_factory = sqlite3.Row
+    try:
+        source_tables = {str(row["name"]) for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        target.execute("BEGIN")
+        def count_changes() -> int:
+            nonlocal imported
+            changes = int(target.execute("SELECT changes()").fetchone()[0] or 0)
+            imported += changes
+            return changes
+
+        if "wallet_cursors" in source_tables:
+            for row in source.execute("SELECT wallet, last_trade_timestamp, last_trade_id, last_seen_at, raw_json FROM wallet_cursors"):
+                wallet = str(row["wallet"] or "").lower()
+                key = f"{category}:{wallet}"
+                target.execute(
+                    """
+                    INSERT OR IGNORE INTO wallet_cursors(wallet, last_trade_timestamp, last_trade_id, last_seen_at, raw_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (key, row["last_trade_timestamp"], row["last_trade_id"], row["last_seen_at"], _json_with_category(row["raw_json"], category, wallet=wallet)),
+                )
+                count_changes()
+        if "follow_signals" in source_tables:
+            for row in source.execute("SELECT signal_id, status, wallet, condition_id, outcome_index, created_at, updated_at, raw_json FROM follow_signals"):
+                target.execute(
+                    """
+                    INSERT OR IGNORE INTO follow_signals(signal_id, status, wallet, condition_id, outcome_index, created_at, updated_at, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (row["signal_id"], row["status"], row["wallet"], row["condition_id"], row["outcome_index"], row["created_at"], row["updated_at"], _json_with_category(row["raw_json"], category)),
+                )
+                count_changes()
+        if "follow_legs" in source_tables:
+            for row in source.execute("SELECT signal_id, trade_id, wallet, condition_id, leg_at, stake, raw_json FROM follow_legs"):
+                target.execute(
+                    """
+                    INSERT OR IGNORE INTO follow_legs(signal_id, trade_id, wallet, condition_id, leg_at, stake, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (row["signal_id"], row["trade_id"], row["wallet"], row["condition_id"], row["leg_at"], row["stake"], _json_with_category(row["raw_json"], category)),
+                )
+                count_changes()
+        if "follow_behavior_events" in source_tables:
+            for row in source.execute("SELECT signal_id, kind, timestamp, raw_json FROM follow_behavior_events"):
+                raw_json = _json_with_category(row["raw_json"], category)
+                target.execute(
+                    """
+                    INSERT INTO follow_behavior_events(signal_id, kind, timestamp, raw_json)
+                    SELECT ?, ?, ?, ?
+                    WHERE NOT EXISTS (
+                      SELECT 1 FROM follow_behavior_events
+                      WHERE signal_id = ? AND kind = ? AND timestamp = ? AND raw_json = ?
+                    )
+                    """,
+                    (row["signal_id"], row["kind"], row["timestamp"], raw_json, row["signal_id"], row["kind"], row["timestamp"], raw_json),
+                )
+                count_changes()
+        if "follow_results" in source_tables:
+            for row in source.execute("SELECT signal_id, status, wallet, condition_id, resolved_at, raw_json FROM follow_results"):
+                target.execute(
+                    """
+                    INSERT OR IGNORE INTO follow_results(signal_id, status, wallet, condition_id, resolved_at, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (row["signal_id"], row["status"], row["wallet"], row["condition_id"], row["resolved_at"], _json_with_category(row["raw_json"], category)),
+                )
+                count_changes()
+        if "wallet_quarantine" in source_tables:
+            for row in source.execute("SELECT wallet, reason, quarantined_at, raw_json FROM wallet_quarantine"):
+                wallet = str(row["wallet"] or "").lower()
+                key_wallet = wallet if ":" in wallet else f"{category}:{wallet}"
+                target.execute(
+                    """
+                    INSERT OR IGNORE INTO wallet_quarantine(wallet, reason, quarantined_at, raw_json)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (key_wallet, row["reason"], row["quarantined_at"], _json_with_category(row["raw_json"], category, wallet=wallet.split(":", 1)[-1])),
+                )
+                count_changes()
+        target.execute("COMMIT")
+    except Exception:
+        target.execute("ROLLBACK")
+        raise
+    finally:
+        source.close()
+        target.close()
+    return imported
 
 
 def default_log_dir(data_dir: Path) -> Path:
@@ -722,6 +933,18 @@ def backfill_user_trade_submarkets(
     }
 
 
+def empty_user_trade_backfill_summary() -> dict[str, Any]:
+    return {
+        "user_trade_backfill_candidate_count": 0,
+        "user_trade_backfilled_market_count": 0,
+        "user_trade_backfilled_by_market_type": {},
+        "user_trade_backfill_cache_hits": 0,
+        "user_trade_backfill_api_fetches": 0,
+        "user_trade_backfill_api_error_count": 0,
+        "user_trade_backfill_api_error_condition_count": 0,
+    }
+
+
 def observed_performance_quarantine_events(
     performance: dict[str, Any],
     *,
@@ -757,6 +980,22 @@ def market_records_from_events(events: list[dict[str, Any]]) -> dict[str, dict[s
     return records
 
 
+def active_cache_categories(cached: dict[str, Any]) -> set[str]:
+    markets = cached.get("markets") if isinstance(cached, dict) else []
+    if isinstance(markets, dict):
+        rows = markets.values()
+    elif isinstance(markets, list):
+        rows = markets
+    else:
+        rows = []
+    return {str(row.get("category") or "").lower() for row in rows if isinstance(row, dict) and row.get("category")}
+
+
+def active_cache_has_required_categories(cached: dict[str, Any]) -> bool:
+    categories = active_cache_categories(cached)
+    return {"esports", "sports"}.issubset(categories)
+
+
 def load_active_market_cache(
     client: PolymarketClient,
     state: dict[str, Any],
@@ -769,17 +1008,28 @@ def load_active_market_cache(
     legacy_cached = state.pop("active_market_cache", None) or {}
     if cache_path and legacy_cached:
         write_json(cache_path, legacy_cached)
-        if now_ts - int(legacy_cached.get("updated_at") or 0) < ttl_seconds:
+        if now_ts - int(legacy_cached.get("updated_at") or 0) < ttl_seconds and active_cache_has_required_categories(legacy_cached):
             markets = {row["condition_id"]: row for row in legacy_cached.get("markets") or []}
             return markets, state, "legacy_state_cache"
     cached = read_json(cache_path, {}) if cache_path else {}
-    if cached and now_ts - int(cached.get("updated_at") or 0) < ttl_seconds:
+    if cached and now_ts - int(cached.get("updated_at") or 0) < ttl_seconds and active_cache_has_required_categories(cached):
         markets = {row["condition_id"]: row for row in cached.get("markets") or []}
         return markets, state, "cache"
-    events = client.list_events_paginated(closed=False, active=True, max_pages=gamma_pages, order="startTime")
-    markets = market_records_from_events(events)
+    markets: dict[str, dict[str, Any]] = {}
+    fetched_categories: list[str] = []
+    for category, tag_slugs in CATEGORY_TAG_SLUGS.items():
+        events = client.list_events_paginated(
+            closed=False,
+            active=True,
+            max_pages=gamma_pages,
+            order="startTime",
+            tag_slugs=tag_slugs,
+        )
+        markets.update(market_records_from_events(events))
+        fetched_categories.append(category)
     cache_value = {
         "updated_at": now_ts,
+        "categories": fetched_categories,
         "markets": list(markets.values()),
     }
     if cache_path:
@@ -983,7 +1233,7 @@ def _normalize_team_logo_key(value: str) -> str:
 
 def command_refresh_team_logos(args: argparse.Namespace) -> int:
     summary = refresh_team_logo_cache_from_active_markets(
-        Path(args.data_dir),
+        resolve_data_dir(args),
         timeout_seconds=args.logo_timeout_seconds,
         max_workers=args.max_workers,
         max_events=args.max_events,
@@ -998,15 +1248,17 @@ def watched_markets(
     *,
     now_ts: int,
     observe_window_hours: float,
+    post_start_grace_seconds: int = 0,
 ) -> dict[str, dict[str, Any]]:
     window_end = now_ts + int(observe_window_hours * 3600)
+    grace_start = now_ts - max(0, int(post_start_grace_seconds))
     watched = {}
     for condition_id, market in active_markets.items():
         start_dt = parse_dt(market.get("match_start_time") or market.get("market_start_time"))
         if not start_dt:
             continue
         start_ts = int(start_dt.timestamp())
-        if now_ts < start_ts <= window_end:
+        if grace_start <= start_ts <= window_end and (now_ts < start_ts or post_start_grace_seconds > 0):
             watched[condition_id] = market
     return watched
 
@@ -1229,6 +1481,7 @@ def build_leaderboard_from_profiles(
     require_current_scoring_version: bool = False,
     max_leaderboard_wallets: int = 30,
     max_tail_entry_rate: float = 0.34,
+    min_pre_match_entry_rate: float = 0.0,
 ) -> list[dict[str, Any]]:
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
     max_inactive_seconds = max_inactive_days * 86400
@@ -1236,6 +1489,12 @@ def build_leaderboard_from_profiles(
     for profile in profiles_by_wallet.values():
         if require_current_scoring_version and int(profile.get("scoring_version") or 0) != SCORING_VERSION:
             continue
+        # Optional followability filter: drop wallets that mostly buy in-game (their alpha
+        # isn't pre-match copyable). Off by default; only applied when a known rate exists.
+        if min_pre_match_entry_rate > 0:
+            pre_match_rate = profile.get("pre_match_entry_rate")
+            if pre_match_rate is not None and to_float(pre_match_rate) < min_pre_match_entry_rate:
+                continue
         eligible_market_types = profile.get("eligible_market_types") or []
         if profile.get("per_type_grades") is not None and not eligible_market_types:
             continue
@@ -1272,10 +1531,13 @@ def build_leaderboard_from_profiles(
         if not last_trade or now_ts - last_trade > max_inactive_seconds:
             continue
         candidate = profile.get("candidate") or {}
-        if int(candidate.get("participated_market_count") or 0) < min_participated_markets:
+        is_sports_profile = str(profile.get("category") or "").lower() == "sports"
+        effective_min_participated = 1 if is_sports_profile else min_participated_markets
+        if int(candidate.get("participated_market_count") or 0) < effective_min_participated:
             continue
         avg_market_cash = to_float(candidate.get("avg_market_cash") or candidate.get("avg_market_usd"))
-        if avg_market_cash < min_avg_market_cash:
+        effective_min_avg_market_cash = min(min_avg_market_cash, 3_000) if is_sports_profile else min_avg_market_cash
+        if avg_market_cash < effective_min_avg_market_cash:
             continue
         if int(candidate.get("two_sided_market_count") or 0) > 0:
             continue
@@ -1495,24 +1757,29 @@ def make_retryable_profile(candidate: dict[str, Any], exc: Exception, *, now_ts:
 
 
 def command_build_leaderboard(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
-    data_dir = Path(args.data_dir)
+    data_dir = resolve_data_dir(args)
     with acquire_build_lock(data_dir):
         return _command_build_leaderboard_unlocked(args, client=client)
 
 
 def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
     client = client or build_client(args)
-    data_dir = Path(args.data_dir)
+    data_dir = resolve_data_dir(args)
     now_ts = int(datetime.now(timezone.utc).timestamp())
 
     lookback_steps = (args.discovery_lookback_days,) if args.discovery_lookback_days else (7, 14, 30)
     classification_path = data_dir / "esports_classification_set.json"
     classification_meta_path = data_dir / "esports_classification_set.meta.json"
     classification_lookback_days = args.classification_lookback_days
+    category = getattr(args, "category", "esports")
+    tag_slugs = CATEGORY_TAG_SLUGS.get(category, CATEGORY_TAG_SLUGS["esports"])
+    market_scope = CATEGORY_MARKET_SCOPES.get(category, CATEGORY_MARKET_SCOPES["esports"])
     classification_meta = {
+        "category": category,
         "gamma_pages": args.gamma_pages,
         "classification_lookback_days": classification_lookback_days,
-        "market_scope": "cs-dota-lol-main-game-map-winner-v1",
+        "market_scope": market_scope,
+        "tag_slugs": list(tag_slugs),
     }
     classification_source = "api"
     if (
@@ -1539,6 +1806,8 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
             active=None,
             max_pages=args.gamma_pages,
             min_end_date=min_end_date,
+            max_end_date=now_dt,
+            tag_slugs=tag_slugs,
         )
         classification_set = build_classification_set(
             closed_events,
@@ -1725,17 +1994,21 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         wallet, trades = result
         raw_user_trades_by_wallet[normalize_wallet(wallet)] = trades
 
-    backfilled_market_records, backfill_summary = backfill_user_trade_submarkets(
-        client,
-        raw_user_trades_by_wallet,
-        market_records_by_id,
-        data_dir=data_dir,
-        now_ts=now_ts,
-        cache_ttl_days=args.market_trades_cache_ttl_days,
-        force_refresh=args.refresh_market_trades,
-        use_cache=not args.no_market_trades_cache,
-        max_workers=args.max_workers,
-    )
+    if category == "esports":
+        backfilled_market_records, backfill_summary = backfill_user_trade_submarkets(
+            client,
+            raw_user_trades_by_wallet,
+            market_records_by_id,
+            data_dir=data_dir,
+            now_ts=now_ts,
+            cache_ttl_days=args.market_trades_cache_ttl_days,
+            force_refresh=args.refresh_market_trades,
+            use_cache=not args.no_market_trades_cache,
+            max_workers=args.max_workers,
+        )
+    else:
+        backfilled_market_records = {}
+        backfill_summary = empty_user_trade_backfill_summary()
     if backfilled_market_records:
         market_records_by_id = {**market_records_by_id, **backfilled_market_records}
         condition_type_by_id = {
@@ -1812,6 +2085,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         require_tail_entry_field=True,
         require_current_scoring_version=True,
         max_leaderboard_wallets=args.max_leaderboard_wallets,
+        min_pre_match_entry_rate=getattr(args, "min_pre_match_entry_rate", 0.0),
     )
     overlap_report = build_wallet_overlap_report(leaderboard)
     profiles_by_wallet = prune_profile_store(
@@ -1824,6 +2098,8 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
     write_json(data_dir / "leaderboard_wallet_overlap.json", overlap_report)
 
     summary = {
+        "category": category,
+        "market_scope": market_scope,
         "classification_market_count": len(classification_set),
         "classification_source": classification_source,
         "discovery_market_count": len(discovery_slate),
@@ -1844,8 +2120,9 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
     write_json(data_dir / "build_summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
     print()
+    category_label = "sports/mlb" if category == "sports" else "esports"
     print("搜集完成")
-    print(f"- 历史 esports 胜负市场: {summary['classification_market_count']}")
+    print(f"- 历史 {category_label} 胜负市场: {summary['classification_market_count']}")
     print(f"- 本轮发现市场: {summary['discovery_market_count']}")
     print(f"- 候选钱包: {summary['candidate_wallet_count']}")
     print(f"- 通过快速过滤的钱包: {summary['profile_candidate_wallet_count']}")
@@ -1856,7 +2133,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
 
 
 def command_rescore_wallets(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
-    data_dir = Path(args.data_dir)
+    data_dir = resolve_data_dir(args)
     with acquire_build_lock(data_dir):
         return _rescore_tracked_wallets_unlocked(args, client=client)
 
@@ -1869,7 +2146,7 @@ def _rescore_tracked_wallets_unlocked(args: argparse.Namespace, client: Polymark
     summary, re-classifies, and rewrites the leaderboard. Used between the 24h full
     rebuilds so followed wallets' records stay near-real-time.
     """
-    data_dir = Path(args.data_dir)
+    data_dir = resolve_data_dir(args)
     now_ts = int(datetime.now(timezone.utc).timestamp())
 
     leaderboard_in = read_json(data_dir / "smart_wallet_leaderboard.json", [])
@@ -2007,6 +2284,7 @@ def _rescore_tracked_wallets_unlocked(args: argparse.Namespace, client: Polymark
         require_tail_entry_field=True,
         require_current_scoring_version=True,
         max_leaderboard_wallets=args.max_leaderboard_wallets,
+        min_pre_match_entry_rate=getattr(args, "min_pre_match_entry_rate", 0.0),
     )
     overlap_report = build_wallet_overlap_report(leaderboard)
     write_json(data_dir / "wallet_profiles.json", list(profiles_by_wallet.values()))
@@ -2055,7 +2333,7 @@ def find_active_market(client: PolymarketClient, args: argparse.Namespace) -> di
 
 def command_analyze_event(args: argparse.Namespace) -> int:
     client = build_client(args)
-    data_dir = Path(args.data_dir)
+    data_dir = resolve_data_dir(args)
     leaderboard_rows = read_json(data_dir / "smart_wallet_leaderboard.json", [])
     leaderboard = {normalize_wallet(row.get("wallet")): row for row in leaderboard_rows}
 
@@ -2094,8 +2372,8 @@ def command_follow(
     if args.execution_mode != "paper":
         raise SystemExit("Only paper execution mode is implemented.")
     client = client or build_client(args)
-    data_dir = Path(args.data_dir)
-    follow_dir = data_dir / "follow"
+    data_dir = resolve_dashboard_root(args)
+    follow_dir = resolve_follow_dir(args, data_dir)
     now_ts = int(datetime.now(timezone.utc).timestamp())
 
     state_path = follow_dir / "follow_state.json"
@@ -2104,6 +2382,7 @@ def command_follow(
     results_path = follow_dir / "follow_results.jsonl"
     run_log_path = follow_run_log_path(data_dir, getattr(args, "log_dir", None))
     active_cache_path = follow_dir / "active_market_cache.json"
+    migration_summary = migrate_category_follow_dbs(data_dir, follow_dir, now_ts=now_ts)
     store = FollowStore(follow_dir / "follow.db")
     store.import_legacy_json(
         state_path=state_path,
@@ -2111,12 +2390,16 @@ def command_follow(
         results_path=results_path,
         perf_path=perf_path,
     )
-    leaderboard_path = data_dir / "smart_wallet_leaderboard.json"
-    leaderboard_rows = read_json(leaderboard_path, [])
-    leaderboard_wallets = {normalize_wallet(row.get("wallet")) for row in leaderboard_rows if normalize_wallet(row.get("wallet"))}
-    leaderboard_validated_at = int(leaderboard_path.stat().st_mtime) if leaderboard_path.exists() else 0
+    leaderboard_rows, leaderboard_mtimes = read_category_leaderboards(data_dir)
+    leaderboard_wallets = {
+        f"{str(row.get('category') or 'esports').lower()}:{normalize_wallet(row.get('wallet'))}"
+        for row in leaderboard_rows
+        if normalize_wallet(row.get("wallet"))
+    }
+    leaderboard_validated_at = max(leaderboard_mtimes.values() or [0])
     store.clear_revalidated_quarantine(leaderboard_wallets, validated_at=leaderboard_validated_at)
-    quarantined_wallets = set(store.load_wallet_quarantine())
+    quarantine_rows = store.load_wallet_quarantine()
+    quarantined_wallets = set(quarantine_rows)
     eligible_wallet_rows = eligible_follow_wallets(
         leaderboard_rows,
         now_ts=now_ts,
@@ -2126,7 +2409,7 @@ def command_follow(
 
     state = read_json(state_path, {"wallet_trade_state": {}})
     eligible_market_types_by_wallet = {
-        row["wallet"]: {str(value) for value in (row.get("eligible_market_types") or []) if value}
+        f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}": {str(value) for value in (row.get("eligible_market_types") or []) if value}
         for row in eligible_wallet_rows
     }
     wallet_trade_state = store.load_wallet_trade_state()
@@ -2137,14 +2420,24 @@ def command_follow(
         if (signal.get("status") or "open") != "open":
             continue
         wallet = normalize_wallet(signal.get("wallet"))
+        category = str(signal.get("category") or "esports").lower()
+        scope_key = f"{category}:{wallet}"
         condition_id = str(signal.get("condition_id") or "").lower()
         if wallet and condition_id:
-            open_condition_ids_by_wallet.setdefault(wallet, set()).add(condition_id)
-    eligible_wallet_set = {row["wallet"] for row in eligible_wallet_rows}
+            open_condition_ids_by_wallet.setdefault(scope_key, set()).add(condition_id)
+    eligible_wallet_set = {f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}" for row in eligible_wallet_rows}
     lifecycle_wallets = sorted(set(open_condition_ids_by_wallet) - eligible_wallet_set)
     follow_wallets = [
-        *eligible_wallet_rows,
-        *({"wallet": wallet, "follow_scope": "open_signals"} for wallet in lifecycle_wallets),
+        *({**row, "scope_key": f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}"} for row in eligible_wallet_rows),
+        *(
+            {
+                "wallet": wallet.split(":", 1)[1],
+                "category": wallet.split(":", 1)[0],
+                "scope_key": wallet,
+                "follow_scope": "open_signals",
+            }
+            for wallet in lifecycle_wallets
+        ),
     ]
 
     active_markets, state, active_source = load_active_market_cache(
@@ -2170,6 +2463,7 @@ def command_follow(
         active_markets,
         now_ts=now_ts,
         observe_window_hours=args.observe_window_hours,
+        post_start_grace_seconds=args.post_start_trade_grace_seconds,
     )
     gate_open = bool(watched or open_signals)
     next_interval = desired_tick_interval(
@@ -2209,7 +2503,8 @@ def command_follow(
     if gate_open and follow_wallets:
         def fetch_trades_for_wallet(row: dict[str, Any]) -> tuple[str, list[dict], list[dict]]:
             wallet = normalize_wallet(row.get("wallet"))
-            previous_cursor = (wallet_trade_state.get(wallet) or {}).get("last_trade_cursor")
+            scope_key = str(row.get("scope_key") or f"{str(row.get('category') or 'esports').lower()}:{wallet}")
+            previous_cursor = (wallet_trade_state.get(scope_key) or wallet_trade_state.get(wallet) or {}).get("last_trade_cursor")
             try:
                 trades = fetch_user_trades_until_cursor(
                     client,
@@ -2219,11 +2514,11 @@ def command_follow(
                     max_pages=args.user_trades_max_pages,
                 )
                 positions = []
-                if wallet in eligible_wallet_set and previous_cursor is None and args.bootstrap_current_positions:
+                if scope_key in eligible_wallet_set and previous_cursor is None and args.bootstrap_current_positions:
                     positions = client.positions(wallet, limit=args.positions_limit)
-                return wallet, trades, positions
+                return scope_key, trades, positions
             except Exception:
-                return wallet, [], []
+                return scope_key, [], []
 
         trade_results = run_ordered_io_tasks(
             follow_wallets,
@@ -2234,9 +2529,10 @@ def command_follow(
         for result in trade_results:
             if isinstance(result, Exception):
                 continue
-            wallet, trades, positions = result
-            wallet_can_open_new = wallet in eligible_wallet_set
-            previous_cursor = (wallet_trade_state.get(wallet) or {}).get("last_trade_cursor")
+            scope_key, trades, positions = result
+            category, wallet = scope_key.split(":", 1)
+            wallet_can_open_new = scope_key in eligible_wallet_set
+            previous_cursor = (wallet_trade_state.get(scope_key) or wallet_trade_state.get(wallet) or {}).get("last_trade_cursor")
             new_trades, next_cursor, cold_start = select_new_trades(trades, previous_cursor)
             if cold_start:
                 cold_start_wallet_count += 1
@@ -2249,7 +2545,8 @@ def command_follow(
                         markets_by_condition=watched,
                         now_ts=now_ts,
                         max_slippage=args.max_slippage_over_entry,
-                        eligible_market_types=eligible_market_types_by_wallet.get(wallet),
+                        eligible_market_types=eligible_market_types_by_wallet.get(scope_key),
+                        eligible_category=category,
                         require_pre_match=args.require_pre_match,
                     )
                     before_ids = {signal.get("signal_id") for signal in open_signals}
@@ -2263,8 +2560,10 @@ def command_follow(
                         max_follow_legs=args.max_follow_legs,
                         max_slippage=args.max_slippage_over_entry,
                         require_pre_match=args.require_pre_match,
+                        post_start_grace_seconds=args.post_start_trade_grace_seconds,
                         quarantine_sell_frac=args.quarantine_sell_frac,
-                        eligible_market_types=eligible_market_types_by_wallet.get(wallet),
+                        eligible_market_types=eligible_market_types_by_wallet.get(scope_key),
+                        eligible_category=category,
                         conflict_policy=args.conflict_policy,
                         mirror_wallet_sells=args.mirror_wallet_sells,
                     )
@@ -2272,16 +2571,18 @@ def command_follow(
                     new_signal_count += len(after_ids - before_ids)
                     bootstrap_position_count += len(bootstrap_trades)
                     for event in stats.get("quarantine_events") or []:
-                        store.upsert_wallet_quarantine(event.get("wallet"), reason=str(event.get("reason") or ""), ts=int(event.get("timestamp") or now_ts))
+                        store.upsert_wallet_quarantine(event.get("wallet"), reason=str(event.get("reason") or ""), ts=int(event.get("timestamp") or now_ts), category=str(event.get("category") or category))
                         quarantine_event_count += 1
                     market_type_not_eligible_count += stats.get("market_type_not_eligible_count", 0)
                     ignored_trade_count += stats.get("ignored_trade_count", 0)
                     exited_signal_count += stats.get("exited_signal_count", 0)
                     hedge_event_count += stats.get("hedge_event_count", 0)
                     opposite_blocked_count += stats.get("opposite_blocked_count", 0)
-                wallet_trade_state[wallet] = {
+                wallet_trade_state[scope_key] = {
                     "last_trade_cursor": next_cursor,
                     "last_seen_at": now_ts,
+                    "wallet": wallet,
+                    "category": category,
                 }
                 continue
             tracked_condition_ids = {str(condition_id).lower() for condition_id in watched}
@@ -2294,7 +2595,7 @@ def command_follow(
             if wallet_can_open_new:
                 wallet_tracked_condition_ids = tracked_condition_ids
             else:
-                wallet_tracked_condition_ids = open_condition_ids_by_wallet.get(wallet, set())
+                wallet_tracked_condition_ids = open_condition_ids_by_wallet.get(scope_key, set())
             watched_trades = [trade for trade in new_trades if trade_condition_id(trade) in wallet_tracked_condition_ids]
             before_ids = {signal.get("signal_id") for signal in open_signals}
             open_signals, stats = process_follow_trades(
@@ -2307,8 +2608,10 @@ def command_follow(
                 max_follow_legs=args.max_follow_legs,
                 max_slippage=args.max_slippage_over_entry,
                 require_pre_match=args.require_pre_match,
+                post_start_grace_seconds=args.post_start_trade_grace_seconds,
                 quarantine_sell_frac=args.quarantine_sell_frac,
-                eligible_market_types=eligible_market_types_by_wallet.get(wallet) if wallet_can_open_new else None,
+                eligible_market_types=eligible_market_types_by_wallet.get(scope_key) if wallet_can_open_new else None,
+                eligible_category=category if wallet_can_open_new else None,
                 conflict_policy=args.conflict_policy,
                 mirror_wallet_sells=args.mirror_wallet_sells,
             )
@@ -2322,11 +2625,13 @@ def command_follow(
             hedge_event_count += stats.get("hedge_event_count", 0)
             opposite_blocked_count += stats.get("opposite_blocked_count", 0)
             for event in stats.get("quarantine_events") or []:
-                store.upsert_wallet_quarantine(event.get("wallet"), reason=str(event.get("reason") or ""), ts=int(event.get("timestamp") or now_ts))
+                store.upsert_wallet_quarantine(event.get("wallet"), reason=str(event.get("reason") or ""), ts=int(event.get("timestamp") or now_ts), category=str(event.get("category") or category))
                 quarantine_event_count += 1
-            wallet_trade_state[wallet] = {
+            wallet_trade_state[scope_key] = {
                 "last_trade_cursor": next_cursor,
                 "last_seen_at": now_ts,
+                "wallet": wallet,
+                "category": category,
             }
 
     state["wallet_trade_state"] = wallet_trade_state
@@ -2358,10 +2663,12 @@ def command_follow(
         performance = aggregate_follow_performance(performance, [])
     existing_quarantine = set(store.load_wallet_quarantine())
     for event in observed_performance_quarantine_events(performance, now_ts=now_ts):
-        if event["wallet"] in existing_quarantine:
+        category = str(event.get("category") or "esports").lower()
+        key = f"{category}:{event['wallet']}"
+        if key in existing_quarantine:
             continue
-        store.upsert_wallet_quarantine(event["wallet"], reason=event["reason"], ts=int(event["timestamp"]))
-        existing_quarantine.add(event["wallet"])
+        store.upsert_wallet_quarantine(event["wallet"], reason=event["reason"], ts=int(event["timestamp"]), category=category)
+        existing_quarantine.add(key)
         quarantine_event_count += 1
 
     run_log_row = {
@@ -2391,6 +2698,15 @@ def command_follow(
         "open_signal_count": len(open_signals),
         "settled_signal_count": len(settled),
         "desired_next_interval_seconds": next_interval,
+        "migration": migration_summary,
+        "by_category": {
+            category: {
+                "eligible_follow_wallet_count": sum(1 for row in eligible_wallet_rows if str(row.get("category") or "esports").lower() == category),
+                "watched_market_count": sum(1 for market in watched.values() if str(market.get("category") or "esports").lower() == category),
+                "open_signal_count": sum(1 for signal in open_signals if str(signal.get("category") or "esports").lower() == category),
+            }
+            for category in ("esports", "sports")
+        },
     }
     run_log_rows = read_jsonl(run_log_path)
     from .follow import prune_jsonl
@@ -2431,6 +2747,16 @@ def command_run(args: argparse.Namespace) -> int:
     tick_count = 0
     first_error_at: float | None = None
     stop_requested = {"value": False, "reason": ""}
+    collection_root = resolve_dashboard_root(args)
+
+    def category_args(category: str) -> argparse.Namespace:
+        return argparse.Namespace(
+            **{
+                **vars(args),
+                "category": category,
+                "data_dir": str(category_data_dirs(collection_root)[category]),
+            }
+        )
 
     def request_stop(signum, _frame) -> None:
         stop_requested["value"] = True
@@ -2451,7 +2777,8 @@ def command_run(args: argparse.Namespace) -> int:
         nonlocal last_build_at, last_rescore_at
         now_ts = int(datetime.now(timezone.utc).timestamp())
         if force or now_ts - last_build_at >= int(args.pool_refresh_hours * 3600):
-            command_build_leaderboard(args, client=client)
+            for category in category_data_dirs(collection_root):
+                command_build_leaderboard(category_args(category), client=client)
             now_done = int(datetime.now(timezone.utc).timestamp())
             last_build_at = now_done
             last_rescore_at = now_done  # full build already re-scored everyone
@@ -2465,7 +2792,8 @@ def command_run(args: argparse.Namespace) -> int:
             return
         now_ts = int(datetime.now(timezone.utc).timestamp())
         if now_ts - last_rescore_at >= interval:
-            command_rescore_wallets(args, client=client)
+            for category in category_data_dirs(collection_root):
+                command_rescore_wallets(category_args(category), client=client)
             last_rescore_at = int(datetime.now(timezone.utc).timestamp())
 
     try:
@@ -2549,7 +2877,8 @@ def command_serve(args: argparse.Namespace) -> int:
     password = os.environ.get("POLY_FIGHT_DASH_PASSWORD", "")
     cookie_secret = os.environ.get("POLY_FIGHT_DASH_COOKIE_SECRET", "")
     config = DashboardConfig(
-        data_dir=Path(args.data_dir),
+        data_dir=resolve_dashboard_root(args),
+        follow_dir=resolve_follow_dir(args, resolve_dashboard_root(args)),
         log_dir=Path(args.log_dir) if args.log_dir else None,
         host=args.host,
         port=args.port,
@@ -2567,7 +2896,7 @@ def command_serve(args: argparse.Namespace) -> int:
     )
     server = create_server(config)
     host, port = server.server_address[:2]
-    print(f"dashboard listening on http://{host}:{port} data_dir={args.data_dir}", flush=True)
+    print(f"dashboard listening on http://{host}:{port} data_dir={config.data_dir}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -2580,12 +2909,14 @@ def command_serve(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Polymarket esports smart-wallet analysis")
-    parser.add_argument("--data-dir", default=str(DATA_DIR))
+    parser.add_argument("--data-dir", default=None)
     parser.add_argument("--log-dir")
     parser.add_argument("--timeout", type=int, default=30)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    def add_build_arguments(subparser: argparse.ArgumentParser) -> None:
+    def add_build_arguments(subparser: argparse.ArgumentParser, *, include_category: bool = False) -> None:
+        if include_category:
+            subparser.add_argument("--category", choices=["esports", "sports"], default="esports")
         subparser.add_argument("--gamma-pages", type=int, default=10)
         subparser.add_argument("--refresh-classification", action="store_true")
         subparser.add_argument("--classification-cache-ttl-hours", type=int, default=24)
@@ -2636,6 +2967,9 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--leaderboard-min-participated-markets", type=int, default=3)
         subparser.add_argument("--leaderboard-min-avg-market-cash", type=float, default=1_500)
         subparser.add_argument("--max-leaderboard-wallets", type=int, default=30)
+        # Soft followability filter: require this fraction of pre-match (before kickoff)
+        # entries. 0 = off (default). Useful for sports where some alpha is in-game.
+        subparser.add_argument("--min-pre-match-entry-rate", type=float, default=0.0)
         subparser.add_argument("--allow-dirty-profile-candidates", action="store_true")
         subparser.add_argument("--check-current-positions", action="store_true")
         subparser.add_argument("--profile-refresh-ttl-days", type=int, default=7)
@@ -2643,6 +2977,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.set_defaults(func=command_build_leaderboard)
 
     def add_follow_arguments(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument("--follow-dir")
         subparser.add_argument("--stake-usdc", type=float, required=True)
         subparser.add_argument("--follow-recency-days", type=int, default=30)
         subparser.add_argument("--event-gate-horizon-hours", type=float, default=24)
@@ -2651,6 +2986,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
         subparser.add_argument("--resolution-gamma-pages", type=int, default=2)
         subparser.add_argument("--max-slippage-over-entry", type=float, default=0.05)
+        subparser.add_argument("--post-start-trade-grace-seconds", type=int, default=900)
         subparser.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=True)
         subparser.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
         subparser.add_argument("--execution-mode", choices=["paper", "live"], default="paper")
@@ -2677,10 +3013,10 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--max-retry-after-seconds", type=float, default=60)
 
     build = subparsers.add_parser("build-leaderboard")
-    add_build_arguments(build)
+    add_build_arguments(build, include_category=True)
 
     collect = subparsers.add_parser("collect", help="one-shot wallet collection and leaderboard build")
-    add_build_arguments(collect)
+    add_build_arguments(collect, include_category=True)
 
     rescore = subparsers.add_parser(
         "rescore-wallets",
@@ -2709,6 +3045,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="run paper follow loop with scheduled pool refresh")
     add_build_arguments(run)
+    run.add_argument("--follow-dir")
     run.add_argument("--stake-usdc", type=float, required=True)
     run.add_argument("--follow-recency-days", type=int, default=30)
     run.add_argument("--event-gate-horizon-hours", type=float, default=24)
@@ -2717,6 +3054,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
     run.add_argument("--resolution-gamma-pages", type=int, default=2)
     run.add_argument("--max-slippage-over-entry", type=float, default=0.05)
+    run.add_argument("--post-start-trade-grace-seconds", type=int, default=900)
     run.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=True)
     run.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
     run.add_argument("--execution-mode", choices=["paper", "live"], default="paper")
@@ -2758,6 +3096,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--stream-poll-seconds", type=float, default=2.0)
     serve.add_argument("--stream-heartbeat-seconds", type=float, default=15.0)
     serve.add_argument("--max-stream-clients", type=int, default=8)
+    serve.add_argument("--follow-dir")
     serve.set_defaults(func=command_serve)
     return parser
 

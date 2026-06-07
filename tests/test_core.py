@@ -5,6 +5,7 @@ import http.client
 import json
 from io import BytesIO, StringIO
 from pathlib import Path
+import sqlite3
 import sys
 from tempfile import TemporaryDirectory
 import threading
@@ -23,6 +24,7 @@ from poly_fight.dashboard import (
     build_overview,
     build_runner_status,
     build_wallet_follow_detail,
+    category_data_dirs,
     fetch_market_prices,
     read_stream_signal,
     build_wallet_refresh_status,
@@ -30,9 +32,11 @@ from poly_fight.dashboard import (
     DashboardConfig,
     create_server,
     make_session_token,
+    reset_dashboard_data,
     short_addr,
     start_runner,
     stop_runner,
+    start_wallet_refresh,
     stream_dirty_flags,
     StreamSignal,
     verify_session_token,
@@ -49,6 +53,7 @@ from poly_fight.cli import (
     backfill_user_trade_submarkets,
     command_build_leaderboard,
     _rescore_tracked_wallets_unlocked,
+    _command_build_leaderboard_unlocked,
     command_follow,
     fetch_resolutions_for_open_signals,
     fetch_recent_esports_closed_positions_for_wallet,
@@ -60,12 +65,14 @@ from poly_fight.cli import (
     load_active_market_cache,
     merge_cached_profile_with_candidate,
     merge_profiles_with_candidates,
+    migrate_category_follow_dbs,
     observed_performance_quarantine_events,
     prune_profile_store,
     refresh_team_logo_cache_from_active_markets,
     refresh_open_signal_fills,
     read_json,
     read_jsonl,
+    resolve_data_dir,
     should_refresh_file_cache,
     should_use_cached_profile,
     watched_markets,
@@ -81,6 +88,8 @@ from poly_fight.core import (
     build_discovery_slate,
     classify_market_type,
     classify_wallet,
+    event_category,
+    event_league,
     event_to_market_record,
     event_to_market_records,
     normalize_wallet,
@@ -135,6 +144,100 @@ def market_with_end(condition_id, end_ts):
 
 
 class CoreTest(unittest.TestCase):
+    def test_collect_sports_defaults_to_isolated_data_dir(self):
+        parser = build_parser()
+
+        sports_args = parser.parse_args(["collect", "--category", "sports"])
+        esports_args = parser.parse_args(["collect"])
+        follow_args = parser.parse_args(["follow", "--stake-usdc", "1"])
+        explicit_args = parser.parse_args(["--data-dir", "custom_dir", "collect", "--category", "sports"])
+
+        self.assertEqual(sports_args.data_dir, None)
+        self.assertEqual(resolve_data_dir(sports_args), Path("data/sports"))
+        self.assertEqual(resolve_data_dir(esports_args), Path("data/esports"))
+        self.assertEqual(resolve_data_dir(follow_args), Path("data/esports"))
+        self.assertEqual(resolve_data_dir(explicit_args), Path("custom_dir"))
+
+    def test_category_data_dirs_use_fixed_dashboard_root_mapping(self):
+        root = Path("/tmp/poly-data")
+
+        self.assertEqual(
+            category_data_dirs(root),
+            {"esports": root / "esports", "sports": root / "sports"},
+        )
+
+    def test_event_category_and_league_identify_mlb_and_in_scope_esports(self):
+        mlb_event = {"title": "New York Mets vs. San Diego Padres", "tags": [{"slug": "mlb"}]}
+        cs_event = {"title": "Counter-Strike: A vs B (BO3)", "tags": [{"slug": "counter-strike-2"}]}
+        valorant_event = {"title": "Valorant: A vs B (BO3)", "tags": [{"slug": "valorant"}]}
+
+        self.assertEqual(event_category(mlb_event), "sports")
+        self.assertEqual(event_league(mlb_event), "mlb")
+        self.assertEqual(event_category(cs_event), "esports")
+        self.assertEqual(event_league(cs_event), "cs2")
+        self.assertIsNone(event_category(valorant_event))
+        self.assertEqual(event_league(valorant_event), "other")
+
+    def test_mlb_moneyline_is_main_match_and_records_category(self):
+        event = {
+            "id": "e1",
+            "slug": "mlb-nym-sd-2026-06-06",
+            "title": "New York Mets vs. San Diego Padres",
+            "closed": True,
+            "endDate": "2026-06-06T23:00:00Z",
+            "tags": [{"slug": "mlb"}],
+            "markets": [
+                {
+                    "conditionId": "moneyline",
+                    "question": "New York Mets vs. San Diego Padres",
+                    "outcomes": '["New York Mets","San Diego Padres"]',
+                    "outcomePrices": '["0","1"]',
+                    "volume": "1005821.89",
+                }
+            ],
+        }
+
+        records = event_to_market_records(event)
+
+        self.assertEqual(classify_market_type(event, event["markets"][0]), "main_match")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["condition_id"], "moneyline")
+        self.assertEqual(records[0]["category"], "sports")
+        self.assertEqual(records[0]["league"], "mlb")
+        self.assertEqual(records[0]["market_type"], "main_match")
+
+    def test_mlb_classifier_rejects_spread_totals_props_and_futures(self):
+        event = {
+            "title": "Los Angeles Angels vs. Los Angeles Dodgers",
+            "tags": [{"slug": "mlb"}],
+        }
+        spread = {
+            "conditionId": "spread",
+            "question": "Spread: Los Angeles Dodgers (-5.5)",
+            "outcomes": '["Los Angeles Dodgers","Los Angeles Angels"]',
+        }
+        total = {
+            "conditionId": "total",
+            "question": "Los Angeles Angels vs. Los Angeles Dodgers: O/U 12.5",
+            "outcomes": '["Over","Under"]',
+        }
+        first_inning = {
+            "conditionId": "first",
+            "question": "Will there be a run scored in the first inning?: Los Angeles Angels vs. Los Angeles Dodgers",
+            "outcomes": '["Yes","No"]',
+        }
+        future_event = {"title": "Next Dodgers head coach", "tags": [{"slug": "mlb"}]}
+        future = {
+            "conditionId": "coach",
+            "question": "Will Steve Kerr be the next Dodgers head coach?",
+            "outcomes": '["Yes","No"]',
+        }
+
+        self.assertIsNone(classify_market_type(event, spread))
+        self.assertIsNone(classify_market_type(event, total))
+        self.assertIsNone(classify_market_type(event, first_inning))
+        self.assertIsNone(classify_market_type(future_event, future))
+
     def test_market_record_keeps_real_match_start_time(self):
         event = {
             "id": "e1",
@@ -387,6 +490,34 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(rows[-1]["id"], "old-99")
         self.assertEqual(len(rows), 200)
         self.assertEqual(calls, [0, 100])
+
+    def test_event_pagination_passes_max_end_date_filter(self):
+        calls = []
+        max_end_date = datetime(2026, 6, 7, tzinfo=timezone.utc)
+
+        class Client(PolymarketClient):
+            def list_events(
+                self,
+                *,
+                closed,
+                active=None,
+                limit=100,
+                offset=0,
+                order="endDate",
+                tag_slug="esports",
+                max_end_date=None,
+            ):
+                calls.append(max_end_date)
+                return []
+
+        Client().list_events_paginated(
+            closed=True,
+            max_pages=1,
+            max_end_date=max_end_date,
+            tag_slugs=("mlb",),
+        )
+
+        self.assertEqual(calls, [max_end_date])
 
     def test_classification_set_keeps_only_settled_historical_main_matches(self):
         def esports_event(condition_id, end_date, title="Dota 2: A vs B", prices='["1","0"]'):
@@ -895,7 +1026,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(summary["wilson_z"], 1.28)
         self.assertAlmostEqual(summary["wilson_win_rate_lower_bound"], 0.68063869)
 
-    def test_low_edge_profit_rate_is_excluded_by_roi_floor(self):
+    def test_thin_edge_high_price_wallet_is_not_a_grade(self):
+        # Bought at 0.98 with razor-thin profit → tiny capital_weighted_edge (~0.02).
+        # Not excluded (edge > 0) but well below the A edge floor → graded down, roi soft.
         positions = [
             {"conditionId": f"m{i}", "totalBought": 100, "realizedPnl": 2, "avgPrice": 0.98, "timestamp": 100 + i}
             for i in range(20)
@@ -907,8 +1040,9 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(rated["low_edge_profit_rate"], 1.0)
         self.assertEqual(rated["high_price_entry_rate"], 1.0)
-        self.assertEqual(rated["grade"], "excluded")
-        self.assertIn("low_historical_roi", rated["reasons"])
+        self.assertNotEqual(rated["grade"], "A")
+        self.assertIn("low_roi", rated["reasons"])
+        self.assertNotIn("low_historical_roi", rated["reasons"])
 
     def test_wallet_rating_rejects_high_roi_without_stability(self):
         summary = {
@@ -919,6 +1053,7 @@ class CoreTest(unittest.TestCase):
             "esports_loss_count": 11,
             "esports_total_bought": 10_000,
             "median_entry_price": 0.55,
+            "capital_weighted_edge": 0.05,
             "last_esports_trade_at": 100,
             "bot_like_score": 10,
         }
@@ -938,6 +1073,7 @@ class CoreTest(unittest.TestCase):
             "esports_loss_count": 0,
             "esports_total_bought": 5_000,
             "median_entry_price": 0.55,
+            "capital_weighted_edge": 0.10,
             "last_esports_trade_at": 100,
             "bot_like_score": 0,
         }
@@ -957,6 +1093,7 @@ class CoreTest(unittest.TestCase):
             "esports_loss_count": 2,
             "esports_total_bought": 155_000,
             "median_entry_price": 0.51,
+            "capital_weighted_edge": 0.30,
             "last_esports_trade_at": 100,
             "bot_like_score": 0,
         }
@@ -978,6 +1115,7 @@ class CoreTest(unittest.TestCase):
             "esports_total_bought": 100_000,
             "esports_total_cost": 50_000,
             "median_entry_price": 0.51,
+            "capital_weighted_edge": 0.10,
             "last_esports_trade_at": 100,
             "bot_like_score": 0,
         }
@@ -987,7 +1125,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(rated["grade"], "C")
         self.assertIn("low_positive_market_rate", rated["reasons"])
 
-    def test_high_wilson_without_entry_edge_is_not_a_grade(self):
+    def test_high_wilson_with_weak_capital_edge_is_not_a_grade(self):
         summary = {
             "esports_closed_count": 20,
             "esports_realized_pnl": 4_000,
@@ -996,18 +1134,134 @@ class CoreTest(unittest.TestCase):
             "wilson_win_rate_lower_bound": 0.67,
             "esports_loss_count": 2,
             "esports_total_bought": 10_000,
-            "median_entry_price": 0.68,
+            "median_entry_price": 0.55,
+            "capital_weighted_edge": 0.05,  # >0 (not excluded) but below esports A floor 0.08
             "last_esports_trade_at": 100,
             "bot_like_score": 0,
         }
 
         rated = classify_wallet(summary, now_ts=100 + 86400)
 
-        # wilson 0.67 but entry_edge = 0.67 - 0.68 = -0.01 (below the 0.01 A floor / 0.0 B floor)
-        self.assertEqual(rated["grade"], "C")
-        self.assertIn("weak_entry_edge", rated["reasons"])
+        # high wilson but weak capital_weighted_edge → blocked from A
+        self.assertNotEqual(rated["grade"], "A")
+        self.assertIn("weak_capital_weighted_edge", rated["reasons"])
 
-    def test_entry_edge_can_qualify_wallet_with_moderate_wilson(self):
+    def test_sports_wallet_rating_uses_capital_weighted_edge_not_entry_edge_for_a_grade(self):
+        summary = {
+            "category": "sports",
+            "esports_closed_count": 40,
+            "esports_realized_pnl": 46_000,
+            "esports_roi": 0.46,
+            "median_market_roi": 0.35,
+            "positive_market_rate": 26 / 40,
+            "wilson_win_rate_lower_bound": 0.55,
+            "esports_loss_count": 14,
+            "esports_total_bought": 150_000,
+            "esports_total_cost": 100_000,
+            "median_entry_price": 0.51,
+            "capital_weighted_edge": 0.226,
+            "last_esports_trade_at": 100,
+            "bot_like_score": 0,
+        }
+
+        rated = classify_wallet(summary, now_ts=100 + 86400)
+
+        self.assertEqual(rated["grade"], "A")
+        self.assertEqual(rated["entry_edge"], 0.04)
+        self.assertNotIn("weak_entry_edge", rated["reasons"])
+        self.assertNotIn("weak_wilson", rated["reasons"])
+
+    def test_sports_wallet_rating_uses_lower_roi_exclusion_floor(self):
+        summary = {
+            "category": "sports",
+            "esports_closed_count": 20,
+            "esports_realized_pnl": 1_600,
+            "esports_roi": 0.16,
+            "median_market_roi": 0.16,
+            "positive_market_rate": 0.70,
+            "wilson_win_rate_lower_bound": 0.52,
+            "esports_loss_count": 6,
+            "esports_total_bought": 10_000,
+            "esports_total_cost": 10_000,
+            "median_entry_price": 0.51,
+            "capital_weighted_edge": 0.12,
+            "last_esports_trade_at": 100,
+            "bot_like_score": 0,
+        }
+
+        rated = classify_wallet(summary, now_ts=100 + 86400)
+
+        self.assertNotEqual(rated["grade"], "excluded")
+        self.assertNotIn("low_historical_roi", rated["reasons"])
+
+    def test_no_capital_edge_is_excluded(self):
+        # Positive hold pnl but no edge over the entry price (won exactly as much capital as
+        # implied) → excluded by the skill axis.
+        summary = {
+            "esports_closed_count": 20,
+            "esports_realized_pnl": 100,
+            "esports_roi": 0.30,
+            "positive_market_rate": 0.70,
+            "wilson_win_rate_lower_bound": 0.60,
+            "esports_loss_count": 6,
+            "esports_total_bought": 10_000,
+            "median_entry_price": 0.50,
+            "capital_weighted_edge": 0.0,
+            "last_esports_trade_at": 100,
+            "bot_like_score": 0,
+        }
+
+        rated = classify_wallet(summary, now_ts=100 + 86400)
+
+        self.assertEqual(rated["grade"], "excluded")
+        self.assertIn("no_capital_edge", rated["reasons"])
+
+    def test_swing_dependent_is_soft_flagged_not_excluded(self):
+        summary = {
+            "esports_closed_count": 20,
+            "esports_realized_pnl": 4_000,
+            "esports_roi": 0.40,
+            "positive_market_rate": 0.85,
+            "wilson_win_rate_lower_bound": 0.66,
+            "esports_loss_count": 3,
+            "esports_total_bought": 10_000,
+            "median_entry_price": 0.50,
+            "capital_weighted_edge": 0.16,
+            "actual_minus_hold_pnl_rate": 0.5,  # profit leans on selling
+            "last_esports_trade_at": 100,
+            "bot_like_score": 0,
+        }
+
+        rated = classify_wallet(summary, now_ts=100 + 86400)
+
+        self.assertNotEqual(rated["grade"], "excluded")
+        self.assertIn("swing_dependent", rated["reasons"])
+
+    def test_pre_match_entry_rate_from_reconstruction(self):
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [1.0, 0.0],
+            "match_start_time": "2026-06-06T12:00:00Z",
+        }
+        before = int(datetime(2026, 6, 6, 11, 0, tzinfo=timezone.utc).timestamp())
+        after = int(datetime(2026, 6, 6, 13, 0, tzinfo=timezone.utc).timestamp())
+        market_records = {"m1": {**market}, "m2": {**market, "condition_id": "m2"}}
+        trades = [
+            {"conditionId": "m1", "side": "BUY", "outcomeIndex": 0, "size": 100, "price": 0.5, "timestamp": before},
+            {"conditionId": "m2", "side": "BUY", "outcomeIndex": 0, "size": 100, "price": 0.5, "timestamp": after},
+        ]
+
+        positions, _ = reconstruct_closed_positions(trades, market_records)
+        by_cid = {p["conditionId"]: p for p in positions}
+
+        self.assertEqual(by_cid["m1"]["preMatchEntry"], True)
+        self.assertEqual(by_cid["m2"]["preMatchEntry"], False)
+        summary = summarize_trade_reconstructed_positions(trades, market_records, now_ts=200)
+        self.assertEqual(summary["pre_match_entry_market_count"], 2)
+        self.assertEqual(summary["pre_match_entry_rate"], 0.5)
+
+    def test_capital_weighted_edge_can_qualify_wallet_with_moderate_wilson(self):
         summary = {
             "esports_closed_count": 20,
             "esports_realized_pnl": 4_000,
@@ -1017,6 +1271,7 @@ class CoreTest(unittest.TestCase):
             "esports_loss_count": 3,
             "esports_total_bought": 10_000,
             "median_entry_price": 0.50,
+            "capital_weighted_edge": 0.16,
             "last_esports_trade_at": 100,
             "bot_like_score": 0,
         }
@@ -1037,6 +1292,7 @@ class CoreTest(unittest.TestCase):
             "esports_loss_count": 0,
             "esports_total_bought": 500,
             "median_entry_price": 0.55,
+            "capital_weighted_edge": 0.10,
             "last_esports_trade_at": 100,
             "bot_like_score": 0,
         }
@@ -1046,7 +1302,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(rated["grade"], "C")
         self.assertIn("low_volume", rated["reasons"])
 
-    def test_wallet_rating_excludes_low_historical_roi(self):
+    def test_low_roi_is_soft_not_a_hard_exclude(self):
+        # A high-win-rate favorite-buyer: roi 0.18 (< floor) but real edge (positive
+        # capital_weighted_edge). roi is a payoff-structure artifact and must NOT exclude it.
         summary = {
             "esports_closed_count": 28,
             "esports_realized_pnl": 1_800,
@@ -1057,15 +1315,16 @@ class CoreTest(unittest.TestCase):
             "esports_loss_count": 0,
             "esports_total_bought": 10_000,
             "median_entry_price": 0.50,
+            "capital_weighted_edge": 0.12,
             "last_esports_trade_at": 100,
             "bot_like_score": 0,
         }
 
         rated = classify_wallet(summary, now_ts=100 + 86400)
 
-        self.assertEqual(rated["grade"], "excluded")
-        self.assertEqual(rated["profile_state"], "unqualified")
-        self.assertIn("low_historical_roi", rated["reasons"])
+        self.assertNotEqual(rated["grade"], "excluded")
+        self.assertNotIn("low_historical_roi", rated["reasons"])
+        self.assertIn("low_roi", rated["reasons"])
 
     def test_profile_candidate_wallet_does_not_exclude_occasional_sell(self):
         positions = [
@@ -1094,7 +1353,10 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(result["sold_before_resolution_market_rate"], 0.125)
         self.assertNotEqual(result["grade"], "excluded")
 
-    def test_profile_candidate_wallet_excludes_systemic_short_term_selling(self):
+    def test_profile_candidate_wallet_does_not_hard_exclude_systemic_selling(self):
+        # Under hold-to-settlement scoring, selling is no longer a hard exclude — a wallet
+        # that sells in most markets (e.g. frees capital by exiting winners) is graded on
+        # its hold record, not auto-excluded.
         positions = [
             {"conditionId": f"m{i}", "totalBought": 100, "realizedPnl": 50, "avgPrice": 0.4, "timestamp": 100 + i}
             for i in range(8)
@@ -1121,8 +1383,8 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(result["historical_trade_behavior_market_count"], 8)
         self.assertEqual(result["sold_before_resolution_market_count"], 5)
         self.assertEqual(result["sold_before_resolution_market_rate"], 0.625)
-        self.assertEqual(result["grade"], "excluded")
-        self.assertIn("sold_before_resolution", result["reasons"])
+        self.assertNotEqual(result["grade"], "excluded")
+        self.assertNotIn("sold_before_resolution", result["reasons"])
 
     def test_profile_candidate_wallet_does_not_exclude_dust_trim(self):
         positions = [
@@ -1255,7 +1517,7 @@ class CoreTest(unittest.TestCase):
 
     def test_high_frequency_only_candidate_gets_bot_like_penalty(self):
         positions = [
-            {"conditionId": f"m{i}", "totalBought": 100, "realizedPnl": 50, "timestamp": 100 + i}
+            {"conditionId": f"m{i}", "totalBought": 100, "realizedPnl": 50, "avgPrice": 0.5, "timestamp": 100 + i}
             for i in range(20)
         ]
         condition_ids = {f"m{i}" for i in range(20)}
@@ -1843,6 +2105,45 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(store.load_market_cache(cache_kind="closed", now_ts=200, ttl_seconds=900)[0]["m1"]["condition_id"], "m1")
             self.assertEqual(store.load_market_cache(cache_kind="active", now_ts=200, ttl_seconds=900)[0], {})
 
+    def test_category_follow_db_migration_is_guarded_and_dedupes_behavior_events(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            source_db = root / "esports" / "follow" / "follow.db"
+            follow_dir = root / "follow"
+            source_store = FollowStore(source_db)
+            source_store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "sig1",
+                        "wallet": "0xabc",
+                        "condition_id": "m1",
+                        "outcome_index": 0,
+                        "status": "open",
+                        "created_at": 100,
+                        "updated_at": 100,
+                        "legs": [],
+                        "behavior_events": [{"kind": "add", "timestamp": 100}],
+                    }
+                ],
+                result_events=[],
+                performance={},
+            )
+
+            first = migrate_category_follow_dbs(root, follow_dir, now_ts=1000)
+            backups_after_first = sorted((follow_dir / "migration_backups").glob("*.db"))
+            second = migrate_category_follow_dbs(root, follow_dir, now_ts=2000)
+            backups_after_second = sorted((follow_dir / "migration_backups").glob("*.db"))
+
+            self.assertTrue(first["migrated"])
+            self.assertFalse(second["migrated"])
+            self.assertEqual(backups_after_first, backups_after_second)
+            with sqlite3.connect(follow_dir / "follow.db") as conn:
+                event_count = conn.execute("SELECT COUNT(*) FROM follow_behavior_events").fetchone()[0]
+                signal_raw = conn.execute("SELECT raw_json FROM follow_signals WHERE signal_id = 'sig1'").fetchone()[0]
+            self.assertEqual(event_count, 1)
+            self.assertEqual(json.loads(signal_raw)["category"], "esports")
+
     def test_follow_store_initializes_once_per_instance(self):
         with TemporaryDirectory() as tmp:
             store = FollowStore(Path(tmp) / "follow.db")
@@ -1990,10 +2291,79 @@ class CoreTest(unittest.TestCase):
                 ttl_seconds=900,
             )
 
-            self.assertEqual(source, "legacy_state_cache")
-            self.assertIn("m1", markets)
+            self.assertEqual(source, "api")
+            self.assertEqual(markets, {})
             self.assertNotIn("active_market_cache", new_state)
             self.assertTrue(cache_path.exists())
+
+    def test_active_market_cache_fetches_esports_and_sports_tags(self):
+        start = datetime.now(timezone.utc) + timedelta(hours=3)
+
+        class FakeClient:
+            def __init__(self):
+                self.tag_calls = []
+
+            def list_events_paginated(self, **kwargs):
+                tags = tuple(kwargs.get("tag_slugs") or ())
+                self.tag_calls.append(tags)
+                if tags == ("mlb",):
+                    return [
+                        {
+                            "id": "mlb1",
+                            "slug": "mlb1",
+                            "title": "New York Mets vs. San Diego Padres",
+                            "tags": [{"slug": "mlb"}],
+                            "startTime": start.isoformat(),
+                            "markets": [
+                                {
+                                    "conditionId": "sports-m1",
+                                    "question": "New York Mets vs. San Diego Padres",
+                                    "outcomes": '["New York Mets","San Diego Padres"]',
+                                    "outcomePrices": '["0.55","0.45"]',
+                                    "active": True,
+                                    "closed": False,
+                                    "volume": 100000,
+                                    "startTime": start.isoformat(),
+                                }
+                            ],
+                        }
+                    ]
+                return [
+                    {
+                        "id": "esports1",
+                        "slug": "esports1",
+                        "title": "Dota 2: A vs B (BO3)",
+                        "tags": [{"slug": "dota-2"}],
+                        "startTime": start.isoformat(),
+                        "markets": [
+                            {
+                                "conditionId": "esports-m1",
+                                "question": "Dota 2: A vs B (BO3)",
+                                "outcomes": '["A","B"]',
+                                "outcomePrices": '["0.50","0.50"]',
+                                "active": True,
+                                "closed": False,
+                                "volume": 100000,
+                                "startTime": start.isoformat(),
+                            }
+                        ],
+                    }
+                ]
+
+        client = FakeClient()
+        markets, _state, source = load_active_market_cache(
+            client,
+            {},
+            now_ts=int(time.time()),
+            gamma_pages=1,
+            ttl_seconds=900,
+        )
+
+        self.assertEqual(source, "api")
+        self.assertIn(("counter-strike-2", "league-of-legends", "dota-2"), client.tag_calls)
+        self.assertIn(("mlb",), client.tag_calls)
+        self.assertEqual(markets["esports-m1"]["category"], "esports")
+        self.assertEqual(markets["sports-m1"]["category"], "sports")
 
     def test_profile_candidate_filter_keeps_only_clean_active_wallets(self):
         candidates = [
@@ -2313,6 +2683,66 @@ class CoreTest(unittest.TestCase):
         )
 
         self.assertEqual([row["wallet"] for row in leaderboard], ["0xactive"])
+
+    def test_sports_leaderboard_allows_single_recent_discovery_market(self):
+        now = 100 + 10 * 86400
+        profiles_by_wallet = {
+            "0xsports": {
+                "wallet": "0xsports",
+                "category": "sports",
+                "grade": "A",
+                "scoring_version": SCORING_VERSION,
+                "last_esports_trade_at": 100,
+                "eligible_market_types": ["main_match"],
+                "candidate": {
+                    "participated_market_count": 1,
+                    "avg_market_cash": 6_000,
+                    "two_sided_market_count": 0,
+                    "tail_entry_market_count": 0,
+                },
+            }
+        }
+
+        leaderboard = build_leaderboard_from_profiles(
+            profiles_by_wallet,
+            now_ts=now,
+            min_participated_markets=3,
+            min_avg_market_cash=5_000,
+            require_tail_entry_field=True,
+            require_current_scoring_version=True,
+        )
+
+        self.assertEqual([row["wallet"] for row in leaderboard], ["0xsports"])
+
+    def test_sports_leaderboard_uses_lower_recent_cash_floor(self):
+        now = 100 + 10 * 86400
+        profiles_by_wallet = {
+            "0xsports": {
+                "wallet": "0xsports",
+                "category": "sports",
+                "grade": "A",
+                "scoring_version": SCORING_VERSION,
+                "last_esports_trade_at": 100,
+                "eligible_market_types": ["main_match"],
+                "candidate": {
+                    "participated_market_count": 10,
+                    "avg_market_cash": 3_800,
+                    "two_sided_market_count": 0,
+                    "tail_entry_market_count": 0,
+                },
+            }
+        }
+
+        leaderboard = build_leaderboard_from_profiles(
+            profiles_by_wallet,
+            now_ts=now,
+            min_participated_markets=3,
+            min_avg_market_cash=5_000,
+            require_tail_entry_field=True,
+            require_current_scoring_version=True,
+        )
+
+        self.assertEqual([row["wallet"] for row in leaderboard], ["0xsports"])
 
     def test_leaderboard_defaults_to_top_30_a_wallets(self):
         profiles_by_wallet = {}
@@ -2796,6 +3226,18 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(list(watched), ["future"])
 
+    def test_watched_markets_can_include_recently_started_for_delayed_trades(self):
+        now = 1000
+        markets = {
+            "recent": {"condition_id": "recent", "match_start_time": datetime.fromtimestamp(now - 120, timezone.utc).isoformat()},
+            "old": {"condition_id": "old", "match_start_time": datetime.fromtimestamp(now - 1200, timezone.utc).isoformat()},
+            "future": {"condition_id": "future", "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat()},
+        }
+
+        watched = watched_markets(markets, now_ts=now, observe_window_hours=24, post_start_grace_seconds=300)
+
+        self.assertEqual(list(watched), ["recent", "future"])
+
     def test_follow_v2_trade_cursor_cold_start_then_incremental(self):
         trades = [
             {"id": "t3", "timestamp": 30},
@@ -2921,6 +3363,80 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(mirror_signals[0]["status"], "exited")
         self.assertEqual(mirror_signals[0]["exit_price"], 0.6)
         self.assertGreater(mirror_signals[0]["our_realized_pnl"], 0)
+
+    def test_follow_records_pre_start_trade_detected_after_start_within_grace(self):
+        start = 1000
+        now = start + 180
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.42, 0.58],
+            "match_start_time": datetime.fromtimestamp(start, timezone.utc).isoformat(),
+            "title": "Match",
+        }
+        trade = {
+            "id": "b1",
+            "proxyWallet": "0xA",
+            "market": "m1",
+            "outcomeIndex": 0,
+            "side": "BUY",
+            "price": 0.40,
+            "size": 10,
+            "timestamp": start - 30,
+        }
+
+        signals, stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=[trade],
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.05,
+            post_start_grace_seconds=300,
+        )
+
+        self.assertEqual(stats["new_leg_count"], 1)
+        self.assertEqual(len(signals), 1)
+        self.assertTrue(signals[0]["detected_after_start"])
+        self.assertTrue(signals[0]["legs"][0]["detected_after_start"])
+
+    def test_follow_ignores_after_start_trade_detected_after_start(self):
+        start = 1000
+        now = start + 180
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.42, 0.58],
+            "match_start_time": datetime.fromtimestamp(start, timezone.utc).isoformat(),
+            "title": "Match",
+        }
+        trade = {
+            "id": "b1",
+            "proxyWallet": "0xA",
+            "market": "m1",
+            "outcomeIndex": 0,
+            "side": "BUY",
+            "price": 0.40,
+            "size": 10,
+            "timestamp": start + 30,
+        }
+
+        signals, stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=[trade],
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.05,
+            post_start_grace_seconds=300,
+        )
+
+        self.assertEqual(signals, [])
+        self.assertEqual(stats["ignored_trade_count"], 1)
 
     def test_follow_v2_gates_new_signals_by_market_type(self):
         now = 1000
@@ -4114,9 +4630,56 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(status["source"], "external")
             self.assertEqual(status["pid"], 1234)
 
+    def test_dashboard_runner_detects_script_path_process(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            config = DashboardConfig(
+                data_dir=data_dir,
+                username="admin",
+                password="pw",
+                cookie_secret="secret",
+                runner_process_lister=lambda: [
+                    {
+                        "pid": 2234,
+                        "ppid": 1,
+                        "pgid": 2234,
+                        "command": f"{sys.executable} /repo/poly_fight/cli.py --data-dir={data_dir} run --stake-usdc 1",
+                    }
+                ],
+            )
+
+            status = build_runner_status(config)
+
+            self.assertEqual(status["status"], "running")
+            self.assertEqual(status["source"], "external")
+            self.assertEqual(status["pid"], 2234)
+
+    def test_dashboard_runner_detects_default_data_dir_process(self):
+        config = DashboardConfig(
+            data_dir=Path("data"),
+            username="admin",
+            password="pw",
+            cookie_secret="secret",
+            runner_process_lister=lambda: [
+                {
+                    "pid": 3234,
+                    "ppid": 1,
+                    "pgid": 3234,
+                    "command": f"{sys.executable} -m poly_fight.cli run --stake-usdc 1",
+                }
+            ],
+        )
+
+        status = build_runner_status(config)
+
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["source"], "external")
+        self.assertEqual(status["pid"], 3234)
+
     def test_dashboard_runner_start_writes_control_and_blocks_duplicate(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
+            follow_dir = data_dir / "follow"
             calls = []
 
             class FakeProcess:
@@ -4129,6 +4692,7 @@ class CoreTest(unittest.TestCase):
 
             config = DashboardConfig(
                 data_dir=data_dir,
+                follow_dir=follow_dir,
                 username="admin",
                 password="pw",
                 cookie_secret="secret",
@@ -4143,8 +4707,40 @@ class CoreTest(unittest.TestCase):
             self.assertIn("run", calls[0][0])
             self.assertIn("--stake-usdc", calls[0][0])
             self.assertIn("--log-dir", calls[0][0])
+            self.assertIn("--follow-dir", calls[0][0])
+            self.assertIn(str(follow_dir), calls[0][0])
+            self.assertIn("--skip-initial-build", calls[0][0])
             self.assertEqual(calls[0][1].parent, data_dir / "logs" / "follow")
-            self.assertEqual(read_follow_control(data_dir)["runner"]["pid"], 4321)
+            self.assertEqual(read_follow_control(follow_dir)["runner"]["pid"], 4321)
+
+    def test_dashboard_wallet_refresh_is_category_scoped(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "data"
+            follow_dir = root / "follow"
+            calls = []
+            ran = threading.Event()
+
+            def fake_runner(category, data_dir_arg, log_path):
+                calls.append((category, data_dir_arg, log_path))
+                ran.set()
+                return 0
+
+            status = start_wallet_refresh(root, category="sports", follow_dir=follow_dir, runner=fake_runner)
+
+            self.assertEqual(status["category"], "sports")
+            self.assertIn("--category", status["command"])
+            self.assertIn("sports", status["command"])
+            self.assertIn(str(root / "sports"), status["command"])
+            self.assertTrue(ran.wait(2))
+            deadline = time.time() + 2
+            control = read_follow_control(follow_dir)
+            while control.get("wallet_refresh", {}).get("sports", {}).get("status") == "running" and time.time() < deadline:
+                time.sleep(0.01)
+                control = read_follow_control(follow_dir)
+            self.assertEqual(calls[0][0], "sports")
+            self.assertEqual(calls[0][1], root / "sports")
+            self.assertEqual(control["wallet_refresh"]["sports"]["status"], "succeeded")
+            self.assertNotIn("esports", control["wallet_refresh"])
 
     def test_dashboard_runner_stop_allows_external_process(self):
         with TemporaryDirectory() as tmp:
@@ -4171,6 +4767,62 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(status["status"], "stopping")
             self.assertEqual(status["source"], "external")
             self.assertEqual(stopped[0]["pid"], 777)
+
+    def test_dashboard_reset_data_clears_generated_dirs(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            follow_dir = data_dir / "follow"
+            log_dir = data_dir / "logs"
+            for path in [
+                data_dir / "esports" / "smart_wallet_leaderboard.json",
+                data_dir / "sports" / "wallet_profiles.json",
+                follow_dir / "follow.db",
+                log_dir / "follow" / "dashboard-runner.out",
+            ]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("old", encoding="utf-8")
+            config = DashboardConfig(
+                data_dir=data_dir,
+                follow_dir=follow_dir,
+                log_dir=log_dir,
+                username="admin",
+                password="pw",
+                cookie_secret="secret",
+                runner_process_lister=lambda: [],
+            )
+
+            result = reset_dashboard_data(config)
+
+            self.assertEqual(result["status"], "reset")
+            self.assertTrue((data_dir / "esports").is_dir())
+            self.assertTrue((data_dir / "sports").is_dir())
+            self.assertTrue(follow_dir.is_dir())
+            self.assertTrue((log_dir / "follow").is_dir())
+            self.assertEqual(list((data_dir / "esports").iterdir()), [])
+            self.assertEqual(list((data_dir / "sports").iterdir()), [])
+            self.assertEqual(list(follow_dir.iterdir()), [])
+            self.assertEqual(list((log_dir / "follow").iterdir()), [])
+
+    def test_dashboard_reset_data_blocks_running_runner(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            config = DashboardConfig(
+                data_dir=data_dir,
+                username="admin",
+                password="pw",
+                cookie_secret="secret",
+                runner_process_lister=lambda: [
+                    {
+                        "pid": 778,
+                        "ppid": 1,
+                        "pgid": 778,
+                        "command": f"{sys.executable} -m poly_fight.cli --data-dir {data_dir} run --stake-usdc 1",
+                    }
+                ],
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "runner_running"):
+                reset_dashboard_data(config)
 
     def test_dashboard_runner_api_auth_and_conflict(self):
         with TemporaryDirectory() as tmp:
@@ -4225,8 +4877,9 @@ class CoreTest(unittest.TestCase):
             data_dir = Path(tmp)
             ran = threading.Event()
 
-            def fake_runner(data_dir_arg, log_path):
-                self.assertEqual(data_dir_arg, data_dir)
+            def fake_runner(category, data_dir_arg, log_path):
+                self.assertEqual(category, "esports")
+                self.assertEqual(data_dir_arg, data_dir / "esports")
                 log_path.write_text("refreshed", encoding="utf-8")
                 ran.set()
                 return 0
@@ -4249,7 +4902,7 @@ class CoreTest(unittest.TestCase):
                 token = make_session_token("admin", "secret", now=int(datetime.now(timezone.utc).timestamp()))
                 cookie = f"poly_fight_session={token}"
                 conn = http.client.HTTPConnection(host, port, timeout=5)
-                conn.request("POST", "/api/wallet-refresh", headers={"Cookie": cookie})
+                conn.request("POST", "/api/wallet-refresh?category=esports", headers={"Cookie": cookie})
                 response = conn.getresponse()
                 payload = json.loads(response.read().decode())
                 conn.close()
@@ -4261,12 +4914,12 @@ class CoreTest(unittest.TestCase):
 
                 status = build_wallet_refresh_status(data_dir)
                 deadline = time.time() + 2
-                while status["status"].get("status") == "running" and time.time() < deadline:
+                while status["status"].get("esports", {}).get("status") == "running" and time.time() < deadline:
                     time.sleep(0.01)
                     status = build_wallet_refresh_status(data_dir)
-                self.assertEqual(status["status"]["status"], "succeeded")
-                self.assertEqual(status["status"]["returncode"], 0)
-                self.assertEqual(read_follow_control(data_dir)["wallet_refresh"]["status"], "succeeded")
+                self.assertEqual(status["status"]["esports"]["status"], "succeeded")
+                self.assertEqual(status["status"]["esports"]["returncode"], 0)
+                self.assertEqual(read_follow_control(data_dir)["wallet_refresh"]["esports"]["status"], "succeeded")
                 self.assertNotIn("pause_follow", read_follow_control(data_dir))
             finally:
                 server.shutdown()
@@ -4350,6 +5003,28 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(overview["clean_signal_count"], 1)
             self.assertEqual(overview["avg_wallet_clv"], 0.1)
 
+    def test_dashboard_overview_exposes_category_breakdown(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {"signal_id": "e:m1:0", "wallet": "0xe", "condition_id": "m1", "status": "open", "category": "esports", "legs": [{"stake": 1}]},
+                    {"signal_id": "s:m2:0", "wallet": "0xs", "condition_id": "m2", "status": "open", "category": "sports", "legs": [{"stake": 1}]},
+                ],
+                result_events=[
+                    {"signal_id": "r:m3:0", "wallet": "0xr", "condition_id": "m3", "status": "settled", "category": "sports", "our_paper_pnl": 0.5, "legs": [{"stake": 1}]}
+                ],
+                performance={"wallets": {}, "total": {}},
+            )
+
+            overview = build_overview(data_dir)
+
+            self.assertEqual(overview["by_category"]["esports"]["open_signal_count"], 1)
+            self.assertEqual(overview["by_category"]["sports"]["open_signal_count"], 1)
+            self.assertEqual(overview["by_category"]["sports"]["result_count"], 1)
+
     def test_dashboard_follows_use_sql_pagination_not_full_snapshot(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -4398,6 +5073,25 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(settled_page["total"], 1)
             self.assertEqual(settled_page["status"], "settled")
             self.assertEqual(settled_page["follows"][0]["condition_id"], "m1")
+
+    def test_dashboard_follows_filter_by_category(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {"signal_id": "e:m1:0", "wallet": "0xe", "condition_id": "m1", "status": "open", "category": "esports", "created_at": 100, "legs": []},
+                    {"signal_id": "s:m2:0", "wallet": "0xs", "condition_id": "m2", "status": "open", "category": "sports", "created_at": 200, "legs": []},
+                ],
+                result_events=[],
+                performance={},
+            )
+
+            sports_page = build_follows(data_dir, page=1, size=10, category="sports")
+
+            self.assertEqual(sports_page["category"], "sports")
+            self.assertEqual(sports_page["total"], 1)
+            self.assertEqual(sports_page["follows"][0]["condition_id"], "m2")
 
     def test_dashboard_follows_expose_readable_market_fields(self):
         with TemporaryDirectory() as tmp:
@@ -4707,6 +5401,35 @@ class CoreTest(unittest.TestCase):
             self.assertTrue(wallets["wallets"][0]["quarantined"])
             self.assertEqual(wallets["wallets"][0]["quarantine"]["reason"], "material_sell")
 
+    def test_dashboard_wallets_use_observed_follow_trade_time(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [{"wallet": "0xabc", "grade": "A", "last_esports_trade_at": 100}],
+            )
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "sig-1",
+                        "wallet": "0xabc",
+                        "condition_id": "0xmarket",
+                        "outcome_index": 0,
+                        "status": "open",
+                        "created_at": 150,
+                        "updated_at": 200,
+                        "legs": [{"wallet_trade_at": 500, "leg_at": 510, "stake": 1}],
+                    }
+                ],
+                result_events=[],
+                performance={"wallets": {}, "total": {}},
+            )
+
+            wallets = build_wallets(data_dir)
+
+            self.assertEqual(wallets["wallets"][0]["last_esports_trade_at"], 500)
+
     def test_dashboard_wallets_show_eligible_bucket_stats_not_blended_overall(self):
         # Overall record is weak (30W/20L, 0.60 positive rate) and would be filtered by the
         # 0.75 floor, but the wallet is grade A purely on its strong game_winner bucket.
@@ -4990,6 +5713,33 @@ class CoreTest(unittest.TestCase):
             events = build_events(data_dir)
 
             self.assertEqual([row["condition_id"] for row in events["events"]], ["unfollowed_future"])
+
+    def test_dashboard_events_include_recently_started_markets(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now_ts = int(time.time())
+            write_json(
+                data_dir / "follow" / "active_market_cache.json",
+                {
+                    "updated_at": now_ts,
+                    "markets": [
+                        {
+                            "condition_id": "recent",
+                            "title": "Recent",
+                            "match_start_time": datetime.fromtimestamp(now_ts - 120, timezone.utc).isoformat(),
+                        },
+                        {
+                            "condition_id": "old",
+                            "title": "Old",
+                            "match_start_time": datetime.fromtimestamp(now_ts - 3600, timezone.utc).isoformat(),
+                        },
+                    ],
+                },
+            )
+
+            events = build_events(data_dir, post_start_grace_seconds=300)
+
+            self.assertEqual([row["condition_id"] for row in events["events"]], ["recent"])
 
     def test_dashboard_wallet_follow_detail_filters_by_status(self):
         with TemporaryDirectory() as tmp:
@@ -5318,6 +6068,103 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(lock.call_args.args[0], Path("data_test"))
         inner.assert_called_once_with(args, client=client)
 
+    def test_sports_collect_skips_esports_submarket_backfill(self):
+        class FakeClient:
+            def __init__(self):
+                self.user_trades = []
+                for index in range(3):
+                    self.user_trades.append(
+                        {
+                            "conditionId": f"mlb{index}",
+                            "outcomeIndex": 0,
+                            "side": "BUY",
+                            "size": 4000,
+                            "price": 0.5,
+                            "timestamp": 100 + index,
+                        }
+                    )
+                self.user_trades.append(
+                    {
+                        "conditionId": "game1",
+                        "question": "Dota 2: A vs B - Game 1 Winner",
+                        "side": "BUY",
+                        "outcomeIndex": 0,
+                        "size": 100,
+                        "price": 0.5,
+                        "timestamp": 200,
+                    }
+                )
+
+            def list_events_paginated(self, **kwargs):
+                self.tag_slugs = kwargs.get("tag_slugs")
+                events = []
+                for index in range(3):
+                    events.append(
+                        {
+                            "id": f"e{index}",
+                            "slug": f"mlb-a-b-{index}",
+                            "title": f"Atlanta Braves vs. Cincinnati Reds {index}",
+                            "closed": True,
+                            "endDate": "2026-06-01T00:00:00Z",
+                            "tags": [{"slug": "mlb"}],
+                            "markets": [
+                                {
+                                    "conditionId": f"mlb{index}",
+                                    "question": f"Atlanta Braves vs. Cincinnati Reds {index}",
+                                    "outcomes": json.dumps(["Atlanta Braves", f"Cincinnati Reds {index}"]),
+                                    "outcomePrices": '["1","0"]',
+                                    "volume": 500_000,
+                                }
+                            ],
+                        }
+                    )
+                return events
+
+            def trades_for_market(self, condition_id, *, limit, offset, min_trade_cash):
+                return [
+                    {
+                        "proxyWallet": "0xA",
+                        "size": 4000,
+                        "price": 0.5,
+                        "timestamp": 100,
+                    }
+                ]
+
+            def trades_for_user(self, wallet, *, limit=500, offset=0):
+                return self.user_trades[offset : offset + limit]
+
+            def positions(self, wallet, *, limit=100):
+                return []
+
+        with TemporaryDirectory() as tmp:
+            args = build_parser().parse_args(
+                [
+                    "--data-dir",
+                    str(Path(tmp) / "sports"),
+                    "collect",
+                    "--category",
+                    "sports",
+                    "--max-workers",
+                    "1",
+                    "--max-profiles-per-run",
+                    "1",
+                    "--target-markets",
+                    "3",
+                    "--max-markets-per-run",
+                    "3",
+                    "--min-profile-avg-market-cash",
+                    "0",
+                    "--leaderboard-min-avg-market-cash",
+                    "0",
+                ]
+            )
+            client = FakeClient()
+            with patch("poly_fight.cli.backfill_user_trade_submarkets") as backfill:
+                _command_build_leaderboard_unlocked(args, client=client)
+
+            backfill.assert_not_called()
+            self.assertEqual(client.tag_slugs, ("mlb",))
+
     def test_follow_command_uses_paper_defaults(self):
         parser = build_parser()
 
@@ -5389,6 +6236,16 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.stream_poll_seconds, 2.0)
         self.assertEqual(args.stream_heartbeat_seconds, 15.0)
         self.assertEqual(args.max_stream_clients, 8)
+        self.assertEqual(args.follow_dir, None)
+
+    def test_follow_and_run_accept_follow_dir(self):
+        parser = build_parser()
+
+        follow_args = parser.parse_args(["follow", "--stake-usdc", "1", "--follow-dir", "data/follow"])
+        run_args = parser.parse_args(["run", "--stake-usdc", "1", "--follow-dir", "data/follow", "--skip-initial-build"])
+
+        self.assertEqual(follow_args.follow_dir, "data/follow")
+        self.assertEqual(run_args.follow_dir, "data/follow")
 
     def test_run_skip_initial_build_does_not_build_before_first_tick(self):
         parser = build_parser()

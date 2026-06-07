@@ -8,6 +8,8 @@ import mimetypes
 import os
 import re
 import signal
+import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -36,6 +38,7 @@ _MATCH_TITLE_RE = re.compile(r"^([^:]+):\s+(.+?)\s+vs\s+(.+?)(\s+\([^)]+\))?\s+-
 @dataclass(frozen=True)
 class DashboardConfig:
     data_dir: Path
+    follow_dir: Path | None = None
     log_dir: Path | None = None
     host: str = "127.0.0.1"
     port: int = 8787
@@ -108,6 +111,7 @@ def create_server(config: DashboardConfig) -> ThreadingHTTPServer:
     static_dir = config.static_dir or Path(__file__).with_name("dashboard").joinpath("static")
     resolved = DashboardConfig(
         data_dir=config.data_dir,
+        follow_dir=config.follow_dir or config.data_dir / "follow",
         host=config.host,
         port=config.port,
         username=config.username,
@@ -187,6 +191,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/runner/stop":
                 self._runner_stop()
                 return
+            if parsed.path == "/api/reset-data":
+                self._reset_data()
+                return
         self._error("not_found", status=HTTPStatus.NOT_FOUND)
 
     def _handle_api_get(self, parsed: urllib.parse.ParseResult) -> None:
@@ -220,7 +227,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             page = _int_param(query.get("page", ["1"])[0], default=1, minimum=1, maximum=10_000)
             size = _int_param(query.get("size", ["25"])[0], default=25, minimum=1, maximum=200)
             status = str(query.get("status", [""])[0] or "").lower()
-            self._ok(build_follows(self.dashboard_config.data_dir, page=page, size=size, status=status))
+            category = normalize_category(query.get("category", [""])[0])
+            self._ok(build_follows(self.dashboard_config.data_dir, page=page, size=size, status=status, category=category))
             return
         if parsed.path.startswith("/api/follows/"):
             condition_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1]).lower()
@@ -250,9 +258,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._error("not_found", status=HTTPStatus.NOT_FOUND)
 
     def _wallet_refresh(self) -> None:
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        category = normalize_category(query.get("category", [""])[0])
+        if not category:
+            self._error("invalid_category", status=HTTPStatus.BAD_REQUEST)
+            return
         try:
             status = start_wallet_refresh(
                 self.dashboard_config.data_dir,
+                category=category,
+                follow_dir=_follow_dir(self.dashboard_config),
                 runner=self.dashboard_config.wallet_refresh_runner,
                 timeout_seconds=self.dashboard_config.wallet_refresh_timeout_seconds,
             )
@@ -273,6 +288,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         status = stop_runner(self.dashboard_config)
         accepted = status.get("status") in {"stopping", "stopped"}
         self._json({"ok": accepted, "data": status, "generated_at": int(time.time())}, status=HTTPStatus.ACCEPTED if accepted else HTTPStatus.CONFLICT)
+
+    def _reset_data(self) -> None:
+        try:
+            result = reset_dashboard_data(self.dashboard_config)
+        except DataResetBlocked as exc:
+            self._json({"ok": False, "error": exc.reason, "data": exc.status}, status=HTTPStatus.CONFLICT)
+            return
+        self._json({"ok": True, "data": result, "generated_at": int(time.time())}, status=HTTPStatus.OK)
 
     def _wallet_trades(self, raw_addr: str, query: dict[str, list[str]]) -> None:
         wallet = urllib.parse.unquote(raw_addr).lower()
@@ -301,7 +324,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 _TRADES_CACHE[cache_key] = (now, trades)
         watched = build_events(self.dashboard_config.data_dir, observe_window_hours=self.dashboard_config.observe_window_hours)
         watched_ids = {str(row.get("condition_id") or "").lower() for row in watched.get("events", [])}
-        open_snapshot = FollowStore(self.dashboard_config.data_dir / "follow" / "follow.db").load_dashboard_open_signals()
+        open_snapshot = FollowStore(_follow_db_path(self.dashboard_config)).load_dashboard_open_signals()
         followed = {
             (str(signal.get("wallet") or "").lower(), str(signal.get("condition_id") or "").lower())
             for signal in open_snapshot.get("open_signals", [])
@@ -430,14 +453,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
-            store = FollowStore(config.data_dir / "follow" / "follow.db")
+            store = FollowStore(_follow_db_path(config))
             previous: StreamSignal | None = None
             last_heartbeat = 0.0
             while True:
                 if conn is None:
                     conn = store.connect_readonly()
                 signal = read_stream_signal(config.data_dir, log_dir=config.log_dir, store=store, conn=conn)
-                if conn is not None and signal.snapshot_updated_at == 0 and not (config.data_dir / "follow" / "follow.db").exists():
+                if conn is not None and signal.snapshot_updated_at == 0 and not _follow_db_path(config).exists():
                     conn.close()
                     conn = None
                 now = time.time()
@@ -490,7 +513,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def build_health(data_dir: Path, *, started_at: float, log_dir: Path | None = None) -> dict[str, Any]:
     rows = _read_follow_run_logs(data_dir, log_dir=log_dir)
-    db_ready = FollowStore(data_dir / "follow" / "follow.db").dashboard_db_ready()
+    db_ready = FollowStore(_follow_db_path(data_dir)).dashboard_db_ready()
     last_tick = rows[-1] if rows else {}
     build_summary = _read_json(data_dir / "build_summary.json", {})
     leaderboard_path = data_dir / "smart_wallet_leaderboard.json"
@@ -518,6 +541,7 @@ def build_health(data_dir: Path, *, started_at: float, log_dir: Path | None = No
         "recent_error_count": len(errors),
         "last_error": errors[-1] if errors else None,
         "last_tick": last_tick,
+        "by_category": last_tick.get("by_category") if isinstance(last_tick.get("by_category"), dict) else {},
         "uptime_seconds": int(time.time() - started_at),
     }
 
@@ -537,15 +561,15 @@ def read_stream_signal(
     store: FollowStore | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> StreamSignal:
-    store = store or FollowStore(data_dir / "follow" / "follow.db")
+    store = store or FollowStore(_follow_db_path(data_dir))
     return StreamSignal(
         snapshot_updated_at=store.read_meta_int("follow_snapshot_updated_at", conn=conn),
         run_log_mtime=max(
             _file_mtime(_follow_run_log_path(data_dir, log_dir=log_dir)),
             _file_mtime(_legacy_follow_run_log_path(data_dir)),
         ),
-        control_mtime=_file_mtime(data_dir / "follow" / "follow_control.json"),
-        leaderboard_mtime=_file_mtime(data_dir / "smart_wallet_leaderboard.json"),
+        control_mtime=_file_mtime(_follow_dir(data_dir) / "follow_control.json"),
+        leaderboard_mtime=max(_file_mtime(path / "smart_wallet_leaderboard.json") for path in category_data_dirs(data_dir).values()),
     )
 
 
@@ -561,12 +585,12 @@ def stream_dirty_flags(previous: StreamSignal | None, current: StreamSignal) -> 
 
 
 def build_stream_header(config: DashboardConfig, *, started_at: float) -> dict[str, Any]:
-    control = read_follow_control(config.data_dir)
+    control = read_follow_control(_follow_dir(config))
     return {
         "health": build_health(config.data_dir, started_at=started_at, log_dir=config.log_dir),
         "overview": build_overview(config.data_dir),
         "runner": build_runner_status(config),
-        "refresh": build_wallet_refresh_status(config.data_dir).get("status") or {"status": "idle"},
+        "refresh": build_wallet_refresh_status(config.data_dir, follow_dir=_follow_dir(config)).get("status") or {"status": "idle"},
         "pause_follow": control.get("pause_follow") if isinstance(control, dict) else None,
         "live": {
             "status": "connected",
@@ -576,7 +600,7 @@ def build_stream_header(config: DashboardConfig, *, started_at: float) -> dict[s
 
 
 def build_overview(data_dir: Path) -> dict[str, Any]:
-    snapshot = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_snapshot()
+    snapshot = FollowStore(_follow_db_path(data_dir)).load_dashboard_snapshot()
     open_signals = snapshot.get("open_signals", [])
     results = snapshot.get("results", [])
     all_signals = [*open_signals, *results]
@@ -593,7 +617,7 @@ def build_overview(data_dir: Path) -> dict[str, Any]:
     our_pnl = sum(_signal_our_pnl(row) for row in results)
     wallet_basis_pnl = sum(_signal_wallet_pnl(row) for row in results)
     behavior = _behavior_counts(all_signals)
-    return {
+    overview = {
         "db_ready": bool(snapshot.get("db_ready")),
         "open_signal_count": len(open_signals),
         "result_count": len(results),
@@ -614,6 +638,45 @@ def build_overview(data_dir: Path) -> dict[str, Any]:
         "open_exposure": sum(sum(_to_float(leg.get("stake")) for leg in signal.get("legs") or []) for signal in open_signals),
         "behavior_counts": behavior,
         "performance": snapshot.get("performance") or {},
+    }
+    overview["by_category"] = {
+        category: _overview_for_signals(
+            [signal for signal in open_signals if _signal_category(signal) == category],
+            [signal for signal in results if _signal_category(signal) == category],
+        )
+        for category in CATEGORIES
+    }
+    return overview
+
+
+def _signal_category(signal: dict[str, Any]) -> str:
+    return normalize_category(str(signal.get("category") or "")) or "esports"
+
+
+def _overview_for_signals(open_signals: list[dict[str, Any]], results: list[dict[str, Any]]) -> dict[str, Any]:
+    all_signals = [*open_signals, *results]
+    settled = [row for row in results if row.get("status") == "settled"]
+    exited = [row for row in results if row.get("status") == "exited"]
+    wins = [row for row in settled if _result_win(row)]
+    legs = [leg for signal in all_signals for leg in signal.get("legs") or []]
+    result_legs = [leg for signal in results for leg in signal.get("legs") or []]
+    resolved_stake = sum(_to_float(leg.get("stake")) for leg in result_legs)
+    our_pnl = sum(_signal_our_pnl(row) for row in results)
+    wallet_basis_pnl = sum(_signal_wallet_pnl(row) for row in results)
+    contested = [signal for signal in all_signals if signal.get("contested")]
+    return {
+        "open_signal_count": len(open_signals),
+        "result_count": len(results),
+        "settled_count": len(settled),
+        "exited_count": len(exited),
+        "win_rate": (len(wins) / len(settled)) if settled else None,
+        "our_realized_pnl": our_pnl,
+        "wallet_basis_realized_pnl": wallet_basis_pnl,
+        "total_stake": sum(_to_float(leg.get("stake")) for leg in legs),
+        "resolved_stake": resolved_stake,
+        "realized_roi": (our_pnl / resolved_stake) if resolved_stake else None,
+        "contested_signal_count": len(contested),
+        "clean_signal_count": len(all_signals) - len(contested),
     }
 
 
@@ -648,18 +711,55 @@ def _observed_market_types(row: dict[str, Any]) -> list[str]:
     return sorted((str(value) for value in per_type if value), key=lambda value: order.get(value, 99))
 
 
+def _category_leaderboards(root: Path) -> list[tuple[str, Path, list[dict[str, Any]], int]]:
+    rows: list[tuple[str, Path, list[dict[str, Any]], int]] = []
+    for category, data_dir in category_data_dirs(root).items():
+        path = data_dir / "smart_wallet_leaderboard.json"
+        value = _read_json(path, [])
+        leaderboard = []
+        for row in value if isinstance(value, list) else []:
+            if isinstance(row, dict):
+                leaderboard.append({**row, "category": category})
+        rows.append((category, data_dir, leaderboard, int(path.stat().st_mtime) if path.exists() else 0))
+    legacy_path = root / "smart_wallet_leaderboard.json"
+    if not any(leaderboard for _, _, leaderboard, _ in rows) and legacy_path.exists():
+        value = _read_json(legacy_path, [])
+        legacy = [{**row, "category": "esports"} for row in value if isinstance(row, dict)]
+        rows.append(("esports", root, legacy, int(legacy_path.stat().st_mtime)))
+    return rows
+
+
+def _signal_wallet_trade_at(signal: dict[str, Any]) -> int:
+    values = [
+        _parse_timestamp(leg.get("wallet_trade_at") or leg.get("trade_at") or leg.get("created_at"))
+        for leg in signal.get("legs") or []
+        if isinstance(leg, dict)
+    ]
+    direct = _parse_timestamp(signal.get("wallet_trade_at") or signal.get("last_trade_at"))
+    return max([value for value in [direct, *values] if value] or [0])
+
+
 def build_wallets(data_dir: Path) -> dict[str, Any]:
-    leaderboard = _read_json(data_dir / "smart_wallet_leaderboard.json", [])
-    store = FollowStore(data_dir / "follow" / "follow.db")
+    leaderboard_sources = _category_leaderboards(data_dir)
+    leaderboard = [row for _category, _dir, rows, _mtime in leaderboard_sources for row in rows]
+    store = FollowStore(_follow_db_path(data_dir))
     perf_snapshot = store.load_dashboard_performance()
-    open_snapshot = store.load_dashboard_open_signals()
+    follow_snapshot = store.load_dashboard_snapshot()
     quarantine_snapshot = store.load_dashboard_wallet_quarantine()
     performance = (perf_snapshot.get("performance") or {}).get("wallets") or {}
     quarantine = quarantine_snapshot.get("wallet_quarantine") or {}
     open_by_wallet: dict[str, list[dict[str, Any]]] = {}
-    for signal in open_snapshot.get("open_signals", []):
+    observed_trade_at_by_wallet: dict[str, int] = {}
+    open_signals = follow_snapshot.get("open_signals", [])
+    all_follow_signals = [*open_signals, *follow_snapshot.get("results", [])]
+    for signal in open_signals:
         wallet = str(signal.get("wallet") or "").lower()
         open_by_wallet.setdefault(wallet, []).append(signal)
+    for signal in all_follow_signals:
+        wallet = str(signal.get("wallet") or "").lower()
+        if not wallet:
+            continue
+        observed_trade_at_by_wallet[wallet] = max(observed_trade_at_by_wallet.get(wallet, 0), _signal_wallet_trade_at(signal))
     rows = []
     for row in leaderboard if isinstance(leaderboard, list) else []:
         # Grading is per market_type, so a wallet may qualify only on a sub-bucket
@@ -669,14 +769,18 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
         if "positive_market_rate" in metrics and to_float(metrics.get("positive_market_rate")) < MIN_A_POSITIVE_MARKET_RATE:
             continue
         wallet = str(row.get("wallet") or "").lower()
+        category = normalize_category(str(row.get("category") or "")) or "esports"
+        quarantine_key = f"{category}:{wallet}"
         observed = wallet_observed_performance(performance.get(wallet, {}), open_count=len(open_by_wallet.get(wallet, [])))
         observed_market_types = _observed_market_types(row)
+        last_trade_at = max(_parse_timestamp(row.get("last_esports_trade_at")), observed_trade_at_by_wallet.get(wallet, 0))
         rows.append(
             {
                 "wallet": wallet,
+                "category": category,
                 "short_addr": short_addr(wallet),
                 "grade": row.get("grade"),
-                "last_esports_trade_at": row.get("last_esports_trade_at"),
+                "last_esports_trade_at": last_trade_at or row.get("last_esports_trade_at"),
                 "wilson_win_rate_lower_bound": metrics.get("wilson_win_rate_lower_bound"),
                 "entry_edge": metrics.get("entry_edge"),
                 "esports_roi": metrics.get("esports_roi"),
@@ -695,8 +799,8 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
                 "observed_market_types": observed_market_types,
                 "observed_market_type_labels": row.get("observed_market_type_labels") or _market_type_labels(observed_market_types),
                 "per_type_grades": row.get("per_type_grades") or {},
-                "quarantined": wallet in quarantine,
-                "quarantine": quarantine.get(wallet),
+                "quarantined": quarantine_key in quarantine or wallet in quarantine,
+                "quarantine": quarantine.get(quarantine_key) or quarantine.get(wallet),
                 "performance": performance.get(wallet, {}),
                 "observed": observed,
                 "open_signals": open_by_wallet.get(wallet, []),
@@ -709,11 +813,24 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
         "wallets": rows,
         "count": len(rows),
         "quarantined_count": sum(1 for row in rows if row.get("quarantined")),
-        "leaderboard_updated_at": int((data_dir / "smart_wallet_leaderboard.json").stat().st_mtime)
-        if (data_dir / "smart_wallet_leaderboard.json").exists()
-        else 0,
+        "leaderboard_updated_at": max([mtime for *_rest, mtime in leaderboard_sources] or [0]),
+        "by_category": {
+            category: {
+                "count": sum(1 for row in rows if isinstance(row, dict)),
+                "leaderboard_updated_at": mtime,
+                "scoring_version": max([int(row.get("scoring_version") or 0) for row in rows] or [0]) or None,
+                "quarantined_count": sum(
+                    1
+                    for row in rows
+                    if f"{category}:{str(row.get('wallet') or '').lower()}" in quarantine
+                    or str(row.get("wallet") or "").lower() in quarantine
+                ),
+            }
+            for category, _source_dir, rows, mtime in leaderboard_sources
+            if category in CATEGORIES
+        },
         "scoring_version": max([int(row.get("scoring_version") or 0) for row in rows] or [0]) or None,
-        "db_ready": bool(perf_snapshot.get("db_ready") or open_snapshot.get("db_ready") or quarantine_snapshot.get("db_ready")),
+        "db_ready": bool(perf_snapshot.get("db_ready") or follow_snapshot.get("db_ready") or quarantine_snapshot.get("db_ready")),
     }
 
 
@@ -757,28 +874,35 @@ def wallet_leaderboard_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str = "") -> dict[str, Any]:
-    store = FollowStore(data_dir / "follow" / "follow.db")
+def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str = "", category: str = "") -> dict[str, Any]:
+    store = FollowStore(_follow_db_path(data_dir))
     result = store.load_dashboard_follow_rows(page=1, size=10_000)
     logo_cache = _load_team_logo_cache(data_dir)
     allowed_statuses = {"open", "settled", "exited", "mixed"}
     status_filter = status if status in allowed_statuses else ""
+    category_filter = normalize_category(category)
     groups = _follow_groups_from_signals(result.get("signals", []))
     rows = sorted(groups.values(), key=lambda row: row.get("last_activity_at") or 0, reverse=True)
     if status_filter:
         rows = [row for row in rows if str(row.get("status") or "") == status_filter]
+    if category_filter:
+        rows = [row for row in rows if _signal_category(row) == category_filter]
     total = len(rows)
     page = max(1, int(page or 1))
     size = max(1, int(size or 25))
     start = (page - 1) * size
     rows = rows[start : start + size]
     for row in rows:
+        market = _active_market_by_condition(data_dir, str(row.get("condition_id") or ""))
+        row["match_start_time"] = row.get("match_start_time") or market.get("match_start_time") or market.get("market_start_time")
+        row["end_date"] = row.get("end_date") or market.get("end_date")
         row["team_logos"] = _team_logos_for_title(str(row.get("title") or row.get("question") or ""), logo_cache)
     return {
         "page": page,
         "size": size,
         "total": total,
         "status": status_filter,
+        "category": category_filter,
         "follows": rows,
         "db_ready": bool(result.get("db_ready")),
     }
@@ -786,7 +910,7 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
 
 def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
     condition_id = condition_id.lower()
-    result = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_follow_detail(condition_id)
+    result = FollowStore(_follow_db_path(data_dir)).load_dashboard_follow_detail(condition_id)
     signals = result.get("signals", [])
     market = _active_market_by_condition(data_dir, condition_id)
     logo_cache = _load_team_logo_cache(data_dir)
@@ -799,6 +923,7 @@ def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
     event_slug = ""
     market_type = ""
     market_type_label = ""
+    category = ""
     for signal in signals:
         title = title or str(signal.get("event_title") or signal.get("title") or signal.get("market_title") or "")
         question = question or str(signal.get("market_question") or signal.get("question") or "")
@@ -807,6 +932,7 @@ def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
         event_slug = event_slug or str(signal.get("event_slug") or "")
         market_type = market_type or str(signal.get("market_type") or "")
         market_type_label = market_type_label or str(signal.get("market_type_label") or "")
+        category = category or normalize_category(str(signal.get("category") or ""))
         wallet = str(signal.get("wallet") or "").lower()
         bucket = by_wallet.setdefault(
             wallet,
@@ -827,8 +953,10 @@ def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
     event_slug = event_slug or str(market.get("event_slug") or "")
     market_type = market_type or str(market.get("market_type") or "")
     market_type_label = market_type_label or str(market.get("market_type_label") or "")
+    category = category or normalize_category(str(market.get("category") or "")) or "esports"
     return {
         "condition_id": condition_id,
+        "category": category,
         "title": title,
         "question": question,
         "match_start_time": match_start_time,
@@ -847,7 +975,7 @@ def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
 
 
 def _leaderboard_rank_by_wallet(data_dir: Path) -> dict[str, int]:
-    leaderboard = _read_json(data_dir / "smart_wallet_leaderboard.json", [])
+    leaderboard = [row for _category, _dir, rows, _mtime in _category_leaderboards(data_dir) for row in rows]
     rows: list[dict[str, Any]] = []
     for row in leaderboard if isinstance(leaderboard, list) else []:
         if not isinstance(row, dict):
@@ -868,7 +996,7 @@ def build_wallet_follow_detail(data_dir: Path, wallet: str, *, status: str = "")
         return {"wallet": wallet, "short_addr": short_addr(wallet), "signals": [], "count": 0, "db_ready": False}
     allowed_statuses = {"open", "settled", "exited"}
     statuses = {status} if status in allowed_statuses else set()
-    result = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_wallet_follow_detail(wallet, statuses=statuses)
+    result = FollowStore(_follow_db_path(data_dir)).load_dashboard_wallet_follow_detail(wallet, statuses=statuses)
     signals = result.get("signals", [])
     signals = sorted(
         [signal for signal in signals if isinstance(signal, dict)],
@@ -903,8 +1031,13 @@ def _signal_activity_at(signal: dict[str, Any]) -> int:
     return max([value for value in leg_times if value] or [0])
 
 
-def build_events(data_dir: Path, *, observe_window_hours: float = 24.0) -> dict[str, Any]:
-    cache_path = data_dir / "follow" / "active_market_cache.json"
+def build_events(
+    data_dir: Path,
+    *,
+    observe_window_hours: float = 24.0,
+    post_start_grace_seconds: int = 900,
+) -> dict[str, Any]:
+    cache_path = _follow_dir(data_dir) / "active_market_cache.json"
     cached = _read_json(cache_path, {})
     logo_cache = _load_team_logo_cache(data_dir)
     updated_at = int(cached.get("updated_at") or 0) if isinstance(cached, dict) else 0
@@ -915,10 +1048,16 @@ def build_events(data_dir: Path, *, observe_window_hours: float = 24.0) -> dict[
         rows = markets
     else:
         rows = []
+    market_by_condition = {
+        str(market.get("condition_id") or market.get("conditionId") or "").lower(): market
+        for market in rows
+        if isinstance(market, dict)
+    }
     now_ts = int(time.time())
     window_end = now_ts + int(observe_window_hours * 3600)
+    recent_start_cutoff = now_ts - max(0, int(post_start_grace_seconds))
     events = []
-    follow_snapshot = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_snapshot()
+    follow_snapshot = FollowStore(_follow_db_path(data_dir)).load_dashboard_snapshot()
     open_by_condition: dict[str, list[dict[str, Any]]] = {}
     for signal in follow_snapshot.get("open_signals", []):
         open_by_condition.setdefault(str(signal.get("condition_id") or "").lower(), []).append(signal)
@@ -934,16 +1073,18 @@ def build_events(data_dir: Path, *, observe_window_hours: float = 24.0) -> dict[
         start_ts = _parse_timestamp(market.get("match_start_time") or market.get("market_start_time") or market.get("startTime"))
         open_signals = open_by_condition.get(condition_id, [])
         results = results_by_condition.get(condition_id, [])
-        if (start_ts and now_ts <= start_ts <= window_end) or open_signals:
+        if (start_ts and recent_start_cutoff <= start_ts <= window_end) or open_signals:
             open_signals = open_by_condition.get(condition_id, [])
             results = results_by_condition.get(condition_id, [])
             events.append(
                 {
                     "condition_id": condition_id,
+                    "category": normalize_category(str(market.get("category") or "")) or "esports",
                     "title": market.get("title"),
                     "question": market.get("question"),
                     "team_logos": _team_logos_for_title(str(market.get("title") or market.get("question") or ""), logo_cache),
                     "match_start_time": market.get("match_start_time") or market.get("market_start_time") or market.get("startTime"),
+                    "end_date": market.get("end_date") or market.get("endDate"),
                     "outcomes": market.get("outcomes"),
                     "outcome_prices": market.get("outcome_prices") or market.get("outcomePrices"),
                     "market_type": market.get("market_type"),
@@ -962,9 +1103,60 @@ def build_events(data_dir: Path, *, observe_window_hours: float = 24.0) -> dict[
             _parse_timestamp(row.get("match_start_time")) or 0,
         )
     )
+    archived_events = []
+    for condition_id, results in results_by_condition.items():
+        if not results:
+            continue
+        market = market_by_condition.get(condition_id, {})
+        title = market.get("title") or next(
+            (result.get("event_title") or result.get("title") or result.get("market_title") for result in results if isinstance(result, dict)),
+            "",
+        )
+        question = market.get("question") or next(
+            (result.get("market_question") or result.get("question") for result in results if isinstance(result, dict)),
+            "",
+        )
+        match_start_time = (
+            market.get("match_start_time")
+            or market.get("market_start_time")
+            or market.get("startTime")
+            or next((result.get("match_start_time") or result.get("market_start_time") for result in results if isinstance(result, dict)), None)
+        )
+        end_date = market.get("end_date") or market.get("endDate") or next(
+            (result.get("end_date") for result in results if isinstance(result, dict)),
+            None,
+        )
+        archived_events.append(
+            {
+                "condition_id": condition_id,
+                "category": normalize_category(str(market.get("category") or next((result.get("category") for result in results if isinstance(result, dict)), "") or "")) or "esports",
+                "title": title,
+                "question": question,
+                "team_logos": _team_logos_for_title(str(title or question or ""), logo_cache),
+                "match_start_time": match_start_time,
+                "end_date": end_date,
+                "outcomes": market.get("outcomes"),
+                "outcome_prices": market.get("outcome_prices") or market.get("outcomePrices"),
+                "market_type": market.get("market_type") or next((result.get("market_type") for result in results if isinstance(result, dict)), None),
+                "market_type_label": market.get("market_type_label") or next((result.get("market_type_label") for result in results if isinstance(result, dict)), None),
+                "open_signals": [],
+                "results": results,
+                "settled_count": sum(1 for result in results if result.get("status") == "settled"),
+                "exited_count": sum(1 for result in results if result.get("status") == "exited"),
+                "contested": _signals_contested(results),
+                "side_counts": _signal_side_counts(results),
+                "our_realized_pnl": sum(_signal_our_pnl(result) for result in results),
+                "wallet_basis_realized_pnl": sum(_signal_wallet_pnl(result) for result in results),
+                "last_activity_at": max((_signal_activity_at(result) for result in results), default=0),
+                "archived": True,
+            }
+        )
+    archived_events.sort(key=lambda row: row.get("last_activity_at") or 0, reverse=True)
     return {
         "events": events,
+        "archived_events": archived_events,
         "count": len(events),
+        "archived_count": len(archived_events),
         "cache_updated_at": updated_at,
         "cache_stale": bool(not updated_at or now_ts - updated_at > 15 * 60),
     }
@@ -1028,7 +1220,7 @@ def _normalize_logo_key(value: str) -> str:
 
 
 def _active_market_by_condition(data_dir: Path, condition_id: str) -> dict[str, Any]:
-    cached = _read_json(data_dir / "follow" / "active_market_cache.json", {})
+    cached = _read_json(_follow_dir(data_dir) / "active_market_cache.json", {})
     markets = cached.get("markets") if isinstance(cached, dict) else []
     if isinstance(markets, dict):
         rows = markets.values()
@@ -1074,7 +1266,7 @@ def _market_price_record(market: dict[str, Any]) -> dict[str, Any]:
 
 
 def _update_active_market_price_cache(data_dir: Path, condition_id: str, record: dict[str, Any]) -> None:
-    cache_path = data_dir / "follow" / "active_market_cache.json"
+    cache_path = _follow_dir(data_dir) / "active_market_cache.json"
     cached = _read_json(cache_path, {})
     markets = cached.get("markets") if isinstance(cached, dict) else []
     if isinstance(markets, dict):
@@ -1110,6 +1302,30 @@ def _update_active_market_price_cache(data_dir: Path, condition_id: str, record:
     _write_json(cache_path, {"updated_at": int(cached.get("updated_at") or time.time()) if isinstance(cached, dict) else int(time.time()), "markets": rows})
 
 
+CATEGORIES = ("esports", "sports")
+
+
+def normalize_category(category: str | None) -> str:
+    value = str(category or "").lower()
+    return value if value in CATEGORIES else ""
+
+
+def category_data_dirs(root: Path) -> dict[str, Path]:
+    root = Path(root)
+    return {"esports": root / "esports", "sports": root / "sports"}
+
+
+def _follow_dir(config_or_data_dir: DashboardConfig | Path) -> Path:
+    if isinstance(config_or_data_dir, DashboardConfig):
+        return config_or_data_dir.follow_dir or config_or_data_dir.data_dir / "follow"
+    data_dir = Path(config_or_data_dir)
+    return data_dir if data_dir.name == "follow" else data_dir / "follow"
+
+
+def _follow_db_path(config_or_data_dir: DashboardConfig | Path) -> Path:
+    return _follow_dir(config_or_data_dir) / "follow.db"
+
+
 class WalletRefreshAlreadyRunning(RuntimeError):
     def __init__(self, status: dict[str, Any]) -> None:
         super().__init__("wallet refresh already running")
@@ -1122,8 +1338,16 @@ class RunnerAlreadyRunning(RuntimeError):
         self.status = status
 
 
+class DataResetBlocked(RuntimeError):
+    def __init__(self, reason: str, status: dict[str, Any]) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.status = status
+
+
 def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
-    control = read_follow_control(config.data_dir)
+    follow_dir = _follow_dir(config)
+    control = read_follow_control(follow_dir)
     recorded = control.get("runner") if isinstance(control.get("runner"), dict) else {}
     processes = _find_runner_processes(config)
     recorded_pid = int(recorded.get("pid") or 0) if isinstance(recorded, dict) else 0
@@ -1141,6 +1365,7 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
             "started_at": recorded.get("started_at") if source == "dashboard" else None,
             "log_path": recorded.get("log_path") if source == "dashboard" else None,
             "data_dir": str(config.data_dir),
+            "follow_dir": str(follow_dir),
         }
     if recorded:
         return {
@@ -1148,8 +1373,9 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
             "status": "stopped",
             "pid": recorded_pid or None,
             "data_dir": str(config.data_dir),
+            "follow_dir": str(follow_dir),
         }
-    return {"status": "stopped", "data_dir": str(config.data_dir)}
+    return {"status": "stopped", "data_dir": str(config.data_dir), "follow_dir": str(follow_dir)}
 
 
 def start_runner(config: DashboardConfig) -> dict[str, Any]:
@@ -1157,7 +1383,7 @@ def start_runner(config: DashboardConfig) -> dict[str, Any]:
     if current.get("status") == "running":
         raise RunnerAlreadyRunning(current)
     now_ts = int(time.time())
-    follow_dir = config.data_dir / "follow"
+    follow_dir = _follow_dir(config)
     follow_dir.mkdir(parents=True, exist_ok=True)
     log_dir = _follow_log_dir(config.data_dir, log_dir=config.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1172,8 +1398,11 @@ def start_runner(config: DashboardConfig) -> dict[str, Any]:
         "--log-dir",
         str(log_dir.parent),
         "run",
+        "--follow-dir",
+        str(follow_dir),
         "--stake-usdc",
         str(config.runner_stake_usdc),
+        "--skip-initial-build",
     ]
     if config.runner_process_starter is not None:
         process = config.runner_process_starter(command, log_path)
@@ -1199,8 +1428,9 @@ def start_runner(config: DashboardConfig) -> dict[str, Any]:
         "command": command,
         "log_path": str(log_path),
         "data_dir": str(config.data_dir),
+        "follow_dir": str(follow_dir),
     }
-    _update_runner_control(config.data_dir, status)
+    _update_runner_control(follow_dir, status)
     return status
 
 
@@ -1208,7 +1438,7 @@ def stop_runner(config: DashboardConfig) -> dict[str, Any]:
     current = build_runner_status(config)
     pid = int(current.get("pid") or 0)
     if not pid:
-        return {"status": "stopped", "data_dir": str(config.data_dir)}
+        return {"status": "stopped", "data_dir": str(config.data_dir), "follow_dir": str(_follow_dir(config))}
     if config.runner_process_stopper is not None:
         config.runner_process_stopper(current)
     else:
@@ -1218,8 +1448,42 @@ def stop_runner(config: DashboardConfig) -> dict[str, Any]:
         "status": "stopping",
         "stop_requested_at": int(time.time()),
     }
-    _update_runner_control(config.data_dir, status)
+    _update_runner_control(_follow_dir(config), status)
     return status
+
+
+def reset_dashboard_data(config: DashboardConfig) -> dict[str, Any]:
+    runner = build_runner_status(config)
+    if runner.get("status") == "running":
+        raise DataResetBlocked("runner_running", runner)
+
+    follow_dir = _follow_dir(config)
+    control = read_follow_control(follow_dir)
+    wallet_refresh = control.get("wallet_refresh") if isinstance(control.get("wallet_refresh"), dict) else {}
+    running_refresh = {
+        category: status
+        for category, status in wallet_refresh.items()
+        if isinstance(status, dict) and status.get("status") == "running"
+    }
+    if running_refresh:
+        raise DataResetBlocked("wallet_refresh_running", {"wallet_refresh": running_refresh})
+
+    targets = [*category_data_dirs(config.data_dir).values(), follow_dir, _follow_log_dir(config.data_dir, log_dir=config.log_dir)]
+    removed: list[str] = []
+    for target in targets:
+        target = Path(target)
+        if target.exists():
+            shutil.rmtree(target)
+            removed.append(str(target))
+        target.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "status": "reset",
+        "reset_at": int(time.time()),
+        "data_dir": str(config.data_dir),
+        "follow_dir": str(follow_dir),
+        "removed": removed,
+    }
 
 
 def _update_runner_control(data_dir: Path, status: dict[str, Any]) -> dict[str, Any]:
@@ -1276,16 +1540,48 @@ def _normalize_process_row(row: Any) -> dict[str, Any]:
 def _process_matches_runner(row: dict[str, Any], data_dir: Path) -> bool:
     command = str(row.get("command") or "")
     pid = int(row.get("pid") or 0)
-    tokens = command.split()
-    if pid <= 0 or "poly_fight.cli" not in tokens or "run" not in tokens:
+    tokens = _command_tokens(command)
+    if pid <= 0 or not _is_poly_fight_run_command(tokens, command):
         return False
     if "--execution-mode live" in command:
         return False
     data_dir_values = _data_dir_values_from_command(tokens)
     if not data_dir_values:
-        return False
-    expected = {str(data_dir), str(data_dir.resolve())}
+        return _runner_default_data_dir_matches(data_dir)
+    expected = _data_dir_match_values(data_dir)
     return any(value in expected or str(Path(value).resolve()) in expected for value in data_dir_values)
+
+
+def _command_tokens(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
+def _is_poly_fight_run_command(tokens: list[str], command: str) -> bool:
+    if "run" not in tokens:
+        return False
+    if "poly_fight.cli" in tokens:
+        return True
+    if any(token.endswith("poly_fight/cli.py") or token.endswith("poly_fight\\cli.py") for token in tokens):
+        return True
+    return "poly_fight.cli" in command
+
+
+def _runner_default_data_dir_matches(data_dir: Path) -> bool:
+    # A `run`/`collect` started without --data-dir resolves to data/esports (the esports
+    # default after the per-category split); keep matching the legacy bare "data" too.
+    data_dir = Path(data_dir)
+    candidates = {"data", "data/esports"}
+    if str(data_dir) in candidates:
+        return True
+    resolved = str(data_dir.resolve())
+    return any(resolved == str(Path(c).resolve()) for c in candidates)
+
+
+def _data_dir_match_values(data_dir: Path) -> set[str]:
+    return {str(data_dir), str(data_dir.resolve())}
 
 
 def _data_dir_values_from_command(tokens: list[str]) -> list[str]:
@@ -1331,8 +1627,8 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
-def build_wallet_refresh_status(data_dir: Path) -> dict[str, Any]:
-    control = read_follow_control(data_dir)
+def build_wallet_refresh_status(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str, Any]:
+    control = read_follow_control(follow_dir or data_dir)
     status = control.get("wallet_refresh") if isinstance(control.get("wallet_refresh"), dict) else {}
     return {
         "status": status or {"status": "idle"},
@@ -1342,68 +1638,76 @@ def build_wallet_refresh_status(data_dir: Path) -> dict[str, Any]:
 def start_wallet_refresh(
     data_dir: Path,
     *,
+    category: str = "esports",
+    follow_dir: Path | None = None,
     runner: Any = None,
     timeout_seconds: int = 7200,
 ) -> dict[str, Any]:
+    category = normalize_category(category)
+    if not category:
+        raise ValueError("invalid category")
     now_ts = int(time.time())
-    control = read_follow_control(data_dir)
-    existing = control.get("wallet_refresh")
+    root = Path(data_dir)
+    category_dir = category_data_dirs(root)[category]
+    follow_dir = follow_dir or root / "follow"
+    control = read_follow_control(follow_dir)
+    wallet_refresh = control.get("wallet_refresh") if isinstance(control.get("wallet_refresh"), dict) else {}
+    existing = wallet_refresh.get(category) if isinstance(wallet_refresh.get(category), dict) else {}
     if isinstance(existing, dict) and existing.get("status") == "running":
         started_at = int(existing.get("started_at") or 0)
         if not started_at or now_ts - started_at < timeout_seconds:
             raise WalletRefreshAlreadyRunning(existing)
 
-    follow_dir = data_dir / "follow"
     follow_dir.mkdir(parents=True, exist_ok=True)
-    log_path = follow_dir / f"wallet-refresh-{now_ts}.out"
+    log_path = follow_dir / f"wallet-refresh-{category}-{now_ts}.out"
     command = [
         sys.executable,
         "-u",
         "-m",
         "poly_fight.cli",
         "--data-dir",
-        str(data_dir),
+        str(category_dir),
         "collect",
+        "--category",
+        category,
         "--max-profiles-per-run",
         "1000",
     ]
     status = {
         "status": "running",
+        "category": category,
         "started_at": now_ts,
         "command": command,
         "log_path": str(log_path),
     }
-    update_wallet_refresh_status(data_dir, status)
+    update_wallet_refresh_status(follow_dir, {**wallet_refresh, category: status})
 
     def worker() -> None:
         finished_at = int(time.time())
         try:
             if runner is not None:
-                returncode = int(runner(data_dir, log_path) or 0)
+                try:
+                    returncode = int(runner(category, category_dir, log_path) or 0)
+                except TypeError:
+                    returncode = int(runner(category_dir, log_path) or 0)
             else:
                 with log_path.open("ab") as log_file:
                     result = subprocess.run(command, cwd=Path(__file__).resolve().parents[1], stdout=log_file, stderr=subprocess.STDOUT, check=False)
                     returncode = int(result.returncode)
             finished_at = int(time.time())
+            current = read_follow_control(follow_dir).get("wallet_refresh")
+            current = current if isinstance(current, dict) else {}
             update_wallet_refresh_status(
-                data_dir,
-                {
-                    **status,
-                    "status": "succeeded" if returncode == 0 else "failed",
-                    "finished_at": finished_at,
-                    "returncode": returncode,
-                },
+                follow_dir,
+                {**current, category: {**status, "status": "succeeded" if returncode == 0 else "failed", "finished_at": finished_at, "returncode": returncode}},
             )
         except Exception as exc:
             finished_at = int(time.time())
+            current = read_follow_control(follow_dir).get("wallet_refresh")
+            current = current if isinstance(current, dict) else {}
             update_wallet_refresh_status(
-                data_dir,
-                {
-                    **status,
-                    "status": "failed",
-                    "finished_at": finished_at,
-                    "error": str(exc),
-                },
+                follow_dir,
+                {**current, category: {**status, "status": "failed", "finished_at": finished_at, "error": str(exc)}},
             )
 
     thread = threading.Thread(target=worker, name="poly-fight-wallet-refresh", daemon=True)
@@ -1424,8 +1728,10 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                 "title": signal.get("event_title") or signal.get("title") or signal.get("market_title"),
                 "question": signal.get("market_question") or signal.get("question"),
                 "match_start_time": signal.get("match_start_time") or signal.get("market_start_time"),
+                "end_date": signal.get("end_date"),
                 "market_type": signal.get("market_type"),
                 "market_type_label": signal.get("market_type_label"),
+                "category": _signal_category(signal),
                 "wallets": set(),
                 "leg_count": 0,
                 "stake": 0.0,
@@ -1438,6 +1744,11 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                 "clv_count": 0,
             },
         )
+        bucket["match_start_time"] = bucket.get("match_start_time") or signal.get("match_start_time") or signal.get("market_start_time")
+        bucket["end_date"] = bucket.get("end_date") or signal.get("end_date")
+        bucket["market_type"] = bucket.get("market_type") or signal.get("market_type")
+        bucket["market_type_label"] = bucket.get("market_type_label") or signal.get("market_type_label")
+        bucket["category"] = bucket.get("category") or _signal_category(signal)
         wallet = str(signal.get("wallet") or "").lower()
         if wallet:
             bucket["wallets"].add(wallet)
