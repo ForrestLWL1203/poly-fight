@@ -8,12 +8,15 @@ from typing import Any, Iterable
 
 
 SECONDS_PER_DAY = 86400
-SCORING_VERSION = 9
+SCORING_VERSION = 12
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 TRADE_BEHAVIOR_EXCLUDE_RATE = 0.5
-MIN_A_POSITIVE_MARKET_RATE = 0.75
-MIN_B_POSITIVE_MARKET_RATE = 0.65
+# Thresholds recalibrated for the de-biased trade-reconstruction win rates (v11):
+# real top esports wallets win ~66-81%, not the survivorship-inflated ~90% the old
+# closed_positions floors assumed. See review/scoring analysis.
+MIN_A_POSITIVE_MARKET_RATE = 0.63
+MIN_B_POSITIVE_MARKET_RATE = 0.55
 MAIN_MATCH = "main_match"
 GAME_WINNER = "game_winner"
 MAP_WINNER = "map_winner"
@@ -369,11 +372,23 @@ def build_discovery_slate(
     submarket_fallback_min_market_volume: float = 1_000,
     target_markets: int = 30,
     submarket_target_markets: int = 60,
+    game_winner_target_markets: int | None = None,
+    map_winner_target_markets: int | None = None,
     max_markets_per_run: int = 50,
     submarket_max_markets_per_run: int = 60,
+    game_winner_max_markets_per_run: int | None = None,
+    map_winner_max_markets_per_run: int | None = None,
     market_offset: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     now = now or datetime.now(timezone.utc)
+    game_winner_target_markets = int(game_winner_target_markets if game_winner_target_markets is not None else submarket_target_markets)
+    map_winner_target_markets = int(map_winner_target_markets if map_winner_target_markets is not None else submarket_target_markets)
+    game_winner_max_markets_per_run = int(
+        game_winner_max_markets_per_run if game_winner_max_markets_per_run is not None else submarket_max_markets_per_run
+    )
+    map_winner_max_markets_per_run = int(
+        map_winner_max_markets_per_run if map_winner_max_markets_per_run is not None else submarket_max_markets_per_run
+    )
 
     def select(days: int, min_volume: float, market_types: set[str]) -> list[dict[str, Any]]:
         selected = []
@@ -424,17 +439,24 @@ def build_discovery_slate(
         fallback_min_volume=fallback_min_market_volume,
         target=target_markets,
     )
-    sub_selected, sub_meta = select_bucket(
-        market_types={GAME_WINNER, MAP_WINNER},
+    game_selected, game_meta = select_bucket(
+        market_types={GAME_WINNER},
         primary_min_volume=submarket_min_market_volume,
         fallback_min_volume=submarket_fallback_min_market_volume,
-        target=submarket_target_markets,
+        target=game_winner_target_markets,
+    )
+    map_selected, map_meta = select_bucket(
+        market_types={MAP_WINNER},
+        primary_min_volume=submarket_min_market_volume,
+        fallback_min_volume=submarket_fallback_min_market_volume,
+        target=map_winner_target_markets,
     )
 
     main_slice = main_selected[market_offset : market_offset + max_markets_per_run]
-    sub_slice = sub_selected[:submarket_max_markets_per_run]
+    game_slice = game_selected[:game_winner_max_markets_per_run]
+    map_slice = map_selected[:map_winner_max_markets_per_run]
     merged: dict[str, dict[str, Any]] = {}
-    for market in [*main_slice, *sub_slice]:
+    for market in [*main_slice, *game_slice, *map_slice]:
         merged[str(market.get("condition_id") or "").lower()] = market
     selected = sorted(
         merged.values(),
@@ -459,15 +481,28 @@ def build_discovery_slate(
         "target_markets": target_markets,
         "market_offset": market_offset,
         "max_markets_per_run": max_markets_per_run,
-        "total_selected_market_count": main_meta["total_selected_market_count"] + sub_meta["total_selected_market_count"],
+        "total_selected_market_count": (
+            main_meta["total_selected_market_count"]
+            + game_meta["total_selected_market_count"]
+            + map_meta["total_selected_market_count"]
+        ),
         "market_count": len(selected),
         "market_type_counts": type_counts,
         "selected_by_market_type": selected_type_counts,
         "main_match": main_meta,
         "submarkets": {
-            **sub_meta,
-            "target_markets": submarket_target_markets,
-            "max_markets_per_run": submarket_max_markets_per_run,
+            "target_markets": game_winner_target_markets + map_winner_target_markets,
+            "max_markets_per_run": game_winner_max_markets_per_run + map_winner_max_markets_per_run,
+            "game_winner": {
+                **game_meta,
+                "target_markets": game_winner_target_markets,
+                "max_markets_per_run": game_winner_max_markets_per_run,
+            },
+            "map_winner": {
+                **map_meta,
+                "target_markets": map_winner_target_markets,
+                "max_markets_per_run": map_winner_max_markets_per_run,
+            },
         },
     }
 
@@ -749,6 +784,8 @@ def summarize_closed_positions(
             continue
         avg_price = to_float(position.get("avgPrice") or position.get("avg_price"))
         cost_basis = total_bought * avg_price if avg_price > 0 else total_bought
+        actual_pnl = to_float(position.get("actualPnl"), realized_pnl)
+        hold_pnl = to_float(position.get("holdPnl"), realized_pnl)
         rows.append(
             {
                 "condition_id": condition_id,
@@ -756,6 +793,8 @@ def summarize_closed_positions(
                 "total_bought": total_bought,
                 "cost_basis": cost_basis,
                 "realized_pnl": realized_pnl,
+                "actual_pnl": actual_pnl,
+                "hold_pnl": hold_pnl,
                 "profit_per_share": realized_pnl / total_bought,
                 "roi": realized_pnl / cost_basis if cost_basis > 0 else 0.0,
                 "avg_price": avg_price,
@@ -768,6 +807,8 @@ def summarize_closed_positions(
         total_bought = sum(row["total_bought"] for row in bucket_rows)
         total_cost = sum(row["cost_basis"] for row in bucket_rows)
         realized_pnl = sum(row["realized_pnl"] for row in bucket_rows)
+        actual_pnl = sum(row["actual_pnl"] for row in bucket_rows)
+        hold_pnl = sum(row["hold_pnl"] for row in bucket_rows)
         positive = sum(1 for row in bucket_rows if row["realized_pnl"] > 0)
         losses = count - positive
         last_trade = max((row["timestamp"] for row in bucket_rows), default=0)
@@ -778,6 +819,41 @@ def summarize_closed_positions(
         high_price_entries = sum(1 for row in bucket_rows if row["avg_price"] >= 0.90)
         low_edge_profits = sum(1 for row in bucket_rows if 0 < row["roi"] <= 0.03)
         condition_ids = sorted({row["condition_id"] for row in bucket_rows})
+        winning_cost = sum(row["cost_basis"] for row in bucket_rows if row["realized_pnl"] > 0)
+        capital_weighted_entry_price = total_cost / total_bought if total_bought else 0.0
+        capital_weighted_win_rate = winning_cost / total_cost if total_cost else 0.0
+        entry_price_buckets = {
+            "<0.40": {"market_count": 0, "total_cost": 0.0, "win_count": 0, "hold_pnl": 0.0},
+            "0.40-0.55": {"market_count": 0, "total_cost": 0.0, "win_count": 0, "hold_pnl": 0.0},
+            "0.55-0.70": {"market_count": 0, "total_cost": 0.0, "win_count": 0, "hold_pnl": 0.0},
+            ">=0.70": {"market_count": 0, "total_cost": 0.0, "win_count": 0, "hold_pnl": 0.0},
+        }
+        for row in bucket_rows:
+            avg_price = row["avg_price"]
+            if avg_price < 0.40:
+                bucket_name = "<0.40"
+            elif avg_price < 0.55:
+                bucket_name = "0.40-0.55"
+            elif avg_price < 0.70:
+                bucket_name = "0.55-0.70"
+            else:
+                bucket_name = ">=0.70"
+            bucket = entry_price_buckets[bucket_name]
+            bucket["market_count"] += 1
+            bucket["total_cost"] += row["cost_basis"]
+            bucket["hold_pnl"] += row["hold_pnl"]
+            if row["realized_pnl"] > 0:
+                bucket["win_count"] += 1
+        formatted_buckets = {}
+        for bucket_name, bucket in entry_price_buckets.items():
+            market_count = int(bucket["market_count"])
+            formatted_buckets[bucket_name] = {
+                "market_count": market_count,
+                "total_cost": round(bucket["total_cost"], 6),
+                "win_count": int(bucket["win_count"]),
+                "win_rate": round(bucket["win_count"] / market_count, 8) if market_count else 0.0,
+                "hold_pnl": round(bucket["hold_pnl"], 6),
+            }
         return {
         "esports_closed_count": count,
         "neutral_market_count": neutral_market_count,
@@ -785,6 +861,10 @@ def summarize_closed_positions(
         "esports_loss_count": losses,
         "esports_condition_ids": condition_ids,
         "esports_realized_pnl": round(realized_pnl, 6),
+        "hold_pnl": round(hold_pnl, 6),
+        "actual_pnl": round(actual_pnl, 6),
+        "actual_minus_hold_pnl": round(actual_pnl - hold_pnl, 6),
+        "actual_minus_hold_pnl_rate": round((actual_pnl - hold_pnl) / hold_pnl, 8) if hold_pnl > 0 else None,
         "esports_total_bought": round(total_bought, 6),
         "esports_total_cost": round(total_cost, 6),
         "avg_profit_per_share": round(realized_pnl / total_bought, 8) if total_bought else 0.0,
@@ -798,6 +878,10 @@ def summarize_closed_positions(
         "median_position_size": round(median(sizes), 6) if sizes else 0.0,
         "avg_entry_price": round(sum(entry_prices) / len(entry_prices), 8) if entry_prices else 0.0,
         "median_entry_price": round(median(entry_prices), 8) if entry_prices else 0.0,
+        "capital_weighted_entry_price": round(capital_weighted_entry_price, 8),
+        "capital_weighted_win_rate": round(capital_weighted_win_rate, 8),
+        "capital_weighted_edge": round(capital_weighted_win_rate - capital_weighted_entry_price, 8),
+        "entry_price_buckets": formatted_buckets,
         "high_price_entry_rate": round(high_price_entries / count, 8) if count else 0.0,
         "low_edge_profit_rate": round(low_edge_profits / count, 8) if count else 0.0,
         "last_esports_trade_at": last_trade,
@@ -818,7 +902,214 @@ def summarize_closed_positions(
             "market_type_label": MARKET_TYPE_LABELS.get(market_type, market_type),
         }
     summary = summarize_bucket(rows, neutral_market_count=sum(neutral_market_count_by_type.values()))
-    return {**summary, "per_type": per_type}
+    return {**summary, "per_type": per_type, "data_quality": {"source": "closed_positions", "reliable_losses": False}}
+
+
+def winning_outcome_index(record: dict[str, Any]) -> int | None:
+    prices = [to_float(value) for value in record.get("outcome_prices") or record.get("outcomePrices") or []]
+    if not is_settled_binary_prices(prices):
+        return None
+    return max(range(len(prices)), key=lambda index: prices[index])
+
+
+def reconstruct_closed_positions(
+    trades: list[dict[str, Any]],
+    market_records_by_id: dict[str, dict[str, Any]],
+    *,
+    material_sell_frac: float = 0.2,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    markets = {str(key).lower(): value for key, value in market_records_by_id.items()}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades or []:
+        condition_id = str(trade.get("conditionId") or trade.get("condition_id") or "").lower()
+        if condition_id in markets:
+            grouped.setdefault(condition_id, []).append(trade)
+
+    positions: list[dict[str, Any]] = []
+    behavior_by_market: dict[str, dict[str, Any]] = {}
+    for condition_id, market_trades in grouped.items():
+        record = markets.get(condition_id) or {}
+        winner_index = winning_outcome_index(record)
+        if winner_index is None:
+            continue
+        outcomes = [str(value).lower() for value in record.get("outcomes") or []]
+
+        buy_size_by_outcome: dict[int, float] = {}
+        buy_cost_by_outcome: dict[int, float] = {}
+        sell_size_by_outcome: dict[int, float] = {}
+        sell_proceeds_by_outcome: dict[int, float] = {}
+        last_ts = 0
+        for trade in market_trades:
+            side = str(trade.get("side") or trade.get("type") or "").upper()
+            if side not in {"BUY", "SELL"}:
+                continue
+            size = to_float(trade.get("size") or trade.get("amount"))
+            price = to_float(trade.get("price") or trade.get("avgPrice") or trade.get("avg_price"))
+            if size <= 0:
+                continue
+            cash = trade_cash(trade)
+            outcome_index = to_int(trade.get("outcomeIndex"), -1)
+            if outcome_index < 0:
+                outcome = str(trade.get("outcome") or "").lower()
+                outcome_index = outcomes.index(outcome) if outcome in outcomes else -1
+            if outcome_index < 0:
+                continue
+            last_ts = max(last_ts, to_int(trade.get("timestamp")))
+            if side == "BUY":
+                buy_size_by_outcome[outcome_index] = buy_size_by_outcome.get(outcome_index, 0.0) + size
+                buy_cost_by_outcome[outcome_index] = buy_cost_by_outcome.get(outcome_index, 0.0) + cash
+            elif side == "SELL":
+                sell_size_by_outcome[outcome_index] = sell_size_by_outcome.get(outcome_index, 0.0) + size
+                sell_proceeds_by_outcome[outcome_index] = sell_proceeds_by_outcome.get(outcome_index, 0.0) + cash
+
+        bought_outcomes = {outcome for outcome, size in buy_size_by_outcome.items() if size > 0}
+        if not bought_outcomes:
+            continue
+        incomplete_position = any(
+            sell_size > buy_size_by_outcome.get(outcome_index, 0.0) + 0.000001
+            for outcome_index, sell_size in sell_size_by_outcome.items()
+        )
+        if incomplete_position:
+            continue
+        has_material_sell = any(
+            buy_size_by_outcome.get(outcome_index, 0.0) > 0
+            and sell_size / buy_size_by_outcome.get(outcome_index, 0.0) > material_sell_frac
+            for outcome_index, sell_size in sell_size_by_outcome.items()
+        )
+        two_sided = len(bought_outcomes) >= 2
+        total_bought = sum(buy_size_by_outcome.values())
+        buy_cost = sum(buy_cost_by_outcome.values())
+        sell_proceeds = sum(sell_proceeds_by_outcome.values())
+        net_cost = buy_cost - sell_proceeds
+        net_position_by_outcome = {
+            outcome: buy_size_by_outcome.get(outcome, 0.0) - sell_size_by_outcome.get(outcome, 0.0)
+            for outcome in set(buy_size_by_outcome) | set(sell_size_by_outcome)
+        }
+        actual_payout = max(0.0, net_position_by_outcome.get(winner_index, 0.0))
+        actual_pnl = actual_payout - net_cost
+        hold_payout = max(0.0, buy_size_by_outcome.get(winner_index, 0.0))
+        hold_pnl = hold_payout - buy_cost
+        actual_minus_hold_pnl = actual_pnl - hold_pnl
+        avg_price = buy_cost / total_bought if total_bought > 0 else 0.0
+        dominant_outcome = max(buy_size_by_outcome, key=lambda outcome: buy_size_by_outcome[outcome])
+        positions.append(
+            {
+                "conditionId": condition_id,
+                "outcomeIndex": dominant_outcome,
+                "totalBought": round(total_bought, 8),
+                "avgPrice": round(avg_price, 8),
+                "realizedPnl": round(hold_pnl, 8),
+                "holdPnl": round(hold_pnl, 8),
+                "actualPnl": round(actual_pnl, 8),
+                "actualMinusHoldPnl": round(actual_minus_hold_pnl, 8),
+                "actualMinusHoldPnlRate": round(actual_minus_hold_pnl / hold_pnl, 8) if hold_pnl > 0 else None,
+                "timestamp": last_ts,
+                "netCost": round(net_cost, 8),
+                "buyCost": round(buy_cost, 8),
+                "sellProceeds": round(sell_proceeds, 8),
+                "holdPayout": round(hold_payout, 8),
+                "actualPayout": round(actual_payout, 8),
+                "netPositionByOutcome": {
+                    str(outcome): round(size, 8)
+                    for outcome, size in sorted(net_position_by_outcome.items())
+                    if abs(size) > 0.000001
+                },
+                "winningOutcomeIndex": winner_index,
+                "soldBeforeResolution": has_material_sell,
+                "twoSidedTrade": two_sided,
+            }
+        )
+        behavior_by_market[condition_id] = {
+            "condition_id": condition_id,
+            "sold_before_resolution": has_material_sell,
+            "two_sided": two_sided,
+            "buy_size_by_outcome": {str(k): round(v, 8) for k, v in sorted(buy_size_by_outcome.items())},
+            "sell_size_by_outcome": {str(k): round(v, 8) for k, v in sorted(sell_size_by_outcome.items())},
+        }
+    return positions, behavior_by_market
+
+
+def summarize_trade_reconstructed_positions(
+    trades: list[dict[str, Any]],
+    market_records_by_id: dict[str, dict[str, Any]],
+    *,
+    now_ts: int | None = None,
+    bot_like_score: int = 0,
+    material_sell_frac: float = 0.2,
+) -> dict[str, Any]:
+    markets = {str(key).lower(): value for key, value in market_records_by_id.items()}
+    positions, behavior_by_market = reconstruct_closed_positions(
+        trades,
+        markets,
+        material_sell_frac=material_sell_frac,
+    )
+    esports_condition_ids = set(markets)
+    condition_type_by_id = {
+        condition_id: str(record.get("market_type") or MAIN_MATCH)
+        for condition_id, record in markets.items()
+    }
+    summary = summarize_closed_positions(
+        positions,
+        esports_condition_ids,
+        condition_type_by_id=condition_type_by_id,
+        now_ts=now_ts,
+        bot_like_score=bot_like_score,
+    )
+    behavior_market_count = len(behavior_by_market)
+    sold_before_resolution_market_count = sum(1 for row in behavior_by_market.values() if row.get("sold_before_resolution"))
+    two_sided_trade_market_count = sum(1 for row in behavior_by_market.values() if row.get("two_sided"))
+
+    per_type_behavior: dict[str, dict[str, int]] = {}
+    for condition_id, behavior_row in behavior_by_market.items():
+        market_type = condition_type_by_id.get(condition_id, MAIN_MATCH)
+        bucket = per_type_behavior.setdefault(
+            market_type,
+            {
+                "historical_trade_behavior_market_count": 0,
+                "sold_before_resolution_market_count": 0,
+                "two_sided_trade_market_count": 0,
+            },
+        )
+        bucket["historical_trade_behavior_market_count"] += 1
+        if behavior_row.get("sold_before_resolution"):
+            bucket["sold_before_resolution_market_count"] += 1
+        if behavior_row.get("two_sided"):
+            bucket["two_sided_trade_market_count"] += 1
+
+    per_type = dict(summary.get("per_type") or {})
+    for market_type, behavior in per_type_behavior.items():
+        behavior_count = to_int(behavior.get("historical_trade_behavior_market_count"))
+        per_type[market_type] = {
+            **(per_type.get(market_type) or {}),
+            **behavior,
+            "sold_before_resolution_market_rate": round(
+                to_int(behavior.get("sold_before_resolution_market_count")) / behavior_count,
+                8,
+            )
+            if behavior_count
+            else 0.0,
+            "two_sided_trade_market_rate": round(
+                to_int(behavior.get("two_sided_trade_market_count")) / behavior_count,
+                8,
+            )
+            if behavior_count
+            else 0.0,
+        }
+    return {
+        **summary,
+        "data_quality": {"source": "trade_reconstruction", "reliable_losses": True},
+        "trade_reconstructed_sample_count": summary.get("esports_closed_count", 0),
+        "per_type": per_type,
+        "historical_trade_behavior_market_count": behavior_market_count,
+        "sold_before_resolution_market_count": sold_before_resolution_market_count,
+        "sold_before_resolution_market_rate": round(sold_before_resolution_market_count / behavior_market_count, 8)
+        if behavior_market_count
+        else 0.0,
+        "two_sided_trade_market_count": two_sided_trade_market_count,
+        "two_sided_trade_market_rate": round(two_sided_trade_market_count / behavior_market_count, 8)
+        if behavior_market_count
+        else 0.0,
+    }
 
 
 def summarize_historical_trade_behavior(
@@ -982,7 +1273,7 @@ def classify_wallet_bucket(
             "profile_state": "unqualified",
             "reasons": ["negative_roi"],
         }
-    if historical_roi < 0.30:
+    if historical_roi < 0.20:
         return {
             **summary,
             "entry_edge": round(entry_edge, 8),
@@ -994,13 +1285,13 @@ def classify_wallet_bucket(
         reasons.append("thin_sample")
     if total_bought < 1_000:
         reasons.append("low_volume")
-    if median_entry <= 0 or median_entry > 0.65:
+    if median_entry <= 0 or median_entry > 0.68:
         reasons.append("weak_entry_price")
     if loss_count > 0:
         reasons.append("has_losses")
-    if wilson_lb < 0.55:
+    if wilson_lb < 0.57:
         reasons.append("weak_wilson")
-    if entry_edge < 0.05:
+    if entry_edge < 0.01:
         reasons.append("weak_entry_edge")
     if positive_rate < MIN_A_POSITIVE_MARKET_RATE:
         reasons.append("low_positive_market_rate")
@@ -1009,24 +1300,24 @@ def classify_wallet_bucket(
 
     if (
         count >= min_sample
-        and wilson_lb >= 0.65
-        and entry_edge >= 0.10
+        and wilson_lb >= 0.57
+        and entry_edge >= 0.01
         and pnl > 0
         and positive_rate >= MIN_A_POSITIVE_MARKET_RATE
         and total_bought >= 5_000
-        and 0 < median_entry <= 0.65
+        and 0 < median_entry <= 0.68
         and not stale
         and bot_score < 40
     ):
         grade = "A"
     elif (
         count >= min_sample
-        and wilson_lb >= 0.55
-        and entry_edge >= 0.05
+        and wilson_lb >= 0.50
+        and entry_edge >= 0.0
         and pnl > 0
         and positive_rate >= MIN_B_POSITIVE_MARKET_RATE
         and total_bought >= 1_000
-        and 0 < median_entry <= 0.65
+        and 0 < median_entry <= 0.68
         and not stale
         and bot_score < 50
     ):
@@ -1103,12 +1394,18 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
         }
     else:
         classified = {**classified, "grade": best_grade}
+    observed_market_types = sorted(
+        (str(value) for value in per_type_grades if value),
+        key=lambda value: MARKET_TYPE_ORDER.get(value, 99),
+    )
     return {
         **classified,
         "per_type": per_type,
         "per_type_grades": per_type_grades,
         "eligible_market_types": eligible_market_types,
         "eligible_market_type_labels": [MARKET_TYPE_LABELS.get(value, value) for value in eligible_market_types],
+        "observed_market_types": observed_market_types,
+        "observed_market_type_labels": [MARKET_TYPE_LABELS.get(value, value) for value in observed_market_types],
     }
 
 
@@ -1129,8 +1426,10 @@ def profile_candidate_wallet(
     candidate: dict[str, Any],
     esports_condition_ids: set[str],
     *,
+    market_records_by_id: dict[str, dict[str, Any]] | None = None,
     condition_type_by_id: dict[str, str] | None = None,
-    closed_positions_loader,
+    user_trades_loader=None,
+    closed_positions_loader=None,
     current_positions_loader,
     historical_trades_loader=None,
     now_ts: int | None = None,
@@ -1138,17 +1437,27 @@ def profile_candidate_wallet(
     wallet = normalize_wallet(candidate.get("wallet"))
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
     try:
-        closed_positions = closed_positions_loader(wallet)
         current_positions = current_positions_loader(wallet)
         bot_score = max(bot_like_score_from_positions(current_positions), bot_like_score_from_candidate(candidate))
-        summary = summarize_closed_positions(
-            closed_positions,
-            esports_condition_ids,
-            condition_type_by_id=condition_type_by_id,
-            now_ts=now_ts,
-            bot_like_score=bot_score,
-        )
-        if historical_trades_loader:
+        if user_trades_loader and market_records_by_id:
+            summary = summarize_trade_reconstructed_positions(
+                user_trades_loader(wallet),
+                market_records_by_id,
+                now_ts=now_ts,
+                bot_like_score=bot_score,
+            )
+        else:
+            if not closed_positions_loader:
+                raise ValueError("user_trades_loader or closed_positions_loader is required")
+            closed_positions = closed_positions_loader(wallet)
+            summary = summarize_closed_positions(
+                closed_positions,
+                esports_condition_ids,
+                condition_type_by_id=condition_type_by_id,
+                now_ts=now_ts,
+                bot_like_score=bot_score,
+            )
+        if historical_trades_loader and not user_trades_loader:
             trade_behavior = summarize_historical_trade_behavior(
                 summary.get("esports_condition_ids") or [],
                 historical_trades_loader=lambda condition_id: historical_trades_loader(wallet, condition_id),

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from statistics import median
 from typing import Any
 
-from .core import MIN_A_POSITIVE_MARKET_RATE, SECONDS_PER_DAY, normalize_wallet, parse_dt, to_float, to_int
+from .core import SECONDS_PER_DAY, normalize_wallet, parse_dt, to_float, to_int
 
 
 def eligible_follow_wallets(
@@ -22,8 +22,6 @@ def eligible_follow_wallets(
         if row.get("grade") == "A" and not eligible_market_types:
             eligible_market_types = ["main_match"]
         if row.get("grade") != "A" and not eligible_market_types:
-            continue
-        if "positive_market_rate" in row and to_float(row.get("positive_market_rate")) < MIN_A_POSITIVE_MARKET_RATE:
             continue
         wallet = normalize_wallet(row.get("wallet"))
         if wallet in quarantined_wallets:
@@ -309,10 +307,13 @@ def wallet_behavior_summary(signal: dict[str, Any]) -> dict[str, Any]:
     return {
         "single_sided": "hedge" not in kinds,
         "hedged": "hedge" in kinds,
-        "sold_before_resolution": "exit" in kinds,
+        "sold_before_resolution": bool(kinds & {"sell", "exit"}),
+        "wallet_sold_before_resolution": "sell" in kinds,
+        "local_exited_before_resolution": "exit" in kinds,
         "held_to_resolution": "held_to_resolution" in kinds,
         "add_count": sum(1 for event in events if event.get("kind") == "add"),
         "exit_count": sum(1 for event in events if event.get("kind") == "exit"),
+        "sell_count": sum(1 for event in events if event.get("kind") == "sell"),
     }
 
 
@@ -403,6 +404,8 @@ def process_follow_trades(
     require_pre_match: bool = True,
     quarantine_sell_frac: float = 0.2,
     eligible_market_types: set[str] | None = None,
+    conflict_policy: str = "dual_follow",
+    mirror_wallet_sells: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     wallet = normalize_wallet(wallet)
     stats: dict[str, Any] = {
@@ -433,11 +436,13 @@ def process_follow_trades(
                 continue
             reason = quarantine_reason(signal_for_sell, trade, sell_frac=quarantine_sell_frac)
             signal_for_sell["wallet_sell_size"] = round(to_float(signal_for_sell.get("wallet_sell_size")) + trade_size(trade), 8)
+            signal_for_sell.setdefault("behavior_events", []).append(_behavior_event("sell", trade))
+            signal_for_sell["wallet_behavior"] = wallet_behavior_summary(signal_for_sell)
             if reason:
                 stats["quarantine_events"].append(
                     {"wallet": wallet, "reason": reason, "timestamp": now_ts, "condition_id": condition_id}
                 )
-            if not existing or reason != "material_sell":
+            if not existing or reason != "material_sell" or not mirror_wallet_sells:
                 continue
             existing["status"] = "exited"
             existing["exit_price"] = current_price
@@ -477,12 +482,13 @@ def process_follow_trades(
             signal for signal in market_open_signals if to_int(signal.get("outcome_index"), -1) != outcome_index
         ]
         if opposite_market_signals:
-            for signal in market_open_signals:
-                _exit_signal_for_opposite_buy(signal, market=market, trade=trade, now_ts=now_ts)
-            stats["exited_signal_count"] += len(market_open_signals)
             stats["opposite_blocked_count"] += 1
-            stats["ignored_trade_count"] += 1
-            continue
+            if conflict_policy == "exit_on_opposite":
+                for signal in market_open_signals:
+                    _exit_signal_for_opposite_buy(signal, market=market, trade=trade, now_ts=now_ts)
+                stats["exited_signal_count"] += len(market_open_signals)
+                stats["ignored_trade_count"] += 1
+                continue
 
         start_ts = market_start_ts(market)
         if require_pre_match and start_ts and now_ts >= start_ts:
@@ -671,10 +677,7 @@ def apply_contested_flags(
         if not signal.get("contested"):
             signal.setdefault("behavior_events", []).append({"kind": "contested", "timestamp": now_ts})
         signal["contested"] = True
-        signal["would_follow"] = False
         signal["updated_at"] = now_ts
-        for leg in signal.get("legs") or []:
-            leg["would_follow"] = False
         count += 1
     return open_signals, {"contested_signal_count": count}
 

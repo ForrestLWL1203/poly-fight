@@ -24,9 +24,13 @@ createApp({
       walletPage: 1,
       walletSize: 10,
       followPage: 1,
-      followSize: 25,
+      followSize: 10,
+      eventPage: 1,
+      eventSize: 10,
       followDetail: { wallets: [] },
       detailModal: { open: false, loading: false, conditionId: "" },
+      walletFollowDetail: { signals: [] },
+      walletFollowModal: { open: false, loading: false, wallet: "", status: "" },
       detailLegPages: {},
       detailPriceRefreshing: false,
       detailPriceCooldown: 0,
@@ -79,6 +83,20 @@ createApp({
       const page = Math.min(Math.max(1, this.walletPage), this.walletPageCount);
       const start = (page - 1) * this.walletSize;
       return rows.slice(start, start + this.walletSize);
+    },
+    followPageCount() {
+      const count = Number(this.follows.total || 0);
+      return Math.max(1, Math.ceil(count / this.followSize));
+    },
+    eventPageCount() {
+      const count = Number(this.events.count || (this.events.events || []).length || 0);
+      return Math.max(1, Math.ceil(count / this.eventSize));
+    },
+    eventPageRows() {
+      const rows = this.events.events || [];
+      const page = Math.min(Math.max(1, this.eventPage), this.eventPageCount);
+      const start = (page - 1) * this.eventSize;
+      return rows.slice(start, start + this.eventSize);
     },
     walletRefreshBusy() {
       return this.loading.walletRefresh || (this.refreshStatus && this.refreshStatus.status === "running");
@@ -303,8 +321,14 @@ createApp({
     },
     async loadEvents() {
       const result = await this.request("/api/events");
-      result.events = (result.events || []).slice().sort((a, b) => this.normalizeTs(a.match_start_time) - this.normalizeTs(b.match_start_time));
+      result.events = (result.events || []).slice().sort((a, b) => {
+        const aFollowed = (a.open_signals || []).length > 0 ? 0 : (a.results || []).length > 0 ? 1 : 2;
+        const bFollowed = (b.open_signals || []).length > 0 ? 0 : (b.results || []).length > 0 ? 1 : 2;
+        if (aFollowed !== bFollowed) return aFollowed - bFollowed;
+        return this.normalizeTs(a.match_start_time) - this.normalizeTs(b.match_start_time);
+      });
       this.events = result;
+      if (this.eventPage > this.eventPageCount) this.eventPage = this.eventPageCount;
     },
     async loadWalletRefreshStatus() {
       const result = await this.request("/api/wallet-refresh");
@@ -382,6 +406,9 @@ createApp({
     setWalletPage(page) {
       this.walletPage = Math.min(Math.max(1, page), this.walletPageCount);
     },
+    setEventPage(page) {
+      this.eventPage = Math.min(Math.max(1, page), this.eventPageCount);
+    },
     async toggleRunner() {
       if (this.runner.status === "running") {
         await this.stopRunner();
@@ -406,6 +433,29 @@ createApp({
       this.detailModal.open = false;
       this.detailLegPages = {};
       this.clearDetailPriceCooldown();
+    },
+    async openWalletFollowDetail(wallet, status) {
+      const walletAddr = wallet?.wallet || wallet;
+      if (!walletAddr) return;
+      this.walletFollowModal = { open: true, loading: true, wallet: walletAddr, status };
+      this.walletFollowDetail = { signals: [] };
+      try {
+        const query = new URLSearchParams({ wallet: walletAddr, status });
+        try {
+          this.walletFollowDetail = await this.request(`/api/wallet-follows?${query.toString()}`);
+        } catch (error) {
+          if (error.message !== "not_found") throw error;
+          this.walletFollowDetail = await this.request(`/api/wallets/${encodeURIComponent(walletAddr)}/follows?status=${encodeURIComponent(status)}`);
+        }
+      } catch (error) {
+        this.showToast(`钱包跟单详情加载失败: ${error.message}`, "error");
+      } finally {
+        this.walletFollowModal.loading = false;
+      }
+    },
+    closeWalletFollowDetail() {
+      this.walletFollowModal.open = false;
+      this.walletFollowDetail = { signals: [] };
     },
     async refreshDetailPrices({ silent = false } = {}) {
       const conditionId = this.detailModal.conditionId || this.followDetail.condition_id;
@@ -583,6 +633,90 @@ createApp({
       const types = row?.eligible_market_types || [];
       return Array.isArray(types) ? types.map((type) => map[type] || type).filter(Boolean) : [];
     },
+    observedMarketTypeLabels(row) {
+      const labels = row?.observed_market_type_labels;
+      if (Array.isArray(labels) && labels.length) return labels;
+      const map = { main_match: "主盘", game_winner: "单局", map_winner: "地图" };
+      const types = row?.observed_market_types || [];
+      return Array.isArray(types) ? types.map((type) => map[type] || type).filter(Boolean) : [];
+    },
+    walletHistoryText(wallet) {
+      const wins = Number(wallet?.esports_win_count);
+      const losses = Number(wallet?.esports_loss_count);
+      if (!Number.isFinite(wins) && !Number.isFinite(losses)) return "-";
+      return `${Number.isFinite(wins) ? wins : 0}W / ${Number.isFinite(losses) ? losses : 0}L`;
+    },
+    walletObservedSettled(wallet) {
+      const observed = wallet?.observed || {};
+      const signals = Number(observed.signals || 0);
+      return Number.isFinite(signals) ? signals : 0;
+    },
+    walletObservedOpen(wallet) {
+      const observed = wallet?.observed || {};
+      const open = Number(observed.open || 0);
+      return Number.isFinite(open) ? open : 0;
+    },
+    walletObservedExited(wallet) {
+      const observed = wallet?.observed || {};
+      const exits = Number(observed.exits || 0);
+      return Number.isFinite(exits) ? exits : 0;
+    },
+    walletObservedRecord(wallet) {
+      const observed = wallet?.observed || {};
+      const signals = Number(observed.signals || 0);
+      const wins = Number(observed.wins || 0);
+      const losses = Number(observed.losses || 0);
+      if (!signals) return "-";
+      return `${wins}W / ${losses}L`;
+    },
+    walletObservedPnl(wallet) {
+      const observed = wallet?.observed || {};
+      const signals = Number(observed.signals || 0);
+      const exits = Number(observed.exits || 0);
+      const pnl = Number(observed.our_pnl);
+      if ((!signals && !exits) || !Number.isFinite(pnl)) return "-";
+      return this.money(pnl);
+    },
+    walletFollowModalTitle() {
+      const map = { settled: "已结算跟单", open: "持仓中跟单", exited: "提前退出跟单" };
+      const label = map[this.walletFollowModal.status] || "钱包跟单";
+      const addr = this.walletFollowDetail.short_addr || this.shortId(this.walletFollowModal.wallet);
+      return `${addr} · ${label}`;
+    },
+    signalTitle(signal) {
+      return signal.event_title || signal.title || signal.market_question || signal.question || signal.condition_id || "未命名赛事";
+    },
+    signalFollowTime(signal) {
+      const legs = signal.legs || [];
+      const times = legs.map((leg) => this.normalizeTs(leg.leg_at || leg.created_at)).filter(Boolean);
+      return times.length ? Math.min(...times) : this.normalizeTs(signal.created_at || signal.updated_at);
+    },
+    signalAverageEntry(signal) {
+      let weighted = 0;
+      let totalStake = 0;
+      for (const leg of signal.legs || []) {
+        const stake = Number(leg.stake);
+        const entry = Number(leg.our_entry_price);
+        if (!Number.isFinite(stake) || !Number.isFinite(entry) || stake <= 0) continue;
+        weighted += stake * entry;
+        totalStake += stake;
+      }
+      return totalStake > 0 ? weighted / totalStake : Number(signal.our_entry_price);
+    },
+    signalStatusText(signal) {
+      const status = String(signal.status || "");
+      if (status === "settled") return "已结算";
+      if (status === "exited") return "提前退出";
+      if (status === "open") return "持仓中";
+      return this.statusText(status);
+    },
+    signalSettlementText(signal) {
+      const status = String(signal.status || "");
+      if (status === "open") return "未结算";
+      if (status === "exited") return this.price(signal.exit_price);
+      if (status === "settled") return signal.outcome_won ? "1.000（胜）" : "0.000（负）";
+      return "-";
+    },
     matchParts(title) {
       const text = String(title || "");
       if (!text) return null;
@@ -601,11 +735,46 @@ createApp({
       this.matchTitleCache[text] = parsed;
       return parsed;
     },
+    teamLogo(row, side) {
+      const logos = row?.team_logos || {};
+      return typeof logos[side] === "string" ? logos[side] : "";
+    },
+    signalOutcomeSide(signal) {
+      const outcome = String(signal?.outcome || "").trim().toLowerCase();
+      const parts = this.matchParts(this.detailTitle());
+      if (!outcome || !parts) return "";
+      if (outcome === String(parts.teamA || "").trim().toLowerCase()) return "teamA";
+      if (outcome === String(parts.teamB || "").trim().toLowerCase()) return "teamB";
+      return "";
+    },
+    signalOutcomeLogo(signal) {
+      const side = this.signalOutcomeSide(signal);
+      return side ? this.teamLogo(this.followDetail, side) : "";
+    },
+    signalOutcomeSideClass(signal) {
+      const side = this.signalOutcomeSide(signal);
+      if (side === "teamA") return "team-a";
+      if (side === "teamB") return "team-b";
+      return "";
+    },
     detailTitle() {
       return this.followDetail.title || this.followDetail.question || "跟单详情";
     },
     detailEventUrl() {
       return this.followDetail.event_url || "";
+    },
+    detailSignals() {
+      return (this.followDetail.wallets || []).flatMap((wallet) => wallet.signals || []);
+    },
+    detailSettlementText() {
+      const signals = this.detailSignals();
+      const winning = signals.find((signal) => String(signal.status || "") === "settled" && signal.outcome_won === true);
+      if (winning?.outcome) return `胜方 - ${winning.outcome}`;
+      if (signals.some((signal) => String(signal.status || "") === "settled")) return "已结算";
+      return "未结算";
+    },
+    detailSettlementClass() {
+      return this.detailSettlementText() === "未结算" ? "detail-settlement-pending" : "detail-settlement-done";
     },
     detailMarketPrices() {
       const outcomes = this.asArray(this.followDetail.outcomes);
@@ -647,6 +816,20 @@ createApp({
         totalStake += stake;
       }
       return totalStake > 0 ? weighted / totalStake : null;
+    },
+    walletRealizedPnl(wallet) {
+      return (wallet.signals || []).reduce((total, signal) => {
+        const status = String(signal.status || "");
+        if (status !== "settled" && status !== "exited") return total;
+        const pnl = Number(signal.our_paper_pnl ?? signal.our_realized_pnl);
+        return Number.isFinite(pnl) ? total + pnl : total;
+      }, 0);
+    },
+    walletHasRealizedPnl(wallet) {
+      return (wallet.signals || []).some((signal) => {
+        const status = String(signal.status || "");
+        return status === "settled" || status === "exited";
+      });
     },
     signalPageKey(signal) {
       return signal.signal_id || `${signal.condition_id || "signal"}:${signal.outcome_index || signal.outcome || "side"}`;

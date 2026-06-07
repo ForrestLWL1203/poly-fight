@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import math
 import json
 import os
+import re
 import signal
 import time
 import tempfile
@@ -12,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
+from urllib.request import Request, urlopen
 
 from .api import PolymarketClient, RateLimiter
 from .core import (
@@ -19,16 +22,22 @@ from .core import (
     SCORING_VERSION,
     TRADE_BEHAVIOR_EXCLUDE_RATE,
     TRADE_BEHAVIOR_MIN_MARKETS,
+    GAME_WINNER,
+    MAP_WINNER,
     analyze_holders,
     build_candidate_wallets,
     build_candidate_wallets_from_holders,
     build_classification_set,
     build_discovery_slate,
+    classify_market_type,
     classify_wallet,
     event_to_market_record,
     event_to_market_records,
+    is_settled_binary_prices,
+    normalize_market_text,
     normalize_wallet,
     parse_dt,
+    parse_jsonish,
     profile_candidate_wallet,
     summarize_closed_positions,
     to_float,
@@ -183,6 +192,16 @@ def market_trades_cache_path(data_dir: Path, condition_id: str) -> Path:
     return data_dir / "raw_market_trades" / f"{safe_condition_id}.json"
 
 
+def user_trades_cache_path(data_dir: Path, wallet: str) -> Path:
+    safe_wallet = "".join(ch for ch in wallet.lower() if ch.isalnum() or ch in {"-", "_"})
+    return data_dir / "raw_user_trades" / f"{safe_wallet}.json"
+
+
+def condition_market_cache_path(data_dir: Path, condition_id: str) -> Path:
+    safe_condition_id = "".join(ch for ch in condition_id.lower() if ch.isalnum() or ch in {"-", "_"})
+    return data_dir / "clob_market_metadata" / f"{safe_condition_id}.json"
+
+
 def fetch_market_trades_cached(
     client: PolymarketClient,
     condition_id: str,
@@ -277,6 +296,446 @@ def fetch_recent_esports_closed_positions_for_wallet(
     return positions[:max_esports_closed_positions]
 
 
+def fetch_recent_esports_user_trades_for_wallet(
+    client: PolymarketClient,
+    wallet: str,
+    esports_condition_ids: set[str],
+    *,
+    page_limit: int = 500,
+    max_pages: int = 6,
+    max_esports_markets: int = 50,
+    data_dir: Path | None = None,
+    now_ts: int | None = None,
+    cache_ttl_days: int = 1,
+    force_refresh: bool = False,
+    use_cache: bool = True,
+) -> list[dict]:
+    condition_ids = {str(value).lower() for value in esports_condition_ids if value}
+    if not condition_ids:
+        return []
+    wallet = normalize_wallet(wallet)
+    expected_meta = {
+        "wallet": wallet,
+        "page_limit": int(page_limit),
+        "max_pages": int(max_pages),
+        "max_esports_markets": int(max_esports_markets),
+    }
+    cache_path = user_trades_cache_path(data_dir, wallet) if data_dir else None
+    if (
+        use_cache
+        and cache_path
+        and cache_path.exists()
+        and not should_refresh_file_cache(
+            cache_path.stat().st_mtime,
+            now_ts=now_ts or int(time.time()),
+            ttl_hours=cache_ttl_days * 24,
+            force_refresh=force_refresh,
+        )
+    ):
+        cached = read_json(cache_path, {})
+        if cached.get("meta") == expected_meta:
+            raw_trades = cached.get("trades") or []
+            return _filter_esports_user_trades(raw_trades, condition_ids, max_esports_markets=max_esports_markets)
+
+    trades = []
+    limit = max(1, int(page_limit))
+    for page in range(max(1, int(max_pages))):
+        offset = page * limit
+        try:
+            batch = client.trades_for_user(wallet, limit=limit, offset=offset)
+        except RuntimeError as exc:
+            if offset > 0 and "HTTP Error 400" in str(exc):
+                break
+            raise
+        if not batch:
+            break
+        trades.extend(batch)
+        filtered = _filter_esports_user_trades(trades, condition_ids, max_esports_markets=max_esports_markets)
+        seen_markets = {
+            str(trade.get("conditionId") or trade.get("condition_id") or "").lower()
+            for trade in filtered
+        }
+        if len(seen_markets) >= max_esports_markets:
+            break
+        if len(batch) < limit:
+            break
+    if use_cache and cache_path:
+        write_json(
+            cache_path,
+            {
+                "meta": expected_meta,
+                "trades": trades,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    return _filter_esports_user_trades(trades, condition_ids, max_esports_markets=max_esports_markets)
+
+
+def _filter_esports_user_trades(
+    trades: list[dict],
+    condition_ids: set[str],
+    *,
+    max_esports_markets: int,
+) -> list[dict]:
+    filtered = []
+    seen_markets: set[str] = set()
+    for trade in trades:
+        condition_id = str(trade.get("conditionId") or trade.get("condition_id") or "").lower()
+        if condition_id not in condition_ids:
+            continue
+        filtered.append(trade)
+        seen_markets.add(condition_id)
+    allowed_markets = set(
+        sorted(
+            seen_markets,
+            key=lambda condition_id: max(
+                int(trade.get("timestamp") or 0)
+                for trade in filtered
+                if str(trade.get("conditionId") or trade.get("condition_id") or "").lower() == condition_id
+            ),
+            reverse=True,
+        )[:max_esports_markets]
+    )
+    return [
+        trade
+        for trade in filtered
+        if str(trade.get("conditionId") or trade.get("condition_id") or "").lower() in allowed_markets
+    ]
+
+
+def fetch_recent_user_trades_for_wallet(
+    client: PolymarketClient,
+    wallet: str,
+    *,
+    page_limit: int = 500,
+    max_pages: int = 3,
+    data_dir: Path | None = None,
+    now_ts: int | None = None,
+    cache_ttl_days: int = 1,
+    force_refresh: bool = False,
+    use_cache: bool = True,
+) -> list[dict]:
+    wallet = normalize_wallet(wallet)
+    expected_meta = {
+        "wallet": wallet,
+        "page_limit": int(page_limit),
+        "max_pages": int(max_pages),
+        "raw_user_trades": True,
+    }
+    cache_path = user_trades_cache_path(data_dir, wallet) if data_dir else None
+    if (
+        use_cache
+        and cache_path
+        and cache_path.exists()
+        and not should_refresh_file_cache(
+            cache_path.stat().st_mtime,
+            now_ts=now_ts or int(time.time()),
+            ttl_hours=cache_ttl_days * 24,
+            force_refresh=force_refresh,
+        )
+    ):
+        cached = read_json(cache_path, {})
+        if cached.get("meta") == expected_meta:
+            return cached.get("trades") or []
+
+    trades = []
+    limit = max(1, int(page_limit))
+    for page in range(max(1, int(max_pages))):
+        offset = page * limit
+        try:
+            batch = client.trades_for_user(wallet, limit=limit, offset=offset)
+        except RuntimeError as exc:
+            if offset > 0 and "HTTP Error 400" in str(exc):
+                break
+            raise
+        if not batch:
+            break
+        trades.extend(batch)
+        if len(batch) < limit:
+            break
+    if use_cache and cache_path:
+        write_json(
+            cache_path,
+            {
+                "meta": expected_meta,
+                "trades": trades,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    return trades
+
+
+def user_trade_backfill_candidate_condition_ids(
+    raw_trades_by_wallet: dict[str, list[dict]],
+    known_condition_ids: set[str],
+) -> set[str]:
+    known = {str(value).lower() for value in known_condition_ids if value}
+    candidates: set[str] = set()
+    for trades in raw_trades_by_wallet.values():
+        for trade in trades or []:
+            condition_id = str(trade.get("conditionId") or trade.get("condition_id") or trade.get("market") or "").lower()
+            if not condition_id or condition_id in known:
+                continue
+            text = normalize_market_text(
+                " ".join(
+                    str(trade.get(key) or "")
+                    for key in ("title", "eventTitle", "event_title", "question", "marketQuestion", "market_question", "marketName")
+                )
+            )
+            if not text:
+                continue
+            allowed_family = (
+                "dota 2" in text
+                or text.startswith("lol ")
+                or "league of legends" in text
+                or "counter strike" in text
+                or "cs2" in text
+            )
+            numbered_winner = re.search(r"\b(game|map)\s+[1-5]\b.*\bwinner\b", text) or re.search(
+                r"\bwinner\b.*\b(game|map)\s+[1-5]\b",
+                text,
+            )
+            if allowed_family and numbered_winner:
+                candidates.add(condition_id)
+    return candidates
+
+
+def _normalize_backfill_market(market: dict[str, Any]) -> dict[str, Any]:
+    condition_id = str(market.get("conditionId") or market.get("condition_id") or "").lower()
+    if market.get("conditionId") and market.get("outcomePrices") is not None:
+        return {**market, "conditionId": condition_id}
+    tokens = market.get("tokens") or []
+    outcomes = [token.get("outcome") for token in tokens if token.get("outcome") is not None]
+    prices = [to_float(token.get("price")) for token in tokens if token.get("outcome") is not None]
+    return {
+        **market,
+        "conditionId": condition_id,
+        "question": market.get("question"),
+        "outcomes": outcomes,
+        "outcomePrices": prices,
+        "endDate": market.get("end_date_iso") or market.get("endDate"),
+        "gameStartTime": market.get("game_start_time") or market.get("gameStartTime"),
+        "eventStartTime": market.get("game_start_time") or market.get("eventStartTime"),
+        "closed": bool(market.get("closed")),
+        "active": bool(market.get("active")),
+    }
+
+
+def _infer_backfill_event_tags(*values: Any) -> list[dict[str, str]]:
+    text = normalize_market_text(" ".join(str(value or "") for value in values))
+    slugs: list[str] = []
+    if "dota 2" in text:
+        slugs.extend(["esports", "dota-2"])
+    elif "counter strike" in text or "cs2" in text:
+        slugs.extend(["esports", "counter-strike-2"])
+    elif text.startswith("lol ") or " league of legends " in f" {text} ":
+        slugs.extend(["esports", "league-of-legends"])
+    return [{"slug": slug} for slug in dict.fromkeys(slugs)]
+
+
+def _market_event_for_backfill(market: dict[str, Any]) -> dict[str, Any] | None:
+    events = market.get("events") or market.get("event") or []
+    if isinstance(events, dict):
+        event = dict(events)
+    elif isinstance(events, list) and events:
+        event = dict(events[0])
+    else:
+        tags = market.get("tags") or []
+        question = str(market.get("question") or "")
+        event_title = re.sub(r"\s+-\s+(game|map)\s+[1-5]\s+winner\s*$", "", question, flags=re.IGNORECASE)
+        event = {
+            "id": str(market.get("event_id") or market.get("market_slug") or market.get("conditionId") or ""),
+            "slug": market.get("event_slug") or market.get("market_slug"),
+            "title": market.get("event_title") or event_title or question,
+            "tags": [{"slug": str(tag).lower().replace(" ", "-")} for tag in tags],
+            "closed": bool(market.get("closed")),
+            "endDate": market.get("endDate"),
+            "startTime": market.get("gameStartTime") or market.get("eventStartTime"),
+        }
+    if not event.get("tags"):
+        event["tags"] = _infer_backfill_event_tags(event.get("title"), market.get("question"))
+    if not event.get("endDate"):
+        event["endDate"] = market.get("endDate")
+    if not event.get("startTime"):
+        event["startTime"] = market.get("gameStartTime") or market.get("eventStartTime")
+    if not event.get("closed") and market.get("closed") is not None:
+        event["closed"] = bool(market.get("closed"))
+    event["markets"] = [market]
+    return event
+
+
+def _read_cached_condition_market(
+    condition_id: str,
+    *,
+    data_dir: Path | None,
+    now_ts: int | None,
+    cache_ttl_days: int,
+    force_refresh: bool,
+    use_cache: bool,
+) -> tuple[dict[str, Any] | None, bool]:
+    if not data_dir or not use_cache:
+        return None, False
+    cache_path = condition_market_cache_path(data_dir, condition_id)
+    if not cache_path.exists() or should_refresh_file_cache(
+        cache_path.stat().st_mtime,
+        now_ts=now_ts or int(time.time()),
+        ttl_hours=cache_ttl_days * 24,
+        force_refresh=force_refresh,
+    ):
+        return None, False
+    cached = read_json(cache_path, {})
+    if cached.get("condition_id") != condition_id:
+        return None, False
+    return cached.get("market"), True
+
+
+def _write_cached_condition_market(
+    condition_id: str,
+    market: dict[str, Any] | None,
+    *,
+    data_dir: Path | None,
+    use_cache: bool,
+) -> None:
+    if not data_dir or not use_cache:
+        return
+    write_json(
+        condition_market_cache_path(data_dir, condition_id),
+        {
+            "condition_id": condition_id,
+            "market": market,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def backfill_user_trade_submarkets(
+    client: PolymarketClient,
+    raw_trades_by_wallet: dict[str, list[dict]],
+    known_market_records_by_id: dict[str, dict[str, Any]],
+    *,
+    batch_size: int = 50,
+    data_dir: Path | None = None,
+    now_ts: int | None = None,
+    cache_ttl_days: int = 30,
+    force_refresh: bool = False,
+    use_cache: bool = True,
+    max_workers: int = 8,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    known_ids = {str(value).lower() for value in known_market_records_by_id}
+    candidate_ids = sorted(user_trade_backfill_candidate_condition_ids(raw_trades_by_wallet, known_ids))
+    backfilled: dict[str, dict[str, Any]] = {}
+    cache_hits = 0
+    api_fetches = 0
+    api_error_count = 0
+    api_error_condition_count = 0
+
+    raw_markets_by_id: dict[str, dict[str, Any] | None] = {}
+    uncached_ids: list[str] = []
+    for condition_id in candidate_ids:
+        cached_market, hit = _read_cached_condition_market(
+            condition_id,
+            data_dir=data_dir,
+            now_ts=now_ts,
+            cache_ttl_days=cache_ttl_days,
+            force_refresh=force_refresh,
+            use_cache=use_cache,
+        )
+        if hit:
+            cache_hits += 1
+            raw_markets_by_id[condition_id] = cached_market
+        else:
+            uncached_ids.append(condition_id)
+
+    def fetch_chunk(chunk: list[str]) -> tuple[list[str], list[dict[str, Any]], bool]:
+        try:
+            return chunk, client.markets_by_condition_ids(chunk, limit=len(chunk)), False
+        except Exception:
+            return chunk, [], True
+
+    chunks = [uncached_ids[index : index + max(1, int(batch_size))] for index in range(0, len(uncached_ids), max(1, int(batch_size)))]
+    lookup_results = run_ordered_io_tasks(chunks, fetch_chunk, max_workers=max_workers) if chunks else []
+    for result in lookup_results:
+        if isinstance(result, Exception):
+            continue
+        chunk, markets, errored = result
+        if errored:
+            api_error_count += 1
+            api_error_condition_count += len(chunk)
+            continue
+        api_fetches += len(chunk)
+        markets_by_condition = {
+            str(market.get("conditionId") or market.get("condition_id") or "").lower(): market
+            for market in markets or []
+        }
+        for condition_id in chunk:
+            market = markets_by_condition.get(condition_id)
+            raw_markets_by_id[condition_id] = market
+            _write_cached_condition_market(condition_id, market, data_dir=data_dir, use_cache=use_cache)
+
+    for raw_market in raw_markets_by_id.values():
+        if not raw_market:
+            continue
+        market = _normalize_backfill_market(raw_market)
+        condition_id = str(market.get("conditionId") or market.get("condition_id") or "").lower()
+        if not condition_id or condition_id in known_ids:
+            continue
+        event = _market_event_for_backfill(market)
+        if not event:
+            continue
+        market_type = classify_market_type(event, market)
+        prices = [
+            to_float(value)
+            for value in parse_jsonish(market.get("outcomePrices") or market.get("outcome_prices"), [])
+        ]
+        if market_type not in {GAME_WINNER, MAP_WINNER} or not is_settled_binary_prices(prices):
+            continue
+        records = event_to_market_records(event, allowed_market_types={GAME_WINNER, MAP_WINNER})
+        record = next((row for row in records if row.get("condition_id") == condition_id), None)
+        if not record:
+            continue
+        backfilled[condition_id] = record
+    by_type: dict[str, int] = {}
+    for record in backfilled.values():
+        market_type = str(record.get("market_type") or "")
+        by_type[market_type] = by_type.get(market_type, 0) + 1
+    return backfilled, {
+        "user_trade_backfill_candidate_count": len(candidate_ids),
+        "user_trade_backfilled_market_count": len(backfilled),
+        "user_trade_backfilled_by_market_type": dict(sorted(by_type.items())),
+        "user_trade_backfill_cache_hits": cache_hits,
+        "user_trade_backfill_api_fetches": api_fetches,
+        "user_trade_backfill_api_error_count": api_error_count,
+        "user_trade_backfill_api_error_condition_count": api_error_condition_count,
+    }
+
+
+def observed_performance_quarantine_events(
+    performance: dict[str, Any],
+    *,
+    now_ts: int,
+    min_signals: int = 10,
+) -> list[dict[str, Any]]:
+    events = []
+    for wallet, row in sorted((performance.get("wallets") or {}).items()):
+        wallet = normalize_wallet(wallet)
+        if not wallet:
+            continue
+        signals = int(row.get("signals") or 0)
+        wins = int(row.get("wins") or 0)
+        if signals < min_signals:
+            continue
+        win_rate = wins / signals if signals else 0.0
+        if win_rate < 0.5 or to_float(row.get("our_pnl")) < 0:
+            events.append(
+                {
+                    "wallet": wallet,
+                    "reason": "observed_paper_underperformance",
+                    "timestamp": now_ts,
+                }
+            )
+    return events
+
+
 def market_records_from_events(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     records = {}
     for event in events:
@@ -315,6 +774,165 @@ def load_active_market_cache(
     else:
         state["active_market_cache"] = cache_value
     return markets, state, "api"
+
+
+TEAM_LOGO_URL_RE = re.compile(
+    r"url=(https%3A%2F%2Fpolymarket-upload\.s3\.us-east-2\.amazonaws\.com%2Fteam_logos%2F[^&\"<>]+?\.png)"
+)
+MATCH_TITLE_TEAMS_RE = re.compile(r"^([^:]+):\s+(.+?)\s+vs\s+(.+?)(\s+\([^)]+\))?\s+-\s+(.+)$", re.IGNORECASE)
+
+
+def refresh_team_logo_cache_from_active_markets(
+    data_dir: Path,
+    *,
+    timeout_seconds: int = 8,
+    max_workers: int = 8,
+    max_events: int = 0,
+    observe_window_hours: float = 24.0,
+    now_ts: int | None = None,
+    fetch_html: Any = None,
+) -> dict[str, Any]:
+    active_cache = read_json(data_dir / "follow" / "active_market_cache.json", {})
+    markets = active_cache.get("markets") if isinstance(active_cache, dict) else []
+    if not isinstance(markets, list):
+        markets = list(markets.values()) if isinstance(markets, dict) else []
+    by_slug: dict[str, dict[str, Any]] = {}
+    current_ts = int(now_ts if now_ts is not None else time.time())
+    window_seconds = int(observe_window_hours * 3600)
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+        start_dt = parse_dt(market.get("match_start_time") or market.get("market_start_time") or market.get("startTime"))
+        if start_dt:
+            start_ts = int(start_dt.timestamp())
+            if start_ts < current_ts - window_seconds or start_ts > current_ts + window_seconds:
+                continue
+        slug = str(market.get("event_slug") or "").strip()
+        if slug:
+            by_slug.setdefault(slug, market)
+    slugs = list(by_slug)
+    if max_events and max_events > 0:
+        slugs = slugs[:max_events]
+
+    logo_path = data_dir / "team_logos.json"
+    cache = read_json(logo_path, {})
+    if not isinstance(cache, dict):
+        cache = {}
+    teams = cache.get("teams") if isinstance(cache.get("teams"), dict) else {}
+    teams = dict(teams)
+
+    def default_fetch_html(slug: str) -> str:
+        url = f"https://polymarket.com/zh/event/{slug}"
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        return urlopen(request, timeout=timeout_seconds).read().decode("utf-8", "ignore")
+
+    fetcher = fetch_html or default_fetch_html
+
+    def worker(slug: str) -> tuple[int, list[tuple[str, str]]]:
+        market = by_slug[slug]
+        html = fetcher(slug)
+        game, team_a, team_b = _match_title_teams(str(market.get("title") or market.get("question") or ""))
+        title_teams = [team_a, team_b]
+        rows: list[tuple[str, str]] = []
+        for encoded_url in sorted(set(TEAM_LOGO_URL_RE.findall(html))):
+            logo_url = unquote(encoded_url)
+            team_key = _team_logo_key_from_url(logo_url, game=game, title_teams=title_teams)
+            if not team_key:
+                continue
+            rows.append((team_key, logo_url))
+            game_key = _normalize_team_logo_key(game)
+            if game_key:
+                rows.append((_normalize_team_logo_key(f"{game_key}:{team_key}"), logo_url))
+        return len(rows), rows
+
+    fetched = 0
+    failed = 0
+    updated = 0
+    if slugs:
+        with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+            futures = [pool.submit(worker, slug) for slug in slugs]
+            for future in as_completed(futures):
+                try:
+                    count, rows = future.result()
+                except Exception:
+                    failed += 1
+                    continue
+                if count:
+                    fetched += 1
+                for key, logo_url in rows:
+                    if key and teams.get(key) != logo_url:
+                        teams[key] = logo_url
+                        updated += 1
+
+    payload = {
+        "updated_at": int(time.time()),
+        "source": "polymarket watched event preload images",
+        "teams": teams,
+    }
+    write_json(logo_path, payload)
+    return {
+        "watched_event_count": len(slugs),
+        "fetched_event_count": fetched,
+        "failed_event_count": failed,
+        "updated_logo_key_count": updated,
+        "total_logo_key_count": len(teams),
+        "path": str(logo_path),
+    }
+
+
+def _match_title_teams(title: str) -> tuple[str, str, str]:
+    match = MATCH_TITLE_TEAMS_RE.match(title)
+    if not match:
+        return "", "", ""
+    return match.group(1).strip(), match.group(2).strip(), match.group(3).strip()
+
+
+def _team_logo_key_from_url(logo_url: str, *, game: str, title_teams: list[str]) -> str:
+    base = unquote(logo_url).split("/")[-1]
+    base = re.sub(r"\.png(?:\?.*)?$", "", base)
+    base = re.sub(r"_\d+$", "", base)
+    for prefix in [
+        game,
+        game.replace(" ", "-"),
+        game.replace(" ", "_"),
+        "counter-strike",
+        "cs2",
+        "cs-go",
+        "league-of-legends",
+        "dota-2",
+        "valorant",
+    ]:
+        prefix = prefix.strip()
+        if prefix and base.lower().startswith(prefix.lower() + "_"):
+            base = base[len(prefix) + 1 :]
+            break
+    if "-" in base:
+        first, rest = base.split("-", 1)
+        if re.search(r"\d", rest) or len(rest) >= 6:
+            base = first
+    candidate = _normalize_team_logo_key(base)
+    for team in title_teams:
+        title_key = _normalize_team_logo_key(team)
+        if title_key and (candidate == title_key or candidate.endswith(f" {title_key}") or title_key in candidate.split()):
+            return title_key
+    return candidate
+
+
+def _normalize_team_logo_key(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def command_refresh_team_logos(args: argparse.Namespace) -> int:
+    summary = refresh_team_logo_cache_from_active_markets(
+        Path(args.data_dir),
+        timeout_seconds=args.logo_timeout_seconds,
+        max_workers=args.max_workers,
+        max_events=args.max_events,
+        observe_window_hours=args.observe_window_hours,
+    )
+    print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
 
 
 def watched_markets(
@@ -887,8 +1505,12 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         submarket_fallback_min_market_volume=args.submarket_fallback_min_market_volume,
         target_markets=args.target_markets,
         submarket_target_markets=args.submarket_target_markets,
+        game_winner_target_markets=args.game_winner_target_markets,
+        map_winner_target_markets=args.map_winner_target_markets,
         max_markets_per_run=market_count,
         submarket_max_markets_per_run=args.submarket_max_markets_per_run,
+        game_winner_max_markets_per_run=args.game_winner_max_markets_per_run,
+        map_winner_max_markets_per_run=args.map_winner_max_markets_per_run,
         market_offset=market_offset,
     )
     write_json(data_dir / "discovery_slate.json", discovery_slate)
@@ -997,10 +1619,15 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
     existing_profiles = {
         normalize_wallet(row.get("wallet")): row for row in read_json(data_dir / "wallet_profiles.json", [])
     }
-    condition_ids = {row["condition_id"] for row in discovery_slate}
+    condition_ids = {row["condition_id"] for row in classification_set}
+    market_records_by_id = {
+        str(row.get("condition_id") or "").lower(): row
+        for row in classification_set
+        if row.get("condition_id")
+    }
     condition_type_by_id = {
         str(row.get("condition_id") or "").lower(): str(row.get("market_type") or "main_match")
-        for row in discovery_slate
+        for row in classification_set
         if row.get("condition_id")
     }
     profile_fetch_plan = build_profile_fetch_plan(
@@ -1011,28 +1638,89 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         max_profiles=args.max_profiles_per_run,
     )
 
+    def fetch_raw_user_trades_for_candidate(candidate: dict[str, Any]) -> tuple[str, list[dict]]:
+        wallet = normalize_wallet(candidate.get("wallet"))
+        trades = fetch_recent_user_trades_for_wallet(
+            client,
+            wallet,
+            page_limit=args.user_history_trades_limit,
+            max_pages=args.user_history_trades_max_pages,
+            data_dir=data_dir,
+            now_ts=now_ts,
+            cache_ttl_days=args.market_trades_cache_ttl_days,
+            force_refresh=args.refresh_market_trades,
+            use_cache=not args.no_market_trades_cache,
+        )
+        return wallet, trades
+
+    raw_user_trade_results = run_ordered_io_tasks(
+        profile_fetch_plan,
+        fetch_raw_user_trades_for_candidate,
+        max_workers=args.max_workers,
+    )
+    raw_user_trades_by_wallet: dict[str, list[dict]] = {}
+    for index, result in enumerate(raw_user_trade_results):
+        fallback_wallet = normalize_wallet(profile_fetch_plan[index].get("wallet"))
+        if isinstance(result, Exception):
+            raw_user_trades_by_wallet[fallback_wallet] = []
+            continue
+        wallet, trades = result
+        raw_user_trades_by_wallet[normalize_wallet(wallet)] = trades
+
+    backfilled_market_records, backfill_summary = backfill_user_trade_submarkets(
+        client,
+        raw_user_trades_by_wallet,
+        market_records_by_id,
+        data_dir=data_dir,
+        now_ts=now_ts,
+        cache_ttl_days=args.market_trades_cache_ttl_days,
+        force_refresh=args.refresh_market_trades,
+        use_cache=not args.no_market_trades_cache,
+        max_workers=args.max_workers,
+    )
+    if backfilled_market_records:
+        market_records_by_id = {**market_records_by_id, **backfilled_market_records}
+        condition_type_by_id = {
+            **condition_type_by_id,
+            **{
+                condition_id: str(record.get("market_type") or "main_match")
+                for condition_id, record in backfilled_market_records.items()
+            },
+        }
+        condition_ids = set(market_records_by_id)
+
+    def load_user_trades(wallet: str) -> list[dict]:
+        # Per-user history is the accurate source: a per-market pool over the discovery
+        # slate only covers markets we fetched and is taker-side only, which materially
+        # undercounts a wallet's resolved markets (verified: 0xe16 80→39 markets, A→B).
+        return _filter_esports_user_trades(
+            raw_user_trades_by_wallet.get(normalize_wallet(wallet), []),
+            condition_ids,
+            max_esports_markets=args.max_esports_closed_positions_per_wallet,
+        )
+
+    def load_closed_positions(wallet: str) -> list[dict]:
+        return fetch_recent_esports_closed_positions_for_wallet(
+            client,
+            wallet,
+            condition_ids,
+            max_esports_closed_positions=args.max_esports_closed_positions_per_wallet,
+            market_chunk_size=args.closed_position_market_chunk_size,
+        )
+
     def profile_one_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         try:
             return profile_candidate_wallet(
                 candidate,
                 condition_ids,
+                market_records_by_id=market_records_by_id,
                 condition_type_by_id=condition_type_by_id,
-                closed_positions_loader=lambda w: fetch_recent_esports_closed_positions_for_wallet(
-                    client,
-                    w,
-                    condition_ids,
-                    max_esports_closed_positions=args.max_esports_closed_positions_per_wallet,
-                    market_chunk_size=args.closed_position_market_chunk_size,
-                ),
+                user_trades_loader=load_user_trades,
+                closed_positions_loader=load_closed_positions,
                 current_positions_loader=(
                     (lambda w: client.positions(w, limit=100))
                     if args.check_current_positions
                     else (lambda w: [])
-                ),
-                historical_trades_loader=lambda w, condition_id: client.trades_for_user_market(
-                    w,
-                    condition_id,
-                    limit=500,
                 ),
                 now_ts=now_ts,
             )
@@ -1084,6 +1772,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         "candidate_wallet_count": len(candidates),
         "profile_candidate_wallet_count": len(profile_candidates),
         "profiled_wallet_count": profiled_count,
+        **backfill_summary,
         "leaderboard_wallet_count": len(leaderboard),
         "leaderboard_union_market_count": overlap_report["union_market_count"],
         "leaderboard_pair_overlap_count": len(overlap_report["pair_overlaps"]),
@@ -1339,6 +2028,8 @@ def command_follow(
                         require_pre_match=args.require_pre_match,
                         quarantine_sell_frac=args.quarantine_sell_frac,
                         eligible_market_types=eligible_market_types_by_wallet.get(wallet),
+                        conflict_policy=args.conflict_policy,
+                        mirror_wallet_sells=args.mirror_wallet_sells,
                     )
                     after_ids = {signal.get("signal_id") for signal in open_signals}
                     new_signal_count += len(after_ids - before_ids)
@@ -1381,6 +2072,8 @@ def command_follow(
                 require_pre_match=args.require_pre_match,
                 quarantine_sell_frac=args.quarantine_sell_frac,
                 eligible_market_types=eligible_market_types_by_wallet.get(wallet) if wallet_can_open_new else None,
+                conflict_policy=args.conflict_policy,
+                mirror_wallet_sells=args.mirror_wallet_sells,
             )
             after_ids = {signal.get("signal_id") for signal in open_signals}
             new_signal_count += len(after_ids - before_ids)
@@ -1426,6 +2119,13 @@ def command_follow(
         performance = aggregate_follow_performance(performance, result_events)
     else:
         performance = aggregate_follow_performance(performance, [])
+    existing_quarantine = set(store.load_wallet_quarantine())
+    for event in observed_performance_quarantine_events(performance, now_ts=now_ts):
+        if event["wallet"] in existing_quarantine:
+            continue
+        store.upsert_wallet_quarantine(event["wallet"], reason=event["reason"], ts=int(event["timestamp"]))
+        existing_quarantine.add(event["wallet"])
+        quarantine_event_count += 1
 
     run_log_row = {
         "created_at": now_ts,
@@ -1645,8 +2345,12 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--discovery-lookback-days", type=int, default=14)
         subparser.add_argument("--target-markets", type=int, default=20)
         subparser.add_argument("--submarket-target-markets", type=int, default=60)
+        subparser.add_argument("--game-winner-target-markets", type=int, default=60)
+        subparser.add_argument("--map-winner-target-markets", type=int, default=60)
         subparser.add_argument("--max-markets-per-run", type=int)
         subparser.add_argument("--submarket-max-markets-per-run", type=int, default=60)
+        subparser.add_argument("--game-winner-max-markets-per-run", type=int, default=60)
+        subparser.add_argument("--map-winner-max-markets-per-run", type=int, default=60)
         subparser.add_argument("--market-batch-size", type=int, default=50)
         subparser.add_argument("--market-batch-count", type=int, default=2)
         subparser.add_argument("--market-batch-index", type=int)
@@ -1665,8 +2369,12 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--single-market-cash-threshold", type=float, default=1_000)
         subparser.add_argument("--max-candidate-wallets", type=int, default=1000)
         subparser.add_argument("--max-profiles-per-run", type=int, default=150)
-        subparser.add_argument("--max-esports-closed-positions-per-wallet", type=int, default=50)
+        subparser.add_argument("--max-esports-closed-positions-per-wallet", type=int, default=100)
         subparser.add_argument("--closed-position-market-chunk-size", type=int, default=50)
+        subparser.add_argument("--user-history-trades-limit", type=int, default=500)
+        # Fallback-only path (wallets not in the per-market pool); kept small on purpose —
+        # 3 pages ≈ 1500 trades is plenty to cover a wallet's recent esports markets.
+        subparser.add_argument("--user-history-trades-max-pages", type=int, default=3)
         subparser.add_argument("--min-profile-participated-markets", type=int, default=3)
         subparser.add_argument("--min-profile-avg-market-cash", type=float, default=1_500)
         subparser.add_argument("--leaderboard-min-participated-markets", type=int, default=3)
@@ -1704,6 +2412,8 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--consensus-min-same-side", type=int, default=1)
         subparser.add_argument("--consensus-block-opposite", dest="consensus_block_opposite", action="store_true", default=True)
         subparser.add_argument("--no-consensus-block-opposite", dest="consensus_block_opposite", action="store_false")
+        subparser.add_argument("--conflict-policy", choices=["dual_follow", "exit_on_opposite"], default="dual_follow")
+        subparser.add_argument("--mirror-wallet-sells", action="store_true")
         subparser.add_argument("--quarantine-sell-frac", type=float, default=0.2)
         subparser.add_argument("--max-workers", type=int, default=8)
         subparser.add_argument("--max-requests-per-second", type=float, default=10)
@@ -1722,6 +2432,13 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--condition-id")
     analyze.add_argument("--holders-limit", type=int, default=10)
     analyze.set_defaults(func=command_analyze_event)
+
+    logos = subparsers.add_parser("refresh-team-logos", help="refresh cached team logos for currently watched events")
+    logos.add_argument("--max-workers", type=int, default=8)
+    logos.add_argument("--logo-timeout-seconds", type=int, default=8)
+    logos.add_argument("--max-events", type=int, default=0)
+    logos.add_argument("--observe-window-hours", type=float, default=24)
+    logos.set_defaults(func=command_refresh_team_logos)
 
     follow = subparsers.add_parser("follow", help="run one paper follow tick")
     add_follow_arguments(follow)
@@ -1753,6 +2470,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--consensus-min-same-side", type=int, default=1)
     run.add_argument("--consensus-block-opposite", dest="consensus_block_opposite", action="store_true", default=True)
     run.add_argument("--no-consensus-block-opposite", dest="consensus_block_opposite", action="store_false")
+    run.add_argument("--conflict-policy", choices=["dual_follow", "exit_on_opposite"], default="dual_follow")
+    run.add_argument("--mirror-wallet-sells", action="store_true")
     run.add_argument("--quarantine-sell-frac", type=float, default=0.2)
     run.add_argument("--error-retry-seconds", type=int, default=180)
     run.add_argument("--max-consecutive-error-seconds", type=int, default=600)

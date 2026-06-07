@@ -128,7 +128,7 @@ class PolymarketClient:
         self.sleeper(delay)
 
     def get_json(self, base: str, path: str, params: dict[str, Any]) -> Any:
-        query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+        query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None}, doseq=True)
         url = f"{base}{path}?{query}" if query else f"{base}{path}"
         request = urllib.request.Request(
             url,
@@ -300,3 +300,15 @@ class PolymarketClient:
 
     def holders(self, condition_id: str, *, limit: int = 10) -> list[dict]:
         return self.data("/holders", market=condition_id, limit=limit, minBalance=1)
+
+    def market_by_condition_id(self, condition_id: str) -> dict:
+        markets = self.markets_by_condition_ids([str(condition_id).lower()], limit=1)
+        if not markets:
+            raise RuntimeError(f"market not found: {condition_id}")
+        return markets[0]
+
+    def markets_by_condition_ids(self, condition_ids: list[str], *, limit: int = 500) -> list[dict]:
+        ids = [str(value).lower() for value in condition_ids if value][: max(1, int(limit))]
+        if not ids:
+            return []
+        return self.gamma("/markets", condition_ids=ids, closed="true", limit=max(len(ids), 1))

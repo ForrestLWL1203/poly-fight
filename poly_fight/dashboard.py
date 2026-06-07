@@ -30,6 +30,7 @@ ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 FAILED_LOGINS: dict[str, list[float]] = {}
 _TRADES_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _TRADES_CACHE_LOCK = threading.Lock()
+_MATCH_TITLE_RE = re.compile(r"^([^:]+):\s+(.+?)\s+vs\s+(.+?)(\s+\([^)]+\))?\s+-\s+(.+)$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -198,6 +199,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/wallets":
             self._ok(build_wallets(self.dashboard_config.data_dir))
+            return
+        if parsed.path == "/api/wallet-follows":
+            query = urllib.parse.parse_qs(parsed.query)
+            wallet = str(query.get("wallet", [""])[0] or "").lower()
+            status = str(query.get("status", [""])[0] or "").lower()
+            self._ok(build_wallet_follow_detail(self.dashboard_config.data_dir, wallet, status=status))
+            return
+        match = re.match(r"^/api/wallets/([^/]+)/follows$", parsed.path)
+        if match:
+            wallet = urllib.parse.unquote(match.group(1)).lower()
+            query = urllib.parse.parse_qs(parsed.query)
+            status = str(query.get("status", [""])[0] or "").lower()
+            self._ok(build_wallet_follow_detail(self.dashboard_config.data_dir, wallet, status=status))
             return
         if parsed.path == "/api/follows":
             query = urllib.parse.parse_qs(parsed.query)
@@ -563,6 +577,9 @@ def build_overview(data_dir: Path) -> dict[str, Any]:
     exited = [row for row in results if row.get("status") == "exited"]
     wins = [row for row in settled if _result_win(row)]
     legs = [leg for signal in all_signals for leg in signal.get("legs") or []]
+    result_legs = [leg for signal in results for leg in signal.get("legs") or []]
+    total_stake = sum(_to_float(leg.get("stake")) for leg in legs)
+    resolved_stake = sum(_to_float(leg.get("stake")) for leg in result_legs)
     would_follow = [leg for leg in legs if leg.get("would_follow", True)]
     contested = [signal for signal in all_signals if signal.get("contested")]
     clv_values = [_to_float(signal.get("wallet_clv")) for signal in all_signals if signal.get("wallet_clv") is not None]
@@ -578,6 +595,10 @@ def build_overview(data_dir: Path) -> dict[str, Any]:
         "win_rate": (len(wins) / len(settled)) if settled else None,
         "our_realized_pnl": our_pnl,
         "wallet_basis_realized_pnl": wallet_basis_pnl,
+        "total_stake": total_stake,
+        "resolved_stake": resolved_stake,
+        "realized_roi": (our_pnl / resolved_stake) if resolved_stake else None,
+        "wallet_basis_realized_roi": (wallet_basis_pnl / resolved_stake) if resolved_stake else None,
         "delay_cost": wallet_basis_pnl - our_pnl,
         "would_follow_capture_rate": (len(would_follow) / len(legs)) if legs else None,
         "contested_signal_count": len(contested),
@@ -605,6 +626,21 @@ def _eligible_display_metrics(row: dict[str, Any]) -> dict[str, Any]:
     return max(buckets, key=lambda bucket: int(bucket.get("esports_closed_count") or 0))
 
 
+def _market_type_labels(market_types: list[str]) -> list[str]:
+    labels = {"main_match": "主盘", "game_winner": "单局", "map_winner": "地图"}
+    return [labels.get(value, value) for value in market_types if value]
+
+
+def _observed_market_types(row: dict[str, Any]) -> list[str]:
+    observed = [str(value) for value in (row.get("observed_market_types") or []) if value]
+    if observed:
+        order = {"main_match": 0, "game_winner": 1, "map_winner": 2}
+        return sorted(set(observed), key=lambda value: order.get(value, 99))
+    per_type = row.get("per_type_grades") or row.get("per_type") or {}
+    order = {"main_match": 0, "game_winner": 1, "map_winner": 2}
+    return sorted((str(value) for value in per_type if value), key=lambda value: order.get(value, 99))
+
+
 def build_wallets(data_dir: Path) -> dict[str, Any]:
     leaderboard = _read_json(data_dir / "smart_wallet_leaderboard.json", [])
     store = FollowStore(data_dir / "follow" / "follow.db")
@@ -626,6 +662,8 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
         if "positive_market_rate" in metrics and to_float(metrics.get("positive_market_rate")) < MIN_A_POSITIVE_MARKET_RATE:
             continue
         wallet = str(row.get("wallet") or "").lower()
+        observed = wallet_observed_performance(performance.get(wallet, {}), open_count=len(open_by_wallet.get(wallet, [])))
+        observed_market_types = _observed_market_types(row)
         rows.append(
             {
                 "wallet": wallet,
@@ -647,10 +685,13 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
                 "two_sided_trade_market_rate": row.get("two_sided_trade_market_rate"),
                 "eligible_market_types": row.get("eligible_market_types") or [],
                 "eligible_market_type_labels": row.get("eligible_market_type_labels") or [],
+                "observed_market_types": observed_market_types,
+                "observed_market_type_labels": row.get("observed_market_type_labels") or _market_type_labels(observed_market_types),
                 "per_type_grades": row.get("per_type_grades") or {},
                 "quarantined": wallet in quarantine,
                 "quarantine": quarantine.get(wallet),
                 "performance": performance.get(wallet, {}),
+                "observed": observed,
                 "open_signals": open_by_wallet.get(wallet, []),
             }
         )
@@ -667,9 +708,36 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
     }
 
 
+def wallet_observed_performance(performance: dict[str, Any], *, open_count: int = 0) -> dict[str, Any]:
+    signals = int(performance.get("signals") or 0)
+    wins = int(performance.get("wins") or 0)
+    losses = max(0, signals - wins)
+    exits = int(performance.get("exits") or 0)
+    our_pnl = round(to_float(performance.get("our_pnl")), 8)
+    wallet_pnl = round(to_float(performance.get("wallet_pnl")), 8)
+    win_rate = to_float(performance.get("win_rate")) if signals else None
+    return {
+        "signals": signals,
+        "wins": wins,
+        "losses": losses,
+        "exits": exits,
+        "open": open_count,
+        "our_pnl": our_pnl,
+        "wallet_pnl": wallet_pnl,
+        "win_rate": win_rate,
+        "has_loss": losses > 0 or our_pnl < -0.000001,
+    }
+
+
 def wallet_leaderboard_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
     loss_count = int(row.get("esports_loss_count") or 0)
+    observed = row.get("observed") or {}
+    observed_has_loss = bool(observed.get("has_loss"))
+    observed_pnl = to_float(observed.get("our_pnl"))
     return (
+        bool(row.get("quarantined")),
+        observed_has_loss,
+        -observed_pnl,
         loss_count > 0,
         loss_count,
         -to_float(row.get("positive_market_rate")),
@@ -683,8 +751,11 @@ def wallet_leaderboard_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
 def build_follows(data_dir: Path, *, page: int = 1, size: int = 25) -> dict[str, Any]:
     store = FollowStore(data_dir / "follow" / "follow.db")
     result = store.load_dashboard_follow_rows(page=page, size=size)
+    logo_cache = _load_team_logo_cache(data_dir)
     groups = _follow_groups_from_signals(result.get("signals", []))
     rows = sorted(groups.values(), key=lambda row: row.get("last_activity_at") or 0, reverse=True)
+    for row in rows:
+        row["team_logos"] = _team_logos_for_title(str(row.get("title") or row.get("question") or ""), logo_cache)
     return {"page": page, "size": size, "total": int(result.get("total") or 0), "follows": rows, "db_ready": bool(result.get("db_ready"))}
 
 
@@ -693,6 +764,8 @@ def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
     result = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_follow_detail(condition_id)
     signals = result.get("signals", [])
     market = _active_market_by_condition(data_dir, condition_id)
+    logo_cache = _load_team_logo_cache(data_dir)
+    leaderboard_ranks = _leaderboard_rank_by_wallet(data_dir)
     by_wallet: dict[str, dict[str, Any]] = {}
     title = ""
     question = ""
@@ -710,7 +783,16 @@ def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
         market_type = market_type or str(signal.get("market_type") or "")
         market_type_label = market_type_label or str(signal.get("market_type_label") or "")
         wallet = str(signal.get("wallet") or "").lower()
-        bucket = by_wallet.setdefault(wallet, {"wallet": wallet, "short_addr": short_addr(wallet), "signals": [], "leg_count": 0})
+        bucket = by_wallet.setdefault(
+            wallet,
+            {
+                "wallet": wallet,
+                "short_addr": short_addr(wallet),
+                "leaderboard_rank": leaderboard_ranks.get(wallet),
+                "signals": [],
+                "leg_count": 0,
+            },
+        )
         bucket["signals"].append(signal)
         bucket["leg_count"] += len(signal.get("legs") or [])
     title = title or str(market.get("title") or "")
@@ -730,6 +812,7 @@ def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
         "event_url": f"https://polymarket.com/event/{event_slug}" if event_slug else "",
         "market_type": market_type,
         "market_type_label": market_type_label,
+        "team_logos": _team_logos_for_title(title or question, logo_cache),
         "outcomes": market.get("outcomes"),
         "outcome_prices": market.get("outcome_prices") or market.get("outcomePrices"),
         "wallets": list(by_wallet.values()),
@@ -738,9 +821,67 @@ def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
     }
 
 
+def _leaderboard_rank_by_wallet(data_dir: Path) -> dict[str, int]:
+    leaderboard = _read_json(data_dir / "smart_wallet_leaderboard.json", [])
+    rows: list[dict[str, Any]] = []
+    for row in leaderboard if isinstance(leaderboard, list) else []:
+        if not isinstance(row, dict):
+            continue
+        wallet = str(row.get("wallet") or "").lower()
+        if not wallet:
+            continue
+        metrics = _eligible_display_metrics(row)
+        merged = {**row, **metrics, "wallet": wallet}
+        rows.append(merged)
+    rows.sort(key=wallet_leaderboard_rank_key)
+    return {str(row.get("wallet") or "").lower(): index for index, row in enumerate(rows, start=1)}
+
+
+def build_wallet_follow_detail(data_dir: Path, wallet: str, *, status: str = "") -> dict[str, Any]:
+    wallet = wallet.lower()
+    if not re.fullmatch(r"0x[a-f0-9]{40}", wallet):
+        return {"wallet": wallet, "short_addr": short_addr(wallet), "signals": [], "count": 0, "db_ready": False}
+    allowed_statuses = {"open", "settled", "exited"}
+    statuses = {status} if status in allowed_statuses else set()
+    result = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_wallet_follow_detail(wallet, statuses=statuses)
+    signals = result.get("signals", [])
+    signals = sorted(
+        [signal for signal in signals if isinstance(signal, dict)],
+        key=lambda signal: _signal_activity_at(signal),
+        reverse=True,
+    )
+    return {
+        "wallet": wallet,
+        "short_addr": short_addr(wallet),
+        "status": status if status in allowed_statuses else "",
+        "signals": signals,
+        "count": len(signals),
+        "db_ready": bool(result.get("db_ready")),
+    }
+
+
+def _signal_activity_at(signal: dict[str, Any]) -> int:
+    direct = (
+        signal.get("settled_at")
+        or signal.get("exit_at")
+        or signal.get("updated_at")
+        or signal.get("created_at")
+    )
+    ts = _parse_timestamp(direct)
+    if ts:
+        return ts
+    leg_times = [
+        _parse_timestamp(leg.get("leg_at") or leg.get("created_at"))
+        for leg in signal.get("legs") or []
+        if isinstance(leg, dict)
+    ]
+    return max([value for value in leg_times if value] or [0])
+
+
 def build_events(data_dir: Path, *, observe_window_hours: float = 24.0) -> dict[str, Any]:
     cache_path = data_dir / "follow" / "active_market_cache.json"
     cached = _read_json(cache_path, {})
+    logo_cache = _load_team_logo_cache(data_dir)
     updated_at = int(cached.get("updated_at") or 0) if isinstance(cached, dict) else 0
     markets = cached.get("markets") if isinstance(cached, dict) else []
     if isinstance(markets, dict):
@@ -752,39 +893,112 @@ def build_events(data_dir: Path, *, observe_window_hours: float = 24.0) -> dict[
     now_ts = int(time.time())
     window_end = now_ts + int(observe_window_hours * 3600)
     events = []
-    open_snapshot = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_open_signals()
+    follow_snapshot = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_snapshot()
     open_by_condition: dict[str, list[dict[str, Any]]] = {}
-    for signal in open_snapshot.get("open_signals", []):
+    for signal in follow_snapshot.get("open_signals", []):
         open_by_condition.setdefault(str(signal.get("condition_id") or "").lower(), []).append(signal)
+    results_by_condition: dict[str, list[dict[str, Any]]] = {}
+    for result in follow_snapshot.get("results", []):
+        condition_id = str(result.get("condition_id") or "").lower()
+        if condition_id:
+            results_by_condition.setdefault(condition_id, []).append(result)
     for market in rows:
         if not isinstance(market, dict):
             continue
         condition_id = str(market.get("condition_id") or market.get("conditionId") or "").lower()
         start_ts = _parse_timestamp(market.get("match_start_time") or market.get("market_start_time") or market.get("startTime"))
-        if start_ts and now_ts <= start_ts <= window_end:
+        open_signals = open_by_condition.get(condition_id, [])
+        results = results_by_condition.get(condition_id, [])
+        if (start_ts and now_ts <= start_ts <= window_end) or open_signals:
             open_signals = open_by_condition.get(condition_id, [])
+            results = results_by_condition.get(condition_id, [])
             events.append(
                 {
                     "condition_id": condition_id,
                     "title": market.get("title"),
                     "question": market.get("question"),
+                    "team_logos": _team_logos_for_title(str(market.get("title") or market.get("question") or ""), logo_cache),
                     "match_start_time": market.get("match_start_time") or market.get("market_start_time") or market.get("startTime"),
                     "outcomes": market.get("outcomes"),
                     "outcome_prices": market.get("outcome_prices") or market.get("outcomePrices"),
                     "market_type": market.get("market_type"),
                     "market_type_label": market.get("market_type_label"),
                     "open_signals": open_signals,
-                    "contested": _signals_contested(open_signals),
-                    "side_counts": _signal_side_counts(open_signals),
+                    "results": results,
+                    "settled_count": sum(1 for result in results if result.get("status") == "settled"),
+                    "exited_count": sum(1 for result in results if result.get("status") == "exited"),
+                    "contested": _signals_contested([*open_signals, *results]),
+                    "side_counts": _signal_side_counts([*open_signals, *results]),
                 }
             )
-    events.sort(key=lambda row: _parse_timestamp(row.get("match_start_time")) or 0)
+    events.sort(
+        key=lambda row: (
+            0 if row.get("open_signals") else 1 if row.get("results") else 2,
+            _parse_timestamp(row.get("match_start_time")) or 0,
+        )
+    )
     return {
         "events": events,
         "count": len(events),
         "cache_updated_at": updated_at,
         "cache_stale": bool(not updated_at or now_ts - updated_at > 15 * 60),
     }
+
+
+def _load_team_logo_cache(data_dir: Path) -> dict[str, str]:
+    raw = _read_json(data_dir / "team_logos.json", {})
+    if not isinstance(raw, dict):
+        return {}
+    teams = raw.get("teams") if isinstance(raw.get("teams"), dict) else raw
+    logos: dict[str, str] = {}
+    for key, value in teams.items():
+        url = str(value or "").strip()
+        if not url:
+            continue
+        normalized = _normalize_logo_key(str(key))
+        if normalized:
+            logos[normalized] = url
+    return logos
+
+
+def _team_logos_for_title(title: str, logo_cache: dict[str, str]) -> dict[str, str]:
+    if not title or not logo_cache:
+        return {}
+    parts = _match_title_parts(title)
+    if not parts:
+        return {}
+    team_a = parts.get("teamA") or ""
+    team_b = parts.get("teamB") or ""
+    return {
+        "teamA": _team_logo_url(logo_cache, parts.get("game") or "", team_a),
+        "teamB": _team_logo_url(logo_cache, parts.get("game") or "", team_b),
+    }
+
+
+def _team_logo_url(logo_cache: dict[str, str], game: str, team: str) -> str:
+    team_key = _normalize_logo_key(team)
+    if not team_key:
+        return ""
+    game_key = _normalize_logo_key(game)
+    candidates = [_normalize_logo_key(f"{game_key}:{team_key}") if game_key else "", team_key]
+    return next((logo_cache[key] for key in candidates if key and key in logo_cache), "")
+
+
+def _match_title_parts(title: str) -> dict[str, str] | None:
+    match = _MATCH_TITLE_RE.match(str(title or ""))
+    if not match:
+        return None
+    return {
+        "game": match.group(1).strip(),
+        "teamA": match.group(2).strip(),
+        "teamB": match.group(3).strip(),
+        "meta": f"{(match.group(4) or '').strip()} {match.group(5).strip()}".strip(),
+    }
+
+
+def _normalize_logo_key(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    return re.sub(r"\s+", " ", normalized)
 
 
 def _active_market_by_condition(data_dir: Path, condition_id: str) -> dict[str, Any]:

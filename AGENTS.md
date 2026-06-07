@@ -426,6 +426,15 @@ in `finally`. Use `follow_snapshot_updated_at` from SQLite meta plus run log,
 control file, and leaderboard mtimes for dirty flags. Do not switch this to
 WebSocket unless the project explicitly changes the zero-dependency design.
 
+## Dashboard UI Notes
+
+This is a personal-use dashboard, not a commercial product. When UI work needs
+icons, prefer existing icons over hand-drawn complex SVGs. Good acceptable
+sources are, in order of preference: `https://www.flaticon.com/`, then
+`https://www.iconfont.cn/`. If a source requires login or download is
+inconvenient, fall back to the project's existing icon library or simple text
+badges.
+
 ## Follow-Signal Principle
 
 For future copy-trading logic, single-wallet signals are weak by default.

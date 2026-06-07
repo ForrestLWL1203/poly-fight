@@ -507,6 +507,48 @@ class FollowStore:
             conn.close()
         return {"db_ready": True, "signals": signals}
 
+    def load_dashboard_wallet_follow_detail(self, wallet: str, *, statuses: set[str] | None = None) -> dict[str, Any]:
+        empty = {"db_ready": False, "signals": []}
+        conn = self.connect_readonly()
+        if conn is None:
+            return empty
+        wallet = str(wallet or "").lower()
+        statuses = {str(status).lower() for status in (statuses or set()) if status}
+        try:
+            tables = {
+                str(row["name"])
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            if not {"follow_signals", "follow_results"}.issubset(tables):
+                return empty
+            rows = conn.execute(
+                """
+                SELECT raw_json, COALESCE(updated_at, created_at, 0) AS sort_at, signal_id
+                FROM follow_signals
+                WHERE lower(wallet) = ?
+                UNION ALL
+                SELECT raw_json, COALESCE(resolved_at, 0) AS sort_at, signal_id
+                FROM follow_results
+                WHERE lower(wallet) = ?
+                ORDER BY sort_at DESC, signal_id ASC
+                """,
+                (wallet, wallet),
+            ).fetchall()
+        except sqlite3.Error:
+            return empty
+        finally:
+            conn.close()
+        by_id = {}
+        for row in rows:
+            signal = _loads(row["raw_json"], {})
+            status = str(signal.get("status") or "").lower()
+            if statuses and status not in statuses:
+                continue
+            signal_id = str(signal.get("signal_id") or row["signal_id"] or "")
+            if signal_id and signal_id not in by_id:
+                by_id[signal_id] = signal
+        return {"db_ready": True, "signals": list(by_id.values())}
+
     def _dashboard_signals_for_conditions(
         self,
         conn: sqlite3.Connection,

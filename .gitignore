@@ -4,6 +4,7 @@ __pycache__/
 
 # Generated live analysis data and raw API caches.
 data/
+data*/
 
 # Local review scratch files.
 review/
