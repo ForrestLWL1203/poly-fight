@@ -454,12 +454,12 @@ def build_discovery_slate(
     fallback_min_market_volume: float = 10_000,
     submarket_min_market_volume: float = 5_000,
     submarket_fallback_min_market_volume: float = 1_000,
-    target_markets: int = 30,
-    submarket_target_markets: int = 60,
+    target_markets: int = 150,
+    submarket_target_markets: int = 150,
     game_winner_target_markets: int | None = None,
     map_winner_target_markets: int | None = None,
-    max_markets_per_run: int = 50,
-    submarket_max_markets_per_run: int = 60,
+    max_markets_per_run: int = 150,
+    submarket_max_markets_per_run: int = 150,
     game_winner_max_markets_per_run: int | None = None,
     map_winner_max_markets_per_run: int | None = None,
     market_offset: int = 0,
@@ -491,6 +491,20 @@ def build_discovery_slate(
             days_ago = (now - end).total_seconds() / SECONDS_PER_DAY
             if 0 <= days_ago <= days and to_float(market.get("volume")) >= min_volume:
                 selected.append(market)
+        if league is None:
+            max_volume = max((to_float(row.get("volume")) for row in selected), default=0.0)
+
+            def score_key(row: dict[str, Any]) -> tuple[float, float, float, str]:
+                end = parse_dt(row.get("end_date"))
+                days_ago = (now - end).total_seconds() / SECONDS_PER_DAY if end else days
+                volume = to_float(row.get("volume"))
+                volume_norm = volume / max_volume if max_volume > 0 else 0.0
+                recency_norm = 1 - min(max(days_ago, 0.0) / max(days, 1), 1)
+                score = 0.70 * volume_norm + 0.30 * recency_norm
+                end_ts = end.timestamp() if end else 0.0
+                return (-score, -volume, -end_ts, str(row.get("condition_id") or ""))
+
+            return sorted(selected, key=score_key)
         return sorted(
             selected,
             key=lambda row: (to_float(row.get("volume")), row.get("end_date") or ""),
@@ -581,13 +595,7 @@ def build_discovery_slate(
     merged: dict[str, dict[str, Any]] = {}
     for market in [*main_slice, *game_slice, *map_slice]:
         merged[str(market.get("condition_id") or "").lower()] = market
-    selected = sorted(
-        merged.values(),
-        key=lambda row: (
-            MARKET_TYPE_ORDER.get(str(row.get("market_type") or MAIN_MATCH), 99),
-            -to_float(row.get("volume")),
-        ),
-    )
+    selected = list(merged.values())
 
     type_counts: dict[str, int] = {}
     selected_type_counts: dict[str, int] = {}
@@ -643,6 +651,7 @@ def trade_cash(trade: dict[str, Any]) -> float:
 def build_candidate_wallets(
     trades_by_market: dict[str, list[dict[str, Any]]],
     *,
+    market_type_by_id: dict[str, str] | None = None,
     market_end_times: dict[str, int] | None = None,
     market_start_times: dict[str, int] | None = None,
     min_trade_cash: float = 50,
@@ -651,14 +660,19 @@ def build_candidate_wallets(
     total_cash_threshold: float = 5_000,
     single_market_cash_threshold: float = 1_000,
     max_candidate_wallets: int = 300,
+    candidate_wallets_per_market_type: int | None = None,
     tail_entry_price_threshold: float = 0.75,
 ) -> list[dict[str, Any]]:
     wallets: dict[str, dict[str, Any]] = {}
     market_cash_by_wallet: dict[str, dict[str, float]] = {}
     market_size_by_wallet: dict[str, dict[str, float]] = {}
+    market_buy_cash_by_wallet: dict[str, dict[str, float]] = {}
+    market_buy_size_by_wallet: dict[str, dict[str, float]] = {}
     market_trade_counts_by_wallet: dict[str, dict[str, int]] = {}
-    market_outcomes_by_wallet: dict[str, dict[str, set[str]]] = {}
+    market_buy_outcomes_by_wallet: dict[str, dict[str, set[str]]] = {}
     market_last_trade_by_wallet: dict[str, dict[str, int]] = {}
+    market_last_buy_by_wallet: dict[str, dict[str, int]] = {}
+    market_type_by_id = {str(key).lower(): str(value) for key, value in (market_type_by_id or {}).items()}
     market_end_times = market_end_times or {}
     market_start_times = market_start_times or {}
     for condition_id, trades in trades_by_market.items():
@@ -694,72 +708,92 @@ def build_candidate_wallets(
                 wallet_market_size[condition_id] = wallet_market_size.get(condition_id, 0.0) + size
             wallet_market_counts = market_trade_counts_by_wallet.setdefault(wallet, {})
             wallet_market_counts[condition_id] = wallet_market_counts.get(condition_id, 0) + 1
+            side = str(trade.get("side") or trade.get("type") or "BUY").upper()
             outcome = str(trade.get("outcome") or trade.get("outcomeIndex") or "")
-            if outcome:
-                wallet_market_outcomes = market_outcomes_by_wallet.setdefault(wallet, {})
-                wallet_market_outcomes.setdefault(condition_id, set()).add(outcome)
+            if outcome and side == "BUY":
+                wallet_market_buy_cash = market_buy_cash_by_wallet.setdefault(wallet, {})
+                wallet_market_buy_cash[condition_id] = wallet_market_buy_cash.get(condition_id, 0.0) + cash
+                if size > 0:
+                    wallet_market_buy_size = market_buy_size_by_wallet.setdefault(wallet, {})
+                    wallet_market_buy_size[condition_id] = wallet_market_buy_size.get(condition_id, 0.0) + size
+                wallet_market_buy_outcomes = market_buy_outcomes_by_wallet.setdefault(wallet, {})
+                wallet_market_buy_outcomes.setdefault(condition_id, set()).add(outcome)
+                wallet_market_last_buy = market_last_buy_by_wallet.setdefault(wallet, {})
+                wallet_market_last_buy[condition_id] = max(
+                    wallet_market_last_buy.get(condition_id, 0),
+                    to_int(trade.get("timestamp")),
+                )
             wallet_market_last = market_last_trade_by_wallet.setdefault(wallet, {})
             wallet_market_last[condition_id] = max(
                 wallet_market_last.get(condition_id, 0),
                 to_int(trade.get("timestamp")),
             )
 
-    rows = []
-    for wallet, row in wallets.items():
+    def metrics_for_market_ids(wallet: str, market_ids: set[str], base_row: dict[str, Any]) -> dict[str, Any]:
         market_cash = market_cash_by_wallet.get(wallet, {})
-        market_size = market_size_by_wallet.get(wallet, {})
-        per_market = list(market_cash.values())
+        buy_market_cash = market_buy_cash_by_wallet.get(wallet, {})
+        buy_market_size = market_buy_size_by_wallet.get(wallet, {})
         trade_counts = market_trade_counts_by_wallet.get(wallet, {})
-        outcome_sets = market_outcomes_by_wallet.get(wallet, {})
-        last_trades = market_last_trade_by_wallet.get(wallet, {})
-        two_sided_market_count = sum(1 for outcomes in outcome_sets.values() if len(outcomes) >= 2)
-        high_churn_market_count = sum(1 for count in trade_counts.values() if count >= 20)
+        buy_outcome_sets = market_buy_outcomes_by_wallet.get(wallet, {})
+        last_buys = market_last_buy_by_wallet.get(wallet, {})
+        per_market = [market_cash.get(condition_id, 0.0) for condition_id in market_ids]
+        two_sided_market_count = sum(
+            1 for condition_id in market_ids if len(buy_outcome_sets.get(condition_id, set())) >= 2
+        )
+        high_churn_market_count = sum(1 for condition_id in market_ids if trade_counts.get(condition_id, 0) >= 20)
         last_entry_hours_to_start = []
         last_entry_hours_to_end = []
         tail_entry_market_count = 0
-        for condition_id, last_ts in last_trades.items():
+        for condition_id in market_ids:
+            last_ts = last_buys.get(condition_id, 0)
             start_ts = market_start_times.get(condition_id) or market_end_times.get(condition_id)
             end_ts = market_end_times.get(condition_id)
             if start_ts and last_ts:
                 hours = (start_ts - last_ts) / 3600
                 last_entry_hours_to_start.append(hours)
-                size = market_size.get(condition_id, 0.0)
-                avg_price = market_cash.get(condition_id, 0.0) / size if size > 0 else 0.0
-                if hours < 2 and avg_price >= tail_entry_price_threshold:
+                size = buy_market_size.get(condition_id, 0.0)
+                avg_price = buy_market_cash.get(condition_id, 0.0) / size if size > 0 else 0.0
+                if avg_price >= tail_entry_price_threshold:
                     tail_entry_market_count += 1
             if end_ts and last_ts:
                 last_entry_hours_to_end.append((end_ts - last_ts) / 3600)
-        late_entry_market_count = sum(1 for hours in last_entry_hours_to_start if hours < 2)
-        early_entry_market_count = sum(1 for hours in last_entry_hours_to_start if hours >= 2)
-        participated_market_count = len(row["participated_markets"])
-        max_single_market_cash = max(per_market) if per_market else 0.0
-        avg_market_cash = row["total_cash_volume"] / participated_market_count if participated_market_count else 0
-        total_size = sum(market_size.values())
-        avg_entry_price = row["total_cash_volume"] / total_size if total_size > 0 else 0.0
-        rows.append(
-            {
-                "wallet": wallet,
-                "participated_market_count": participated_market_count,
-                "participated_market_ids": sorted(row["participated_markets"]),
-                "total_trade_count": row["total_trade_count"],
-                "total_cash_volume": round(row["total_cash_volume"], 6),
-                "max_single_market_cash": round(max_single_market_cash, 6),
-                "avg_market_cash": round(avg_market_cash, 6),
-                "two_sided_market_count": two_sided_market_count,
-                "high_churn_market_count": high_churn_market_count,
-                "late_entry_market_count": late_entry_market_count,
-                "tail_entry_market_count": tail_entry_market_count,
-                "early_entry_market_count": early_entry_market_count,
-                "avg_entry_price": round(avg_entry_price, 8),
-                "median_last_entry_hours_to_start": round(median(last_entry_hours_to_start), 8)
-                if last_entry_hours_to_start
-                else 0.0,
-                "median_last_entry_hours_to_end": round(median(last_entry_hours_to_end), 8)
-                if last_entry_hours_to_end
-                else 0.0,
-                "last_seen_at": row["last_seen_at"],
-            }
-        )
+        total_cash_volume = sum(per_market)
+        total_buy_cash = sum(buy_market_cash.get(condition_id, 0.0) for condition_id in market_ids)
+        total_buy_size = sum(buy_market_size.get(condition_id, 0.0) for condition_id in market_ids)
+        participated_market_count = len(market_ids)
+        return {
+            "participated_market_count": participated_market_count,
+            "participated_market_ids": sorted(market_ids),
+            "total_trade_count": sum(trade_counts.get(condition_id, 0) for condition_id in market_ids),
+            "total_cash_volume": round(total_cash_volume, 6),
+            "max_single_market_cash": round(max(per_market) if per_market else 0.0, 6),
+            "avg_market_cash": round(total_cash_volume / participated_market_count, 6) if participated_market_count else 0.0,
+            "two_sided_market_count": two_sided_market_count,
+            "high_churn_market_count": high_churn_market_count,
+            "late_entry_market_count": sum(1 for hours in last_entry_hours_to_start if hours < 2),
+            "tail_entry_market_count": tail_entry_market_count,
+            "early_entry_market_count": sum(1 for hours in last_entry_hours_to_start if hours >= 2),
+            "avg_entry_price": round(total_buy_cash / total_buy_size, 8) if total_buy_size > 0 else 0.0,
+            "median_last_entry_hours_to_start": round(median(last_entry_hours_to_start), 8)
+            if last_entry_hours_to_start
+            else 0.0,
+            "median_last_entry_hours_to_end": round(median(last_entry_hours_to_end), 8)
+            if last_entry_hours_to_end
+            else 0.0,
+            "last_seen_at": base_row["last_seen_at"],
+        }
+
+    rows = []
+    for wallet, row in wallets.items():
+        global_metrics = metrics_for_market_ids(wallet, set(row["participated_markets"]), row)
+        per_type_candidate: dict[str, dict[str, Any]] = {}
+        market_ids_by_type: dict[str, set[str]] = {}
+        for condition_id in row["participated_markets"]:
+            market_type = market_type_by_id.get(str(condition_id).lower(), MAIN_MATCH)
+            market_ids_by_type.setdefault(market_type, set()).add(condition_id)
+        for market_type, market_ids in sorted(market_ids_by_type.items()):
+            per_type_candidate[market_type] = metrics_for_market_ids(wallet, market_ids, row)
+        rows.append({"wallet": wallet, **global_metrics, "per_type_candidate": per_type_candidate})
 
     rows.sort(key=lambda row: (row["participated_market_count"], row["total_cash_volume"]), reverse=True)
     top_wallets = {
@@ -789,6 +823,25 @@ def build_candidate_wallets(
         ),
         reverse=True,
     )
+    if candidate_wallets_per_market_type and candidate_wallets_per_market_type > 0:
+        by_wallet: dict[str, dict[str, Any]] = {}
+        for market_type in sorted({key for row in candidates for key in (row.get("per_type_candidate") or {})}):
+            bucket = [
+                row
+                for row in candidates
+                if isinstance((row.get("per_type_candidate") or {}).get(market_type), dict)
+            ]
+            bucket.sort(
+                key=lambda row: (
+                    to_float(row["per_type_candidate"][market_type].get("max_single_market_cash")),
+                    to_float(row["per_type_candidate"][market_type].get("total_cash_volume")),
+                    int(row["per_type_candidate"][market_type].get("participated_market_count") or 0),
+                ),
+                reverse=True,
+            )
+            for row in bucket[:candidate_wallets_per_market_type]:
+                by_wallet.setdefault(row["wallet"], row)
+        return [row for row in candidates if row["wallet"] in by_wallet]
     return candidates[:max_candidate_wallets]
 
 
@@ -932,6 +985,8 @@ def summarize_closed_positions(
             }
         )
 
+    summary_now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
+
     def summarize_bucket(bucket_rows: list[dict[str, Any]], *, neutral_market_count: int) -> dict[str, Any]:
         count = len(bucket_rows)
         total_bought = sum(row["total_bought"] for row in bucket_rows)
@@ -954,6 +1009,33 @@ def summarize_closed_positions(
         pre_match_entry_count = sum(1 for row in pre_match_rows if row.get("pre_match_entry"))
         capital_weighted_entry_price = total_cost / total_bought if total_bought else 0.0
         capital_weighted_win_rate = winning_cost / total_cost if total_cost else 0.0
+
+        def recent_window(days: int) -> dict[str, Any]:
+            cutoff = summary_now_ts - days * SECONDS_PER_DAY
+            recent_rows = [row for row in bucket_rows if row["timestamp"] >= cutoff]
+            recent_count = len(recent_rows)
+            recent_cost = sum(row["cost_basis"] for row in recent_rows)
+            recent_pnl = sum(row["realized_pnl"] for row in recent_rows)
+            recent_positive = sum(1 for row in recent_rows if row["realized_pnl"] > 0)
+            return {
+                "market_count": recent_count,
+                "roi": round(recent_pnl / recent_cost, 8) if recent_cost else 0.0,
+                "positive_rate": round(recent_positive / recent_count, 8) if recent_count else 0.0,
+                "pnl": round(recent_pnl, 6),
+                "total_cost": round(recent_cost, 6),
+            }
+
+        recent_7d = recent_window(7)
+        recent_14d = recent_window(14)
+        if recent_7d["market_count"] >= 3:
+            recent_bucket = recent_7d
+            recent_window_days = 7
+        elif recent_14d["market_count"] >= 3:
+            recent_bucket = recent_14d
+            recent_window_days = 14
+        else:
+            recent_bucket = recent_14d if recent_14d["market_count"] >= recent_7d["market_count"] else recent_7d
+            recent_window_days = 0
         entry_price_buckets = {
             "<0.40": {"market_count": 0, "total_cost": 0.0, "win_count": 0, "hold_pnl": 0.0},
             "0.40-0.55": {"market_count": 0, "total_cost": 0.0, "win_count": 0, "hold_pnl": 0.0},
@@ -1020,8 +1102,21 @@ def summarize_closed_positions(
         "high_price_entry_rate": round(high_price_entries / count, 8) if count else 0.0,
         "low_edge_profit_rate": round(low_edge_profits / count, 8) if count else 0.0,
         "last_esports_trade_at": last_trade,
+        "recent_7d_market_count": recent_7d["market_count"],
+        "recent_7d_roi": recent_7d["roi"],
+        "recent_7d_positive_rate": recent_7d["positive_rate"],
+        "recent_7d_pnl": recent_7d["pnl"],
+        "recent_14d_market_count": recent_14d["market_count"],
+        "recent_14d_roi": recent_14d["roi"],
+        "recent_14d_positive_rate": recent_14d["positive_rate"],
+        "recent_14d_pnl": recent_14d["pnl"],
+        "recent_bucket_market_count": recent_bucket["market_count"],
+        "recent_bucket_window_days": recent_window_days,
+        "recent_bucket_roi": recent_bucket["roi"],
+        "recent_bucket_positive_rate": recent_bucket["positive_rate"],
+        "recent_bucket_pnl": recent_bucket["pnl"],
         "bot_like_score": bot_like_score,
-        "profiled_at": now_ts or int(datetime.now(timezone.utc).timestamp()),
+        "profiled_at": summary_now_ts,
         "scoring_version": SCORING_VERSION,
         }
 

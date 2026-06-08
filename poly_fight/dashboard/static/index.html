@@ -60,23 +60,10 @@
               @click="openResetModal"
               :disabled="loading.runner || resetModal.loading"
             >
-              <img class="button-icon" src="/icons/flaticon/delete-database.png" alt="" aria-hidden="true" />
+              <span class="reset-cross-icon" aria-hidden="true"></span>
               <span>重置数据</span>
             </button>
             <div class="runner-control-group">
-              <label class="runner-stake-field" title="单笔基础跟单金额">
-                <span>$</span>
-                <input
-                  v-model="runnerStakeInput"
-                  type="number"
-                  min="0.01"
-                  step="0.01"
-                  inputmode="decimal"
-                  placeholder="基础金额"
-                  :disabled="runner.status === 'running' || loading.runner"
-                  required
-                />
-              </label>
               <button
                 class="runner-control-btn"
                 :class="runner.status === 'running' ? 'runner-control-stop' : 'runner-control-start'"
@@ -96,22 +83,38 @@
                   <span>{{ runnerControlLabel }}</span>
                 </template>
               </button>
+              <label class="runner-stake-field" title="按目标钱包买入金额的固定比例跟单，最低 1 USDC">
+                <input
+                  v-model="runnerStakeRatioInput"
+                  type="text"
+                  inputmode="decimal"
+                  pattern="[0-9]*\\.?[0-9]*"
+                  placeholder="比例"
+                  :disabled="runner.status === 'running' || loading.runner"
+                  required
+                />
+                <span>%</span>
+              </label>
               <button
                 v-if="runner.status !== 'running' && !hasFollowWallets"
                 class="runner-start-warning"
                 type="button"
-                title="需先采集目标跟单钱包"
                 aria-label="需先采集目标跟单钱包"
-                @click="showToast('需先采集目标跟单钱包', 'error')"
-              >!</button>
+                @click="showRunnerWarning('需先采集目标跟单钱包')"
+              >
+                !
+                <span v-if="runnerWarningMessage" class="runner-warning-popover">{{ runnerWarningMessage }}</span>
+              </button>
               <button
-                v-else-if="runner.status !== 'running' && !runnerStakeValid"
+                v-else-if="runner.status !== 'running' && !runnerStakeRatioValid"
                 class="runner-start-warning"
                 type="button"
-                title="需填写基础跟单金额"
-                aria-label="需填写基础跟单金额"
-                @click="showToast('需填写基础跟单金额', 'error')"
-              >!</button>
+                aria-label="需填写跟单比例"
+                @click="showRunnerWarning('需填写跟单比例')"
+              >
+                !
+                <span v-if="runnerWarningMessage" class="runner-warning-popover">{{ runnerWarningMessage }}</span>
+              </button>
             </div>
           </div>
         </header>
@@ -159,8 +162,8 @@
               </div>
             </article>
             <article class="overview-analysis-card">
-              <div><span>监控赛事</span><strong>{{ numberOrDash(health.watched_market_count) }}</strong><small>eSports {{ numberOrDash(healthWatchedByCategory('esports')) }} / Sports {{ numberOrDash(healthWatchedByCategory('sports')) }}</small></div>
-              <div><span>进行中跟单</span><strong>{{ numberOrDash(overview.open_signal_count ?? health.open_signal_count) }}</strong><small>eSports {{ numberOrDash(overviewCategory('esports').open_signal_count) }} / Sports {{ numberOrDash(overviewCategory('sports').open_signal_count) }}</small></div>
+              <div><span>监控赛事</span><strong>{{ numberOrDash(healthWatchedByCategory('esports') || health.watched_market_count) }}</strong></div>
+              <div><span>进行中跟单</span><strong>{{ numberOrDash(overviewCategory('esports').open_signal_count ?? overview.open_signal_count ?? health.open_signal_count) }}</strong></div>
               <div><span>干净信号</span><strong>{{ numberOrDash(overview.clean_signal_count) }}</strong><small>未出现对手盘冲突</small></div>
               <div><span>分歧盘</span><strong>{{ numberOrDash(overview.contested_signal_count) }}</strong><small>同市场出现反向钱包</small></div>
             </article>
@@ -168,17 +171,6 @@
         </section>
 
         <section class="toolbar-band leaderboard-console" :class="{ 'is-refreshing': walletRefreshBusy }">
-          <div class="center-category-tabs">
-            <div class="category-tabs" aria-label="钱包类目">
-              <button
-                v-for="category in categoryTabs"
-                :key="`wallet-${category.id}`"
-                type="button"
-                :class="{ active: activeCategory === category.id }"
-                @click="setCategory(category.id)"
-              >{{ category.label }} <span>{{ walletCountByCategory(category.id) }}</span></button>
-            </div>
-          </div>
           <div class="section-head category-section-head">
             <div>
               <h2>聪明钱包</h2>
@@ -192,7 +184,7 @@
               <button class="sample-refresh-btn" @click="startWalletRefresh" :disabled="walletRefreshBusy">
                 <span v-if="walletRefreshBusy" class="loading loading-spinner loading-sm"></span>
                 <img v-else class="button-icon" src="/icons/flaticon/refresh.png" alt="" aria-hidden="true" />
-                {{ categoryLabel(activeCategory) }} 立即采样
+                采样
               </button>
             </div>
           </div>
@@ -202,10 +194,12 @@
                 <tr>
                   <th>Rank</th>
                   <th>钱包</th>
-                  <th>评级</th>
-                  <th>ROI</th>
-                  <th>历史胜负</th>
-                  <th>可跟类型</th>
+                  <th>评分</th>
+                  <th>专精 ROI</th>
+                  <th>专精胜率</th>
+                  <th>场均交易额</th>
+                  <th>近期表现</th>
+                  <th>专精类型</th>
                   <th>已结算</th>
                   <th>持仓中</th>
                   <th>已退出</th>
@@ -225,23 +219,24 @@
                       {{ wallet.short_addr }}
                     </a>
                   </td>
-                  <td><span class="badge" :class="gradeClass(wallet.grade)">{{ wallet.grade || "-" }}</span></td>
-                  <td>{{ percent(wallet.esports_roi) }}</td>
-                  <td class="metric-strong">{{ walletHistoryText(wallet) }}</td>
+                  <td class="metric-strong">{{ bucketScoreText(wallet) }}</td>
+                  <td>
+                    <div :class="pnlClass(wallet.esports_roi)">{{ percent(wallet.esports_roi) }}</div>
+                    <small v-if="overallRoiText(wallet)" class="subtle">{{ overallRoiText(wallet) }}</small>
+                  </td>
+                  <td class="winrate-cell">
+                    <div class="metric-strong">{{ walletRecordText(wallet) }}</div>
+                    <small v-if="walletWinRateText(wallet)" class="subtle">{{ walletWinRateText(wallet) }}</small>
+                  </td>
+                  <td class="metric-strong" :title="money(wallet.avg_market_cash)">{{ compactMoney(wallet.avg_market_cash) }}</td>
+                  <td>
+                    <div :class="pnlClass(wallet.recent_bucket_roi)">{{ recentBucketText(wallet) }}</div>
+                    <small v-if="recentBucketSubtext(wallet)" class="subtle">{{ recentBucketSubtext(wallet) }}</small>
+                  </td>
                   <td>
                     <div class="type-row">
-                      <span class="type-prefix">{{ wallet.category === 'sports' ? '观察' : '可跟' }}</span>
                       <span v-for="label in walletScopeLabels(wallet)" :key="`eligible-${label}`" class="badge badge-neutral badge-sm mr-1">{{ label }}</span>
                       <span v-if="!walletScopeLabels(wallet).length" class="subtle">-</span>
-                    </div>
-                    <div v-if="wallet.category === 'sports'" class="type-row type-row-muted">
-                      <span class="type-prefix">参与</span>
-                      <span>{{ sportsParticipationText(wallet) }}</span>
-                    </div>
-                    <div class="type-row type-row-muted">
-                      <span class="type-prefix">历史</span>
-                      <span v-for="label in observedMarketTypeLabels(wallet)" :key="`observed-${label}`" class="badge badge-ghost badge-sm mr-1">{{ label }}</span>
-                      <span v-if="!observedMarketTypeLabels(wallet).length" class="subtle">-</span>
                     </div>
                   </td>
                   <td>
@@ -279,7 +274,7 @@
                   </td>
                 </tr>
                 <tr v-if="!walletPageRows.length">
-                  <td colspan="12" class="empty-cell">暂无候选钱包</td>
+                  <td colspan="14" class="empty-cell">暂无候选钱包</td>
                 </tr>
               </tbody>
             </table>
@@ -300,17 +295,6 @@
 
         <div class="tab-panels">
           <section v-show="activeTab === 'follows'" class="data-panel console-panel">
-            <div class="center-category-tabs">
-              <div class="category-tabs" aria-label="跟单类目">
-                <button
-                  v-for="category in categoryTabs"
-                  :key="`follow-${category.id}`"
-                  type="button"
-                  :class="{ active: activeCategory === category.id }"
-                  @click="setCategory(category.id)"
-                >{{ category.label }}</button>
-              </div>
-            </div>
             <div class="section-head category-section-head">
               <div class="toolbar-actions">
                 <div class="table-filter">
@@ -370,8 +354,8 @@
                     <td>{{ follow.leg_count }}</td>
                     <td>{{ money(follow.stake) }}</td>
                     <td>
-                      <span class="tier-chip" :class="convictionTierClass((follow.conviction_tier_counts || {}).conviction ? 'conviction' : 'normal')">
-                        {{ convictionSummary(follow) }}
+                      <span class="tier-chip" :class="stakeModeClass(primaryStakeMode(follow))">
+                        {{ stakeModeSummary(follow) }}
                       </span>
                       <small v-if="signalStakeRange(follow)" class="tier-stake-range">{{ signalStakeRange(follow) }}</small>
                     </td>
@@ -399,17 +383,6 @@
           </section>
 
           <section v-show="activeTab === 'events'" class="data-panel console-panel">
-            <div class="center-category-tabs">
-              <div class="category-tabs" aria-label="赛事类目">
-                <button
-                  v-for="category in categoryTabs"
-                  :key="`event-${category.id}`"
-                  type="button"
-                  :class="{ active: activeCategory === category.id }"
-                  @click="setCategory(category.id)"
-                >{{ category.label }}</button>
-              </div>
-            </div>
             <div class="section-head category-section-head">
               <div>
                 <div class="event-subtabs" role="tablist" aria-label="赛事列表类型">
@@ -617,7 +590,7 @@
                         <th>目标购入金额</th>
                         <th>跟单时间</th>
                         <th>跟单额</th>
-                        <th>档位</th>
+                        <th>比例</th>
                         <th>跟单价格</th>
                         <th>买入均价</th>
                         <th>滑点</th>
@@ -631,7 +604,7 @@
                         <td>{{ money(legWalletTradeCash(leg)) }}</td>
                         <td>{{ formatTime(leg.leg_at || leg.created_at) }}</td>
                         <td>{{ money(leg.stake) }}</td>
-                        <td><span class="tier-chip tier-chip-xs" :class="convictionTierClass(signal.conviction_tier)">{{ convictionTierLabel(signal.conviction_tier) }}</span></td>
+                        <td><span class="tier-chip tier-chip-xs" :class="stakeModeClass(leg.stake_mode || signal.stake_mode)">{{ stakeModeLabel(leg.stake_mode || signal.stake_mode) }}</span></td>
                         <td>{{ price(leg.our_entry_price) }}</td>
                         <td>{{ price(leg.wallet_fill_price || leg.wallet_avg_price) }}</td>
                         <td :class="pnlClass(-(legSlippageValue(leg) || 0))">{{ legSlippageText(leg) }}</td>

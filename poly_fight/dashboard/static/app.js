@@ -13,13 +13,12 @@ createApp({
       ],
       categoryTabs: [
         { id: "esports", label: "eSports" },
-        { id: "sports", label: "Sports" },
       ],
       loginForm: { username: "admin", password: "" },
       loginError: "",
       loading: {},
       runnerActionText: "",
-      runnerStakeInput: "",
+      runnerStakeRatioInput: "",
       health: {},
       overview: {},
       wallets: { wallets: [] },
@@ -27,6 +26,8 @@ createApp({
       events: { events: [] },
       refreshStatus: { status: "idle" },
       runner: { status: "checking" },
+      runnerWarningMessage: "",
+      runnerWarningTimer: null,
       pauseFollow: null,
       walletPage: 1,
       walletSize: 10,
@@ -100,18 +101,18 @@ createApp({
       return Number(this.wallets?.count || (this.wallets?.wallets || []).length || 0) > 0;
     },
     runnerStartBlocked() {
-      return this.runner.status !== "running" && (!this.hasFollowWallets || !this.runnerStakeValid);
+      return this.runner.status !== "running" && (!this.hasFollowWallets || !this.runnerStakeRatioValid);
     },
-    runnerStakeValue() {
-      const value = Number(this.runnerStakeInput);
+    runnerStakeRatioValue() {
+      const value = Number(this.runnerStakeRatioInput);
       return Number.isFinite(value) ? value : 0;
     },
-    runnerStakeValid() {
-      return this.runnerStakeValue > 0;
+    runnerStakeRatioValid() {
+      return this.runnerStakeRatioValue > 0;
     },
     runnerControlTitle() {
       if (this.runner.status !== "running" && !this.hasFollowWallets) return "需先采集目标跟单钱包";
-      if (this.runner.status !== "running" && !this.runnerStakeValid) return "需填写基础跟单金额";
+      if (this.runner.status !== "running" && !this.runnerStakeRatioValid) return "需填写跟单比例";
       return this.runner.status === "running" ? "停止跟单脚本" : "启动跟单脚本";
     },
     healthPillText() {
@@ -459,8 +460,8 @@ createApp({
     },
     async loadRunner() {
       this.runner = await this.request("/api/runner");
-      if (this.runner.status === "running" && this.runner.stake_usdc) {
-        this.runnerStakeInput = String(this.runner.stake_usdc);
+      if (this.runner.status === "running" && this.runner.stake_ratio_percent) {
+        this.runnerStakeRatioInput = String(this.runner.stake_ratio_percent);
       }
     },
     async refreshAfterRunnerChange() {
@@ -475,7 +476,7 @@ createApp({
     },
     async startRunner() {
       if (this.runnerStartBlocked) {
-        this.showToast(this.hasFollowWallets ? "需填写基础跟单金额" : "需先采集目标跟单钱包", "error");
+        this.showRunnerWarning(this.hasFollowWallets ? "需填写跟单比例" : "需先采集目标跟单钱包");
         return;
       }
       await this.loadRunner();
@@ -483,8 +484,8 @@ createApp({
         this.showToast("跟单脚本已经在运行");
         return;
       }
-      if (!this.runnerStakeValid) {
-        this.showToast("需填写基础跟单金额", "error");
+      if (!this.runnerStakeRatioValid) {
+        this.showRunnerWarning("需填写跟单比例");
         return;
       }
       this.loading.runner = true;
@@ -493,7 +494,7 @@ createApp({
         this.runner = await this.request("/api/runner/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ stake_usdc: this.runnerStakeValue }),
+          body: JSON.stringify({ stake_ratio_percent: this.runnerStakeRatioValue }),
         });
         this.showToast("跟单脚本已启动");
         await this.refreshAfterRunnerChange();
@@ -602,7 +603,7 @@ createApp({
       this.walletPage = Math.min(Math.max(1, page), this.walletPageCount);
     },
     async setCategory(category) {
-      this.activeCategory = category === "sports" ? "sports" : "esports";
+      this.activeCategory = "esports";
       this.walletPage = 1;
       this.followPage = 1;
       this.eventPage = 1;
@@ -725,6 +726,14 @@ createApp({
       setTimeout(() => {
         this.toasts = this.toasts.filter((toast) => toast.id !== id);
       }, 4200);
+    },
+    showRunnerWarning(message) {
+      this.runnerWarningMessage = message;
+      if (this.runnerWarningTimer) clearTimeout(this.runnerWarningTimer);
+      this.runnerWarningTimer = setTimeout(() => {
+        this.runnerWarningMessage = "";
+        this.runnerWarningTimer = null;
+      }, 3200);
     },
     profileUrl(wallet) {
       return `https://polymarket.com/@${wallet}?tab=activity`;
@@ -886,28 +895,47 @@ createApp({
       if (!Number.isFinite(num)) return "-";
       return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(num);
     },
-    convictionTierLabel(tier) {
-      const value = String(tier || "normal");
-      if (value === "conviction") return "确信";
-      if (value === "downgraded") return "降级";
-      if (value === "skipped") return "跳过";
-      return "普通";
+    compactMoney(value) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return "-";
+      return new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: "USD",
+        notation: "compact",
+        maximumFractionDigits: num >= 1000 ? 1 : 0,
+      }).format(num);
     },
-    convictionTierClass(tier) {
-      const value = String(tier || "normal");
-      if (value === "conviction") return "tier-conviction";
-      if (value === "downgraded") return "tier-downgraded";
+    stakeModeLabel(mode) {
+      const value = String(mode || "fixed");
+      if (value === "proportional") return "比例";
+      if (value === "minimum") return "下限";
+      if (value === "capped") return "封顶";
+      if (value === "skipped") return "跳过";
+      return "固定";
+    },
+    stakeModeClass(mode) {
+      const value = String(mode || "fixed");
+      if (value === "proportional") return "tier-conviction";
+      if (value === "minimum") return "tier-normal";
+      if (value === "capped") return "tier-downgraded";
       if (value === "skipped") return "tier-skipped";
       return "tier-normal";
     },
-    convictionSummary(row) {
-      const counts = row?.conviction_tier_counts || {};
-      const parts = [];
-      for (const tier of ["conviction", "downgraded", "normal"]) {
-        const count = Number(counts[tier] || 0);
-        if (count > 0) parts.push(`${this.convictionTierLabel(tier)} ${count}`);
+    primaryStakeMode(row) {
+      const counts = row?.stake_mode_counts || {};
+      for (const mode of ["proportional", "minimum", "capped", "fixed"]) {
+        if (Number(counts[mode] || 0) > 0) return mode;
       }
-      return parts.length ? parts.join(" / ") : "普通";
+      return "fixed";
+    },
+    stakeModeSummary(row) {
+      const counts = row?.stake_mode_counts || {};
+      const parts = [];
+      for (const mode of ["proportional", "minimum", "capped", "fixed"]) {
+        const count = Number(counts[mode] || 0);
+        if (count > 0) parts.push(`${this.stakeModeLabel(mode)} ${count}`);
+      }
+      return parts.length ? parts.join(" / ") : "固定";
     },
     signalStakeRange(row) {
       const min = Number(row?.signal_stake_min);
@@ -920,6 +948,33 @@ createApp({
       const num = Number(value);
       if (!Number.isFinite(num)) return "-";
       return `${(num * 100).toFixed(1)}%`;
+    },
+    bucketScoreText(row) {
+      const num = Number(row?.best_bucket_score);
+      return Number.isFinite(num) ? num.toFixed(2) : "-";
+    },
+    overallRoiText(row) {
+      if ((row?.category || "esports") === "sports") return "";
+      const overall = Number(row?.overall_esports_roi);
+      const bucket = Number(row?.esports_roi);
+      if (!Number.isFinite(overall) || !Number.isFinite(bucket)) return "";
+      if (Math.abs(overall - bucket) < 0.0005) return "";
+      return `Overall ${this.percent(overall)}`;
+    },
+    recentBucketText(row) {
+      const count = Number(row?.recent_bucket_market_count);
+      const windowDays = Number(row?.recent_bucket_window_days);
+      if (!Number.isFinite(count) || count < 3 || !Number.isFinite(windowDays) || windowDays <= 0) {
+        return "样本不足";
+      }
+      return `${windowDays}D ${this.percent(row?.recent_bucket_roi)}`;
+    },
+    recentBucketSubtext(row) {
+      const count = Number(row?.recent_bucket_market_count);
+      const windowDays = Number(row?.recent_bucket_window_days);
+      if (!Number.isFinite(count) || count <= 0) return "";
+      if (!Number.isFinite(windowDays) || windowDays <= 0 || count < 3) return `${count} 场`;
+      return `${count} 场 / ${this.percent(row?.recent_bucket_positive_rate)}`;
     },
     signedPctPoints(value) {
       const num = Number(value);
@@ -1041,6 +1096,23 @@ createApp({
       const total = safeWins + safeLosses;
       const winRate = total > 0 ? ` (${this.percent(safeWins / total)})` : "";
       return `${safeWins}W / ${safeLosses}L${winRate}`;
+    },
+    walletRecordText(wallet) {
+      const wins = Number(wallet?.esports_win_count);
+      const losses = Number(wallet?.esports_loss_count);
+      if (!Number.isFinite(wins) && !Number.isFinite(losses)) return "-";
+      const safeWins = Number.isFinite(wins) ? wins : 0;
+      const safeLosses = Number.isFinite(losses) ? losses : 0;
+      return `${safeWins}W / ${safeLosses}L`;
+    },
+    walletWinRateText(wallet) {
+      const wins = Number(wallet?.esports_win_count);
+      const losses = Number(wallet?.esports_loss_count);
+      if (!Number.isFinite(wins) && !Number.isFinite(losses)) return "";
+      const safeWins = Number.isFinite(wins) ? wins : 0;
+      const safeLosses = Number.isFinite(losses) ? losses : 0;
+      const total = safeWins + safeLosses;
+      return total > 0 ? this.percent(safeWins / total) : "";
     },
     walletObservedSettled(wallet) {
       const observed = wallet?.observed || {};

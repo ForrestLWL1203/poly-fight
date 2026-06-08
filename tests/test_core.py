@@ -49,9 +49,14 @@ from poly_fight.cli import (
     BuildLockUnavailable,
     acquire_build_lock,
     build_leaderboard_from_profiles,
+    build_collection_diagnostics,
+    ESPORTS_CANDIDATE_MARKET_TYPE_THRESHOLDS,
+    build_profile_budget_summary,
     build_parser,
     build_wallet_overlap_report,
     build_profile_fetch_plan,
+    effective_build_defaults,
+    effective_discovery_defaults,
     effective_build_limits,
     backfill_user_trade_submarkets,
     command_build_leaderboard,
@@ -777,6 +782,49 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(len(slate), 35)
         self.assertEqual(meta["selected_lookback_days"], 14)
 
+    def test_discovery_slate_default_main_quota_is_not_legacy_thirty_fifty(self):
+        markets = [market(f"m{i}", days_ago=1, volume=300_000 - i * 1_000) for i in range(170)]
+
+        slate, meta = build_discovery_slate(
+            markets,
+            now=datetime(2026, 6, 4, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(len(slate), 150)
+        self.assertEqual(meta["target_markets"], 150)
+        self.assertEqual(meta["max_markets_per_run"], 150)
+        self.assertEqual(meta["total_selected_market_count"], 170)
+
+    def test_discovery_slate_score_sort_can_prefer_recent_market_over_old_volume(self):
+        markets = [
+            market("old-big", days_ago=60, volume=100_000),
+            market("recent-mid", days_ago=1, volume=80_000),
+        ]
+
+        slate, _meta = build_discovery_slate(
+            markets,
+            now=datetime(2026, 6, 4, tzinfo=timezone.utc),
+            lookback_steps=(60,),
+            target_markets=2,
+            max_markets_per_run=1,
+        )
+
+        self.assertEqual([row["condition_id"] for row in slate], ["recent-mid"])
+
+    def test_discovery_slate_score_sort_uses_stable_tiebreakers(self):
+        markets = [
+            market("b", days_ago=1, volume=80_000),
+            market("a", days_ago=1, volume=80_000),
+        ]
+
+        slate, _meta = build_discovery_slate(
+            markets,
+            now=datetime(2026, 6, 4, tzinfo=timezone.utc),
+            target_markets=2,
+        )
+
+        self.assertEqual([row["condition_id"] for row in slate], ["a", "b"])
+
     def test_discovery_slate_batches_volume_sorted_markets(self):
         markets = [market(f"m{i}", days_ago=1, volume=100_000 - i * 1_000) for i in range(10)]
 
@@ -895,8 +943,8 @@ class CoreTest(unittest.TestCase):
     def test_candidate_records_two_sided_and_churn_markets(self):
         trades_by_market = {
             "m1": [
-                {"proxyWallet": "0xCHURN", "size": 1000, "price": 0.5, "outcome": "A", "timestamp": 1},
-                {"proxyWallet": "0xCHURN", "size": 1000, "price": 0.5, "outcome": "B", "timestamp": 2},
+                {"proxyWallet": "0xCHURN", "side": "BUY", "size": 1000, "price": 0.5, "outcome": "A", "timestamp": 1},
+                {"proxyWallet": "0xCHURN", "side": "BUY", "size": 1000, "price": 0.5, "outcome": "B", "timestamp": 2},
             ],
             "m2": [
                 {"proxyWallet": "0xCHURN", "size": 100, "price": 0.5, "outcome": "A", "timestamp": i}
@@ -914,6 +962,29 @@ class CoreTest(unittest.TestCase):
         candidate = {row["wallet"]: row for row in candidates}["0xchurn"]
         self.assertEqual(candidate["two_sided_market_count"], 1)
         self.assertEqual(candidate["high_churn_market_count"], 1)
+
+    def test_candidate_two_sided_counts_opposite_buys_not_sells(self):
+        trades_by_market = {
+            "m1": [
+                {"proxyWallet": "0xONEWAY", "side": "BUY", "size": 1000, "price": 0.5, "outcome": "A", "timestamp": 1},
+                {"proxyWallet": "0xONEWAY", "side": "SELL", "size": 500, "price": 0.5, "outcome": "B", "timestamp": 2},
+            ],
+            "m2": [
+                {"proxyWallet": "0xTWOWAY", "side": "BUY", "size": 1000, "price": 0.5, "outcome": "A", "timestamp": 1},
+                {"proxyWallet": "0xTWOWAY", "side": "BUY", "size": 500, "price": 0.5, "outcome": "B", "timestamp": 2},
+            ],
+        }
+
+        candidates = build_candidate_wallets(
+            trades_by_market,
+            min_trade_cash=50,
+            participation_threshold=1,
+            single_market_cash_threshold=1_000,
+        )
+
+        by_wallet = {row["wallet"]: row for row in candidates}
+        self.assertEqual(by_wallet["0xoneway"]["two_sided_market_count"], 0)
+        self.assertEqual(by_wallet["0xtwoway"]["two_sided_market_count"], 1)
 
     def test_candidate_records_entry_timing_against_match_start(self):
         trades_by_market = {
@@ -936,7 +1007,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(candidate["tail_entry_market_count"], 0)
         self.assertEqual(candidate["median_last_entry_hours_to_start"], 1.50138889)
 
-    def test_tail_entry_requires_late_timing_and_high_average_price(self):
+    def test_tail_entry_requires_high_buy_average_price_not_timing(self):
         trades_by_market = {
             "m1": [
                 {"proxyWallet": "0xLOW", "size": 1000, "price": 0.45, "outcome": "A", "timestamp": 100},
@@ -945,8 +1016,11 @@ class CoreTest(unittest.TestCase):
             "m2": [
                 {"proxyWallet": "0xCHASE", "size": 1000, "price": 0.80, "outcome": "A", "timestamp": 1200},
             ],
+            "m3": [
+                {"proxyWallet": "0xEARLYCHASE", "size": 1000, "price": 0.80, "outcome": "A", "timestamp": 100},
+            ],
         }
-        market_start_times = {"m1": 1000, "m2": 1000}
+        market_start_times = {"m1": 1000, "m2": 1000, "m3": 10000}
 
         candidates = build_candidate_wallets(
             trades_by_market,
@@ -963,6 +1037,113 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(by_wallet["0xchase"]["late_entry_market_count"], 1)
         self.assertEqual(by_wallet["0xchase"]["tail_entry_market_count"], 1)
         self.assertEqual(by_wallet["0xchase"]["avg_entry_price"], 0.8)
+        self.assertEqual(by_wallet["0xearlychase"]["late_entry_market_count"], 0)
+        self.assertEqual(by_wallet["0xearlychase"]["tail_entry_market_count"], 1)
+        self.assertEqual(by_wallet["0xearlychase"]["avg_entry_price"], 0.8)
+
+    def test_tail_entry_ignores_late_sells(self):
+        trades_by_market = {
+            "m1": [
+                {
+                    "proxyWallet": "0xSELLTAKE",
+                    "side": "BUY",
+                    "size": 1000,
+                    "price": 0.40,
+                    "outcome": "A",
+                    "timestamp": 100,
+                },
+                {
+                    "proxyWallet": "0xSELLTAKE",
+                    "side": "SELL",
+                    "size": 500,
+                    "price": 0.90,
+                    "outcome": "A",
+                    "timestamp": 990,
+                },
+            ]
+        }
+        market_start_times = {"m1": 10000}
+
+        candidates = build_candidate_wallets(
+            trades_by_market,
+            market_start_times=market_start_times,
+            min_trade_cash=50,
+            participation_threshold=1,
+            single_market_cash_threshold=100,
+        )
+
+        candidate = {row["wallet"]: row for row in candidates}["0xselltake"]
+        self.assertEqual(candidate["late_entry_market_count"], 0)
+        self.assertEqual(candidate["tail_entry_market_count"], 0)
+        self.assertEqual(candidate["avg_entry_price"], 0.4)
+
+    def test_candidate_wallets_include_per_type_discovery_metrics(self):
+        trades_by_market = {}
+        market_type_by_id = {}
+
+        def add_market(condition_id, market_type, wallet, cash):
+            market_type_by_id[condition_id] = market_type
+            trades_by_market[condition_id] = [
+                {
+                    "proxyWallet": wallet,
+                    "side": "BUY",
+                    "price": 0.5,
+                    "size": cash / 0.5,
+                    "cash": cash,
+                    "outcomeIndex": 0,
+                    "timestamp": 100,
+                }
+            ]
+
+        for index in range(3):
+            add_market(f"main{index}", "main_match", "0xmix", 2_000)
+        for index in range(2):
+            add_market(f"game{index}", "game_winner", "0xmix", 900)
+
+        candidates = build_candidate_wallets(
+            trades_by_market,
+            market_type_by_id=market_type_by_id,
+            participation_threshold=1,
+            total_cash_threshold=999_999,
+            single_market_cash_threshold=999_999,
+        )
+
+        candidate = {row["wallet"]: row for row in candidates}["0xmix"]
+        self.assertEqual(candidate["participated_market_count"], 5)
+        self.assertEqual(candidate["per_type_candidate"]["main_match"]["participated_market_count"], 3)
+        self.assertEqual(candidate["per_type_candidate"]["main_match"]["avg_market_cash"], 2_000)
+        self.assertEqual(candidate["per_type_candidate"]["game_winner"]["participated_market_count"], 2)
+        self.assertEqual(candidate["per_type_candidate"]["game_winner"]["avg_market_cash"], 900)
+
+    def test_candidate_wallets_can_use_per_type_caps_before_union(self):
+        trades_by_market = {
+            "main": [
+                {"proxyWallet": "0xMAIN", "side": "BUY", "size": 20_000, "price": 0.5, "outcome": "A", "timestamp": 1},
+            ],
+            "game": [
+                {"proxyWallet": "0xGAME", "side": "BUY", "size": 2_000, "price": 0.5, "outcome": "A", "timestamp": 1},
+            ],
+        }
+        market_type_by_id = {"main": "main_match", "game": "game_winner"}
+
+        global_capped = build_candidate_wallets(
+            trades_by_market,
+            market_type_by_id=market_type_by_id,
+            min_trade_cash=50,
+            participation_threshold=1,
+            max_candidate_wallets=1,
+        )
+        per_type_capped = build_candidate_wallets(
+            trades_by_market,
+            market_type_by_id=market_type_by_id,
+            min_trade_cash=50,
+            participation_threshold=1,
+            max_candidate_wallets=1,
+            candidate_wallets_per_market_type=1,
+        )
+
+        self.assertEqual([row["wallet"] for row in global_capped], ["0xmain"])
+        self.assertEqual({row["wallet"] for row in per_type_capped}, {"0xmain", "0xgame"})
 
     def test_candidate_wallets_can_be_built_from_top_holders(self):
         holders_by_market = {
@@ -2547,6 +2728,61 @@ class CoreTest(unittest.TestCase):
             ["0xgood", "0xchurnok", "0xlateok", "0xlate", "0xtailone"],
         )
 
+    def test_profile_candidate_filter_uses_esports_per_type_thresholds(self):
+        thresholds = {
+            "main_match": {"min_participated_markets": 11, "min_avg_market_cash": 800},
+            "game_winner": {"min_participated_markets": 11, "min_avg_market_cash": 800},
+            "map_winner": {"min_participated_markets": 11, "min_avg_market_cash": 500},
+        }
+        self.assertEqual(ESPORTS_CANDIDATE_MARKET_TYPE_THRESHOLDS, thresholds)
+        candidates = [
+            {
+                "wallet": "0xsplit",
+                "participated_market_count": 30,
+                "avg_market_cash": 2_000,
+                "per_type_candidate": {
+                    "main_match": {"participated_market_count": 10, "avg_market_cash": 2_000},
+                    "game_winner": {"participated_market_count": 10, "avg_market_cash": 900},
+                    "map_winner": {"participated_market_count": 10, "avg_market_cash": 600},
+                },
+            },
+            {
+                "wallet": "0xmain",
+                "per_type_candidate": {
+                    "main_match": {"participated_market_count": 11, "avg_market_cash": 800},
+                },
+            },
+            {
+                "wallet": "0xgame",
+                "per_type_candidate": {
+                    "game_winner": {"participated_market_count": 11, "avg_market_cash": 800},
+                },
+            },
+            {
+                "wallet": "0xmap",
+                "per_type_candidate": {
+                    "map_winner": {"participated_market_count": 11, "avg_market_cash": 500},
+                },
+            },
+            {
+                "wallet": "0xtail",
+                "per_type_candidate": {
+                    "main_match": {
+                        "participated_market_count": 11,
+                        "avg_market_cash": 2_000,
+                        "tail_entry_market_count": 6,
+                    },
+                },
+            },
+        ]
+
+        filtered = filter_profile_candidates(candidates, market_type_thresholds=thresholds)
+
+        self.assertEqual([row["wallet"] for row in filtered], ["0xmain", "0xgame", "0xmap"])
+        self.assertEqual(filtered[0]["qualified_market_types"], ["main_match"])
+        self.assertEqual(filtered[1]["qualified_market_types"], ["game_winner"])
+        self.assertEqual(filtered[2]["qualified_market_types"], ["map_winner"])
+
     def test_wallet_overlap_report_uses_closed_esports_markets(self):
         report = build_wallet_overlap_report(
             [
@@ -2639,6 +2875,396 @@ class CoreTest(unittest.TestCase):
         wallets = [row["wallet"] for row in ranked]
         self.assertIn("0xsubspec", wallets)  # sub-specialist kept
         self.assertNotIn("0xlegacy", wallets)  # overall-graded wallet still gated
+
+    def test_esports_leaderboard_requires_eligible_qualified_type_overlap(self):
+        now = 1_000_000
+
+        def profile(wallet, eligible, qualified, avg_cash):
+            return {
+                "wallet": wallet,
+                "grade": "A",
+                "eligible_market_types": eligible,
+                "last_esports_trade_at": now,
+                "positive_market_rate": 0.90,
+                "wilson_win_rate_lower_bound": 0.70,
+                "entry_edge": 0.10,
+                "median_market_roi": 0.30,
+                "candidate": {
+                    "qualified_market_types": qualified,
+                    "per_type_candidate": {
+                        market_type: {
+                            "participated_market_count": 20,
+                            "avg_market_cash": avg_cash,
+                            "tail_entry_market_count": 0,
+                            "two_sided_market_count": 0,
+                            "high_churn_market_count": 0,
+                        }
+                        for market_type in qualified
+                    },
+                    "participated_market_count": 20,
+                    "avg_market_cash": avg_cash,
+                    "two_sided_market_count": 0,
+                    "tail_entry_market_count": 0,
+                },
+            }
+
+        ranked = build_leaderboard_from_profiles(
+            {
+                "0xmismatch": profile("0xmismatch", ["game_winner"], ["main_match"], 2_000),
+                "0xmap": profile("0xmap", ["map_winner"], ["map_winner"], 600),
+            },
+            now_ts=now,
+            min_participated_markets=99,
+            min_avg_market_cash=9_999,
+        )
+
+        self.assertEqual([row["wallet"] for row in ranked], ["0xmap"])
+
+    def test_esports_leaderboard_ranks_by_eligible_bucket_metrics(self):
+        now = 1_000_000
+
+        def profile(wallet, overall_positive, bucket_positive):
+            return {
+                "wallet": wallet,
+                "grade": "A",
+                "eligible_market_types": ["game_winner"],
+                "last_esports_trade_at": now,
+                "positive_market_rate": overall_positive,
+                "wilson_win_rate_lower_bound": overall_positive,
+                "entry_edge": 0.01,
+                "capital_weighted_edge": 0.10,
+                "median_market_roi": 0.20,
+                "esports_roi": 0.20,
+                "per_type_grades": {
+                    "game_winner": {
+                        "grade": "A",
+                        "esports_loss_count": 1,
+                        "positive_market_rate": bucket_positive,
+                        "wilson_win_rate_lower_bound": bucket_positive,
+                        "entry_edge": 0.05,
+                        "capital_weighted_edge": 0.12,
+                        "median_market_roi": 0.30,
+                        "esports_roi": 0.30,
+                    }
+                },
+                "candidate": {
+                    "qualified_market_types": ["game_winner"],
+                    "per_type_candidate": {
+                        "game_winner": {
+                            "participated_market_count": 11,
+                            "avg_market_cash": 900,
+                            "tail_entry_market_count": 0,
+                            "two_sided_market_count": 0,
+                            "high_churn_market_count": 0,
+                        }
+                    },
+                },
+            }
+
+        ranked = build_leaderboard_from_profiles(
+            {
+                "0xoverallhigh": profile("0xoverallhigh", 0.90, 0.65),
+                "0xbuckethigh": profile("0xbuckethigh", 0.70, 0.80),
+            },
+            now_ts=now,
+            min_participated_markets=99,
+            require_tail_entry_field=True,
+        )
+
+        self.assertEqual([row["wallet"] for row in ranked], ["0xbuckethigh", "0xoverallhigh"])
+        self.assertEqual(ranked[0]["best_market_type"], "game_winner")
+        self.assertGreater(ranked[0]["best_bucket_score"], ranked[1]["best_bucket_score"])
+
+    def test_esports_leaderboard_best_bucket_score_uses_quality_before_volume(self):
+        now = 1_000_000
+
+        def profile(wallet, *, wilson, edge, positive, roi, avg_cash):
+            return {
+                "wallet": wallet,
+                "grade": "A",
+                "eligible_market_types": ["game_winner"],
+                "last_esports_trade_at": now,
+                "positive_market_rate": 0.50,
+                "wilson_win_rate_lower_bound": 0.45,
+                "capital_weighted_edge": 0.01,
+                "median_market_roi": -0.10,
+                "esports_roi": -0.10,
+                "per_type_grades": {
+                    "game_winner": {
+                        "grade": "A",
+                        "esports_win_count": 18,
+                        "esports_loss_count": 2,
+                        "esports_closed_count": 20,
+                        "positive_market_rate": positive,
+                        "wilson_win_rate_lower_bound": wilson,
+                        "entry_edge": edge,
+                        "capital_weighted_edge": edge,
+                        "median_market_roi": roi,
+                        "esports_roi": roi,
+                    }
+                },
+                "candidate": {
+                    "qualified_market_types": ["game_winner"],
+                    "per_type_candidate": {
+                        "game_winner": {
+                            "participated_market_count": 20,
+                            "avg_market_cash": avg_cash,
+                            "tail_entry_market_count": 0,
+                            "two_sided_market_count": 0,
+                            "high_churn_market_count": 0,
+                            "total_cash_volume": avg_cash * 20,
+                        }
+                    },
+                },
+            }
+
+        ranked = build_leaderboard_from_profiles(
+            {
+                "0xvolume": profile("0xvolume", wilson=0.58, edge=0.04, positive=0.70, roi=0.18, avg_cash=10_000),
+                "0xquality": profile("0xquality", wilson=0.72, edge=0.18, positive=0.90, roi=0.35, avg_cash=900),
+            },
+            now_ts=now,
+            min_participated_markets=99,
+            require_tail_entry_field=True,
+        )
+
+        self.assertEqual([row["wallet"] for row in ranked], ["0xquality", "0xvolume"])
+        self.assertEqual(ranked[0]["best_market_type"], "game_winner")
+        self.assertIn("game_winner", ranked[0]["bucket_scores"])
+        self.assertLess(ranked[0]["overall_esports_roi"], 0)
+
+    def test_esports_bucket_score_prioritizes_profit_after_win_quality(self):
+        now = 1_000_000
+
+        def profile(
+            wallet,
+            *,
+            wilson,
+            positive,
+            roi,
+            median_roi,
+            edge,
+            participated,
+            tail,
+        ):
+            return {
+                "wallet": wallet,
+                "grade": "A",
+                "eligible_market_types": ["main_match"],
+                "last_esports_trade_at": now,
+                "positive_market_rate": 0.50,
+                "wilson_win_rate_lower_bound": 0.45,
+                "capital_weighted_edge": 0.01,
+                "median_market_roi": -0.10,
+                "esports_roi": -0.10,
+                "per_type_grades": {
+                    "main_match": {
+                        "grade": "A",
+                        "esports_win_count": 15,
+                        "esports_loss_count": 6,
+                        "esports_closed_count": 21,
+                        "positive_market_rate": positive,
+                        "wilson_win_rate_lower_bound": wilson,
+                        "entry_edge": edge,
+                        "capital_weighted_edge": edge,
+                        "median_entry_price": 0.59,
+                        "median_market_roi": median_roi,
+                        "esports_roi": roi,
+                    }
+                },
+                "candidate": {
+                    "qualified_market_types": ["main_match"],
+                    "per_type_candidate": {
+                        "main_match": {
+                            "participated_market_count": participated,
+                            "avg_market_cash": 1_400,
+                            "tail_entry_market_count": tail,
+                            "two_sided_market_count": 0,
+                            "high_churn_market_count": 0,
+                        }
+                    },
+                },
+            }
+
+        ranked = build_leaderboard_from_profiles(
+            {
+                "0xquality": profile(
+                    "0xquality",
+                    wilson=0.72,
+                    positive=0.88,
+                    roi=0.34,
+                    median_roi=0.42,
+                    edge=0.20,
+                    participated=20,
+                    tail=0,
+                ),
+                "0xhighroi": profile(
+                    "0xhighroi",
+                    wilson=0.56,
+                    positive=0.70,
+                    roi=0.659,
+                    median_roi=0.562,
+                    edge=0.293,
+                    participated=11,
+                    tail=3,
+                ),
+                "0xedgeonly": profile(
+                    "0xedgeonly",
+                    wilson=0.68,
+                    positive=0.78,
+                    roi=0.13,
+                    median_roi=0.14,
+                    edge=0.40,
+                    participated=20,
+                    tail=0,
+                ),
+            },
+            now_ts=now,
+            min_participated_markets=99,
+            require_tail_entry_field=True,
+        )
+
+        self.assertEqual([row["wallet"] for row in ranked], ["0xquality", "0xhighroi", "0xedgeonly"])
+        self.assertLess(ranked[1]["best_bucket_score"], ranked[0]["best_bucket_score"])
+
+    def test_esports_leaderboard_uses_best_bucket_activity_window(self):
+        now = 1_000_000
+
+        def profile(wallet, *, overall_last, main_last, map_last):
+            return {
+                "wallet": wallet,
+                "grade": "A",
+                "eligible_market_types": ["main_match"],
+                "last_esports_trade_at": overall_last,
+                "positive_market_rate": 0.80,
+                "wilson_win_rate_lower_bound": 0.70,
+                "capital_weighted_edge": 0.20,
+                "median_market_roi": 0.30,
+                "esports_roi": 0.30,
+                "per_type_grades": {
+                    "main_match": {
+                        "grade": "A",
+                        "esports_win_count": 12,
+                        "esports_loss_count": 2,
+                        "esports_closed_count": 14,
+                        "positive_market_rate": 0.85,
+                        "wilson_win_rate_lower_bound": 0.74,
+                        "capital_weighted_edge": 0.20,
+                        "median_entry_price": 0.50,
+                        "median_market_roi": 0.40,
+                        "esports_roi": 0.35,
+                        "last_esports_trade_at": main_last,
+                    },
+                    "map_winner": {
+                        "grade": "excluded",
+                        "esports_win_count": 0,
+                        "esports_loss_count": 1,
+                        "esports_closed_count": 1,
+                        "positive_market_rate": 0.0,
+                        "wilson_win_rate_lower_bound": 0.0,
+                        "capital_weighted_edge": -0.50,
+                        "median_entry_price": 0.50,
+                        "median_market_roi": -1.0,
+                        "esports_roi": -1.0,
+                        "last_esports_trade_at": map_last,
+                    },
+                },
+                "candidate": {
+                    "qualified_market_types": ["main_match"],
+                    "per_type_candidate": {
+                        "main_match": {
+                            "participated_market_count": 14,
+                            "avg_market_cash": 2_000,
+                            "tail_entry_market_count": 0,
+                            "two_sided_market_count": 0,
+                            "high_churn_market_count": 0,
+                        }
+                    },
+                },
+            }
+
+        ranked = build_leaderboard_from_profiles(
+            {
+                "0xstale": profile(
+                    "0xstale",
+                    overall_last=now,
+                    main_last=now - 4 * 86400,
+                    map_last=now,
+                ),
+                "0xactive": profile(
+                    "0xactive",
+                    overall_last=now - 4 * 86400,
+                    main_last=now - 2 * 86400,
+                    map_last=now - 4 * 86400,
+                ),
+            },
+            now_ts=now,
+            min_participated_markets=99,
+            require_tail_entry_field=True,
+        )
+
+        self.assertEqual([row["wallet"] for row in ranked], ["0xactive"])
+        self.assertEqual(ranked[0]["best_bucket_last_trade_at"], now - 2 * 86400)
+
+    def test_esports_leaderboard_excludes_recent_bad_best_bucket_performance(self):
+        now = 1_000_000
+
+        def profile(wallet, *, recent_roi, recent_positive):
+            return {
+                "wallet": wallet,
+                "grade": "A",
+                "eligible_market_types": ["main_match"],
+                "last_esports_trade_at": now,
+                "positive_market_rate": 0.80,
+                "wilson_win_rate_lower_bound": 0.70,
+                "capital_weighted_edge": 0.20,
+                "median_market_roi": 0.30,
+                "esports_roi": 0.30,
+                "per_type_grades": {
+                    "main_match": {
+                        "grade": "A",
+                        "esports_win_count": 12,
+                        "esports_loss_count": 2,
+                        "esports_closed_count": 14,
+                        "positive_market_rate": 0.85,
+                        "wilson_win_rate_lower_bound": 0.74,
+                        "capital_weighted_edge": 0.20,
+                        "median_entry_price": 0.50,
+                        "median_market_roi": 0.40,
+                        "esports_roi": 0.35,
+                        "last_esports_trade_at": now,
+                        "recent_bucket_market_count": 3,
+                        "recent_bucket_window_days": 7,
+                        "recent_bucket_roi": recent_roi,
+                        "recent_bucket_positive_rate": recent_positive,
+                    },
+                },
+                "candidate": {
+                    "qualified_market_types": ["main_match"],
+                    "per_type_candidate": {
+                        "main_match": {
+                            "participated_market_count": 14,
+                            "avg_market_cash": 2_000,
+                            "tail_entry_market_count": 0,
+                            "two_sided_market_count": 0,
+                            "high_churn_market_count": 0,
+                        }
+                    },
+                },
+            }
+
+        ranked = build_leaderboard_from_profiles(
+            {
+                "0xbadroi": profile("0xbadroi", recent_roi=-0.01, recent_positive=0.67),
+                "0xbadrate": profile("0xbadrate", recent_roi=0.20, recent_positive=0.33),
+                "0xgood": profile("0xgood", recent_roi=0.10, recent_positive=0.67),
+            },
+            now_ts=now,
+            min_participated_markets=99,
+            require_tail_entry_field=True,
+        )
+
+        self.assertEqual([row["wallet"] for row in ranked], ["0xgood"])
 
     def test_leaderboard_tail_entry_gate_is_rate_based(self):
         now = 1_000_000
@@ -2785,6 +3411,36 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(merged["0xabc"]["candidate"]["avg_entry_price"], 0.8)
         self.assertEqual(merged["0xdef"]["candidate"]["tail_entry_market_count"], 0)
 
+    def test_existing_profiles_receive_current_esports_bucket_qualification(self):
+        profiles = {
+            "0xabc": {
+                "wallet": "0xabc",
+                "grade": "A",
+                "candidate": {"participated_market_count": 50, "avg_market_cash": 2_000},
+            },
+        }
+        profile_candidates = [
+            {
+                "wallet": "0xABC",
+                "qualified_market_types": ["game_winner"],
+                "per_type_candidate": {
+                    "game_winner": {
+                        "participated_market_count": 20,
+                        "avg_market_cash": 900,
+                        "total_cash_volume": 18_000,
+                    }
+                },
+            },
+        ]
+
+        merged = merge_profiles_with_candidates(profiles, profile_candidates)
+
+        self.assertEqual(merged["0xabc"]["candidate"]["qualified_market_types"], ["game_winner"])
+        self.assertEqual(
+            merged["0xabc"]["candidate"]["per_type_candidate"]["game_winner"]["participated_market_count"],
+            20,
+        )
+
     def test_profile_fetch_plan_uses_70_30_budget_and_candidate_priority(self):
         candidates = [
             {"wallet": "0xC1"},
@@ -2821,6 +3477,52 @@ class CoreTest(unittest.TestCase):
         )
 
         self.assertEqual([row["wallet"].lower() for row in plan], ["0xc1", "0xc2", "0xc3", "0xm1"])
+
+    def test_profile_fetch_plan_prioritizes_esports_qualified_volume(self):
+        candidates = [
+            {
+                "wallet": "0xlow",
+                "qualified_market_types": ["main_match"],
+                "per_type_candidate": {
+                    "main_match": {
+                        "participated_market_count": 15,
+                        "avg_market_cash": 1_500,
+                        "total_cash_volume": 22_500,
+                    }
+                },
+            },
+            {
+                "wallet": "0xmulti",
+                "qualified_market_types": ["main_match", "game_winner"],
+                "per_type_candidate": {
+                    "main_match": {
+                        "participated_market_count": 15,
+                        "avg_market_cash": 1_600,
+                        "total_cash_volume": 24_000,
+                    },
+                    "game_winner": {
+                        "participated_market_count": 20,
+                        "avg_market_cash": 900,
+                        "total_cash_volume": 18_000,
+                    },
+                },
+            },
+            {
+                "wallet": "0xhigh",
+                "qualified_market_types": ["main_match"],
+                "per_type_candidate": {
+                    "main_match": {
+                        "participated_market_count": 15,
+                        "avg_market_cash": 5_000,
+                        "total_cash_volume": 75_000,
+                    }
+                },
+            },
+        ]
+
+        plan = build_profile_fetch_plan(candidates, {}, now_ts=200, ttl_seconds=7 * 86400, max_profiles=3)
+
+        self.assertEqual([row["wallet"] for row in plan], ["0xmulti", "0xhigh", "0xlow"])
 
     def test_profile_fetch_plan_does_not_migrate_current_unqualified_missing_edge(self):
         existing = {
@@ -2868,6 +3570,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual([row["wallet"] for row in plan], ["0xa"])
 
     def test_leaderboard_is_rebuilt_from_all_profiles_not_only_current_candidates(self):
+        now = 100 + 10 * 86400
         profiles_by_wallet = {
             "0xold": {
                 "wallet": "0xold",
@@ -2875,7 +3578,7 @@ class CoreTest(unittest.TestCase):
                 "esports_roi": 0.32,
                 "positive_market_rate": 0.96,
                 "median_entry_price": 0.55,
-                "last_esports_trade_at": 100,
+                "last_esports_trade_at": now,
                 "candidate": {"participated_market_count": 10, "avg_market_cash": 2_000},
             },
             "0xnew": {
@@ -2884,7 +3587,7 @@ class CoreTest(unittest.TestCase):
                 "esports_roi": 0.31,
                 "positive_market_rate": 0.96,
                 "median_entry_price": 0.55,
-                "last_esports_trade_at": 100,
+                "last_esports_trade_at": now,
                 "candidate": {"participated_market_count": 10, "avg_market_cash": 2_000},
             },
             "0xbad": {
@@ -2893,36 +3596,37 @@ class CoreTest(unittest.TestCase):
                 "esports_roi": 0.50,
                 "positive_market_rate": 0.96,
                 "median_entry_price": 0.55,
-                "last_esports_trade_at": 100,
+                "last_esports_trade_at": now,
                 "candidate": {"participated_market_count": 10, "avg_market_cash": 2_000},
             },
         }
 
-        leaderboard = build_leaderboard_from_profiles(profiles_by_wallet, now_ts=100 + 10 * 86400)
+        leaderboard = build_leaderboard_from_profiles(profiles_by_wallet, now_ts=now)
 
         self.assertEqual([row["wallet"] for row in leaderboard], ["0xold"])
 
     def test_leaderboard_requires_recent_discovery_participation(self):
+        now = 100 + 10 * 86400
         profiles_by_wallet = {
             "0xactive": {
                 "wallet": "0xactive",
                 "grade": "A",
                 "esports_roi": 0.80,
-                "last_esports_trade_at": 100,
+                "last_esports_trade_at": now,
                 "candidate": {"participated_market_count": 3, "avg_market_cash": 2_000},
             },
             "0xinactive": {
                 "wallet": "0xinactive",
                 "grade": "A",
                 "esports_roi": 1.20,
-                "last_esports_trade_at": 100,
+                "last_esports_trade_at": now,
                 "candidate": {"participated_market_count": 1, "avg_market_cash": 20_000},
             },
         }
 
         leaderboard = build_leaderboard_from_profiles(
             profiles_by_wallet,
-            now_ts=100 + 10 * 86400,
+            now_ts=now,
             min_participated_markets=3,
         )
 
@@ -3062,6 +3766,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(leaderboard[0]["sports_follow_mode"], "flat")
 
     def test_leaderboard_defaults_to_top_30_a_wallets(self):
+        now = 100 + 10 * 86400
         profiles_by_wallet = {}
         for index in range(35):
             wallet = f"0x{index:040x}"
@@ -3069,11 +3774,11 @@ class CoreTest(unittest.TestCase):
                 "wallet": wallet,
                 "grade": "A",
                 "esports_roi": 0.30 + index / 100,
-                "last_esports_trade_at": 100,
+                "last_esports_trade_at": now,
                 "candidate": {"participated_market_count": 10, "avg_market_cash": 2_000},
             }
 
-        leaderboard = build_leaderboard_from_profiles(profiles_by_wallet, now_ts=100 + 10 * 86400)
+        leaderboard = build_leaderboard_from_profiles(profiles_by_wallet, now_ts=now)
 
         self.assertEqual(len(leaderboard), 30)
         self.assertEqual(leaderboard[0]["esports_roi"], 0.64)
@@ -3109,13 +3814,41 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual([row["wallet"] for row in leaderboard], ["0xfresh"])
 
+    def test_esports_leaderboard_defaults_to_three_day_activity_window(self):
+        now = 100 + 10 * 86400
+        profiles_by_wallet = {
+            "0xrecent": {
+                "wallet": "0xrecent",
+                "grade": "A",
+                "esports_roi": 0.31,
+                "positive_market_rate": 0.96,
+                "median_entry_price": 0.55,
+                "last_esports_trade_at": now - 3 * 86400 + 1,
+                "candidate": {"participated_market_count": 10, "avg_market_cash": 2_000},
+            },
+            "0xstale": {
+                "wallet": "0xstale",
+                "grade": "A",
+                "esports_roi": 0.80,
+                "positive_market_rate": 0.99,
+                "median_entry_price": 0.50,
+                "last_esports_trade_at": now - 3 * 86400 - 1,
+                "candidate": {"participated_market_count": 10, "avg_market_cash": 2_000},
+            },
+        }
+
+        leaderboard = build_leaderboard_from_profiles(profiles_by_wallet, now_ts=now)
+
+        self.assertEqual([row["wallet"] for row in leaderboard], ["0xrecent"])
+
     def test_old_scoring_profile_is_not_kept_on_current_leaderboard(self):
+        now = 100 + 10 * 86400
         profiles_by_wallet = {
             "0xold": {
                 "wallet": "0xold",
                 "grade": "A",
                 "scoring_version": SCORING_VERSION - 1,
-                "last_esports_trade_at": 100,
+                "last_esports_trade_at": now,
                 "candidate": {"participated_market_count": 10, "avg_market_cash": 2_000},
             },
             "0xcurrent": {
@@ -3123,14 +3856,14 @@ class CoreTest(unittest.TestCase):
                 "grade": "A",
                 "scoring_version": SCORING_VERSION,
                 "esports_roi": 0.30,
-                "last_esports_trade_at": 100,
+                "last_esports_trade_at": now,
                 "candidate": {"participated_market_count": 10, "avg_market_cash": 2_000},
             },
         }
 
         leaderboard = build_leaderboard_from_profiles(
             profiles_by_wallet,
-            now_ts=100 + 10 * 86400,
+            now_ts=now,
             require_current_scoring_version=True,
         )
 
@@ -3319,6 +4052,7 @@ class CoreTest(unittest.TestCase):
         leaderboard = build_leaderboard_from_profiles(
             profiles_by_wallet,
             now_ts=100 + 10 * 86400,
+            max_inactive_days=90,
         )
 
         self.assertEqual(
@@ -3464,6 +4198,16 @@ class CoreTest(unittest.TestCase):
         eligible = eligible_follow_wallets(rows, now_ts=1000, recency_days=30)
 
         self.assertEqual([row["wallet"] for row in eligible], ["0xa", "0xb"])
+
+    def test_follow_eligible_wallets_can_be_limited_to_esports(self):
+        rows = [
+            {"wallet": "0xA", "category": "esports", "grade": "A", "last_esports_trade_at": 1000},
+            {"wallet": "0xB", "category": "sports", "grade": "A", "last_esports_trade_at": 1000},
+        ]
+
+        eligible = eligible_follow_wallets(rows, now_ts=1000, recency_days=30, allowed_categories={"esports"})
+
+        self.assertEqual([row["wallet"] for row in eligible], ["0xa"])
 
     def test_follow_store_records_wallet_quarantine(self):
         with TemporaryDirectory() as tmp:
@@ -3657,98 +4401,59 @@ class CoreTest(unittest.TestCase):
         self.assertEqual([row["id"] for row in trades], ["t2", "t1"])
         self.assertEqual(client.calls, [0])
 
-    def test_follow_stake_conviction_tiers_gate_and_balance(self):
-        # Wallet whose big bets win more (capWin >= win): a bet >= 2x its own typical size
-        # upsizes to the conviction stake.
-        informative = {
-            "median_position_size": 500,
-            "capital_weighted_win_rate": 0.74,
-            "positive_market_rate": 0.66,
-        }
+    def test_follow_stake_uses_wallet_cash_ratio_and_minimum(self):
         stake, tier, ratio = follow_stake_for_signal(
-            informative, wallet_trade_size=5000, market_type="main_match",
-            normal_stake=1, conviction_stake=5, conviction_multiple=2.0,
-            conviction_gate=True, available_balance=1000,
+            wallet_trade_cash=3000,
+            stake_ratio_percent=10,
+            min_stake_usdc=1,
+            available_balance=1000,
         )
-        self.assertEqual((stake, tier), (5, "conviction"))
-        self.assertEqual(ratio, 10.0)  # 5000 / 500, judged against the wallet's OWN typical
+        self.assertEqual((stake, tier), (300, "proportional"))
+        self.assertEqual(ratio, 0.1)
 
-        # Same big bet, but this wallet's big bets win LESS (capWin < win) -> gate keeps it normal.
-        uninformative = {**informative, "capital_weighted_win_rate": 0.60, "positive_market_rate": 0.70}
         stake, tier, _ = follow_stake_for_signal(
-            uninformative, wallet_trade_size=5000, market_type="main_match",
-            normal_stake=1, conviction_stake=5, conviction_multiple=2.0,
-            conviction_gate=True, available_balance=1000,
+            wallet_trade_cash=3,
+            stake_ratio_percent=10,
+            min_stake_usdc=1,
+            available_balance=1000,
         )
-        self.assertEqual((stake, tier), (1, "normal"))
+        self.assertEqual((stake, tier), (1, "minimum"))
 
-        # Normal-sized bet (< 2x typical) -> normal stake.
         stake, tier, _ = follow_stake_for_signal(
-            informative, wallet_trade_size=600, market_type="main_match",
-            normal_stake=1, conviction_stake=5, conviction_multiple=2.0,
-            conviction_gate=True, available_balance=1000,
+            wallet_trade_cash=3000,
+            stake_ratio_percent=10,
+            min_stake_usdc=1,
+            available_balance=50,
         )
-        self.assertEqual((stake, tier), (1, "normal"))
+        self.assertEqual((stake, tier), (50, "capped"))
 
-        # Balance can't cover the conviction stake -> downgrade to normal.
         stake, tier, _ = follow_stake_for_signal(
-            informative, wallet_trade_size=5000, market_type="main_match",
-            normal_stake=1, conviction_stake=5, conviction_multiple=2.0,
-            conviction_gate=True, available_balance=3,
-        )
-        self.assertEqual((stake, tier), (1, "downgraded"))
-
-        # Balance can't even cover the normal stake -> skip.
-        stake, tier, _ = follow_stake_for_signal(
-            informative, wallet_trade_size=5000, market_type="main_match",
-            normal_stake=1, conviction_stake=5, conviction_multiple=2.0,
-            conviction_gate=True, available_balance=0.5,
+            wallet_trade_cash=3000,
+            stake_ratio_percent=10,
+            min_stake_usdc=1,
+            available_balance=0.5,
         )
         self.assertEqual((stake, tier), (0.0, "skipped"))
 
-    def test_follow_stake_uses_per_type_typical_and_missing_falls_back(self):
-        row = {
-            "median_position_size": 5000,  # overall typical is large
-            "capital_weighted_win_rate": 0.8,
-            "positive_market_rate": 0.6,
-            "per_type": {"game_winner": {"median_position_size": 200, "capital_weighted_win_rate": 0.8, "positive_market_rate": 0.6}},
-        }
-        # 600 is only 0.12x the overall typical, but 3x the game_winner typical -> conviction.
-        stake, tier, ratio = follow_stake_for_signal(
-            row, wallet_trade_size=600, market_type="game_winner",
-            normal_stake=1, conviction_stake=5, conviction_multiple=2.0,
-            conviction_gate=True, available_balance=1000,
-        )
-        self.assertEqual((stake, tier), (5, "conviction"))
-        self.assertEqual(ratio, 3.0)
-        # No typical size known -> stays normal (never upsize on unknown conviction).
-        stake, tier, _ = follow_stake_for_signal(
-            {}, wallet_trade_size=5000, market_type="main_match",
-            normal_stake=1, conviction_stake=5, conviction_multiple=2.0,
-            conviction_gate=True, available_balance=1000,
-        )
-        self.assertEqual((stake, tier), (1, "normal"))
-
-    def test_process_follow_trades_applies_conviction_stake_to_signal(self):
+    def test_process_follow_trades_applies_wallet_cash_ratio_to_signal(self):
         now = 1000
         market = {
             "condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [0.5, 0.5],
             "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
             "title": "Match", "market_type": "main_match",
         }
-        trades = [{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 5000, "timestamp": now}]
-        wallet_row = {"median_position_size": 500, "capital_weighted_win_rate": 0.74, "positive_market_rate": 0.66}
+        trades = [{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 6000, "timestamp": now}]
         signals, _ = process_follow_trades(
             [], wallet="0xA", trades=trades, markets_by_condition={"m1": market}, now_ts=now,
-            stake_usdc=1, max_follow_legs=10, max_slippage=0.05,
-            wallet_row=wallet_row, conviction_stake_usdc=5, conviction_size_multiple=2.0,
-            conviction_gate=True, bankroll_usdc=1000,
+            stake_usdc=1, stake_ratio_percent=10, max_follow_legs=10, max_slippage=0.05,
+            bankroll_usdc=1000,
         )
-        self.assertEqual(signals[0]["conviction_tier"], "conviction")
-        self.assertEqual(signals[0]["signal_stake"], 5)
-        self.assertEqual(signals[0]["legs"][0]["stake"], 5)
+        self.assertEqual(signals[0]["stake_mode"], "proportional")
+        self.assertEqual(signals[0]["signal_stake"], 300)
+        self.assertEqual(signals[0]["legs"][0]["stake"], 300)
+        self.assertEqual(signals[0]["legs"][0]["wallet_trade_cash"], 3000)
 
-    def test_process_follow_trades_caps_conviction_adds_by_bankroll(self):
+    def test_process_follow_trades_recalculates_ratio_for_each_add(self):
         now = 1000
         market = {
             "condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [0.5, 0.5],
@@ -3756,20 +4461,18 @@ class CoreTest(unittest.TestCase):
             "title": "Match", "market_type": "main_match",
         }
         trades = [
-            {"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 5000, "timestamp": now},
-            {"id": "b2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 5000, "timestamp": now + 1},
+            {"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 6000, "timestamp": now},
+            {"id": "b2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 600, "timestamp": now + 1},
         ]
-        wallet_row = {"median_position_size": 500, "capital_weighted_win_rate": 0.74, "positive_market_rate": 0.66}
 
         signals, stats = process_follow_trades(
             [], wallet="0xA", trades=trades, markets_by_condition={"m1": market}, now_ts=now,
-            stake_usdc=1, max_follow_legs=10, max_slippage=0.05,
-            wallet_row=wallet_row, conviction_stake_usdc=5, conviction_size_multiple=2.0,
-            conviction_gate=True, bankroll_usdc=6,
+            stake_usdc=1, stake_ratio_percent=10, max_follow_legs=10, max_slippage=0.05,
+            bankroll_usdc=1000,
         )
 
-        self.assertEqual([leg["stake"] for leg in signals[0]["legs"]], [5, 1])
-        self.assertEqual(stats["insufficient_balance_count"], 1)
+        self.assertEqual([leg["stake"] for leg in signals[0]["legs"]], [300, 30])
+        self.assertEqual(stats["insufficient_balance_count"], 0)
 
     def test_follow_v2_buy_legs_sell_mirror_exits_by_default(self):
         now = 1000
@@ -4595,6 +5298,77 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(calls[0][0], data_dir)
             self.assertEqual(calls[0][1]["max_workers"], 3)
 
+    def test_follow_tick_ignores_sports_wallets_and_markets(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now = datetime.now(timezone.utc)
+            start = now + timedelta(hours=2)
+            write_json(
+                data_dir / "esports" / "smart_wallet_leaderboard.json",
+                [{"wallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
+            )
+            write_json(
+                data_dir / "sports" / "smart_wallet_leaderboard.json",
+                [{"wallet": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
+            )
+            write_json(
+                data_dir / "follow" / "active_market_cache.json",
+                {
+                    "updated_at": int(now.timestamp()),
+                    "categories": ["esports", "sports"],
+                    "markets": [
+                        {
+                            "condition_id": "esports_m1",
+                            "category": "esports",
+                            "market_type": "main_match",
+                            "match_start_time": start.isoformat(),
+                            "outcomes": ["A", "B"],
+                            "outcome_prices": [0.5, 0.5],
+                        },
+                        {
+                            "condition_id": "sports_m1",
+                            "category": "sports",
+                            "market_type": "main_match",
+                            "league": "nba",
+                            "match_start_time": start.isoformat(),
+                            "outcomes": ["C", "D"],
+                            "outcome_prices": [0.5, 0.5],
+                        },
+                    ],
+                },
+            )
+
+            requested_wallets = []
+
+            class FakeClient:
+                def trades_for_user(self, wallet, *_args, **_kwargs):
+                    requested_wallets.append(wallet)
+                    return []
+
+                def positions(self, *_args, **_kwargs):
+                    return []
+
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "--data-dir",
+                    str(data_dir),
+                    "follow",
+                    "--stake-usdc",
+                    "1",
+                    "--user-trades-max-pages",
+                    "1",
+                    "--max-workers",
+                    "1",
+                ]
+            )
+
+            summary = command_follow(args, client=FakeClient(), emit=False)
+
+            self.assertEqual(summary["eligible_follow_wallet_count"], 1)
+            self.assertEqual(summary["watched_market_count"], 1)
+            self.assertEqual(requested_wallets, ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
+
     def test_dashboard_events_parse_sports_matchups_and_team_logos(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -4932,7 +5706,7 @@ class CoreTest(unittest.TestCase):
             self.assertTrue(snapshot["results"][0]["wallet_behavior"]["wallet_sold_before_resolution"])
             self.assertNotIn("m2", {row.get("condition_id") for row in snapshot["open_signals"]})
 
-    def test_follow_tick_uses_sports_wallet_league_scope(self):
+    def test_follow_tick_disables_sports_wallets(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             now = datetime.now(timezone.utc)
@@ -5017,11 +5791,11 @@ class CoreTest(unittest.TestCase):
             summary = command_follow(args, client=FakeClient(), emit=False)
             snapshot = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_snapshot()
 
-            self.assertEqual(wallets, ["0xa"])
-            self.assertEqual(summary["new_signal_count"], 1, summary)
-            self.assertEqual(summary["ignored_trade_count"], 1)
-            self.assertEqual(snapshot["open_signals"][0]["condition_id"], "nba1")
-            self.assertEqual(snapshot["open_signals"][0]["league"], "nba")
+            self.assertEqual(wallets, [])
+            self.assertEqual(summary["eligible_follow_wallet_count"], 0, summary)
+            self.assertEqual(summary["watched_market_count"], 0, summary)
+            self.assertEqual(summary["new_signal_count"], 0, summary)
+            self.assertEqual(snapshot["open_signals"], [])
 
     def test_follow_tick_dual_follows_opposite_wallet_buys(self):
         with TemporaryDirectory() as tmp:
@@ -5534,7 +6308,7 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(calls[0][1].parent, data_dir / "logs" / "follow")
             self.assertEqual(read_follow_control(follow_dir)["runner"]["pid"], 4321)
 
-    def test_dashboard_runner_start_accepts_required_stake(self):
+    def test_dashboard_runner_start_accepts_required_stake_ratio(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             follow_dir = data_dir / "follow"
@@ -5558,13 +6332,16 @@ class CoreTest(unittest.TestCase):
                     runner_process_lister=lambda: [],
                     runner_process_starter=fake_starter,
                 ),
-                stake_usdc=2.5,
+                stake_ratio_percent=5,
             )
 
             stake_index = calls[0][0].index("--stake-usdc") + 1
-            self.assertEqual(calls[0][0][stake_index], "2.5")
-            self.assertEqual(status["stake_usdc"], 2.5)
-            self.assertEqual(read_follow_control(follow_dir)["runner"]["stake_usdc"], 2.5)
+            ratio_index = calls[0][0].index("--stake-ratio-percent") + 1
+            self.assertEqual(calls[0][0][stake_index], "1.0")
+            self.assertEqual(calls[0][0][ratio_index], "5.0")
+            self.assertEqual(status["stake_usdc"], 1.0)
+            self.assertEqual(status["stake_ratio_percent"], 5.0)
+            self.assertEqual(read_follow_control(follow_dir)["runner"]["stake_ratio_percent"], 5.0)
 
     def test_dashboard_wallet_refresh_is_category_scoped(self):
         with TemporaryDirectory() as tmp:
@@ -5787,7 +6564,7 @@ class CoreTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
-    def test_dashboard_runner_start_api_requires_stake(self):
+    def test_dashboard_runner_start_api_requires_stake_ratio(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             calls = []
@@ -5825,23 +6602,25 @@ class CoreTest(unittest.TestCase):
                 payload = json.loads(response.read().decode())
                 conn.close()
                 self.assertEqual(response.status, 400)
-                self.assertEqual(payload["error"], "invalid_stake_usdc")
+                self.assertEqual(payload["error"], "invalid_stake_ratio_percent")
                 self.assertEqual(calls, [])
 
                 conn = http.client.HTTPConnection(host, port, timeout=5)
                 conn.request(
                     "POST",
                     "/api/runner/start",
-                    body=json.dumps({"stake_usdc": 2.5}),
+                    body=json.dumps({"stake_ratio_percent": 5}),
                     headers={"Cookie": cookie, "Content-Type": "application/json"},
                 )
                 response = conn.getresponse()
                 payload = json.loads(response.read().decode())
                 conn.close()
                 self.assertEqual(response.status, 202)
-                self.assertEqual(payload["data"]["stake_usdc"], 2.5)
+                self.assertEqual(payload["data"]["stake_usdc"], 1.0)
+                self.assertEqual(payload["data"]["stake_ratio_percent"], 5.0)
                 self.assertIn("--stake-usdc", calls[0][0])
-                self.assertEqual(calls[0][0][calls[0][0].index("--stake-usdc") + 1], "2.5")
+                self.assertIn("--stake-ratio-percent", calls[0][0])
+                self.assertEqual(calls[0][0][calls[0][0].index("--stake-ratio-percent") + 1], "5.0")
             finally:
                 server.shutdown()
                 server.server_close()
@@ -6101,7 +6880,7 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(detail["title"], "Counter-Strike: A vs B")
             self.assertEqual(detail["match_start_time"], "2026-06-06T12:00:00Z")
 
-    def test_dashboard_follows_expose_conviction_stake_fields(self):
+    def test_dashboard_follows_expose_stake_mode_fields(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             store = FollowStore(data_dir / "follow" / "follow.db")
@@ -6114,11 +6893,11 @@ class CoreTest(unittest.TestCase):
                         "condition_id": "m1",
                         "status": "open",
                         "event_title": "Counter-Strike: A vs B",
-                        "conviction_tier": "conviction",
-                        "conviction_ratio": 3.25,
+                        "stake_mode": "proportional",
+                        "stake_ratio_percent": 10,
                         "signal_stake": 5,
                         "created_at": 100,
-                        "legs": [{"stake": 5}, {"stake": 1}],
+                        "legs": [{"stake": 5, "stake_mode": "proportional"}, {"stake": 1, "stake_mode": "minimum"}],
                     }
                 ],
                 result_events=[],
@@ -6129,10 +6908,10 @@ class CoreTest(unittest.TestCase):
             detail = build_follow_detail(data_dir, "m1")
 
             row = page["follows"][0]
-            self.assertEqual(row["conviction_tier_counts"], {"conviction": 1})
+            self.assertEqual(row["stake_mode_counts"], {"proportional": 1})
             self.assertEqual(row["signal_stake_min"], 5.0)
             self.assertEqual(row["signal_stake_max"], 5.0)
-            self.assertEqual(detail["wallets"][0]["signals"][0]["conviction_tier"], "conviction")
+            self.assertEqual(detail["wallets"][0]["signals"][0]["stake_mode"], "proportional")
             self.assertEqual(detail["wallets"][0]["signals"][0]["signal_stake"], 5)
 
     def test_dashboard_rows_include_cached_team_logos(self):
@@ -6498,7 +7277,7 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(row["observed_market_types"], ["main_match", "game_winner"])
             self.assertEqual(row["observed_market_type_labels"], ["主盘", "单局"])
 
-    def test_dashboard_wallets_surface_local_follow_losses_and_rank_them_back(self):
+    def test_dashboard_wallets_surface_local_follow_losses_without_changing_historical_rank(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             write_json(
@@ -6541,9 +7320,9 @@ class CoreTest(unittest.TestCase):
 
             wallets = build_wallets(data_dir)
 
-            self.assertEqual([row["wallet"] for row in wallets["wallets"]], ["0xclean", "0xloser"])
+            self.assertEqual([row["wallet"] for row in wallets["wallets"]], ["0xloser", "0xclean"])
             self.assertEqual([row["rank"] for row in wallets["wallets"]], [1, 2])
-            loser = wallets["wallets"][1]
+            loser = wallets["wallets"][0]
             self.assertEqual(loser["esports_win_count"], 8)
             self.assertEqual(loser["esports_loss_count"], 0)
             self.assertEqual(loser["observed"]["signals"], 1)
@@ -7087,7 +7866,7 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(args.command, "collect")
         self.assertEqual(args.discovery_source, "trades")
-        self.assertEqual(args.target_markets, 20)
+        self.assertIsNone(args.target_markets)
         self.assertIsNone(args.max_markets_per_run)
         self.assertIsNone(args.discovery_lookback_days)
         self.assertEqual(args.market_batch_size, 50)
@@ -7095,7 +7874,7 @@ class CoreTest(unittest.TestCase):
         self.assertIsNone(args.market_batch_index)
         self.assertEqual(args.market_offset, 0)
         self.assertEqual(args.max_pages_per_market, 3)
-        self.assertEqual(args.max_profiles_per_run, 150)
+        self.assertEqual(args.max_profiles_per_run, 300)
         self.assertEqual(args.max_workers, 8)
         self.assertEqual(args.max_requests_per_second, 10)
         self.assertEqual(args.request_burst, 5)
@@ -7109,15 +7888,28 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.closed_position_market_chunk_size, 50)
         self.assertEqual(args.user_history_trades_limit, 500)
         self.assertEqual(args.user_history_trades_max_pages, 3)
-        self.assertEqual(args.min_profile_participated_markets, 3)
+        self.assertIsNone(args.min_profile_participated_markets)
         self.assertEqual(args.min_profile_avg_market_cash, 1_500)
         self.assertEqual(args.market_trades_cache_ttl_days, 7)
         self.assertFalse(args.refresh_market_trades)
         self.assertFalse(args.no_market_trades_cache)
-        self.assertEqual(args.leaderboard_min_participated_markets, 3)
+        self.assertIsNone(args.leaderboard_min_participated_markets)
         self.assertEqual(args.leaderboard_min_avg_market_cash, 1_500)
         self.assertEqual(args.max_leaderboard_wallets, 30)
         self.assertFalse(args.check_current_positions)
+
+    def test_esports_collect_profile_budget_default_and_override(self):
+        parser = build_parser()
+
+        default_args = parser.parse_args(["collect"])
+        explicit_args = parser.parse_args(["collect", "--max-profiles-per-run", "123"])
+        sports_args = parser.parse_args(["collect", "--category", "sports"])
+
+        self.assertEqual(default_args.max_profiles_per_run, 300)
+        self.assertEqual(explicit_args.max_profiles_per_run, 123)
+        self.assertEqual(effective_build_limits(default_args), {})
+        self.assertEqual(effective_build_limits(explicit_args), {})
+        self.assertEqual(effective_build_limits(sports_args)["max_profiles_per_run"], 200)
 
     def test_sports_collect_uses_deeper_effective_history_defaults(self):
         parser = build_parser()
@@ -7164,6 +7956,231 @@ class CoreTest(unittest.TestCase):
             },
         )
 
+    def test_category_effective_build_defaults_keep_sports_unchanged(self):
+        parser = build_parser()
+
+        esports = parser.parse_args(["collect"])
+        sports = parser.parse_args(["collect", "--category", "sports"])
+        explicit_esports = parser.parse_args(
+            [
+                "collect",
+                "--classification-lookback-days",
+                "14",
+                "--discovery-lookback-days",
+                "14",
+                "--min-profile-participated-markets",
+                "3",
+                "--leaderboard-min-participated-markets",
+                "3",
+            ]
+        )
+
+        self.assertEqual(
+            effective_build_defaults(esports),
+            {
+                "classification_lookback_days": 60,
+                "discovery_lookback_days": 60,
+                "min_profile_participated_markets": 6,
+                "leaderboard_min_participated_markets": 6,
+            },
+        )
+        self.assertEqual(
+            effective_build_defaults(sports),
+            {
+                "classification_lookback_days": 90,
+                "discovery_lookback_days": 90,
+                "min_profile_participated_markets": 3,
+                "leaderboard_min_participated_markets": 3,
+            },
+        )
+        self.assertEqual(
+            effective_build_defaults(explicit_esports),
+            {
+                "classification_lookback_days": 14,
+                "discovery_lookback_days": 14,
+                "min_profile_participated_markets": 3,
+                "leaderboard_min_participated_markets": 3,
+            },
+        )
+
+    def test_collection_diagnostics_summarizes_esports_funnel(self):
+        now = 1_000_000
+        discovery_slate = [
+            {
+                "condition_id": "m1",
+                "market_type": "main_match",
+                "volume": 1000,
+                "end_date": datetime.fromtimestamp(now - 86400, timezone.utc).isoformat(),
+            },
+            {
+                "condition_id": "m2",
+                "market_type": "main_match",
+                "volume": 500,
+                "end_date": datetime.fromtimestamp(now - 3 * 86400, timezone.utc).isoformat(),
+            },
+            {"condition_id": "g1", "market_type": "game_winner", "volume": 800},
+            {"condition_id": "p1", "market_type": "map_winner", "volume": 300},
+        ]
+        candidates = [
+            {
+                "wallet": "0xaaa",
+                "per_type_candidate": {
+                    "main_match": {"participated_market_count": 12, "avg_market_cash": 1700}
+                },
+            },
+            {
+                "wallet": "0xbbb",
+                "per_type_candidate": {
+                    "game_winner": {"participated_market_count": 12, "avg_market_cash": 900}
+                },
+            },
+        ]
+        profile_candidates = [
+            {
+                **candidates[0],
+                "qualified_market_types": ["main_match"],
+            }
+        ]
+        profiles_by_wallet = {
+            "0xaaa": {
+                "wallet": "0xaaa",
+                "grade": "A",
+                "scoring_version": SCORING_VERSION,
+                "last_esports_trade_at": now,
+                "eligible_market_types": ["main_match"],
+                "candidate": profile_candidates[0],
+            },
+            "0xbbb": {
+                "wallet": "0xbbb",
+                "grade": "A",
+                "scoring_version": SCORING_VERSION,
+                "last_esports_trade_at": now - 10 * 86400,
+                "eligible_market_types": ["game_winner"],
+                "per_type_grades": {
+                    "game_winner": {
+                        "grade": "A",
+                        "esports_roi": 0.40,
+                        "capital_weighted_edge": 0.12,
+                        "positive_market_rate": 0.75,
+                        "wilson_win_rate_lower_bound": 0.62,
+                        "esports_closed_count": 12,
+                    }
+                },
+                "candidate": candidates[1],
+            },
+        }
+        leaderboard = [
+            {
+                "wallet": "0xaaa",
+                "best_market_type": "main_match",
+                "eligible_market_types": ["main_match"],
+            }
+        ]
+
+        diagnostics = build_collection_diagnostics(
+            discovery_slate=discovery_slate,
+            candidates=candidates,
+            profile_candidates=profile_candidates,
+            profiles_by_wallet=profiles_by_wallet,
+            leaderboard=leaderboard,
+            now_ts=now,
+            stage_timings={"wallet_profiling_seconds": 1.25},
+        )
+
+        self.assertEqual(diagnostics["market_type_slate"]["main_match"]["market_count"], 2)
+        self.assertEqual(diagnostics["market_type_slate"]["main_match"]["min_volume"], 500)
+        self.assertEqual(diagnostics["market_type_slate"]["main_match"]["median_volume"], 750)
+        self.assertEqual(diagnostics["market_type_slate"]["main_match"]["median_days_ago"], 2)
+        self.assertEqual(diagnostics["market_type_slate"]["main_match"]["sort_mode"], "volume_recency_score_70_30")
+        self.assertEqual(diagnostics["candidate_funnel"]["main_match"]["candidate_wallets"], 1)
+        self.assertEqual(diagnostics["candidate_funnel"]["main_match"]["qualified_profile_candidates"], 1)
+        self.assertEqual(diagnostics["profile_grade_counts"]["A"], 2)
+        self.assertEqual(diagnostics["eligible_market_type_counts"]["main_match"], 1)
+        self.assertEqual(diagnostics["leaderboard_best_market_type_counts"]["main_match"], 1)
+        self.assertIn("best_bucket_inactive_gt3d", diagnostics["leaderboard_reject_reasons"])
+        self.assertEqual(diagnostics["stage_timings"]["wallet_profiling_seconds"], 1.25)
+
+    def test_profile_budget_summary_reports_unprofiled_candidates(self):
+        summary = build_profile_budget_summary(
+            profile_candidate_wallet_count=267,
+            profile_fetch_plan_count=150,
+            max_profiles_per_run_effective=150,
+        )
+
+        self.assertEqual(summary["profile_fetch_plan_count"], 150)
+        self.assertEqual(summary["unprofiled_profile_candidate_count"], 117)
+        self.assertEqual(summary["max_profiles_per_run_effective"], 150)
+
+        covered = build_profile_budget_summary(
+            profile_candidate_wallet_count=267,
+            profile_fetch_plan_count=267,
+            max_profiles_per_run_effective=300,
+        )
+
+        self.assertEqual(covered["unprofiled_profile_candidate_count"], 0)
+
+    def test_esports_discovery_defaults_use_balanced_type_buckets(self):
+        parser = build_parser()
+
+        esports = parser.parse_args(["collect"])
+        sports = parser.parse_args(["collect", "--category", "sports"])
+        explicit_esports = parser.parse_args(
+            [
+                "collect",
+                "--target-markets",
+                "30",
+                "--game-winner-target-markets",
+                "40",
+                "--map-winner-target-markets",
+                "20",
+                "--max-markets-per-run",
+                "30",
+                "--game-winner-max-markets-per-run",
+                "40",
+                "--map-winner-max-markets-per-run",
+                "20",
+            ]
+        )
+
+        self.assertEqual(
+            effective_discovery_defaults(esports),
+            {
+                "target_markets": 150,
+                "submarket_target_markets": 150,
+                "game_winner_target_markets": 150,
+                "map_winner_target_markets": 150,
+                "max_markets_per_run": 150,
+                "submarket_max_markets_per_run": 150,
+                "game_winner_max_markets_per_run": 150,
+                "map_winner_max_markets_per_run": 150,
+            },
+        )
+        self.assertEqual(
+            effective_discovery_defaults(sports),
+            {
+                "target_markets": 20,
+                "submarket_target_markets": 60,
+                "game_winner_target_markets": 60,
+                "map_winner_target_markets": 60,
+                "max_markets_per_run": 100,
+                "submarket_max_markets_per_run": 60,
+                "game_winner_max_markets_per_run": 60,
+                "map_winner_max_markets_per_run": 60,
+            },
+        )
+        self.assertEqual(
+            effective_discovery_defaults(explicit_esports),
+            {
+                "target_markets": 30,
+                "submarket_target_markets": 150,
+                "game_winner_target_markets": 40,
+                "map_winner_target_markets": 20,
+                "max_markets_per_run": 30,
+                "submarket_max_markets_per_run": 150,
+                "game_winner_max_markets_per_run": 40,
+                "map_winner_max_markets_per_run": 20,
+            },
+        )
     def test_collect_command_accepts_build_options(self):
         parser = build_parser()
 
@@ -7333,6 +8350,22 @@ class CoreTest(unittest.TestCase):
             classification = read_json(Path(tmp) / "sports" / "esports_classification_set.json", [])
             self.assertEqual(len(classification), 3)
             self.assertTrue(all(row["end_date"] == "2026-06-01T03:00:00Z" for row in classification))
+            summary = read_json(Path(tmp) / "sports" / "build_summary.json", {})
+            self.assertEqual(summary["profile_fetch_plan_count"], 1)
+            self.assertEqual(summary["unprofiled_profile_candidate_count"], 0)
+            self.assertEqual(summary["max_profiles_per_run_effective"], 1)
+            timings = summary["diagnostics"]["stage_timings"]
+            for key in [
+                "classification_seconds",
+                "discovery_slate_seconds",
+                "market_trades_fetch_seconds",
+                "candidate_filtering_seconds",
+                "raw_user_trades_fetch_seconds",
+                "submarket_backfill_seconds",
+                "wallet_profiling_seconds",
+                "leaderboard_build_seconds",
+            ]:
+                self.assertIn(key, timings)
 
     def test_sports_collect_honors_explicit_fourteen_day_lookback(self):
         now = datetime.now(timezone.utc)
@@ -7424,6 +8457,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.command, "follow")
         self.assertEqual(args.execution_mode, "paper")
         self.assertEqual(args.stake_usdc, 25)
+        self.assertEqual(args.stake_ratio_percent, 10)
         self.assertEqual(args.follow_recency_days, 30)
         self.assertEqual(args.observe_window_hours, 24)
         self.assertEqual(args.max_slippage_over_entry, 0.05)
@@ -7452,6 +8486,7 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(args.command, "run")
         self.assertEqual(args.stake_usdc, 1)
+        self.assertEqual(args.stake_ratio_percent, 10)
         self.assertTrue(args.skip_initial_build)
         self.assertEqual(args.max_run_ticks, 1)
         self.assertEqual(args.pool_refresh_hours, 24)
@@ -7485,6 +8520,12 @@ class CoreTest(unittest.TestCase):
             ["run", "--stake-usdc", "1", "--event-gate-horizon-hours", "24"],
             ["run", "--stake-usdc", "1", "--results-retention-days", "0"],
             ["run", "--stake-usdc", "1", "--consensus-min-same-side", "1"],
+            ["follow", "--stake-usdc", "1", "--conviction-stake-usdc", "5"],
+            ["follow", "--stake-usdc", "1", "--conviction-size-multiple", "2"],
+            ["follow", "--stake-usdc", "1", "--no-conviction-gate"],
+            ["run", "--stake-usdc", "1", "--conviction-stake-usdc", "5"],
+            ["run", "--stake-usdc", "1", "--conviction-size-multiple", "2"],
+            ["run", "--stake-usdc", "1", "--no-conviction-gate"],
         ]
         for argv in removed_options:
             with self.subTest(argv=argv):
@@ -7607,8 +8648,8 @@ class CoreTest(unittest.TestCase):
                 with redirect_stdout(StringIO()):
                     self.assertEqual(command_run(args), 0)
 
-            self.assertEqual(build.call_count, 2)
-            self.assertEqual(set(paused_categories), {"esports", "sports"})
+            self.assertEqual(build.call_count, 1)
+            self.assertEqual(set(paused_categories), {"esports"})
 
     def test_run_loop_stops_after_consecutive_error_window(self):
         parser = build_parser()

@@ -25,7 +25,7 @@ from typing import Any
 
 from .control import read_follow_control, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
 from .core import LEAGUE_LABELS, MIN_A_POSITIVE_MARKET_RATE, parse_dt, parse_jsonish, to_float
-from .cli import prepare_category_refresh_dir
+from .cli import enrich_esports_bucket_scores, prepare_category_refresh_dir
 from .storage import FollowStore
 
 
@@ -57,6 +57,7 @@ class DashboardConfig:
     wallet_refresh_runner: Any = None
     wallet_refresh_timeout_seconds: int = 7200
     runner_stake_usdc: float = 1.0
+    runner_stake_ratio_percent: float = 10.0
     stream_poll_seconds: float = 2.0
     stream_heartbeat_seconds: float = 15.0
     max_stream_clients: int = 8
@@ -130,6 +131,7 @@ def create_server(config: DashboardConfig) -> ThreadingHTTPServer:
         wallet_refresh_runner=config.wallet_refresh_runner,
         wallet_refresh_timeout_seconds=config.wallet_refresh_timeout_seconds,
         runner_stake_usdc=config.runner_stake_usdc,
+        runner_stake_ratio_percent=config.runner_stake_ratio_percent,
         stream_poll_seconds=config.stream_poll_seconds,
         stream_heartbeat_seconds=config.stream_heartbeat_seconds,
         max_stream_clients=config.max_stream_clients,
@@ -285,12 +287,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "runner_already_running", "data": current}, status=HTTPStatus.CONFLICT)
             return
         form = self._read_request_form()
-        stake_usdc = to_float(form.get("stake_usdc"))
-        if not math.isfinite(stake_usdc) or stake_usdc <= 0:
-            self._error("invalid_stake_usdc", status=HTTPStatus.BAD_REQUEST)
+        stake_ratio_percent = to_float(form.get("stake_ratio_percent") or form.get("stake_ratio"))
+        if not math.isfinite(stake_ratio_percent) or stake_ratio_percent <= 0:
+            self._error("invalid_stake_ratio_percent", status=HTTPStatus.BAD_REQUEST)
             return
         try:
-            status = start_runner(self.dashboard_config, stake_usdc=stake_usdc)
+            status = start_runner(self.dashboard_config, stake_ratio_percent=stake_ratio_percent)
         except RunnerAlreadyRunning as exc:
             self._json({"ok": False, "error": "runner_already_running", "data": exc.status}, status=HTTPStatus.CONFLICT)
             return
@@ -698,12 +700,16 @@ def _overview_for_signals(open_signals: list[dict[str, Any]], results: list[dict
 def _eligible_display_metrics(row: dict[str, Any]) -> dict[str, Any]:
     """Stats to show for a leaderboard row.
 
-    When a wallet qualifies via per-type buckets, return the eligible bucket with the
-    most evidence (largest sample) so the displayed win rate / ROI / edge align with the
-    grade and market-type label. Falls back to the overall row for legacy profiles that
-    predate per-type grading.
+    When a wallet qualifies via per-type buckets, return the best eligible bucket so
+    the displayed win rate / ROI / edge align with the actual follow scope. Falls
+    back to the overall row for legacy profiles that predate per-type grading.
     """
-    eligible = row.get("eligible_market_types") or []
+    enriched = enrich_esports_bucket_scores(row, now_ts=int(time.time()))
+    best_market_type = str(enriched.get("best_market_type") or "")
+    bucket_scores = enriched.get("bucket_scores") if isinstance(enriched.get("bucket_scores"), dict) else {}
+    if best_market_type and isinstance(bucket_scores.get(best_market_type), dict):
+        return bucket_scores[best_market_type]
+    eligible = enriched.get("eligible_market_types") or []
     per_type = row.get("per_type_grades") or {}
     buckets = [per_type[market_type] for market_type in eligible if isinstance(per_type.get(market_type), dict)]
     if not buckets:
@@ -777,6 +783,7 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
         observed_trade_at_by_wallet[wallet] = max(observed_trade_at_by_wallet.get(wallet, 0), _signal_wallet_trade_at(signal))
     rows = []
     for row in leaderboard if isinstance(leaderboard, list) else []:
+        row = enrich_esports_bucket_scores(row, now_ts=int(time.time())) if normalize_category(str(row.get("category") or "")) != "sports" else row
         # Grading is per market_type, so a wallet may qualify only on a sub-bucket
         # (e.g. game_winner) while its blended overall record looks weak. Display the
         # eligible bucket's own stats so the shown numbers match the grade + type label.
@@ -802,11 +809,37 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
                 "short_addr": short_addr(wallet),
                 "grade": row.get("grade"),
                 "last_esports_trade_at": last_trade_at or row.get("last_esports_trade_at"),
+                "best_market_type": row.get("best_market_type"),
+                "best_market_type_label": row.get("best_market_type_label"),
+                "best_bucket_score": row.get("best_bucket_score"),
+                "bucket_scores": row.get("bucket_scores") or {},
+                "overall_esports_roi": row.get("overall_esports_roi", row.get("esports_roi")),
+                "overall_wilson_win_rate_lower_bound": row.get(
+                    "overall_wilson_win_rate_lower_bound",
+                    row.get("wilson_win_rate_lower_bound"),
+                ),
+                "overall_positive_market_rate": row.get("overall_positive_market_rate", row.get("positive_market_rate")),
                 "wilson_win_rate_lower_bound": metrics.get("wilson_win_rate_lower_bound"),
                 "entry_edge": metrics.get("entry_edge"),
+                "capital_weighted_edge": metrics.get("capital_weighted_edge"),
                 "esports_roi": metrics.get("esports_roi"),
                 "median_market_roi": metrics.get("median_market_roi"),
                 "median_entry_price": metrics.get("median_entry_price"),
+                "avg_market_cash": metrics.get("avg_market_cash"),
+                "participated_market_count": metrics.get("participated_market_count"),
+                "total_cash_volume": metrics.get("total_cash_volume"),
+                "best_bucket_last_trade_at": row.get("best_bucket_last_trade_at"),
+                "recent_bucket_market_count": metrics.get("recent_bucket_market_count"),
+                "recent_bucket_window_days": metrics.get("recent_bucket_window_days"),
+                "recent_bucket_roi": metrics.get("recent_bucket_roi"),
+                "recent_bucket_positive_rate": metrics.get("recent_bucket_positive_rate"),
+                "recent_bucket_pnl": metrics.get("recent_bucket_pnl"),
+                "recent_7d_market_count": metrics.get("recent_7d_market_count"),
+                "recent_7d_roi": metrics.get("recent_7d_roi"),
+                "recent_7d_positive_rate": metrics.get("recent_7d_positive_rate"),
+                "recent_14d_market_count": metrics.get("recent_14d_market_count"),
+                "recent_14d_roi": metrics.get("recent_14d_roi"),
+                "recent_14d_positive_rate": metrics.get("recent_14d_positive_rate"),
                 "reasons": metrics.get("reasons") or row.get("reasons") or [],
                 "scoring_version": row.get("scoring_version"),
                 "esports_win_count": metrics.get("esports_win_count"),
@@ -887,14 +920,20 @@ def wallet_observed_performance(performance: dict[str, Any], *, open_count: int 
 
 
 def wallet_leaderboard_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    score = row.get("best_bucket_score")
+    if score is not None:
+        return (
+            bool(row.get("quarantined")),
+            -to_float(score),
+            -to_float(row.get("wilson_win_rate_lower_bound")),
+            -to_float(row.get("capital_weighted_edge") or row.get("entry_edge")),
+            -to_float(row.get("positive_market_rate")),
+            -int(row.get("esports_closed_count") or 0),
+            str(row.get("wallet") or ""),
+        )
     loss_count = int(row.get("esports_loss_count") or 0)
-    observed = row.get("observed") or {}
-    observed_has_loss = bool(observed.get("has_loss"))
-    observed_pnl = to_float(observed.get("our_pnl"))
     return (
         bool(row.get("quarantined")),
-        observed_has_loss,
-        -observed_pnl,
         loss_count > 0,
         loss_count,
         -to_float(row.get("positive_market_rate")),
@@ -1026,6 +1065,7 @@ def _leaderboard_rank_by_wallet(data_dir: Path) -> dict[str, int]:
             if not wallet:
                 continue
             category = normalize_category(str(row.get("category") or source_category or "")) or "esports"
+            row = enrich_esports_bucket_scores(row, now_ts=int(time.time())) if category != "sports" else row
             metrics = _eligible_display_metrics(row)
             merged = {**row, **metrics, "wallet": wallet, "category": category}
             rows_by_category.setdefault(category, []).append(merged)
@@ -1469,6 +1509,7 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
             "command": matched.get("command") or recorded.get("command"),
             "started_at": recorded.get("started_at") if source == "dashboard" else None,
             "stake_usdc": recorded.get("stake_usdc"),
+            "stake_ratio_percent": recorded.get("stake_ratio_percent"),
             "log_path": recorded.get("log_path") if source == "dashboard" else None,
             "data_dir": str(config.data_dir),
             "follow_dir": str(follow_dir),
@@ -1484,13 +1525,16 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
     return {"status": "stopped", "data_dir": str(config.data_dir), "follow_dir": str(follow_dir)}
 
 
-def start_runner(config: DashboardConfig, *, stake_usdc: float | None = None) -> dict[str, Any]:
+def start_runner(config: DashboardConfig, *, stake_ratio_percent: float | None = None) -> dict[str, Any]:
     current = build_runner_status(config)
     if current.get("status") == "running":
         raise RunnerAlreadyRunning(current)
-    stake = to_float(config.runner_stake_usdc if stake_usdc is None else stake_usdc)
-    if not math.isfinite(stake) or stake <= 0:
+    min_stake = to_float(config.runner_stake_usdc)
+    if not math.isfinite(min_stake) or min_stake <= 0:
         raise ValueError("invalid_stake_usdc")
+    stake_ratio = to_float(config.runner_stake_ratio_percent if stake_ratio_percent is None else stake_ratio_percent)
+    if not math.isfinite(stake_ratio) or stake_ratio <= 0:
+        raise ValueError("invalid_stake_ratio_percent")
     now_ts = int(time.time())
     follow_dir = _follow_dir(config)
     follow_dir.mkdir(parents=True, exist_ok=True)
@@ -1510,7 +1554,9 @@ def start_runner(config: DashboardConfig, *, stake_usdc: float | None = None) ->
         "--follow-dir",
         str(follow_dir),
         "--stake-usdc",
-        str(stake),
+        str(min_stake),
+        "--stake-ratio-percent",
+        str(stake_ratio),
         "--skip-initial-build",
     ]
     if config.runner_process_starter is not None:
@@ -1535,7 +1581,8 @@ def start_runner(config: DashboardConfig, *, stake_usdc: float | None = None) ->
         "pgid": pgid,
         "started_at": now_ts,
         "command": command,
-        "stake_usdc": stake,
+        "stake_usdc": min_stake,
+        "stake_ratio_percent": stake_ratio,
         "log_path": str(log_path),
         "data_dir": str(config.data_dir),
         "follow_dir": str(follow_dir),
@@ -1855,7 +1902,7 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                 "leg_count": 0,
                 "stake": 0.0,
                 "signal_stakes": [],
-                "conviction_tier_counts": {},
+                "stake_mode_counts": {},
                 "status_counts": {},
                 "our_realized_pnl": 0.0,
                 "wallet_basis_realized_pnl": 0.0,
@@ -1879,8 +1926,8 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
         signal_stake = _to_float(signal.get("signal_stake"))
         if signal_stake > 0:
             bucket["signal_stakes"].append(signal_stake)
-        tier = str(signal.get("conviction_tier") or "normal")
-        bucket["conviction_tier_counts"][tier] = bucket["conviction_tier_counts"].get(tier, 0) + 1
+        mode = str(signal.get("stake_mode") or signal.get("conviction_tier") or "fixed")
+        bucket["stake_mode_counts"][mode] = bucket["stake_mode_counts"].get(mode, 0) + 1
         status = str(signal.get("status") or "open")
         bucket["status_counts"][status] = bucket["status_counts"].get(status, 0) + 1
         bucket["our_realized_pnl"] += _signal_our_pnl(signal)

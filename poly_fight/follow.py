@@ -13,12 +13,16 @@ def eligible_follow_wallets(
     now_ts: int,
     recency_days: int = 30,
     quarantined_wallets: set[str] | None = None,
+    allowed_categories: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     cutoff = now_ts - recency_days * SECONDS_PER_DAY
     quarantined_wallets = {normalize_wallet(wallet) for wallet in (quarantined_wallets or set())}
+    allowed_categories = {str(category).lower() for category in allowed_categories} if allowed_categories is not None else None
     rows = []
     for row in leaderboard:
         category = str(row.get("category") or "esports").lower()
+        if allowed_categories is not None and category not in allowed_categories:
+            continue
         eligible_market_types = [str(value) for value in (row.get("eligible_market_types") or []) if value]
         if row.get("grade") == "A" and not eligible_market_types:
             eligible_market_types = ["main_match"]
@@ -404,53 +408,21 @@ def _exit_signal_for_opposite_buy(
     signal["wallet_behavior"] = wallet_behavior_summary(signal)
 
 
-def _wallet_typical_position_size(wallet_row: dict[str, Any], market_type: str) -> float:
-    # Conviction is judged per-wallet against the wallet's OWN typical bet, never across
-    # wallets (capital sizes differ). Prefer the per-market-type median, fall back to overall.
-    per_type = wallet_row.get("per_type") if isinstance(wallet_row.get("per_type"), dict) else {}
-    bucket = per_type.get(market_type) if isinstance(per_type.get(market_type), dict) else {}
-    size = to_float(bucket.get("median_position_size"))
-    if size <= 0:
-        size = to_float(wallet_row.get("median_position_size"))
-    return size
-
-
-def _wallet_conviction_informative(wallet_row: dict[str, Any], market_type: str) -> bool:
-    # Only trust bet size as a conviction signal when the wallet's bigger bets actually win
-    # more — i.e. capital-weighted win rate >= unweighted win rate (per-type, else overall).
-    per_type = wallet_row.get("per_type") if isinstance(wallet_row.get("per_type"), dict) else {}
-    bucket = per_type.get(market_type) if isinstance(per_type.get(market_type), dict) else {}
-    cap = bucket.get("capital_weighted_win_rate")
-    win = bucket.get("positive_market_rate")
-    if cap is None or win is None:
-        cap = wallet_row.get("capital_weighted_win_rate")
-        win = wallet_row.get("positive_market_rate")
-    if cap is None or win is None:
-        return False
-    return to_float(cap) >= to_float(win)
-
-
 def follow_stake_for_signal(
-    wallet_row: dict[str, Any],
     *,
-    wallet_trade_size: float,
-    market_type: str,
-    normal_stake: float,
-    conviction_stake: float,
-    conviction_multiple: float,
-    conviction_gate: bool,
+    wallet_trade_cash: float,
+    stake_ratio_percent: float,
+    min_stake_usdc: float,
     available_balance: float,
 ) -> tuple[float, str, float]:
-    typical = _wallet_typical_position_size(wallet_row, market_type)
-    ratio = (wallet_trade_size / typical) if typical > 0 else 0.0
-    is_big = conviction_stake > normal_stake and ratio >= conviction_multiple
-    if is_big and conviction_gate and not _wallet_conviction_informative(wallet_row, market_type):
-        is_big = False
-    desired = conviction_stake if is_big else normal_stake
+    ratio = max(0.0, to_float(stake_ratio_percent)) / 100.0
+    min_stake = max(0.0, to_float(min_stake_usdc))
+    desired = max(min_stake, to_float(wallet_trade_cash) * ratio)
     if available_balance >= desired:
-        return round(desired, 8), ("conviction" if is_big else "normal"), round(ratio, 6)
-    if available_balance >= normal_stake:
-        return round(normal_stake, 8), "downgraded", round(ratio, 6)
+        mode = "minimum" if desired == min_stake else "proportional"
+        return round(desired, 8), mode, round(ratio, 6)
+    if available_balance >= min_stake:
+        return round(available_balance, 8), "capped", round(ratio, 6)
     return 0.0, "skipped", round(ratio, 6)
 
 
@@ -473,6 +445,7 @@ def process_follow_trades(
     stake_usdc: float,
     max_follow_legs: int,
     max_slippage: float,
+    stake_ratio_percent: float = 10.0,
     require_pre_match: bool = True,
     post_start_grace_seconds: int = 0,
     quarantine_sell_frac: float = 0.2,
@@ -480,14 +453,8 @@ def process_follow_trades(
     eligible_category: str | None = None,
     eligible_leagues: set[str] | None = None,
     conflict_policy: str = "dual_follow",
-    wallet_row: dict[str, Any] | None = None,
-    conviction_stake_usdc: float | None = None,
-    conviction_size_multiple: float = 2.0,
-    conviction_gate: bool = True,
     bankroll_usdc: float = float("inf"),
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    conviction_stake = stake_usdc if conviction_stake_usdc is None else float(conviction_stake_usdc)
-    wallet_row = wallet_row or {}
     wallet = normalize_wallet(wallet)
     stats: dict[str, Any] = {
         "new_leg_count": 0,
@@ -604,39 +571,22 @@ def process_follow_trades(
 
         wallet_fill_price = trade_price(trade)
         slippage = evaluate_slippage(wallet_fill_price, current_price, max_slippage=max_slippage)
-        signal_tier = None
-        conviction_ratio = None
-        if existing:
-            # Adds reuse the tier stake decided when the signal opened (v1: no per-leg re-eval).
-            desired_stake = to_float(existing.get("signal_stake")) or stake_usdc
-            available_balance = bankroll_usdc - _open_signals_exposure(open_signals)
-            if available_balance >= desired_stake:
-                leg_stake = desired_stake
-            elif available_balance >= stake_usdc:
-                leg_stake = stake_usdc
-                stats["insufficient_balance_count"] += 1
-            else:
-                stats["ignored_trade_count"] += 1
-                stats["insufficient_balance_count"] += 1
-                continue
-        else:
-            available_balance = bankroll_usdc - _open_signals_exposure(open_signals)
-            leg_stake, signal_tier, conviction_ratio = follow_stake_for_signal(
-                wallet_row,
-                wallet_trade_size=trade_size(trade),
-                market_type=market_type,
-                normal_stake=stake_usdc,
-                conviction_stake=conviction_stake,
-                conviction_multiple=conviction_size_multiple,
-                conviction_gate=conviction_gate,
-                available_balance=available_balance,
-            )
-            if leg_stake <= 0:
-                stats["ignored_trade_count"] += 1
-                stats["insufficient_balance_count"] += 1
-                continue
-            if signal_tier == "downgraded":
-                stats["insufficient_balance_count"] += 1
+        stake_mode = None
+        stake_ratio = None
+        wallet_cash = round(trade_size(trade) * wallet_fill_price, 8)
+        available_balance = bankroll_usdc - _open_signals_exposure(open_signals)
+        leg_stake, stake_mode, stake_ratio = follow_stake_for_signal(
+            wallet_trade_cash=wallet_cash,
+            stake_ratio_percent=stake_ratio_percent,
+            min_stake_usdc=stake_usdc,
+            available_balance=available_balance,
+        )
+        if leg_stake <= 0:
+            stats["ignored_trade_count"] += 1
+            stats["insufficient_balance_count"] += 1
+            continue
+        if stake_mode == "capped":
+            stats["insufficient_balance_count"] += 1
         leg = {
             "category": market_category,
             "our_entry_price": current_price,
@@ -648,6 +598,9 @@ def process_follow_trades(
             "leg_at": now_ts,
             "wallet_trade_at": trade_ts,
             "wallet_trade_size": round(trade_size(trade), 8),
+            "wallet_trade_cash": wallet_cash,
+            "stake_mode": stake_mode,
+            "stake_ratio_percent": round(stake_ratio_percent, 8),
         }
         if detected_after_start:
             leg["detected_after_start"] = True
@@ -681,8 +634,9 @@ def process_follow_trades(
                 "updated_at": now_ts,
                 "current_price": current_price,
                 "signal_stake": leg_stake,
-                "conviction_tier": signal_tier,
-                "conviction_ratio": conviction_ratio,
+                "stake_mode": stake_mode,
+                "stake_ratio": stake_ratio,
+                "stake_ratio_percent": round(stake_ratio_percent, 8),
                 "legs": [leg],
                 "behavior_events": [_behavior_event("add", trade)],
                 "wallet_behavior": {
