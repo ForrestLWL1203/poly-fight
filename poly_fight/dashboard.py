@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import mimetypes
 import os
 import re
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .control import read_follow_control, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
-from .core import MIN_A_POSITIVE_MARKET_RATE, parse_jsonish, to_float
+from .core import LEAGUE_LABELS, MIN_A_POSITIVE_MARKET_RATE, parse_dt, parse_jsonish, to_float
 from .cli import prepare_category_refresh_dir
 from .storage import FollowStore
 
@@ -279,8 +280,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._json({"ok": True, "data": status, "generated_at": int(time.time())}, status=HTTPStatus.ACCEPTED)
 
     def _runner_start(self) -> None:
+        current = build_runner_status(self.dashboard_config)
+        if current.get("status") == "running":
+            self._json({"ok": False, "error": "runner_already_running", "data": current}, status=HTTPStatus.CONFLICT)
+            return
+        form = self._read_request_form()
+        stake_usdc = to_float(form.get("stake_usdc"))
+        if not math.isfinite(stake_usdc) or stake_usdc <= 0:
+            self._error("invalid_stake_usdc", status=HTTPStatus.BAD_REQUEST)
+            return
         try:
-            status = start_runner(self.dashboard_config)
+            status = start_runner(self.dashboard_config, stake_usdc=stake_usdc)
         except RunnerAlreadyRunning as exc:
             self._json({"ok": False, "error": "runner_already_running", "data": exc.status}, status=HTTPStatus.CONFLICT)
             return
@@ -356,15 +366,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         )
 
     def _login(self) -> None:
-        body = self.rfile.read(_int_param(self.headers.get("Content-Length"), default=0, minimum=0, maximum=16384))
-        content_type = self.headers.get("Content-Type", "")
-        if "application/json" in content_type:
-            try:
-                form = json.loads(body.decode() or "{}")
-            except json.JSONDecodeError:
-                form = {}
-        else:
-            form = {key: values[0] for key, values in urllib.parse.parse_qs(body.decode()).items()}
+        form = self._read_request_form()
         username = str(form.get("username") or "")
         password = str(form.get("password") or "")
         client = self.client_address[0] if self.client_address else "unknown"
@@ -493,6 +495,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
         self.wfile.write(b"data: " + body + b"\n\n")
         self.wfile.flush()
+
+    def _read_request_form(self) -> dict[str, Any]:
+        body = self.rfile.read(_int_param(self.headers.get("Content-Length"), default=0, minimum=0, maximum=16384))
+        content_type = self.headers.get("Content-Type", "")
+        if "application/json" in content_type:
+            try:
+                form = json.loads(body.decode() or "{}")
+            except json.JSONDecodeError:
+                form = {}
+            return form if isinstance(form, dict) else {}
+        return {key: values[0] for key, values in urllib.parse.parse_qs(body.decode()).items()}
 
     def _ok(self, data: Any) -> None:
         self._json({"ok": True, "data": data, "generated_at": int(time.time())})
@@ -772,6 +785,8 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
             continue
         wallet = str(row.get("wallet") or "").lower()
         category = normalize_category(str(row.get("category") or "")) or "esports"
+        league = normalize_league(row.get("league"))
+        row_league_label = str(row.get("league_label") or league_label(league)).strip()
         quarantine_key = f"{category}:{wallet}"
         observed = wallet_observed_performance(performance.get(wallet, {}), open_count=len(open_by_wallet.get(wallet, [])))
         observed_market_types = _observed_market_types(row)
@@ -780,6 +795,10 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
             {
                 "wallet": wallet,
                 "category": category,
+                "league": league,
+                "league_label": row_league_label,
+                "game": league if category == "sports" else "",
+                "game_label": row_league_label if category == "sports" else "",
                 "short_addr": short_addr(wallet),
                 "grade": row.get("grade"),
                 "last_esports_trade_at": last_trade_at or row.get("last_esports_trade_at"),
@@ -801,6 +820,9 @@ def build_wallets(data_dir: Path) -> dict[str, Any]:
                 "observed_market_types": observed_market_types,
                 "observed_market_type_labels": row.get("observed_market_type_labels") or _market_type_labels(observed_market_types),
                 "per_type_grades": row.get("per_type_grades") or {},
+                "participation_rate": row.get("participation_rate"),
+                "participated_events": row.get("participated_events"),
+                "eligible_event_count": row.get("eligible_event_count"),
                 "quarantined": quarantine_key in quarantine or wallet in quarantine,
                 "quarantine": quarantine.get(quarantine_key) or quarantine.get(wallet),
                 "performance": performance.get(wallet, {}),
@@ -1104,10 +1126,17 @@ def build_events(
             open_signals = open_by_condition.get(condition_id, [])
             results = results_by_condition.get(condition_id, [])
             match_parts = _match_parts_for_row(market)
+            category = normalize_category(str(market.get("category") or "")) or "esports"
+            league = normalize_league(market.get("league"))
+            row_league_label = str(market.get("league_label") or league_label(league)).strip()
             events.append(
                 {
                     "condition_id": condition_id,
-                    "category": normalize_category(str(market.get("category") or "")) or "esports",
+                    "category": category,
+                    "league": league,
+                    "league_label": row_league_label,
+                    "game": league if category == "sports" else "",
+                    "game_label": row_league_label if category == "sports" else "",
                     "title": market.get("title"),
                     "question": market.get("question"),
                     "match_parts": match_parts,
@@ -1156,12 +1185,16 @@ def build_events(
             None,
         )
         category = normalize_category(str(market.get("category") or next((result.get("category") for result in results if isinstance(result, dict)), "") or "")) or "esports"
+        league = normalize_league(market.get("league") or next((result.get("league") for result in results if isinstance(result, dict)), ""))
+        row_league_label = str(market.get("league_label") or next((result.get("league_label") for result in results if isinstance(result, dict)), "") or league_label(league)).strip()
         market_type_label = market.get("market_type_label") or next((result.get("market_type_label") for result in results if isinstance(result, dict)), None)
         match_parts = _match_parts_for_row(
             {
                 "title": title,
                 "question": question,
                 "category": category,
+                "league": league,
+                "league_label": row_league_label,
                 "market_type_label": market_type_label,
             }
         )
@@ -1169,6 +1202,10 @@ def build_events(
             {
                 "condition_id": condition_id,
                 "category": category,
+                "league": league,
+                "league_label": row_league_label,
+                "game": league if category == "sports" else "",
+                "game_label": row_league_label if category == "sports" else "",
                 "title": title,
                 "question": question,
                 "match_parts": match_parts,
@@ -1270,8 +1307,9 @@ def _match_parts_for_row(row: dict[str, Any]) -> dict[str, str] | None:
     if not match:
         return None
     meta = str(row.get("market_type_label") or match.group(3) or "").strip()
+    game = str(row.get("league_label") or league_label(row.get("league")) or "Sports").strip()
     return {
-        "game": "MLB",
+        "game": game,
         "teamA": match.group(1).strip(),
         "teamB": match.group(2).strip(),
         "meta": meta,
@@ -1374,6 +1412,16 @@ def normalize_category(category: str | None) -> str:
     return value if value in CATEGORIES else ""
 
 
+def normalize_league(value: Any) -> str:
+    league = str(value or "").strip().lower()
+    return league if league in LEAGUE_LABELS else ""
+
+
+def league_label(value: Any) -> str:
+    league = normalize_league(value)
+    return LEAGUE_LABELS.get(league, str(value or "").strip().upper() if value else "")
+
+
 def category_data_dirs(root: Path) -> dict[str, Path]:
     root = Path(root)
     return {"esports": root / "esports", "sports": root / "sports"}
@@ -1427,6 +1475,7 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
             "source": source,
             "command": matched.get("command") or recorded.get("command"),
             "started_at": recorded.get("started_at") if source == "dashboard" else None,
+            "stake_usdc": recorded.get("stake_usdc"),
             "log_path": recorded.get("log_path") if source == "dashboard" else None,
             "data_dir": str(config.data_dir),
             "follow_dir": str(follow_dir),
@@ -1442,10 +1491,13 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
     return {"status": "stopped", "data_dir": str(config.data_dir), "follow_dir": str(follow_dir)}
 
 
-def start_runner(config: DashboardConfig) -> dict[str, Any]:
+def start_runner(config: DashboardConfig, *, stake_usdc: float | None = None) -> dict[str, Any]:
     current = build_runner_status(config)
     if current.get("status") == "running":
         raise RunnerAlreadyRunning(current)
+    stake = to_float(config.runner_stake_usdc if stake_usdc is None else stake_usdc)
+    if not math.isfinite(stake) or stake <= 0:
+        raise ValueError("invalid_stake_usdc")
     now_ts = int(time.time())
     follow_dir = _follow_dir(config)
     follow_dir.mkdir(parents=True, exist_ok=True)
@@ -1465,7 +1517,7 @@ def start_runner(config: DashboardConfig) -> dict[str, Any]:
         "--follow-dir",
         str(follow_dir),
         "--stake-usdc",
-        str(config.runner_stake_usdc),
+        str(stake),
         "--skip-initial-build",
     ]
     if config.runner_process_starter is not None:
@@ -1490,6 +1542,7 @@ def start_runner(config: DashboardConfig) -> dict[str, Any]:
         "pgid": pgid,
         "started_at": now_ts,
         "command": command,
+        "stake_usdc": stake,
         "log_path": str(log_path),
         "data_dir": str(config.data_dir),
         "follow_dir": str(follow_dir),
@@ -1808,6 +1861,8 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                 "wallets": set(),
                 "leg_count": 0,
                 "stake": 0.0,
+                "signal_stakes": [],
+                "conviction_tier_counts": {},
                 "status_counts": {},
                 "our_realized_pnl": 0.0,
                 "wallet_basis_realized_pnl": 0.0,
@@ -1828,6 +1883,11 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
         legs = signal.get("legs") or []
         bucket["leg_count"] += len(legs)
         bucket["stake"] += sum(_to_float(leg.get("stake")) for leg in legs)
+        signal_stake = _to_float(signal.get("signal_stake"))
+        if signal_stake > 0:
+            bucket["signal_stakes"].append(signal_stake)
+        tier = str(signal.get("conviction_tier") or "normal")
+        bucket["conviction_tier_counts"][tier] = bucket["conviction_tier_counts"].get(tier, 0) + 1
         status = str(signal.get("status") or "open")
         bucket["status_counts"][status] = bucket["status_counts"].get(status, 0) + 1
         bucket["our_realized_pnl"] += _signal_our_pnl(signal)
@@ -1852,6 +1912,10 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
             bucket["status"] = "mixed"
         bucket["roi"] = bucket["our_realized_pnl"] / bucket["stake"] if bucket["stake"] else None
         bucket["avg_wallet_clv"] = bucket["clv_sum"] / bucket["clv_count"] if bucket["clv_count"] else None
+        signal_stakes = [value for value in bucket.get("signal_stakes") or [] if value > 0]
+        bucket["signal_stake_min"] = min(signal_stakes) if signal_stakes else None
+        bucket["signal_stake_max"] = max(signal_stakes) if signal_stakes else None
+        bucket.pop("signal_stakes", None)
     return groups
 
 
@@ -1980,16 +2044,8 @@ def _parse_timestamp(value: Any) -> int:
         return 0
     if isinstance(value, (int, float)):
         return int(value)
-    text = str(value).replace("Z", "+00:00")
-    try:
-        from datetime import datetime, timezone
-
-        parsed = datetime.fromisoformat(text)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return int(parsed.timestamp())
-    except ValueError:
-        return 0
+    parsed = parse_dt(str(value))
+    return int(parsed.timestamp()) if parsed else 0
 
 
 def _trade_condition_id(trade: dict[str, Any]) -> str:

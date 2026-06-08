@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import hashlib
+import html as html_lib
 import math
 import json
 import os
@@ -21,9 +22,12 @@ from urllib.request import Request, urlopen
 
 from .api import PolymarketClient, RateLimiter
 from .core import (
+    LEAGUE_LABELS,
     MARKET_TYPE_LABELS,
+    MAX_HIGH_CHURN_MARKET_RATE,
     MIN_A_POSITIVE_MARKET_RATE,
     SCORING_VERSION,
+    SWING_DEPENDENT_RATE,
     TRADE_BEHAVIOR_EXCLUDE_RATE,
     TRADE_BEHAVIOR_MIN_MARKETS,
     GAME_WINNER,
@@ -85,9 +89,7 @@ class BuildLockUnavailable(RuntimeError):
 
 ESPORTS_LEADERBOARD_MIN_TYPE_ROI = 0.12
 ESPORTS_LEADERBOARD_MIN_TYPE_CAPITAL_EDGE = 0.0
-ESPORTS_LEADERBOARD_MIN_TYPE_PRE_MATCH_RATE = 0.20
 SPORTS_LEADERBOARD_MIN_CAPITAL_EDGE = 0.0
-SPORTS_LEADERBOARD_MIN_PRE_MATCH_RATE = 0.20
 CATEGORY_REFRESH_OUTPUT_FILES = {
     "smart_wallet_leaderboard.json",
     "wallet_profiles.json",
@@ -180,11 +182,11 @@ def build_client(args: argparse.Namespace) -> PolymarketClient:
 DATA_DIR = Path("data")
 CATEGORY_TAG_SLUGS = {
     "esports": ("counter-strike-2", "league-of-legends", "dota-2"),
-    "sports": ("mlb",),
+    "sports": ("nba", "ufc"),
 }
 CATEGORY_MARKET_SCOPES = {
     "esports": "cs-dota-lol-main-game-map-winner-v1",
-    "sports": "mlb-moneyline-v1",
+    "sports": "nba-ufc-moneyline-v1",
 }
 
 
@@ -1097,7 +1099,8 @@ def load_active_market_cache(
 
 
 TEAM_LOGO_URL_RE = re.compile(
-    r"url=(https%3A%2F%2Fpolymarket-upload\.s3\.us-east-2\.amazonaws\.com%2Fteam_logos%2F[^&\"<>]+?\.png)"
+    r"(?:url=)?(https%3A%2F%2Fpolymarket-upload\.s3\.us-east-2\.amazonaws\.com%2F[^&\"<>\s]+?\.(?:png|jpg|jpeg|webp)|https://polymarket-upload\.s3\.us-east-2\.amazonaws\.com/[^\"<>\s]+?\.(?:png|jpg|jpeg|webp))",
+    re.IGNORECASE,
 )
 MATCH_TITLE_TEAMS_RE = re.compile(r"^([^:]+):\s+(.+?)\s+vs\s+(.+?)(\s+\([^)]+\))?\s+-\s+(.+)$", re.IGNORECASE)
 SPORTS_TITLE_TEAMS_RE = re.compile(r"^(.+?)\s+vs\.?\s+(.+?)(?:\s+-\s+(.+))?$", re.IGNORECASE)
@@ -1148,7 +1151,8 @@ def refresh_team_logo_cache_from_active_markets(
 
     slugs = []
     for slug, market in by_slug.items():
-        game, team_a, team_b = _match_title_teams(str(market.get("title") or market.get("question") or ""))
+        fallback_game = str(market.get("league_label") or LEAGUE_LABELS.get(str(market.get("league") or "").lower(), "") or "")
+        game, team_a, team_b = _match_title_teams(str(market.get("title") or market.get("question") or ""), fallback_game=fallback_game)
         game_key = _normalize_team_logo_key(game)
         keys = []
         for team in (team_a, team_b):
@@ -1179,13 +1183,25 @@ def refresh_team_logo_cache_from_active_markets(
     def worker(slug: str) -> tuple[int, list[tuple[str, str, str, bytes]]]:
         market = by_slug[slug]
         html = fetcher(slug)
-        game, team_a, team_b = _match_title_teams(str(market.get("title") or market.get("question") or ""))
+        fallback_game = str(market.get("league_label") or LEAGUE_LABELS.get(str(market.get("league") or "").lower(), "") or "")
+        game, team_a, team_b = _match_title_teams(str(market.get("title") or market.get("question") or ""), fallback_game=fallback_game)
         title_teams = [team_a, team_b]
         rows: list[tuple[str, str, str, bytes]] = []
-        for encoded_url in sorted(set(TEAM_LOGO_URL_RE.findall(html))):
-            logo_url = unquote(encoded_url)
+        seen_urls: set[str] = set()
+        for match in TEAM_LOGO_URL_RE.finditer(html):
+            encoded_url = match.group(1)
+            logo_url = unquote(html_lib.unescape(encoded_url))
+            if logo_url in seen_urls:
+                continue
+            seen_urls.add(logo_url)
             team_key = _team_logo_key_from_url(logo_url, game=game, title_teams=title_teams)
-            if not team_key:
+            if not _team_logo_key_matches_title(team_key, title_teams):
+                img_start = html.rfind("<img", 0, match.start())
+                context_start = img_start if img_start >= 0 else max(0, match.start() - 600)
+                context = html[context_start : match.end() + 200]
+                alt_match = re.search(r'alt=["\']([^"\']+)["\']', context, re.IGNORECASE)
+                team_key = _team_logo_key_from_alt(alt_match.group(1) if alt_match else "", title_teams=title_teams)
+            if not _team_logo_key_matches_title(team_key, title_teams):
                 continue
             local_url = local_logo_url(logo_url)
             logo_bytes = b""
@@ -1246,13 +1262,13 @@ def _fetch_team_logo_bytes(url: str, timeout_seconds: int) -> bytes:
     return urlopen(request, timeout=timeout_seconds).read()
 
 
-def _match_title_teams(title: str) -> tuple[str, str, str]:
+def _match_title_teams(title: str, *, fallback_game: str = "Sports") -> tuple[str, str, str]:
     match = MATCH_TITLE_TEAMS_RE.match(title)
     if match:
         return match.group(1).strip(), match.group(2).strip(), match.group(3).strip()
     sports_match = SPORTS_TITLE_TEAMS_RE.match(title)
     if sports_match:
-        return "MLB", sports_match.group(1).strip(), sports_match.group(2).strip()
+        return fallback_game, sports_match.group(1).strip(), sports_match.group(2).strip()
     return "", "", ""
 
 
@@ -1264,7 +1280,6 @@ def _team_logo_key_from_url(logo_url: str, *, game: str, title_teams: list[str])
         game,
         game.replace(" ", "-"),
         game.replace(" ", "_"),
-        "mlb",
         "counter-strike",
         "cs2",
         "cs-go",
@@ -1291,6 +1306,24 @@ def _team_logo_key_from_url(logo_url: str, *, game: str, title_teams: list[str])
         if title_key and (candidate == title_key or candidate.endswith(f" {title_key}") or title_key in candidate.split()):
             return title_key
     return candidate
+
+
+def _team_logo_key_from_alt(alt: str, *, title_teams: list[str]) -> str:
+    candidate = _normalize_team_logo_key(html_lib.unescape(str(alt or "")))
+    if not candidate:
+        return ""
+    for team in title_teams:
+        title_key = _normalize_team_logo_key(team)
+        if title_key and (candidate == title_key or title_key.endswith(f" {candidate}") or candidate in title_key.split()):
+            return title_key
+    return ""
+
+
+def _team_logo_key_matches_title(team_key: str, title_teams: list[str]) -> bool:
+    normalized = _normalize_team_logo_key(team_key)
+    if not normalized:
+        return False
+    return any(normalized == _normalize_team_logo_key(team) for team in title_teams)
 
 
 def _normalize_team_logo_key(value: str) -> str:
@@ -1533,8 +1566,95 @@ def filter_profile_candidates(
             tail_entry_count = int(candidate.get("tail_entry_market_count") or 0)
             if participated > 0 and tail_entry_count / participated > max_tail_entry_rate:
                 continue
+            # Drop bot / high-frequency / market-maker wallets before profiling — their edge
+            # (re-trading a market 20+ times) isn't copyable by following a single entry.
+            high_churn_count = int(candidate.get("high_churn_market_count") or 0)
+            if participated > 0 and high_churn_count / participated > MAX_HIGH_CHURN_MARKET_RATE:
+                continue
         rows.append(candidate)
     return rows
+
+
+def league_event_counts_from_classification_set(classification_set: list[dict[str, Any]]) -> dict[str, int]:
+    event_keys_by_league: dict[str, set[str]] = {}
+    for row in classification_set:
+        if str(row.get("category") or "").lower() != "sports":
+            continue
+        league = str(row.get("league") or "").lower()
+        if not league:
+            continue
+        event_key = str(row.get("event_id") or row.get("event_slug") or row.get("condition_id") or "").lower()
+        if not event_key:
+            continue
+        event_keys_by_league.setdefault(league, set()).add(event_key)
+    return {league: len(event_keys) for league, event_keys in sorted(event_keys_by_league.items())}
+
+
+def augment_profile_sports_league_fields(profile: dict[str, Any], market_records_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    if str(profile.get("category") or "").lower() != "sports":
+        return profile
+    condition_ids = [str(value).lower() for value in profile.get("esports_condition_ids") or [] if value]
+    condition_ids_by_league: dict[str, set[str]] = {}
+    for condition_id in condition_ids:
+        record = market_records_by_id.get(condition_id) or {}
+        league = str(record.get("league") or "").lower()
+        if league:
+            condition_ids_by_league.setdefault(league, set()).add(condition_id)
+    if not condition_ids_by_league and profile.get("league"):
+        league = str(profile.get("league") or "").lower()
+        condition_ids_by_league[league] = set(condition_ids)
+    if not condition_ids_by_league:
+        return profile
+    primary_league = max(
+        sorted(condition_ids_by_league),
+        key=lambda league: len(condition_ids_by_league.get(league) or set()),
+    )
+    augmented = dict(profile)
+    augmented["league"] = primary_league
+    augmented["league_label"] = LEAGUE_LABELS.get(primary_league, primary_league.upper())
+    augmented["league_condition_ids_by_league"] = {
+        league: sorted(ids)
+        for league, ids in sorted(condition_ids_by_league.items())
+    }
+    return augmented
+
+
+def sports_wallet_participation(profile: dict[str, Any], league_event_counts: dict[str, int]) -> dict[str, Any] | None:
+    if not league_event_counts:
+        return None
+    raw_by_league = profile.get("league_condition_ids_by_league")
+    condition_ids_by_league: dict[str, set[str]] = {}
+    if isinstance(raw_by_league, dict):
+        for league, values in raw_by_league.items():
+            normalized_league = str(league or "").lower()
+            ids = {str(value).lower() for value in values or [] if value}
+            if normalized_league and ids:
+                condition_ids_by_league[normalized_league] = ids
+    if not condition_ids_by_league:
+        league = str(profile.get("league") or "").lower()
+        ids = {str(value).lower() for value in profile.get("esports_condition_ids") or [] if value}
+        if league and ids:
+            condition_ids_by_league[league] = ids
+    if not condition_ids_by_league:
+        return None
+    best: dict[str, Any] | None = None
+    for league, ids in sorted(condition_ids_by_league.items()):
+        denominator = int(league_event_counts.get(league) or 0)
+        participated = len(ids)
+        rate = participated / denominator if denominator > 0 else 0.0
+        candidate = {
+            "league": league,
+            "league_label": LEAGUE_LABELS.get(league, league.upper()),
+            "participated_events": participated,
+            "eligible_event_count": denominator,
+            "participation_rate": round(rate, 8),
+        }
+        if best is None or (candidate["participated_events"], candidate["participation_rate"]) > (
+            best["participated_events"],
+            best["participation_rate"],
+        ):
+            best = candidate
+    return best
 
 
 def build_leaderboard_from_profiles(
@@ -1549,6 +1669,9 @@ def build_leaderboard_from_profiles(
     max_leaderboard_wallets: int = 30,
     max_tail_entry_rate: float = 0.34,
     min_pre_match_entry_rate: float = 0.0,
+    league_event_counts: dict[str, int] | None = None,
+    min_sports_participation_rate: float = 0.5,
+    min_sports_participated_events: int = 5,
 ) -> list[dict[str, Any]]:
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
     max_inactive_seconds = max_inactive_days * 86400
@@ -1581,12 +1704,12 @@ def build_leaderboard_from_profiles(
         ):
             continue
         behavior_market_count = int(profile.get("historical_trade_behavior_market_count") or 0)
-        sold_rate = to_float(profile.get("sold_before_resolution_market_rate"))
-        if (
-            int(profile.get("sold_before_resolution_market_count") or 0) > 0
-            and behavior_market_count >= TRADE_BEHAVIOR_MIN_MARKETS
-            and sold_rate > TRADE_BEHAVIOR_EXCLUDE_RATE
-        ):
+        # Do NOT cut on sold_before_resolution rate: selling winners at ~0.99 to free capital
+        # is smart-money behavior, not short-term noise. The copyability concern is captured by
+        # actual_minus_hold (swing_dependent) — a wallet whose profit leans on in-game selling
+        # (actual PnL >> hold-to-settlement PnL) can't be followed on entry alone, so exclude
+        # it instead. Pure profit-takers have actual ≈ hold, so they pass.
+        if to_float(profile.get("actual_minus_hold_pnl_rate")) > SWING_DEPENDENT_RATE:
             continue
         two_sided_trade_rate = to_float(profile.get("two_sided_trade_market_rate"))
         if (
@@ -1595,16 +1718,24 @@ def build_leaderboard_from_profiles(
             and two_sided_trade_rate > TRADE_BEHAVIOR_EXCLUDE_RATE
         ):
             continue
-        last_trade = int(profile.get("last_esports_trade_at") or 0)
-        if not last_trade or now_ts - last_trade > max_inactive_seconds:
-            continue
         candidate = profile.get("candidate") or {}
         is_sports_profile = str(profile.get("category") or "").lower() == "sports"
+        last_trade = int(profile.get("last_esports_trade_at") or 0)
+        if not is_sports_profile and (not last_trade or now_ts - last_trade > max_inactive_seconds):
+            continue
         if is_sports_profile:
             profile = _with_sports_followable_market_types(profile)
             if profile is None:
                 continue
             eligible_market_types = profile.get("eligible_market_types") or []
+            participation = sports_wallet_participation(profile, league_event_counts or {})
+            if participation is None:
+                continue
+            if int(participation.get("participated_events") or 0) < min_sports_participated_events:
+                continue
+            if to_float(participation.get("participation_rate")) < min_sports_participation_rate:
+                continue
+            profile = {**profile, **participation}
         else:
             profile = _with_esports_followable_market_types(profile)
             if profile is None:
@@ -1627,6 +1758,11 @@ def build_leaderboard_from_profiles(
         participated_count = int(candidate.get("participated_market_count") or 0)
         if participated_count > 0 and tail_entry_count / participated_count > max_tail_entry_rate:
             continue
+        # Exclude bot / high-frequency / market-maker wallets: their edge is microstructure
+        # speed (re-trading a market 20+ times), which we can't copy by following one entry.
+        high_churn_count = int(candidate.get("high_churn_market_count") or 0)
+        if participated_count > 0 and high_churn_count / participated_count > MAX_HIGH_CHURN_MARKET_RATE:
+            continue
         leaderboard.append(profile)
     ranked = sorted(leaderboard, key=leaderboard_rank_key)
     if max_leaderboard_wallets > 0:
@@ -1640,9 +1776,6 @@ def _with_esports_followable_market_types(profile: dict[str, Any]) -> dict[str, 
         if _esports_followable_roi(profile) < ESPORTS_LEADERBOARD_MIN_TYPE_ROI:
             return None
         if _followable_capital_edge(profile) < ESPORTS_LEADERBOARD_MIN_TYPE_CAPITAL_EDGE:
-            return None
-        pre_match_rate = profile.get("pre_match_entry_rate")
-        if pre_match_rate is not None and to_float(pre_match_rate) < ESPORTS_LEADERBOARD_MIN_TYPE_PRE_MATCH_RATE:
             return None
         return profile
 
@@ -1658,9 +1791,6 @@ def _with_esports_followable_market_types(profile: dict[str, Any]) -> dict[str, 
         if _esports_followable_roi(metrics) < ESPORTS_LEADERBOARD_MIN_TYPE_ROI:
             continue
         if _followable_capital_edge(metrics) < ESPORTS_LEADERBOARD_MIN_TYPE_CAPITAL_EDGE:
-            continue
-        pre_match_rate = metrics.get("pre_match_entry_rate")
-        if pre_match_rate is not None and to_float(pre_match_rate) < ESPORTS_LEADERBOARD_MIN_TYPE_PRE_MATCH_RATE:
             continue
         followable_types.append(market_type)
     if not followable_types:
@@ -1680,9 +1810,6 @@ def _with_sports_followable_market_types(profile: dict[str, Any]) -> dict[str, A
     if not eligible_market_types:
         if _followable_capital_edge(profile) < SPORTS_LEADERBOARD_MIN_CAPITAL_EDGE:
             return None
-        pre_match_rate = profile.get("pre_match_entry_rate")
-        if pre_match_rate is not None and to_float(pre_match_rate) < SPORTS_LEADERBOARD_MIN_PRE_MATCH_RATE:
-            return None
         return profile
 
     per_type = profile.get("per_type") if isinstance(profile.get("per_type"), dict) else {}
@@ -1695,9 +1822,6 @@ def _with_sports_followable_market_types(profile: dict[str, Any]) -> dict[str, A
         if isinstance(per_type_grades.get(market_type), dict):
             metrics.update(per_type_grades[market_type])
         if _followable_capital_edge(metrics) < SPORTS_LEADERBOARD_MIN_CAPITAL_EDGE:
-            continue
-        pre_match_rate = metrics.get("pre_match_entry_rate")
-        if pre_match_rate is not None and to_float(pre_match_rate) < SPORTS_LEADERBOARD_MIN_PRE_MATCH_RATE:
             continue
         followable_types.append(market_type)
     if not followable_types:
@@ -1935,11 +2059,24 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
     data_dir = resolve_data_dir(args)
     now_ts = int(datetime.now(timezone.utc).timestamp())
 
-    lookback_steps = (args.discovery_lookback_days,) if args.discovery_lookback_days else (7, 14, 30)
+    category = getattr(args, "category", "esports")
+    classification_lookback_days = (
+        args.classification_lookback_days
+        if args.classification_lookback_days is not None
+        else 90
+        if category == "sports"
+        else 14
+    )
+    discovery_lookback_days = (
+        args.discovery_lookback_days
+        if args.discovery_lookback_days is not None
+        else 90
+        if category == "sports"
+        else 14
+    )
+    lookback_steps = (discovery_lookback_days,) if discovery_lookback_days else (7, 14, 30)
     classification_path = data_dir / "esports_classification_set.json"
     classification_meta_path = data_dir / "esports_classification_set.meta.json"
-    classification_lookback_days = args.classification_lookback_days
-    category = getattr(args, "category", "esports")
     tag_slugs = CATEGORY_TAG_SLUGS.get(category, CATEGORY_TAG_SLUGS["esports"])
     market_scope = CATEGORY_MARKET_SCOPES.get(category, CATEGORY_MARKET_SCOPES["esports"])
     classification_meta = {
@@ -1948,6 +2085,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         "classification_lookback_days": classification_lookback_days,
         "market_scope": market_scope,
         "tag_slugs": list(tag_slugs),
+        "sports_event_min_volume": getattr(args, "sports_event_min_volume", 0.0) if category == "sports" else 0.0,
     }
     classification_source = "api"
     if (
@@ -1981,9 +2119,11 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
             closed_events,
             now=now_dt,
             lookback_days=classification_lookback_days if classification_lookback_days > 0 else None,
+            sports_event_min_volume=getattr(args, "sports_event_min_volume", 0.0) if category == "sports" else 0.0,
         )
         write_json(classification_path, classification_set)
         write_json(classification_meta_path, classification_meta)
+    league_event_counts = league_event_counts_from_classification_set(classification_set)
 
     market_batch_size = args.market_batch_size or 50
     market_count = args.max_markets_per_run or market_batch_size * args.market_batch_count
@@ -2244,6 +2384,11 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         for row in [*existing_profiles.values(), *profiles]
         if normalize_wallet(row.get("wallet"))
     }
+    if category == "sports":
+        profiles_by_wallet = {
+            wallet: augment_profile_sports_league_fields(profile, market_records_by_id)
+            for wallet, profile in profiles_by_wallet.items()
+        }
     profiles_by_wallet = merge_profiles_with_candidates(profiles_by_wallet, candidates)
     leaderboard = build_leaderboard_from_profiles(
         profiles_by_wallet,
@@ -2254,6 +2399,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         require_current_scoring_version=True,
         max_leaderboard_wallets=args.max_leaderboard_wallets,
         min_pre_match_entry_rate=getattr(args, "min_pre_match_entry_rate", 0.0),
+        league_event_counts=league_event_counts if category == "sports" else None,
     )
     overlap_report = build_wallet_overlap_report(leaderboard)
     profiles_by_wallet = prune_profile_store(
@@ -2269,6 +2415,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         "category": category,
         "market_scope": market_scope,
         "classification_market_count": len(classification_set),
+        "eligible_event_count_by_league": league_event_counts if category == "sports" else {},
         "classification_source": classification_source,
         "discovery_market_count": len(discovery_slate),
         "candidate_wallet_count": len(candidates),
@@ -2288,7 +2435,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
     write_json(data_dir / "build_summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
     print()
-    category_label = "sports/mlb" if category == "sports" else "esports"
+    category_label = "sports" if category == "sports" else "esports"
     print("搜集完成")
     print(f"- 历史 {category_label} 胜负市场: {summary['classification_market_count']}")
     print(f"- 本轮发现市场: {summary['discovery_market_count']}")
@@ -2298,175 +2445,6 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
     print(f"- A/B 优质钱包: {summary['leaderboard_wallet_count']}")
     print(f"- 输出目录: {data_dir}")
     return 0
-
-
-def command_rescore_wallets(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
-    data_dir = resolve_data_dir(args)
-    with acquire_build_lock(data_dir):
-        return _rescore_tracked_wallets_unlocked(args, client=client)
-
-
-def _rescore_tracked_wallets_unlocked(args: argparse.Namespace, client: PolymarketClient | None = None) -> dict[str, Any]:
-    """Lightweight incremental re-score of the wallets currently on the leaderboard.
-
-    Skips the expensive discovery/candidate phase: re-fetches each tracked wallet's
-    trades (force refresh), backfills newly-settled markets, re-reconstructs the hold
-    summary, re-classifies, and rewrites the leaderboard. Used between the 24h full
-    rebuilds so followed wallets' records stay near-real-time.
-    """
-    data_dir = resolve_data_dir(args)
-    now_ts = int(datetime.now(timezone.utc).timestamp())
-
-    leaderboard_in = read_json(data_dir / "smart_wallet_leaderboard.json", [])
-    existing_profiles = {
-        normalize_wallet(row.get("wallet")): row for row in read_json(data_dir / "wallet_profiles.json", [])
-    }
-    tracked: list[str] = []
-    seen: set[str] = set()
-    for row in leaderboard_in if isinstance(leaderboard_in, list) else []:
-        if row.get("grade") != "A":
-            continue
-        wallet = normalize_wallet(row.get("wallet"))
-        if wallet and wallet not in seen:
-            seen.add(wallet)
-            tracked.append(wallet)
-
-    summary = {"rescored_wallet_count": 0, "tracked_wallet_count": len(tracked), "leaderboard_wallet_count": len(leaderboard_in or [])}
-    if not tracked:
-        print(json.dumps({"status": "rescore_skipped", "reason": "empty_leaderboard", **summary}, ensure_ascii=False))
-        return summary
-
-    client = client or build_client(args)
-
-    classification_set = read_json(data_dir / "esports_classification_set.json", [])
-    market_records_by_id = {
-        str(row.get("condition_id") or "").lower(): row
-        for row in classification_set
-        if row.get("condition_id")
-    }
-    condition_type_by_id = {
-        str(row.get("condition_id") or "").lower(): str(row.get("market_type") or "main_match")
-        for row in classification_set
-        if row.get("condition_id")
-    }
-    condition_ids = set(market_records_by_id)
-
-    rescore_candidates: list[dict[str, Any]] = []
-    for wallet in tracked:
-        candidate = dict((existing_profiles.get(wallet) or {}).get("candidate") or {})
-        candidate["wallet"] = wallet
-        rescore_candidates.append(candidate)
-
-    def fetch_raw(candidate: dict[str, Any]) -> tuple[str, list[dict]]:
-        wallet = normalize_wallet(candidate.get("wallet"))
-        trades = fetch_recent_user_trades_for_wallet(
-            client,
-            wallet,
-            page_limit=args.user_history_trades_limit,
-            max_pages=args.user_history_trades_max_pages,
-            data_dir=data_dir,
-            now_ts=now_ts,
-            cache_ttl_days=args.market_trades_cache_ttl_days,
-            force_refresh=True,  # incremental pass must see new trades, not the cache
-            use_cache=not args.no_market_trades_cache,
-        )
-        return wallet, trades
-
-    raw_results = run_ordered_io_tasks(rescore_candidates, fetch_raw, max_workers=args.max_workers)
-    raw_user_trades_by_wallet: dict[str, list[dict]] = {}
-    for index, result in enumerate(raw_results):
-        fallback_wallet = normalize_wallet(rescore_candidates[index].get("wallet"))
-        if isinstance(result, Exception):
-            raw_user_trades_by_wallet[fallback_wallet] = []
-            continue
-        wallet, trades = result
-        raw_user_trades_by_wallet[normalize_wallet(wallet)] = trades
-
-    backfilled_market_records, backfill_summary = backfill_user_trade_submarkets(
-        client,
-        raw_user_trades_by_wallet,
-        market_records_by_id,
-        data_dir=data_dir,
-        now_ts=now_ts,
-        cache_ttl_days=args.market_trades_cache_ttl_days,
-        force_refresh=True,  # newly-settled markets won't be in the (possibly stale) cache
-        use_cache=not args.no_market_trades_cache,
-        max_workers=args.max_workers,
-    )
-    if backfilled_market_records:
-        market_records_by_id = {**market_records_by_id, **backfilled_market_records}
-        condition_type_by_id = {
-            **condition_type_by_id,
-            **{
-                condition_id: str(record.get("market_type") or "main_match")
-                for condition_id, record in backfilled_market_records.items()
-            },
-        }
-        condition_ids = set(market_records_by_id)
-
-    def load_user_trades(wallet: str) -> list[dict]:
-        return _filter_esports_user_trades(
-            raw_user_trades_by_wallet.get(normalize_wallet(wallet), []),
-            condition_ids,
-            max_esports_markets=args.max_esports_closed_positions_per_wallet,
-        )
-
-    def profile_one(candidate: dict[str, Any]) -> dict[str, Any]:
-        try:
-            return profile_candidate_wallet(
-                candidate,
-                condition_ids,
-                market_records_by_id=market_records_by_id,
-                condition_type_by_id=condition_type_by_id,
-                user_trades_loader=load_user_trades,
-                current_positions_loader=(
-                    (lambda w: client.positions(w, limit=100))
-                    if args.check_current_positions
-                    else (lambda w: [])
-                ),
-                now_ts=now_ts,
-            )
-        except Exception as exc:
-            return make_retryable_profile(candidate, exc, now_ts=now_ts)
-
-    profile_results = run_ordered_io_tasks(rescore_candidates, profile_one, max_workers=args.max_workers)
-    rescored = [
-        make_retryable_profile(rescore_candidates[index], result, now_ts=now_ts)
-        if isinstance(result, Exception)
-        else result
-        for index, result in enumerate(profile_results)
-    ]
-
-    profiles_by_wallet = dict(existing_profiles)
-    for profile in rescored:
-        wallet = normalize_wallet(profile.get("wallet"))
-        if wallet:
-            profiles_by_wallet[wallet] = profile
-    profiles_by_wallet = merge_profiles_with_candidates(profiles_by_wallet, rescore_candidates)
-
-    leaderboard = build_leaderboard_from_profiles(
-        profiles_by_wallet,
-        now_ts=now_ts,
-        min_participated_markets=args.leaderboard_min_participated_markets,
-        min_avg_market_cash=args.leaderboard_min_avg_market_cash,
-        require_tail_entry_field=True,
-        require_current_scoring_version=True,
-        max_leaderboard_wallets=args.max_leaderboard_wallets,
-        min_pre_match_entry_rate=getattr(args, "min_pre_match_entry_rate", 0.0),
-    )
-    overlap_report = build_wallet_overlap_report(leaderboard)
-    write_json(data_dir / "wallet_profiles.json", list(profiles_by_wallet.values()))
-    write_json(data_dir / "smart_wallet_leaderboard.json", leaderboard)
-    write_json(data_dir / "leaderboard_wallet_overlap.json", overlap_report)
-
-    summary = {
-        "rescored_wallet_count": len(rescored),
-        "tracked_wallet_count": len(tracked),
-        "leaderboard_wallet_count": len(leaderboard),
-        **backfill_summary,
-    }
-    print(json.dumps({"status": "rescore_complete", **summary}, ensure_ascii=False))
-    return summary
 
 
 def find_active_market(client: PolymarketClient, args: argparse.Namespace) -> dict[str, Any] | None:
@@ -2580,6 +2558,10 @@ def command_follow(
         f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}": {str(value) for value in (row.get("eligible_market_types") or []) if value}
         for row in eligible_wallet_rows
     }
+    wallet_row_by_scope = {
+        f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}": row
+        for row in eligible_wallet_rows
+    }
     wallet_trade_state = store.load_wallet_trade_state()
     open_signals = store.load_open_signals()
     performance = store.load_performance()
@@ -2667,6 +2649,7 @@ def command_follow(
     bootstrap_position_count = 0
     bootstrap_position_request_count = 0
     trade_request_count = 0
+    insufficient_balance_count = 0
 
     tracked_condition_ids = {str(condition_id).lower() for condition_id in watched}
     tracked_condition_ids.update(str(signal.get("condition_id") or "").lower() for signal in open_signals)
@@ -2741,6 +2724,11 @@ def command_follow(
                         eligible_market_types=eligible_market_types_by_wallet.get(scope_key),
                         eligible_category=category,
                         conflict_policy=args.conflict_policy,
+                        wallet_row=wallet_row_by_scope.get(scope_key),
+                        conviction_stake_usdc=args.conviction_stake_usdc,
+                        conviction_size_multiple=args.conviction_size_multiple,
+                        conviction_gate=args.conviction_gate,
+                        bankroll_usdc=args.bankroll_usdc,
                     )
                     after_ids = {signal.get("signal_id") for signal in open_signals}
                     new_signal_count += len(after_ids - before_ids)
@@ -2750,6 +2738,7 @@ def command_follow(
                         quarantine_event_count += 1
                     market_type_not_eligible_count += stats.get("market_type_not_eligible_count", 0)
                     ignored_trade_count += stats.get("ignored_trade_count", 0)
+                    insufficient_balance_count += stats.get("insufficient_balance_count", 0)
                     exited_signal_count += stats.get("exited_signal_count", 0)
                     hedge_event_count += stats.get("hedge_event_count", 0)
                     opposite_blocked_count += stats.get("opposite_blocked_count", 0)
@@ -2788,12 +2777,18 @@ def command_follow(
                 eligible_market_types=eligible_market_types_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 eligible_category=category if wallet_can_open_new else None,
                 conflict_policy=args.conflict_policy,
+                wallet_row=wallet_row_by_scope.get(scope_key),
+                conviction_stake_usdc=args.conviction_stake_usdc,
+                conviction_size_multiple=args.conviction_size_multiple,
+                conviction_gate=args.conviction_gate,
+                bankroll_usdc=args.bankroll_usdc,
             )
             after_ids = {signal.get("signal_id") for signal in open_signals}
             new_signal_count += len(after_ids - before_ids)
             total_new_trade_count += len(new_trades)
             watched_new_trade_count += len(watched_trades)
             ignored_trade_count += stats.get("ignored_trade_count", 0) + (len(new_trades) - len(watched_trades))
+            insufficient_balance_count += stats.get("insufficient_balance_count", 0)
             market_type_not_eligible_count += stats.get("market_type_not_eligible_count", 0)
             exited_signal_count += stats.get("exited_signal_count", 0)
             hedge_event_count += stats.get("hedge_event_count", 0)
@@ -2861,6 +2856,7 @@ def command_follow(
         "watched_new_trade_count": watched_new_trade_count,
         "new_trade_count": watched_new_trade_count,
         "ignored_trade_count": ignored_trade_count,
+        "insufficient_balance_count": insufficient_balance_count,
         "market_type_not_eligible_count": market_type_not_eligible_count,
         "opposite_blocked_count": opposite_blocked_count,
         "new_signal_count": new_signal_count,
@@ -2917,7 +2913,6 @@ def command_run(args: argparse.Namespace) -> int:
     client = build_client(args)
     now_init = int(datetime.now(timezone.utc).timestamp())
     last_build_at = now_init if args.skip_initial_build else 0
-    last_rescore_at = now_init
     tick_count = 0
     first_error_at: float | None = None
     stop_requested = {"value": False, "reason": ""}
@@ -2949,7 +2944,7 @@ def command_run(args: argparse.Namespace) -> int:
             time.sleep(max(1, int(seconds)))
 
     def maybe_build(force: bool = False) -> bool:
-        nonlocal last_build_at, last_rescore_at
+        nonlocal last_build_at
         now_ts = int(datetime.now(timezone.utc).timestamp())
         if force or now_ts - last_build_at >= int(args.pool_refresh_hours * 3600):
             for category in category_data_dirs(collection_root):
@@ -2970,20 +2965,8 @@ def command_run(args: argparse.Namespace) -> int:
                     set_pause_new_signals(follow_dir, category, None)
             now_done = int(datetime.now(timezone.utc).timestamp())
             last_build_at = now_done
-            last_rescore_at = now_done  # full build already re-scored everyone
             return True
         return False
-
-    def maybe_rescore() -> None:
-        nonlocal last_rescore_at
-        interval = int(getattr(args, "wallet_rescore_hours", 0) * 3600)
-        if interval <= 0:
-            return
-        now_ts = int(datetime.now(timezone.utc).timestamp())
-        if now_ts - last_rescore_at >= interval:
-            for category in category_data_dirs(collection_root):
-                command_rescore_wallets(category_args(category), client=client)
-            last_rescore_at = int(datetime.now(timezone.utc).timestamp())
 
     try:
         if not args.skip_initial_build:
@@ -3006,7 +2989,6 @@ def command_run(args: argparse.Namespace) -> int:
         while not stop_requested["value"]:
             try:
                 maybe_build(force=False)
-                maybe_rescore()  # no-op right after a full build (last_rescore_at was reset)
                 summary = command_follow(args, client=client, emit=True)
             except Exception as exc:
                 now = time.time()
@@ -3109,16 +3091,17 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--gamma-pages", type=int, default=10)
         subparser.add_argument("--refresh-classification", action="store_true")
         subparser.add_argument("--classification-cache-ttl-hours", type=int, default=24)
-        subparser.add_argument("--classification-lookback-days", type=int, default=14)
+        subparser.add_argument("--classification-lookback-days", type=int, default=None)
         subparser.add_argument("--max-workers", type=int, default=8)
         subparser.add_argument("--max-requests-per-second", type=float, default=10)
         subparser.add_argument("--request-burst", type=int, default=5)
         subparser.add_argument("--max-retry-after-seconds", type=float, default=60)
         subparser.add_argument("--min-market-volume", type=float, default=25_000)
+        subparser.add_argument("--sports-event-min-volume", type=float, default=50_000)
         subparser.add_argument("--fallback-min-market-volume", type=float, default=10_000)
         subparser.add_argument("--submarket-min-market-volume", type=float, default=5_000)
         subparser.add_argument("--submarket-fallback-min-market-volume", type=float, default=1_000)
-        subparser.add_argument("--discovery-lookback-days", type=int, default=14)
+        subparser.add_argument("--discovery-lookback-days", type=int, default=None)
         subparser.add_argument("--target-markets", type=int, default=20)
         subparser.add_argument("--submarket-target-markets", type=int, default=60)
         subparser.add_argument("--game-winner-target-markets", type=int, default=60)
@@ -3168,6 +3151,13 @@ def build_parser() -> argparse.ArgumentParser:
     def add_follow_arguments(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--follow-dir")
         subparser.add_argument("--stake-usdc", type=float, required=True)
+        # Conviction-tiered sizing: bet Y on high-conviction signals (wallet's own bet is
+        # >= multiple x its typical size AND its big bets actually win more), else X.
+        subparser.add_argument("--conviction-stake-usdc", type=float, default=5.0)
+        subparser.add_argument("--conviction-size-multiple", type=float, default=2.0)
+        subparser.add_argument("--bankroll-usdc", type=float, default=1000.0)
+        subparser.add_argument("--conviction-gate", dest="conviction_gate", action="store_true", default=True)
+        subparser.add_argument("--no-conviction-gate", dest="conviction_gate", action="store_false")
         subparser.add_argument("--follow-recency-days", type=int, default=30)
         subparser.add_argument("--event-gate-horizon-hours", type=float, default=24)
         subparser.add_argument("--observe-window-hours", type=float, default=24)
@@ -3176,7 +3166,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--resolution-gamma-pages", type=int, default=2)
         subparser.add_argument("--max-slippage-over-entry", type=float, default=0.05)
         subparser.add_argument("--post-start-trade-grace-seconds", type=int, default=900)
-        subparser.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=True)
+        subparser.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=False)
         subparser.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
         subparser.add_argument("--execution-mode", choices=["paper", "live"], default="paper")
         subparser.add_argument("--run-log-retention-days", type=int, default=7)
@@ -3209,13 +3199,6 @@ def build_parser() -> argparse.ArgumentParser:
     collect = subparsers.add_parser("collect", help="one-shot wallet collection and leaderboard build")
     add_build_arguments(collect, include_category=True)
 
-    rescore = subparsers.add_parser(
-        "rescore-wallets",
-        help="lightweight re-score of current leaderboard wallets (no discovery)",
-    )
-    add_build_arguments(rescore)
-    rescore.set_defaults(func=command_rescore_wallets)
-
     analyze = subparsers.add_parser("analyze-event")
     analyze.add_argument("--gamma-pages", type=int, default=3)
     analyze.add_argument("--event-slug")
@@ -3238,6 +3221,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_build_arguments(run)
     run.add_argument("--follow-dir")
     run.add_argument("--stake-usdc", type=float, required=True)
+    # Conviction-tiered sizing (see add_follow_arguments for semantics).
+    run.add_argument("--conviction-stake-usdc", type=float, default=5.0)
+    run.add_argument("--conviction-size-multiple", type=float, default=2.0)
+    run.add_argument("--bankroll-usdc", type=float, default=1000.0)
+    run.add_argument("--conviction-gate", dest="conviction_gate", action="store_true", default=True)
+    run.add_argument("--no-conviction-gate", dest="conviction_gate", action="store_false")
     run.add_argument("--follow-recency-days", type=int, default=30)
     run.add_argument("--event-gate-horizon-hours", type=float, default=24)
     run.add_argument("--observe-window-hours", type=float, default=24)
@@ -3246,7 +3235,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--resolution-gamma-pages", type=int, default=2)
     run.add_argument("--max-slippage-over-entry", type=float, default=0.05)
     run.add_argument("--post-start-trade-grace-seconds", type=int, default=900)
-    run.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=True)
+    run.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=False)
     run.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
     run.add_argument("--execution-mode", choices=["paper", "live"], default="paper")
     run.add_argument("--run-log-retention-days", type=int, default=7)
@@ -3269,7 +3258,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--error-retry-seconds", type=int, default=180)
     run.add_argument("--max-consecutive-error-seconds", type=int, default=600)
     run.add_argument("--pool-refresh-hours", type=float, default=24)
-    run.add_argument("--wallet-rescore-hours", type=float, default=2)
     run.add_argument("--skip-initial-build", action="store_true")
     run.add_argument("--max-run-ticks", type=int, default=0)
     run.set_defaults(func=command_run)

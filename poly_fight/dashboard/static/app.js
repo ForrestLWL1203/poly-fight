@@ -19,6 +19,7 @@ createApp({
       loginError: "",
       loading: {},
       runnerActionText: "",
+      runnerStakeInput: "",
       health: {},
       overview: {},
       wallets: { wallets: [] },
@@ -99,10 +100,18 @@ createApp({
       return Number(this.wallets?.count || (this.wallets?.wallets || []).length || 0) > 0;
     },
     runnerStartBlocked() {
-      return this.runner.status !== "running" && !this.hasFollowWallets;
+      return this.runner.status !== "running" && (!this.hasFollowWallets || !this.runnerStakeValid);
+    },
+    runnerStakeValue() {
+      const value = Number(this.runnerStakeInput);
+      return Number.isFinite(value) ? value : 0;
+    },
+    runnerStakeValid() {
+      return this.runnerStakeValue > 0;
     },
     runnerControlTitle() {
-      if (this.runnerStartBlocked) return "需先采集目标跟单钱包";
+      if (this.runner.status !== "running" && !this.hasFollowWallets) return "需先采集目标跟单钱包";
+      if (this.runner.status !== "running" && !this.runnerStakeValid) return "需填写基础跟单金额";
       return this.runner.status === "running" ? "停止跟单脚本" : "启动跟单脚本";
     },
     healthPillText() {
@@ -450,6 +459,9 @@ createApp({
     },
     async loadRunner() {
       this.runner = await this.request("/api/runner");
+      if (this.runner.status === "running" && this.runner.stake_usdc) {
+        this.runnerStakeInput = String(this.runner.stake_usdc);
+      }
     },
     async refreshAfterRunnerChange() {
       await Promise.allSettled([
@@ -463,7 +475,7 @@ createApp({
     },
     async startRunner() {
       if (this.runnerStartBlocked) {
-        this.showToast("需先采集目标跟单钱包", "error");
+        this.showToast(this.hasFollowWallets ? "需填写基础跟单金额" : "需先采集目标跟单钱包", "error");
         return;
       }
       await this.loadRunner();
@@ -471,10 +483,18 @@ createApp({
         this.showToast("跟单脚本已经在运行");
         return;
       }
+      if (!this.runnerStakeValid) {
+        this.showToast("需填写基础跟单金额", "error");
+        return;
+      }
       this.loading.runner = true;
       this.runnerActionText = "正在启动跟单脚本并刷新数据";
       try {
-        this.runner = await this.request("/api/runner/start", { method: "POST" });
+        this.runner = await this.request("/api/runner/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ stake_usdc: this.runnerStakeValue }),
+        });
         this.showToast("跟单脚本已启动");
         await this.refreshAfterRunnerChange();
       } catch (error) {
@@ -866,6 +886,36 @@ createApp({
       if (!Number.isFinite(num)) return "-";
       return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(num);
     },
+    convictionTierLabel(tier) {
+      const value = String(tier || "normal");
+      if (value === "conviction") return "确信";
+      if (value === "downgraded") return "降级";
+      if (value === "skipped") return "跳过";
+      return "普通";
+    },
+    convictionTierClass(tier) {
+      const value = String(tier || "normal");
+      if (value === "conviction") return "tier-conviction";
+      if (value === "downgraded") return "tier-downgraded";
+      if (value === "skipped") return "tier-skipped";
+      return "tier-normal";
+    },
+    convictionSummary(row) {
+      const counts = row?.conviction_tier_counts || {};
+      const parts = [];
+      for (const tier of ["conviction", "downgraded", "normal"]) {
+        const count = Number(counts[tier] || 0);
+        if (count > 0) parts.push(`${this.convictionTierLabel(tier)} ${count}`);
+      }
+      return parts.length ? parts.join(" / ") : "普通";
+    },
+    signalStakeRange(row) {
+      const min = Number(row?.signal_stake_min);
+      const max = Number(row?.signal_stake_max);
+      if (!Number.isFinite(min) || min <= 0) return "";
+      if (!Number.isFinite(max) || max <= 0 || Math.abs(max - min) < 0.000001) return this.money(min);
+      return `${this.money(min)}-${this.money(max)}`;
+    },
     percent(value) {
       const num = Number(value);
       if (!Number.isFinite(num)) return "-";
@@ -945,6 +995,21 @@ createApp({
       const map = { main_match: "主盘", game_winner: "单局", map_winner: "地图" };
       const types = row?.eligible_market_types || [];
       return Array.isArray(types) ? types.map((type) => map[type] || type).filter(Boolean) : [];
+    },
+    walletScopeLabels(row) {
+      if ((row?.category || "esports") === "sports") {
+        const label = row?.game_label || row?.league_label || (row?.league ? String(row.league).toUpperCase() : "");
+        return label ? [`${label} Moneyline`] : [];
+      }
+      return this.marketTypeLabels(row);
+    },
+    sportsParticipationText(row) {
+      const participated = Number(row?.participated_events);
+      const eligible = Number(row?.eligible_event_count);
+      const rate = row?.participation_rate;
+      const countText = Number.isFinite(participated) && Number.isFinite(eligible) && eligible > 0 ? `${participated}/${eligible}` : "-";
+      const rateText = rate === null || rate === undefined ? "-" : this.percent(rate);
+      return `${countText} · ${rateText}`;
     },
     observedMarketTypeLabels(row) {
       const labels = row?.observed_market_type_labels;
@@ -1071,9 +1136,33 @@ createApp({
       this.matchTitleCache[text] = parsed;
       return parsed;
     },
+    matchMeta(row) {
+      const parts = this.matchParts(row);
+      const meta = String(parts?.meta || "").trim();
+      const label = String(row?.market_type_label || "").trim();
+      if (!meta || (label && meta === label)) return "";
+      return meta;
+    },
+    showMarketTypeChip(row) {
+      const label = String(row?.market_type_label || "").trim();
+      if (!label) return false;
+      const parts = this.matchParts(row);
+      const meta = String(parts?.meta || "").trim();
+      return !parts || meta !== label;
+    },
     teamLogo(row, side) {
       const logos = row?.team_logos || {};
       return typeof logos[side] === "string" ? logos[side] : "";
+    },
+    teamInitials(name) {
+      const words = String(name || "")
+        .replace(/[^a-zA-Z0-9\s]/g, " ")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      if (!words.length) return "-";
+      if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+      return `${words[0][0] || ""}${words[words.length - 1][0] || ""}`.toUpperCase();
     },
     signalOutcomeSide(signal) {
       const outcome = String(signal?.outcome || "").trim().toLowerCase();

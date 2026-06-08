@@ -497,6 +497,39 @@ body {
   gap: 0.4rem;
 }
 
+.runner-stake-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-height: 2.55rem;
+  border: 1px solid rgba(141, 160, 169, 0.24);
+  border-radius: 999px;
+  background: rgba(8, 12, 15, 0.44);
+  color: var(--pf-muted);
+  padding: 0 0.68rem;
+  font-size: 0.82rem;
+  font-weight: 850;
+}
+
+.runner-stake-field input {
+  width: 6.4rem;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--pf-text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.runner-stake-field input::placeholder {
+  color: rgba(184, 199, 205, 0.55);
+}
+
+.runner-stake-field:has(input:disabled) {
+  opacity: 0.72;
+}
+
 .danger-reset-btn {
   display: inline-flex;
   align-items: center;
@@ -635,6 +668,58 @@ body {
   border-color: var(--pf-amber);
   background: rgba(243, 185, 95, 0.2);
   outline: none;
+}
+
+.tier-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 1.65rem;
+  border: 1px solid rgba(141, 160, 169, 0.24);
+  border-radius: 999px;
+  padding: 0 0.55rem;
+  font-size: 0.74rem;
+  font-weight: 900;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.tier-chip-xs {
+  min-height: 1.35rem;
+  padding: 0 0.45rem;
+  font-size: 0.68rem;
+}
+
+.tier-normal {
+  background: rgba(141, 160, 169, 0.12);
+  color: var(--pf-muted);
+}
+
+.tier-conviction {
+  border-color: rgba(114, 217, 141, 0.38);
+  background: rgba(65, 151, 92, 0.16);
+  color: #a8edba;
+}
+
+.tier-downgraded {
+  border-color: rgba(243, 185, 95, 0.42);
+  background: rgba(243, 185, 95, 0.14);
+  color: #f1cc83;
+}
+
+.tier-skipped {
+  border-color: rgba(238, 111, 141, 0.42);
+  background: rgba(238, 111, 141, 0.14);
+  color: #ffafbd;
+}
+
+.tier-stake-range {
+  display: block;
+  margin-top: 0.28rem;
+  color: var(--pf-muted);
+  font-size: 0.7rem;
+  font-weight: 800;
+  white-space: nowrap;
 }
 
 .sample-refresh-btn {
@@ -1250,7 +1335,7 @@ body {
 }
 
 .dense-table {
-  min-width: 760px;
+  min-width: 860px;
 }
 
 .dense-table th {
@@ -1543,7 +1628,7 @@ body {
 .event-row {
   display: grid;
   gap: 0.7rem;
-  grid-template-columns: minmax(0, 1fr) minmax(12rem, auto) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(11rem, auto) minmax(0, auto);
   align-items: center;
   border-bottom: 1px solid rgba(141, 160, 169, 0.14);
   padding: 0.62rem 0;
@@ -1613,6 +1698,7 @@ body {
 .event-title-row .team {
   flex: 0 1 auto;
   min-width: 0;
+  max-width: min(18rem, 38vw);
   font-size: 1rem;
 }
 
@@ -1626,6 +1712,20 @@ body {
   width: 1.35rem;
   height: 1.35rem;
   flex-basis: 1.35rem;
+}
+
+.team-logo-fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-color: rgba(86, 214, 201, 0.32);
+  background:
+    radial-gradient(circle at 35% 25%, rgba(255, 255, 255, 0.18), transparent 45%),
+    linear-gradient(145deg, rgba(86, 214, 201, 0.24), rgba(120, 183, 255, 0.16));
+  color: #e8fbf8;
+  font-size: 0.56rem;
+  font-weight: 950;
+  letter-spacing: 0;
 }
 
 .event-title-row .vs-pill {
@@ -1670,7 +1770,7 @@ body {
 .event-meta {
   justify-content: flex-end;
   gap: 0.42rem;
-  min-width: 18rem;
+  min-width: 0;
 }
 
 .event-meta .badge {
@@ -2092,7 +2192,7 @@ body {
 }
 
 .leg-table {
-  min-width: 780px;
+  min-width: 980px;
 }
 
 .wallet-follow-modal {
@@ -2179,6 +2279,11 @@ body {
     justify-content: flex-end;
     width: 100%;
   }
+
+  .topbar-actions,
+  .runner-control-group {
+    justify-content: flex-start;
+  }
 }
 
 @media (max-width: 620px) {
@@ -2215,6 +2320,17 @@ body {
 
   .event-filters .table-filter {
     flex: 1 1 11rem;
+  }
+
+  .topbar-actions,
+  .runner-control-group,
+  .runner-stake-field,
+  .runner-control-btn {
+    width: 100%;
+  }
+
+  .runner-stake-field input {
+    width: 100%;
   }
 
   .event-filters select {

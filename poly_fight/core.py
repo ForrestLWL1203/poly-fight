@@ -27,6 +27,9 @@ ESPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE = 0.08
 SPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE = 0.10
 # actual_minus_hold_pnl_rate 超过此值 = 利润主要靠盘中卖出（我们复制不了）→ 软标记
 SWING_DEPENDENT_RATE = 0.2
+# 单市场成交 >=20 笔记为 high churn。high_churn 市场占比超过此值 = 机器人/高频/做市
+# （盈利来自微观价差和速度，复制不了）→ 直接排除出 leaderboard。
+MAX_HIGH_CHURN_MARKET_RATE = 0.5
 MAIN_MATCH = "main_match"
 GAME_WINNER = "game_winner"
 MAP_WINNER = "map_winner"
@@ -38,7 +41,12 @@ ESPORTS_CATEGORY_TAGS = {
     "league-of-legends",
 }
 SPORTS_LEAGUE_TAGS = {
-    "mlb": "mlb",
+    "nba": "nba",
+    "ufc": "ufc",
+}
+LEAGUE_LABELS = {
+    "nba": "NBA",
+    "ufc": "UFC",
 }
 MARKET_TYPE_LABELS = {
     MAIN_MATCH: "主盘",
@@ -268,6 +276,20 @@ def is_prop_market_question(question: str) -> bool:
         r"\bhit\b",
         r"\bhits\b",
         r"\btotal bases\b",
+        r"\bpoints\b",
+        r"\brebounds\b",
+        r"\bassists\b",
+        r"\bdouble double\b",
+        r"\btriple double\b",
+        r"\bmethod of victory\b",
+        r"\bdecision\b",
+        r"\bko\b",
+        r"\btko\b",
+        r"\bsubmission\b",
+        r"\bgo the distance\b",
+        r"\bdistance\b",
+        r"\bround\b",
+        r"\bwins by\b",
     ]
     return any(re.search(pattern, text) for pattern in prop_patterns)
 
@@ -290,8 +312,6 @@ def classify_market_type(event: dict[str, Any], market: dict[str, Any]) -> str |
     if not question_norm or is_prop_market_question(question) or has_prop_like_outcomes(market):
         return None
     if category == "sports":
-        if event_league(event) != "mlb":
-            return None
         if not market_outcomes_match_event_teams(event, market):
             return None
         return MAIN_MATCH
@@ -372,6 +392,7 @@ def event_to_market_records(
             "game_family": game_family_from_event(event),
             "category": category,
             "league": league,
+            "league_label": LEAGUE_LABELS.get(league, league.upper() if league else ""),
             "market_type": market_type,
             "market_type_label": MARKET_TYPE_LABELS.get(market_type, market_type),
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -400,6 +421,7 @@ def build_classification_set(
     *,
     now: datetime | None = None,
     lookback_days: int | None = None,
+    sports_event_min_volume: float = 0.0,
 ) -> list[dict[str, Any]]:
     now = now or datetime.now(timezone.utc)
     records: dict[str, dict[str, Any]] = {}
@@ -409,6 +431,8 @@ def build_classification_set(
             if not end or end > now:
                 continue
             if not is_settled_binary_prices(record.get("outcome_prices") or []):
+                continue
+            if record.get("category") == "sports" and to_float(record.get("volume")) < sports_event_min_volume:
                 continue
             if lookback_days is not None:
                 days_ago = (now - end).total_seconds() / SECONDS_PER_DAY
@@ -1427,7 +1451,8 @@ def classify_wallet_bucket(
 
 def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> dict[str, Any]:
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
-    classified = classify_wallet_bucket(summary, now_ts=now_ts, min_sample=8)
+    category = str(summary.get("category") or "").lower()
+    classified = classify_wallet_bucket(summary, now_ts=now_ts, min_sample=5 if category == "sports" else 8)
     per_type = summary.get("per_type") or {}
     if not isinstance(per_type, dict):
         return classified
@@ -1441,7 +1466,7 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
         per_type.items(),
         key=lambda item: MARKET_TYPE_ORDER.get(str(item[0]), 99),
     ):
-        min_sample = 8 if market_type == MAIN_MATCH else 10
+        min_sample = 5 if category == "sports" else 8 if market_type == MAIN_MATCH else 10
         bucket_input = {
             **bucket_summary,
             "category": summary.get("category", bucket_summary.get("category")),

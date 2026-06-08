@@ -64,6 +64,19 @@
               <span>重置数据</span>
             </button>
             <div class="runner-control-group">
+              <label class="runner-stake-field" title="单笔基础跟单金额">
+                <span>$</span>
+                <input
+                  v-model="runnerStakeInput"
+                  type="number"
+                  min="0.01"
+                  step="0.01"
+                  inputmode="decimal"
+                  placeholder="基础金额"
+                  :disabled="runner.status === 'running' || loading.runner"
+                  required
+                />
+              </label>
               <button
                 class="runner-control-btn"
                 :class="runner.status === 'running' ? 'runner-control-stop' : 'runner-control-start'"
@@ -84,12 +97,20 @@
                 </template>
               </button>
               <button
-                v-if="runnerStartBlocked"
+                v-if="runner.status !== 'running' && !hasFollowWallets"
                 class="runner-start-warning"
                 type="button"
                 title="需先采集目标跟单钱包"
                 aria-label="需先采集目标跟单钱包"
                 @click="showToast('需先采集目标跟单钱包', 'error')"
+              >!</button>
+              <button
+                v-else-if="runner.status !== 'running' && !runnerStakeValid"
+                class="runner-start-warning"
+                type="button"
+                title="需填写基础跟单金额"
+                aria-label="需填写基础跟单金额"
+                @click="showToast('需填写基础跟单金额', 'error')"
               >!</button>
             </div>
           </div>
@@ -209,9 +230,13 @@
                   <td class="metric-strong">{{ walletHistoryText(wallet) }}</td>
                   <td>
                     <div class="type-row">
-                      <span class="type-prefix">可跟</span>
-                      <span v-for="label in marketTypeLabels(wallet)" :key="`eligible-${label}`" class="badge badge-neutral badge-sm mr-1">{{ label }}</span>
-                      <span v-if="!marketTypeLabels(wallet).length" class="subtle">-</span>
+                      <span class="type-prefix">{{ wallet.category === 'sports' ? '观察' : '可跟' }}</span>
+                      <span v-for="label in walletScopeLabels(wallet)" :key="`eligible-${label}`" class="badge badge-neutral badge-sm mr-1">{{ label }}</span>
+                      <span v-if="!walletScopeLabels(wallet).length" class="subtle">-</span>
+                    </div>
+                    <div v-if="wallet.category === 'sports'" class="type-row type-row-muted">
+                      <span class="type-prefix">参与</span>
+                      <span>{{ sportsParticipationText(wallet) }}</span>
                     </div>
                     <div class="type-row type-row-muted">
                       <span class="type-prefix">历史</span>
@@ -305,6 +330,7 @@
                     <th>钱包数</th>
                     <th>单数</th>
                     <th>投入</th>
+                    <th>档位</th>
                     <th>盈亏</th>
                     <th>质量</th>
                   </tr>
@@ -317,15 +343,17 @@
                         <div class="event-title-row">
                           <span class="team team-a">
                             <img v-if="teamLogo(follow, 'teamA')" class="team-logo" :src="teamLogo(follow, 'teamA')" :alt="matchParts(follow).teamA" loading="lazy">
+                            <span v-else class="team-logo team-logo-fallback">{{ teamInitials(matchParts(follow).teamA) }}</span>
                             <span>{{ matchParts(follow).teamA }}</span>
                           </span>
                           <span class="vs-pill">VS</span>
                           <span class="team team-b">
                             <img v-if="teamLogo(follow, 'teamB')" class="team-logo" :src="teamLogo(follow, 'teamB')" :alt="matchParts(follow).teamB" loading="lazy">
+                            <span v-else class="team-logo team-logo-fallback">{{ teamInitials(matchParts(follow).teamB) }}</span>
                             <span>{{ matchParts(follow).teamB }}</span>
                           </span>
-                          <span class="match-meta">{{ matchParts(follow).meta }}</span>
-                          <span v-if="follow.market_type_label" class="event-type-chip">{{ follow.market_type_label }}</span>
+                          <span v-if="matchMeta(follow)" class="match-meta">{{ matchMeta(follow) }}</span>
+                          <span v-if="showMarketTypeChip(follow)" class="event-type-chip">{{ follow.market_type_label }}</span>
                         </div>
                       </div>
                       <div v-else class="market-title">{{ followTitle(follow) }}</div>
@@ -341,11 +369,17 @@
                     <td>{{ follow.wallet_count }}</td>
                     <td>{{ follow.leg_count }}</td>
                     <td>{{ money(follow.stake) }}</td>
+                    <td>
+                      <span class="tier-chip" :class="convictionTierClass((follow.conviction_tier_counts || {}).conviction ? 'conviction' : 'normal')">
+                        {{ convictionSummary(follow) }}
+                      </span>
+                      <small v-if="signalStakeRange(follow)" class="tier-stake-range">{{ signalStakeRange(follow) }}</small>
+                    </td>
                     <td :class="pnlClass(follow.our_realized_pnl)">{{ money(follow.our_realized_pnl) }}</td>
                     <td><span class="badge" :class="follow.contested_signal_count ? 'badge-error badge-outline' : 'badge-success badge-outline'">{{ follow.contested_signal_count ? "双边" : "单边" }}</span></td>
                   </tr>
                   <tr v-if="!(follows.follows || []).length">
-                    <td colspan="7" class="empty-cell">暂无跟单记录</td>
+                    <td colspan="8" class="empty-cell">暂无跟单记录</td>
                   </tr>
                 </tbody>
               </table>
@@ -415,15 +449,17 @@
                     <div class="event-title-row">
                       <span class="team team-a">
                         <img v-if="teamLogo(event, 'teamA')" class="team-logo" :src="teamLogo(event, 'teamA')" :alt="matchParts(event).teamA" loading="lazy">
+                        <span v-else class="team-logo team-logo-fallback">{{ teamInitials(matchParts(event).teamA) }}</span>
                         <span>{{ matchParts(event).teamA }}</span>
                       </span>
                       <span class="vs-pill">VS</span>
                       <span class="team team-b">
                         <img v-if="teamLogo(event, 'teamB')" class="team-logo" :src="teamLogo(event, 'teamB')" :alt="matchParts(event).teamB" loading="lazy">
+                        <span v-else class="team-logo team-logo-fallback">{{ teamInitials(matchParts(event).teamB) }}</span>
                         <span>{{ matchParts(event).teamB }}</span>
                       </span>
-                      <span class="match-meta">{{ matchParts(event).meta }}</span>
-                      <span v-if="event.market_type_label" class="event-type-chip">{{ event.market_type_label }}</span>
+                      <span v-if="matchMeta(event)" class="match-meta">{{ matchMeta(event) }}</span>
+                      <span v-if="showMarketTypeChip(event)" class="event-type-chip">{{ event.market_type_label }}</span>
                     </div>
                   </div>
                   <div v-else class="market-title">{{ event.title || event.question || shortId(event.condition_id) }}</div>
@@ -580,6 +616,8 @@
                         <th>目标成交价格</th>
                         <th>目标购入金额</th>
                         <th>跟单时间</th>
+                        <th>跟单额</th>
+                        <th>档位</th>
                         <th>跟单价格</th>
                         <th>买入均价</th>
                         <th>滑点</th>
@@ -592,6 +630,8 @@
                         <td>{{ price(leg.wallet_fill_price || leg.wallet_avg_price) }}</td>
                         <td>{{ money(legWalletTradeCash(leg)) }}</td>
                         <td>{{ formatTime(leg.leg_at || leg.created_at) }}</td>
+                        <td>{{ money(leg.stake) }}</td>
+                        <td><span class="tier-chip tier-chip-xs" :class="convictionTierClass(signal.conviction_tier)">{{ convictionTierLabel(signal.conviction_tier) }}</span></td>
                         <td>{{ price(leg.our_entry_price) }}</td>
                         <td>{{ price(leg.wallet_fill_price || leg.wallet_avg_price) }}</td>
                         <td :class="pnlClass(-(legSlippageValue(leg) || 0))">{{ legSlippageText(leg) }}</td>
@@ -600,7 +640,7 @@
                         </td>
                       </tr>
                       <tr v-if="!(signal.legs || []).length">
-                        <td colspan="8" class="empty-cell">暂无跟单记录</td>
+                        <td colspan="10" class="empty-cell">暂无跟单记录</td>
                       </tr>
                     </tbody>
                   </table>

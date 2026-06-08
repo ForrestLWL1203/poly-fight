@@ -54,7 +54,6 @@ from poly_fight.cli import (
     build_profile_fetch_plan,
     backfill_user_trade_submarkets,
     command_build_leaderboard,
-    _rescore_tracked_wallets_unlocked,
     _command_build_leaderboard_unlocked,
     command_follow,
     fetch_resolutions_for_open_signals,
@@ -119,6 +118,7 @@ from poly_fight.follow import (
     material_sell,
     paper_pnl,
     process_follow_trades,
+    follow_stake_for_signal,
     qualify_follow,
     quarantine_reason,
     select_new_trades,
@@ -170,19 +170,71 @@ class CoreTest(unittest.TestCase):
             {"esports": root / "esports", "sports": root / "sports"},
         )
 
-    def test_event_category_and_league_identify_mlb_and_in_scope_esports(self):
+    def test_event_category_and_league_identify_nba_ufc_and_in_scope_esports(self):
+        nba_event = {"title": "Los Angeles Lakers vs. Boston Celtics", "tags": [{"slug": "nba"}]}
+        ufc_event = {"title": "Justin Gaethje vs Ilia Topuria", "tags": [{"slug": "ufc"}]}
         mlb_event = {"title": "New York Mets vs. San Diego Padres", "tags": [{"slug": "mlb"}]}
         cs_event = {"title": "Counter-Strike: A vs B (BO3)", "tags": [{"slug": "counter-strike-2"}]}
         valorant_event = {"title": "Valorant: A vs B (BO3)", "tags": [{"slug": "valorant"}]}
 
-        self.assertEqual(event_category(mlb_event), "sports")
-        self.assertEqual(event_league(mlb_event), "mlb")
+        self.assertEqual(event_category(nba_event), "sports")
+        self.assertEqual(event_league(nba_event), "nba")
+        self.assertEqual(event_category(ufc_event), "sports")
+        self.assertEqual(event_league(ufc_event), "ufc")
+        self.assertIsNone(event_category(mlb_event))
+        self.assertEqual(event_league(mlb_event), "other")
         self.assertEqual(event_category(cs_event), "esports")
         self.assertEqual(event_league(cs_event), "cs2")
         self.assertIsNone(event_category(valorant_event))
         self.assertEqual(event_league(valorant_event), "other")
 
-    def test_mlb_moneyline_is_main_match_and_records_category(self):
+    def test_nba_and_ufc_moneylines_are_main_match_and_record_league(self):
+        nba_event = {
+            "id": "nba1",
+            "slug": "nba-lakers-celtics-2026-06-06",
+            "title": "Los Angeles Lakers vs. Boston Celtics",
+            "closed": True,
+            "endDate": "2026-06-06T23:00:00Z",
+            "tags": [{"slug": "nba"}],
+            "markets": [
+                {
+                    "conditionId": "nba-moneyline",
+                    "question": "Los Angeles Lakers vs. Boston Celtics",
+                    "outcomes": '["Los Angeles Lakers","Boston Celtics"]',
+                    "outcomePrices": '["0","1"]',
+                    "volume": "1005821.89",
+                }
+            ],
+        }
+        ufc_event = {
+            "id": "ufc1",
+            "slug": "ufc-gaethje-topuria-2026-06-06",
+            "title": "Justin Gaethje vs Ilia Topuria",
+            "closed": True,
+            "endDate": "2026-06-06T23:00:00Z",
+            "tags": [{"slug": "ufc"}],
+            "markets": [
+                {
+                    "conditionId": "ufc-moneyline",
+                    "question": "Justin Gaethje vs Ilia Topuria",
+                    "outcomes": '["Justin Gaethje","Ilia Topuria"]',
+                    "outcomePrices": '["1","0"]',
+                    "volume": "230000",
+                }
+            ],
+        }
+
+        nba_records = event_to_market_records(nba_event)
+        ufc_records = event_to_market_records(ufc_event)
+
+        self.assertEqual(classify_market_type(nba_event, nba_event["markets"][0]), "main_match")
+        self.assertEqual(classify_market_type(ufc_event, ufc_event["markets"][0]), "main_match")
+        self.assertEqual(nba_records[0]["category"], "sports")
+        self.assertEqual(nba_records[0]["league"], "nba")
+        self.assertEqual(ufc_records[0]["category"], "sports")
+        self.assertEqual(ufc_records[0]["league"], "ufc")
+
+    def test_sports_props_and_out_of_scope_mlb_are_excluded(self):
         event = {
             "id": "e1",
             "slug": "mlb-nym-sd-2026-06-06",
@@ -200,32 +252,56 @@ class CoreTest(unittest.TestCase):
                 }
             ],
         }
+        ufc_future = {
+            "id": "ufc-future",
+            "title": "Who will Jon Jones fight next?",
+            "tags": [{"slug": "ufc"}],
+            "markets": [
+                {
+                    "conditionId": "ufc-future-yes-no",
+                    "question": "Will Jon Jones fight Tom Aspinall next?",
+                    "outcomes": '["Yes","No"]',
+                    "outcomePrices": '["0.4","0.6"]',
+                }
+            ],
+        }
+        nba_prop = {
+            "id": "nba-prop",
+            "title": "Los Angeles Lakers vs. Boston Celtics",
+            "tags": [{"slug": "nba"}],
+            "markets": [
+                {
+                    "conditionId": "nba-player-points",
+                    "question": "Will LeBron James score over 24.5 points?",
+                    "outcomes": '["Over","Under"]',
+                    "outcomePrices": '["0.5","0.5"]',
+                }
+            ],
+        }
 
-        records = event_to_market_records(event)
+        self.assertIsNone(classify_market_type(event, event["markets"][0]))
+        self.assertEqual(event_to_market_records(event), [])
+        self.assertIsNone(classify_market_type(ufc_future, ufc_future["markets"][0]))
+        self.assertEqual(event_to_market_records(ufc_future), [])
+        self.assertIsNone(classify_market_type(nba_prop, nba_prop["markets"][0]))
+        self.assertEqual(event_to_market_records(nba_prop), [])
 
-        self.assertEqual(classify_market_type(event, event["markets"][0]), "main_match")
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["condition_id"], "moneyline")
-        self.assertEqual(records[0]["category"], "sports")
-        self.assertEqual(records[0]["league"], "mlb")
-        self.assertEqual(records[0]["market_type"], "main_match")
-
-    def test_mlb_moneyline_uses_actual_close_time_not_week_later_end_date(self):
+    def test_sports_moneyline_uses_actual_close_time_not_week_later_end_date(self):
         event = {
             "id": "e1",
-            "slug": "mlb-nym-sd-2026-06-07",
-            "title": "New York Mets vs. San Diego Padres",
+            "slug": "nba-lakers-celtics-2026-06-07",
+            "title": "Los Angeles Lakers vs. Boston Celtics",
             "closed": True,
             "startTime": "2026-06-07T20:10:00Z",
             "endDate": "2026-06-14T20:10:00Z",
             "closedTime": "2026-06-08T00:13:19Z",
             "finishedTimestamp": "2026-06-07T23:08:19.040393Z",
-            "tags": [{"slug": "mlb"}],
+            "tags": [{"slug": "nba"}],
             "markets": [
                 {
                     "conditionId": "moneyline",
-                    "question": "New York Mets vs. San Diego Padres",
-                    "outcomes": '["New York Mets","San Diego Padres"]',
+                    "question": "Los Angeles Lakers vs. Boston Celtics",
+                    "outcomes": '["Los Angeles Lakers","Boston Celtics"]',
                     "outcomePrices": '["1","0"]',
                     "volume": "1005821.89",
                     "gameStartTime": "2026-06-07 20:10:00+00",
@@ -243,36 +319,36 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(record["end_date"], "2026-06-07T23:27:48Z")
         self.assertEqual(parse_dt("2026-06-07 20:10:00+00"), datetime(2026, 6, 7, 20, 10, tzinfo=timezone.utc))
 
-    def test_mlb_classifier_rejects_spread_totals_props_and_futures(self):
+    def test_sports_classifier_rejects_spread_totals_props_and_futures(self):
         event = {
-            "title": "Los Angeles Angels vs. Los Angeles Dodgers",
-            "tags": [{"slug": "mlb"}],
+            "title": "Los Angeles Lakers vs. Boston Celtics",
+            "tags": [{"slug": "nba"}],
         }
         spread = {
             "conditionId": "spread",
-            "question": "Spread: Los Angeles Dodgers (-5.5)",
-            "outcomes": '["Los Angeles Dodgers","Los Angeles Angels"]',
+            "question": "Spread: Los Angeles Lakers (-5.5)",
+            "outcomes": '["Los Angeles Lakers","Boston Celtics"]',
         }
         total = {
             "conditionId": "total",
-            "question": "Los Angeles Angels vs. Los Angeles Dodgers: O/U 12.5",
+            "question": "Los Angeles Lakers vs. Boston Celtics: O/U 212.5",
             "outcomes": '["Over","Under"]',
         }
-        first_inning = {
-            "conditionId": "first",
-            "question": "Will there be a run scored in the first inning?: Los Angeles Angels vs. Los Angeles Dodgers",
+        player_points = {
+            "conditionId": "points",
+            "question": "Will LeBron James score over 24.5 points?",
             "outcomes": '["Yes","No"]',
         }
-        future_event = {"title": "Next Dodgers head coach", "tags": [{"slug": "mlb"}]}
+        future_event = {"title": "Who will Jon Jones fight next?", "tags": [{"slug": "ufc"}]}
         future = {
-            "conditionId": "coach",
-            "question": "Will Steve Kerr be the next Dodgers head coach?",
+            "conditionId": "fight-next",
+            "question": "Will Jon Jones fight Tom Aspinall next?",
             "outcomes": '["Yes","No"]',
         }
 
         self.assertIsNone(classify_market_type(event, spread))
         self.assertIsNone(classify_market_type(event, total))
-        self.assertIsNone(classify_market_type(event, first_inning))
+        self.assertIsNone(classify_market_type(event, player_points))
         self.assertIsNone(classify_market_type(future_event, future))
 
     def test_market_record_keeps_real_match_start_time(self):
@@ -589,6 +665,57 @@ class CoreTest(unittest.TestCase):
         )
 
         self.assertEqual([row["condition_id"] for row in rows], ["recent", "old"])
+
+    def test_sports_classification_set_applies_volume_floor_and_counts_leagues(self):
+        def sports_event(condition_id, *, league, title, outcomes, volume):
+            return {
+                "id": condition_id,
+                "slug": condition_id,
+                "title": title,
+                "closed": True,
+                "endDate": "2026-06-01T00:00:00Z",
+                "tags": [{"slug": league}],
+                "markets": [
+                    {
+                        "conditionId": condition_id,
+                        "question": title,
+                        "outcomes": json.dumps(outcomes),
+                        "outcomePrices": '["1","0"]',
+                        "volume": volume,
+                    }
+                ],
+            }
+
+        rows = build_classification_set(
+            [
+                sports_event(
+                    "nba-high",
+                    league="nba",
+                    title="Los Angeles Lakers vs. Boston Celtics",
+                    outcomes=["Los Angeles Lakers", "Boston Celtics"],
+                    volume=75_000,
+                ),
+                sports_event(
+                    "nba-low",
+                    league="nba",
+                    title="Denver Nuggets vs. Miami Heat",
+                    outcomes=["Denver Nuggets", "Miami Heat"],
+                    volume=20_000,
+                ),
+                sports_event(
+                    "ufc-high",
+                    league="ufc",
+                    title="Justin Gaethje vs Ilia Topuria",
+                    outcomes=["Justin Gaethje", "Ilia Topuria"],
+                    volume=230_000,
+                ),
+            ],
+            now=datetime(2026, 6, 5, tzinfo=timezone.utc),
+            sports_event_min_volume=50_000,
+        )
+
+        self.assertEqual({row["condition_id"] for row in rows}, {"nba-high", "ufc-high"})
+        self.assertEqual({row["league"] for row in rows}, {"nba", "ufc"})
 
     def test_discovery_slate_uses_progressive_window(self):
         markets = [market(f"m{i}", days_ago=10, volume=30_000) for i in range(35)]
@@ -1947,119 +2074,6 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(len(client.calls[0]), 41)
 
-    def _rescore_fixture(self, tmp, *, wins, losses):
-        """Write classification + leaderboard + profiles for one tracked wallet and
-        return (args, FakeClient) whose trades reconstruct to `wins`/`losses` markets."""
-        data_dir = Path(tmp)
-        total = wins + losses
-        classification = []
-        trades = []
-        now_ts = int(time.time())
-        start_iso = datetime.fromtimestamp(now_ts + 3600, tz=timezone.utc).isoformat().replace("+00:00", "Z")
-        end_iso = datetime.fromtimestamp(now_ts + 7200, tz=timezone.utc).isoformat().replace("+00:00", "Z")
-        for index in range(total):
-            cid = f"0x{index:064x}"
-            classification.append(
-                {
-                    "condition_id": cid,
-                    "market_type": "main_match",
-                    "title": "Dota 2: A vs B (BO3)",
-                    "question": "Dota 2: A vs B (BO3)",
-                    "outcomes": ["A", "B"],
-                    "outcome_prices": [1.0, 0.0],  # outcome 0 wins
-                    "end_date": end_iso,
-                    "match_start_time": start_iso,
-                }
-            )
-            bought = 0 if index < wins else 1  # buy winner for wins, loser for losses
-            trades.append(
-                {
-                    "conditionId": cid,
-                    "outcomeIndex": bought,
-                    "side": "BUY",
-                    "size": 1000,
-                    "price": 0.5,
-                    "timestamp": now_ts,
-                    "title": "Dota 2: A vs B (BO3)",
-                }
-            )
-        write_json(data_dir / "esports_classification_set.json", classification)
-        candidate = {
-            "wallet": "0xa",
-            "participated_market_count": total,
-            "avg_market_cash": 5000,
-            "two_sided_market_count": 0,
-            "tail_entry_market_count": 0,
-        }
-        write_json(
-            data_dir / "wallet_profiles.json",
-            [
-                {"wallet": "0xa", "grade": "A", "scoring_version": 1, "candidate": candidate},
-                {"wallet": "0xz", "grade": "C", "scoring_version": 1, "candidate": {"wallet": "0xz"}},
-            ],
-        )
-        write_json(
-            data_dir / "smart_wallet_leaderboard.json",
-            [{"wallet": "0xa", "grade": "A", "eligible_market_types": ["main_match"]}],
-        )
-
-        class FakeClient:
-            def trades_for_user(self, wallet, *, limit=500, offset=0):
-                return trades[offset : offset + limit] if normalize_wallet(wallet) == "0xa" else []
-
-            def markets_by_condition_ids(self, condition_ids, *, limit=500):
-                return []
-
-            def positions(self, wallet, *, limit=100):
-                return []
-
-        args = build_parser().parse_args(["--data-dir", str(data_dir), "rescore-wallets"])
-        return args, FakeClient()
-
-    def test_rescore_refreshes_tracked_wallet_and_keeps_others(self):
-        with TemporaryDirectory() as tmp:
-            args, client = self._rescore_fixture(tmp, wins=9, losses=1)
-
-            summary = _rescore_tracked_wallets_unlocked(args, client=client)
-
-            self.assertEqual(summary["rescored_wallet_count"], 1)
-            leaderboard = read_json(Path(tmp) / "smart_wallet_leaderboard.json", [])
-            board = {row["wallet"]: row for row in leaderboard}
-            self.assertIn("0xa", board)
-            self.assertEqual(board["0xa"]["grade"], "A")
-            self.assertEqual(board["0xa"]["esports_closed_count"], 10)
-            self.assertEqual(board["0xa"]["esports_win_count"], 9)
-            self.assertEqual(board["0xa"]["esports_loss_count"], 1)
-            # non-tracked profile is preserved untouched
-            profiles = {row["wallet"]: row for row in read_json(Path(tmp) / "wallet_profiles.json", [])}
-            self.assertIn("0xz", profiles)
-            self.assertEqual(profiles["0xa"]["scoring_version"], SCORING_VERSION)
-
-    def test_rescore_demotes_wallet_that_now_loses(self):
-        with TemporaryDirectory() as tmp:
-            args, client = self._rescore_fixture(tmp, wins=2, losses=8)
-
-            _rescore_tracked_wallets_unlocked(args, client=client)
-
-            leaderboard = read_json(Path(tmp) / "smart_wallet_leaderboard.json", [])
-            self.assertNotIn("0xa", {row["wallet"] for row in leaderboard})
-
-    def test_rescore_skips_empty_leaderboard(self):
-        with TemporaryDirectory() as tmp:
-            data_dir = Path(tmp)
-            write_json(data_dir / "smart_wallet_leaderboard.json", [])
-            write_json(data_dir / "wallet_profiles.json", [])
-
-            class FakeClient:
-                def trades_for_user(self, *a, **k):
-                    raise AssertionError("should not fetch on empty leaderboard")
-
-            args = build_parser().parse_args(["--data-dir", str(data_dir), "rescore-wallets"])
-            summary = _rescore_tracked_wallets_unlocked(args, client=FakeClient())
-
-            self.assertEqual(summary["rescored_wallet_count"], 0)
-            self.assertEqual(summary["tracked_wallet_count"], 0)
-
     def test_recent_esports_user_trades_cache_avoids_repeat_fetches(self):
         class FakeClient:
             def __init__(self):
@@ -2345,19 +2359,19 @@ class CoreTest(unittest.TestCase):
             def list_events_paginated(self, **kwargs):
                 tags = tuple(kwargs.get("tag_slugs") or ())
                 self.tag_calls.append(tags)
-                if tags == ("mlb",):
+                if tags == ("nba", "ufc"):
                     return [
                         {
-                            "id": "mlb1",
-                            "slug": "mlb1",
-                            "title": "New York Mets vs. San Diego Padres",
-                            "tags": [{"slug": "mlb"}],
+                            "id": "nba1",
+                            "slug": "nba1",
+                            "title": "Los Angeles Lakers vs. Boston Celtics",
+                            "tags": [{"slug": "nba"}],
                             "startTime": start.isoformat(),
                             "markets": [
                                 {
                                     "conditionId": "sports-m1",
-                                    "question": "New York Mets vs. San Diego Padres",
-                                    "outcomes": '["New York Mets","San Diego Padres"]',
+                                    "question": "Los Angeles Lakers vs. Boston Celtics",
+                                    "outcomes": '["Los Angeles Lakers","Boston Celtics"]',
                                     "outcomePrices": '["0.55","0.45"]',
                                     "active": True,
                                     "closed": False,
@@ -2400,7 +2414,7 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(source, "api")
         self.assertIn(("counter-strike-2", "league-of-legends", "dota-2"), client.tag_calls)
-        self.assertIn(("mlb",), client.tag_calls)
+        self.assertIn(("nba", "ufc"), client.tag_calls)
         self.assertEqual(markets["esports-m1"]["category"], "esports")
         self.assertEqual(markets["sports-m1"]["category"], "sports")
 
@@ -2409,7 +2423,8 @@ class CoreTest(unittest.TestCase):
             {"wallet": "0xgood", "participated_market_count": 1, "avg_market_cash": 1_500},
             {"wallet": "0xsmall", "participated_market_count": 1, "avg_market_cash": 1_499},
             {"wallet": "0xtwosided", "participated_market_count": 10, "avg_market_cash": 1_500, "two_sided_market_count": 1},
-            {"wallet": "0xchurnok", "participated_market_count": 10, "avg_market_cash": 1_500, "high_churn_market_count": 10, "late_entry_market_count": 0},
+            {"wallet": "0xchurn", "participated_market_count": 10, "avg_market_cash": 1_500, "high_churn_market_count": 6, "late_entry_market_count": 0},
+            {"wallet": "0xchurnok", "participated_market_count": 10, "avg_market_cash": 1_500, "high_churn_market_count": 4, "late_entry_market_count": 0},
             {"wallet": "0xlateok", "participated_market_count": 10, "avg_market_cash": 1_500, "late_entry_market_count": 5},
             {"wallet": "0xlate", "participated_market_count": 10, "avg_market_cash": 1_500, "late_entry_market_count": 6},
             {"wallet": "0xtailone", "participated_market_count": 10, "avg_market_cash": 1_500, "tail_entry_market_count": 1},
@@ -2423,6 +2438,7 @@ class CoreTest(unittest.TestCase):
         )
 
         # 0xtailone (1/10 tail rate) is kept; 0xtail (6/10) exceeds the rate gate.
+        # 0xchurnok (4/10 high-churn) is kept; 0xchurn (6/10) exceeds the 0.5 churn gate.
         self.assertEqual(
             [row["wallet"] for row in filtered],
             ["0xgood", "0xchurnok", "0xlateok", "0xlate", "0xtailone"],
@@ -2589,6 +2605,7 @@ class CoreTest(unittest.TestCase):
             "0xsportslate": {
                 "wallet": "0xsportslate",
                 "category": "sports",
+                "league": "nba",
                 "grade": "A",
                 "eligible_market_types": ["main_match"],
                 "last_esports_trade_at": now,
@@ -2598,11 +2615,13 @@ class CoreTest(unittest.TestCase):
                 "median_market_roi": 0.05,
                 "esports_roi": 0.05,
                 "pre_match_entry_rate": 0.0,
-                "candidate": {"participated_market_count": 1, "avg_market_cash": 2_000, "two_sided_market_count": 0, "tail_entry_market_count": 0},
+                "esports_condition_ids": [f"nba-{index}" for index in range(5)],
+                "candidate": {"participated_market_count": 5, "avg_market_cash": 2_000, "two_sided_market_count": 0, "tail_entry_market_count": 0},
             },
             "0xsportsnegedge": {
                 "wallet": "0xsportsnegedge",
                 "category": "sports",
+                "league": "nba",
                 "grade": "A",
                 "eligible_market_types": ["main_match"],
                 "last_esports_trade_at": now,
@@ -2612,11 +2631,13 @@ class CoreTest(unittest.TestCase):
                 "median_market_roi": 0.8,
                 "esports_roi": 0.8,
                 "pre_match_entry_rate": 1.0,
-                "candidate": {"participated_market_count": 1, "avg_market_cash": 2_000, "two_sided_market_count": 0, "tail_entry_market_count": 0},
+                "esports_condition_ids": [f"nba-{index}" for index in range(5)],
+                "candidate": {"participated_market_count": 5, "avg_market_cash": 2_000, "two_sided_market_count": 0, "tail_entry_market_count": 0},
             },
             "0xsportscapedge": {
                 "wallet": "0xsportscapedge",
                 "category": "sports",
+                "league": "nba",
                 "grade": "A",
                 "eligible_market_types": ["main_match"],
                 "per_type": {
@@ -2635,20 +2656,29 @@ class CoreTest(unittest.TestCase):
                 "median_market_roi": 0.8,
                 "esports_roi": 0.8,
                 "pre_match_entry_rate": 0.8,
-                "candidate": {"participated_market_count": 1, "avg_market_cash": 2_000, "two_sided_market_count": 0, "tail_entry_market_count": 0},
+                "esports_condition_ids": [f"nba-{index}" for index in range(5)],
+                "candidate": {"participated_market_count": 5, "avg_market_cash": 2_000, "two_sided_market_count": 0, "tail_entry_market_count": 0},
             },
         }
 
-        ranked = build_leaderboard_from_profiles(profiles, now_ts=now, min_participated_markets=3)
+        ranked = build_leaderboard_from_profiles(
+            profiles,
+            now_ts=now,
+            min_participated_markets=3,
+            league_event_counts={"nba": 10},
+        )
         by_wallet = {row["wallet"]: row for row in ranked}
 
         self.assertEqual(by_wallet["0xpass"]["eligible_market_types"], ["main_match"])
         self.assertIn("0xsportscapedge", by_wallet)
-        self.assertNotIn("0xsportslate", by_wallet)
+        # Pre-match entry rate is no longer a sports gate (aligned with esports): a low
+        # pre-match-rate wallet still qualifies on capital edge alone.
+        self.assertIn("0xsportslate", by_wallet)
         self.assertNotIn("0xsportsnegedge", by_wallet)
         self.assertNotIn("0xlowroi", by_wallet)
         self.assertNotIn("0xnegcapedge", by_wallet)
-        self.assertNotIn("0xlate", by_wallet)
+        self.assertIn("0xlate", by_wallet)
+        self.assertEqual(by_wallet["0xlate"]["eligible_market_types"], ["main_match"])
 
     def test_cached_profile_receives_fresh_candidate_metadata(self):
         cached = {"wallet": "0xabc", "grade": "A", "candidate": {"late_entry_market_count": 0}}
@@ -2817,23 +2847,57 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual([row["wallet"] for row in leaderboard], ["0xactive"])
 
-    def test_sports_leaderboard_allows_single_recent_discovery_market(self):
-        now = 100 + 10 * 86400
+    def test_sports_leaderboard_requires_participation_rate_and_skips_recency_gate(self):
+        now = 100 + 120 * 86400
         profiles_by_wallet = {
-            "0xsports": {
-                "wallet": "0xsports",
+            "0xactive": {
+                "wallet": "0xactive",
                 "category": "sports",
+                "league": "nba",
                 "grade": "A",
                 "scoring_version": SCORING_VERSION,
                 "last_esports_trade_at": 100,
                 "eligible_market_types": ["main_match"],
+                "esports_condition_ids": [f"nba-{index}" for index in range(5)],
+                "candidate": {
+                    "participated_market_count": 5,
+                    "avg_market_cash": 6_000,
+                    "two_sided_market_count": 0,
+                    "tail_entry_market_count": 0,
+                },
+            },
+            "0xtiny": {
+                "wallet": "0xtiny",
+                "category": "sports",
+                "league": "ufc",
+                "grade": "A",
+                "scoring_version": SCORING_VERSION,
+                "last_esports_trade_at": 100,
+                "eligible_market_types": ["main_match"],
+                "esports_condition_ids": ["ufc-1"],
                 "candidate": {
                     "participated_market_count": 1,
                     "avg_market_cash": 6_000,
                     "two_sided_market_count": 0,
                     "tail_entry_market_count": 0,
                 },
-            }
+            },
+            "0xlowrate": {
+                "wallet": "0xlowrate",
+                "category": "sports",
+                "league": "ufc",
+                "grade": "A",
+                "scoring_version": SCORING_VERSION,
+                "last_esports_trade_at": 100,
+                "eligible_market_types": ["main_match"],
+                "esports_condition_ids": [f"ufc-low-{index}" for index in range(5)],
+                "candidate": {
+                    "participated_market_count": 5,
+                    "avg_market_cash": 6_000,
+                    "two_sided_market_count": 0,
+                    "tail_entry_market_count": 0,
+                },
+            },
         }
 
         leaderboard = build_leaderboard_from_profiles(
@@ -2843,9 +2907,15 @@ class CoreTest(unittest.TestCase):
             min_avg_market_cash=5_000,
             require_tail_entry_field=True,
             require_current_scoring_version=True,
+            league_event_counts={"nba": 10, "ufc": 20},
         )
 
-        self.assertEqual([row["wallet"] for row in leaderboard], ["0xsports"])
+        self.assertEqual([row["wallet"] for row in leaderboard], ["0xactive"])
+        self.assertEqual(leaderboard[0]["league"], "nba")
+        self.assertEqual(leaderboard[0]["league_label"], "NBA")
+        self.assertEqual(leaderboard[0]["participated_events"], 5)
+        self.assertEqual(leaderboard[0]["eligible_event_count"], 10)
+        self.assertEqual(leaderboard[0]["participation_rate"], 0.5)
 
     def test_sports_leaderboard_uses_lower_recent_cash_floor(self):
         now = 100 + 10 * 86400
@@ -2853,10 +2923,12 @@ class CoreTest(unittest.TestCase):
             "0xsports": {
                 "wallet": "0xsports",
                 "category": "sports",
+                "league": "ufc",
                 "grade": "A",
                 "scoring_version": SCORING_VERSION,
                 "last_esports_trade_at": 100,
                 "eligible_market_types": ["main_match"],
+                "esports_condition_ids": [f"ufc-{index}" for index in range(5)],
                 "candidate": {
                     "participated_market_count": 10,
                     "avg_market_cash": 3_800,
@@ -2873,6 +2945,7 @@ class CoreTest(unittest.TestCase):
             min_avg_market_cash=5_000,
             require_tail_entry_field=True,
             require_current_scoring_version=True,
+            league_event_counts={"ufc": 10},
         )
 
         self.assertEqual([row["wallet"] for row in leaderboard], ["0xsports"])
@@ -3059,18 +3132,49 @@ class CoreTest(unittest.TestCase):
                 "candidate": {"participated_market_count": 10, "avg_market_cash": 2_000, "two_sided_market_count": 0},
             },
             "0xscalper": {
+                # High sold rate AND profit depends on in-game swing selling (actual >> hold):
+                # excluded as swing_dependent, not for selling per se.
                 "wallet": "0xscalper",
                 "grade": "A",
                 "esports_roi": 0.4,
                 "positive_market_rate": 0.99,
                 "median_entry_price": 0.55,
                 "last_esports_trade_at": 100,
+                "actual_minus_hold_pnl_rate": 0.5,
                 "historical_trade_behavior_market_count": 6,
                 "sold_before_resolution_market_count": 4,
                 "sold_before_resolution_market_rate": 4 / 6,
                 "two_sided_trade_market_count": 0,
                 "two_sided_trade_market_rate": 0.0,
                 "candidate": {"participated_market_count": 10, "avg_market_cash": 2_000, "two_sided_market_count": 0},
+            },
+            "0xprofittaker": {
+                # High sold rate but actual ≈ hold: takes profit on near-decided winners
+                # (~0.99) without depending on swing trading -> followable, kept.
+                "wallet": "0xprofittaker",
+                "grade": "A",
+                "esports_roi": 0.4,
+                "positive_market_rate": 0.99,
+                "median_entry_price": 0.55,
+                "last_esports_trade_at": 100,
+                "actual_minus_hold_pnl_rate": 0.0,
+                "historical_trade_behavior_market_count": 6,
+                "sold_before_resolution_market_count": 5,
+                "sold_before_resolution_market_rate": 5 / 6,
+                "two_sided_trade_market_count": 0,
+                "two_sided_trade_market_rate": 0.0,
+                "candidate": {"participated_market_count": 10, "avg_market_cash": 2_000, "two_sided_market_count": 0, "high_churn_market_count": 0},
+            },
+            "0xhftbot": {
+                # Re-trades most of its markets 20+ times: bot / market-maker, edge isn't
+                # copyable by following one entry -> excluded on high_churn rate.
+                "wallet": "0xhftbot",
+                "grade": "A",
+                "esports_roi": 0.4,
+                "positive_market_rate": 0.99,
+                "median_entry_price": 0.55,
+                "last_esports_trade_at": 100,
+                "candidate": {"participated_market_count": 10, "avg_market_cash": 2_000, "two_sided_market_count": 0, "high_churn_market_count": 8},
             },
             "0xsmallbehavior": {
                 "wallet": "0xsmallbehavior",
@@ -3116,6 +3220,7 @@ class CoreTest(unittest.TestCase):
                 "0xlateentry",
                 "0xoccasionalsell",
                 "0xsmallbehavior",
+                "0xprofittaker",
             },
         )
 
@@ -3441,6 +3546,120 @@ class CoreTest(unittest.TestCase):
         self.assertEqual([row["id"] for row in trades], ["t2", "t1"])
         self.assertEqual(client.calls, [0])
 
+    def test_follow_stake_conviction_tiers_gate_and_balance(self):
+        # Wallet whose big bets win more (capWin >= win): a bet >= 2x its own typical size
+        # upsizes to the conviction stake.
+        informative = {
+            "median_position_size": 500,
+            "capital_weighted_win_rate": 0.74,
+            "positive_market_rate": 0.66,
+        }
+        stake, tier, ratio = follow_stake_for_signal(
+            informative, wallet_trade_size=5000, market_type="main_match",
+            normal_stake=1, conviction_stake=5, conviction_multiple=2.0,
+            conviction_gate=True, available_balance=1000,
+        )
+        self.assertEqual((stake, tier), (5, "conviction"))
+        self.assertEqual(ratio, 10.0)  # 5000 / 500, judged against the wallet's OWN typical
+
+        # Same big bet, but this wallet's big bets win LESS (capWin < win) -> gate keeps it normal.
+        uninformative = {**informative, "capital_weighted_win_rate": 0.60, "positive_market_rate": 0.70}
+        stake, tier, _ = follow_stake_for_signal(
+            uninformative, wallet_trade_size=5000, market_type="main_match",
+            normal_stake=1, conviction_stake=5, conviction_multiple=2.0,
+            conviction_gate=True, available_balance=1000,
+        )
+        self.assertEqual((stake, tier), (1, "normal"))
+
+        # Normal-sized bet (< 2x typical) -> normal stake.
+        stake, tier, _ = follow_stake_for_signal(
+            informative, wallet_trade_size=600, market_type="main_match",
+            normal_stake=1, conviction_stake=5, conviction_multiple=2.0,
+            conviction_gate=True, available_balance=1000,
+        )
+        self.assertEqual((stake, tier), (1, "normal"))
+
+        # Balance can't cover the conviction stake -> downgrade to normal.
+        stake, tier, _ = follow_stake_for_signal(
+            informative, wallet_trade_size=5000, market_type="main_match",
+            normal_stake=1, conviction_stake=5, conviction_multiple=2.0,
+            conviction_gate=True, available_balance=3,
+        )
+        self.assertEqual((stake, tier), (1, "downgraded"))
+
+        # Balance can't even cover the normal stake -> skip.
+        stake, tier, _ = follow_stake_for_signal(
+            informative, wallet_trade_size=5000, market_type="main_match",
+            normal_stake=1, conviction_stake=5, conviction_multiple=2.0,
+            conviction_gate=True, available_balance=0.5,
+        )
+        self.assertEqual((stake, tier), (0.0, "skipped"))
+
+    def test_follow_stake_uses_per_type_typical_and_missing_falls_back(self):
+        row = {
+            "median_position_size": 5000,  # overall typical is large
+            "capital_weighted_win_rate": 0.8,
+            "positive_market_rate": 0.6,
+            "per_type": {"game_winner": {"median_position_size": 200, "capital_weighted_win_rate": 0.8, "positive_market_rate": 0.6}},
+        }
+        # 600 is only 0.12x the overall typical, but 3x the game_winner typical -> conviction.
+        stake, tier, ratio = follow_stake_for_signal(
+            row, wallet_trade_size=600, market_type="game_winner",
+            normal_stake=1, conviction_stake=5, conviction_multiple=2.0,
+            conviction_gate=True, available_balance=1000,
+        )
+        self.assertEqual((stake, tier), (5, "conviction"))
+        self.assertEqual(ratio, 3.0)
+        # No typical size known -> stays normal (never upsize on unknown conviction).
+        stake, tier, _ = follow_stake_for_signal(
+            {}, wallet_trade_size=5000, market_type="main_match",
+            normal_stake=1, conviction_stake=5, conviction_multiple=2.0,
+            conviction_gate=True, available_balance=1000,
+        )
+        self.assertEqual((stake, tier), (1, "normal"))
+
+    def test_process_follow_trades_applies_conviction_stake_to_signal(self):
+        now = 1000
+        market = {
+            "condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [0.5, 0.5],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "Match", "market_type": "main_match",
+        }
+        trades = [{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 5000, "timestamp": now}]
+        wallet_row = {"median_position_size": 500, "capital_weighted_win_rate": 0.74, "positive_market_rate": 0.66}
+        signals, _ = process_follow_trades(
+            [], wallet="0xA", trades=trades, markets_by_condition={"m1": market}, now_ts=now,
+            stake_usdc=1, max_follow_legs=10, max_slippage=0.05,
+            wallet_row=wallet_row, conviction_stake_usdc=5, conviction_size_multiple=2.0,
+            conviction_gate=True, bankroll_usdc=1000,
+        )
+        self.assertEqual(signals[0]["conviction_tier"], "conviction")
+        self.assertEqual(signals[0]["signal_stake"], 5)
+        self.assertEqual(signals[0]["legs"][0]["stake"], 5)
+
+    def test_process_follow_trades_caps_conviction_adds_by_bankroll(self):
+        now = 1000
+        market = {
+            "condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [0.5, 0.5],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "Match", "market_type": "main_match",
+        }
+        trades = [
+            {"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 5000, "timestamp": now},
+            {"id": "b2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 5000, "timestamp": now + 1},
+        ]
+        wallet_row = {"median_position_size": 500, "capital_weighted_win_rate": 0.74, "positive_market_rate": 0.66}
+
+        signals, stats = process_follow_trades(
+            [], wallet="0xA", trades=trades, markets_by_condition={"m1": market}, now_ts=now,
+            stake_usdc=1, max_follow_legs=10, max_slippage=0.05,
+            wallet_row=wallet_row, conviction_stake_usdc=5, conviction_size_multiple=2.0,
+            conviction_gate=True, bankroll_usdc=6,
+        )
+
+        self.assertEqual([leg["stake"] for leg in signals[0]["legs"]], [5, 1])
+        self.assertEqual(stats["insufficient_balance_count"], 1)
+
     def test_follow_v2_buy_legs_sell_mirror_exits_by_default(self):
         now = 1000
         market = {
@@ -3530,7 +3749,7 @@ class CoreTest(unittest.TestCase):
         self.assertTrue(signals[0]["detected_after_start"])
         self.assertTrue(signals[0]["legs"][0]["detected_after_start"])
 
-    def test_follow_ignores_after_start_trade_detected_after_start(self):
+    def test_follow_accepts_after_start_trade_when_pre_match_not_required(self):
         start = 1000
         now = start + 180
         market = {
@@ -3560,11 +3779,14 @@ class CoreTest(unittest.TestCase):
             stake_usdc=1,
             max_follow_legs=10,
             max_slippage=0.05,
+            require_pre_match=False,
             post_start_grace_seconds=300,
         )
 
-        self.assertEqual(signals, [])
-        self.assertEqual(stats["ignored_trade_count"], 1)
+        self.assertEqual(stats["new_leg_count"], 1)
+        self.assertEqual(len(signals), 1)
+        self.assertTrue(signals[0]["detected_after_start"])
+        self.assertTrue(signals[0]["legs"][0]["detected_after_start"])
 
     def test_follow_v2_gates_new_signals_by_market_type(self):
         now = 1000
@@ -4295,6 +4517,8 @@ class CoreTest(unittest.TestCase):
                         {
                             "condition_id": "mlb1",
                             "category": "sports",
+                            "league": "nba",
+                            "league_label": "NBA",
                             "title": "Los Angeles Dodgers vs. San Diego Padres",
                             "question": "Los Angeles Dodgers vs. San Diego Padres",
                             "match_start_time": start.isoformat(),
@@ -4308,8 +4532,8 @@ class CoreTest(unittest.TestCase):
                 dashboard_module,
                 "_load_team_logo_cache",
                 return_value={
-                    "mlb los angeles dodgers": "/team_logos/dodgers.png",
-                    "mlb san diego padres": "/team_logos/padres.png",
+                    "nba los angeles dodgers": "/team_logos/dodgers.png",
+                    "nba san diego padres": "/team_logos/padres.png",
                 },
             ):
                 events = build_events(data_dir)
@@ -4318,7 +4542,7 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(
                 events["events"][0]["match_parts"],
                 {
-                    "game": "MLB",
+                    "game": "NBA",
                     "teamA": "Los Angeles Dodgers",
                     "teamB": "San Diego Padres",
                     "meta": "Moneyline",
@@ -4342,8 +4566,10 @@ class CoreTest(unittest.TestCase):
                         "updated_at": int(time.time()),
                         "markets": [
                             {
-                                "condition_id": "mlb1",
+                                "condition_id": "nba1",
                                 "category": "sports",
+                                "league": "nba",
+                                "league_label": "NBA",
                                 "event_slug": "pytest-bears-kings-2026-06-08",
                                 "title": "Pytest Expansion Bears vs. Pytest Sample Kings",
                                 "match_start_time": start.isoformat(),
@@ -4356,8 +4582,11 @@ class CoreTest(unittest.TestCase):
                 def fake_fetch_html(slug):
                     calls.append(slug)
                     return (
-                        "url=https%3A%2F%2Fpolymarket-upload.s3.us-east-2.amazonaws.com%2F"
-                        "team_logos%2Fmlb_pytest-expansion-bears.png"
+                        '<img alt="Expansion Bears" srcset="/_next/image?url=https%3A%2F%2F'
+                        'polymarket-upload.s3.us-east-2.amazonaws.com%2Fopaque-bears-logo.png&amp;w=96&amp;q=75">'
+                        '<img alt="Pytest Sample Kings" srcset="/_next/image?url=https%3A%2F%2F'
+                        'polymarket-upload.s3.us-east-2.amazonaws.com%2Fsample-kings-logo.png&amp;w=96&amp;q=75">'
+                        '<img alt="NBA" src="https://polymarket-upload.s3.us-east-2.amazonaws.com/Repetitive-markets/NBA.jpg">'
                     )
 
                 def fake_fetch_logo_bytes(_url, _timeout_seconds):
@@ -4374,7 +4603,8 @@ class CoreTest(unittest.TestCase):
 
                 self.assertEqual(summary["watched_event_count"], 1)
                 self.assertEqual(calls, ["pytest-bears-kings-2026-06-08"])
-                self.assertEqual(logo_cache["teams"]["mlb pytest expansion bears"], local_url)
+                self.assertTrue(logo_cache["teams"]["pytest sample kings"].startswith("/team_logos/"))
+                self.assertNotIn("nba", logo_cache["teams"])
             finally:
                 if before_json is None:
                     logo_path.unlink(missing_ok=True)
@@ -4692,6 +4922,78 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(len(snapshot["results"]), 0)
             self.assertEqual({signal["outcome_index"] for signal in snapshot["open_signals"]}, {0, 1})
             self.assertTrue(all(signal["contested"] for signal in snapshot["open_signals"]))
+
+    def test_follow_tick_logs_insufficient_balance_count(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now = datetime.now(timezone.utc)
+            start = now + timedelta(hours=2)
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [{"wallet": "0xa", "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.save_follow_snapshot(
+                wallet_trade_state={
+                    "esports:0xa": {"last_trade_cursor": {"timestamp": 10, "id": "old"}, "last_seen_at": 10},
+                },
+                open_signals=[],
+                result_events=[],
+                performance={},
+            )
+
+            class FakeClient:
+                def list_events_paginated(self, **_kwargs):
+                    return [
+                        {
+                            "id": "event1",
+                            "slug": "event1",
+                            "title": "Dota 2: Team A vs Team B (BO3)",
+                            "tags": [{"slug": "dota-2"}],
+                            "startTime": start.isoformat(),
+                            "markets": [
+                                {
+                                    "conditionId": "m1",
+                                    "question": "Dota 2: Team A vs Team B (BO3)",
+                                    "outcomes": ["Team A", "Team B"],
+                                    "outcomePrices": ["0.50", "0.50"],
+                                    "active": True,
+                                    "closed": False,
+                                    "volume": 100000,
+                                    "startTime": start.isoformat(),
+                                }
+                            ],
+                        }
+                    ]
+
+                def trades_for_user(self, _wallet, **_kwargs):
+                    return [{"id": "b1", "timestamp": 20, "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 10}]
+
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "--data-dir",
+                    str(data_dir),
+                    "follow",
+                    "--stake-usdc",
+                    "1",
+                    "--bankroll-usdc",
+                    "0.5",
+                    "--gamma-pages",
+                    "1",
+                    "--user-trades-max-pages",
+                    "1",
+                    "--max-workers",
+                    "1",
+                ]
+            )
+
+            summary = command_follow(args, client=FakeClient(), emit=False)
+            run_log = read_jsonl(follow_run_log_path(data_dir))
+
+            self.assertEqual(summary["new_signal_count"], 0)
+            self.assertEqual(summary["insufficient_balance_count"], 1)
+            self.assertEqual(run_log[-1]["insufficient_balance_count"], 1)
 
     def test_dashboard_short_addr_and_session_token(self):
         self.assertEqual(short_addr("0x1234567890abcdef1234567890abcdef12345678"), "0x123...678")
@@ -5051,6 +5353,38 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(calls[0][1].parent, data_dir / "logs" / "follow")
             self.assertEqual(read_follow_control(follow_dir)["runner"]["pid"], 4321)
 
+    def test_dashboard_runner_start_accepts_required_stake(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            follow_dir = data_dir / "follow"
+            calls = []
+
+            class FakeProcess:
+                pid = 4321
+                pgid = 4321
+
+            def fake_starter(command, log_path):
+                calls.append((command, log_path))
+                return FakeProcess()
+
+            status = start_runner(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    follow_dir=follow_dir,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                    runner_process_lister=lambda: [],
+                    runner_process_starter=fake_starter,
+                ),
+                stake_usdc=2.5,
+            )
+
+            stake_index = calls[0][0].index("--stake-usdc") + 1
+            self.assertEqual(calls[0][0][stake_index], "2.5")
+            self.assertEqual(status["stake_usdc"], 2.5)
+            self.assertEqual(read_follow_control(follow_dir)["runner"]["stake_usdc"], 2.5)
+
     def test_dashboard_wallet_refresh_is_category_scoped(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp) / "data"
@@ -5268,6 +5602,65 @@ class CoreTest(unittest.TestCase):
                 self.assertEqual(payload["error"], "runner_already_running")
                 self.assertEqual(payload["data"]["pid"], 888)
                 conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_runner_start_api_requires_stake(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            calls = []
+
+            class FakeProcess:
+                pid = 4321
+                pgid = 4321
+
+            def fake_starter(command, log_path):
+                calls.append((command, log_path))
+                return FakeProcess()
+
+            server = create_server(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                    runner_process_lister=lambda: [],
+                    runner_process_starter=fake_starter,
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                token = make_session_token("admin", "secret", now=int(datetime.now(timezone.utc).timestamp()))
+                cookie = f"poly_fight_session={token}"
+
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("POST", "/api/runner/start", headers={"Cookie": cookie})
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+                self.assertEqual(response.status, 400)
+                self.assertEqual(payload["error"], "invalid_stake_usdc")
+                self.assertEqual(calls, [])
+
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/runner/start",
+                    body=json.dumps({"stake_usdc": 2.5}),
+                    headers={"Cookie": cookie, "Content-Type": "application/json"},
+                )
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+                self.assertEqual(response.status, 202)
+                self.assertEqual(payload["data"]["stake_usdc"], 2.5)
+                self.assertIn("--stake-usdc", calls[0][0])
+                self.assertEqual(calls[0][0][calls[0][0].index("--stake-usdc") + 1], "2.5")
             finally:
                 server.shutdown()
                 server.server_close()
@@ -5526,6 +5919,40 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(page["follows"][0]["match_start_time"], "2026-06-06T12:00:00Z")
             self.assertEqual(detail["title"], "Counter-Strike: A vs B")
             self.assertEqual(detail["match_start_time"], "2026-06-06T12:00:00Z")
+
+    def test_dashboard_follows_expose_conviction_stake_fields(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "sig-open",
+                        "wallet": "0xabc",
+                        "condition_id": "m1",
+                        "status": "open",
+                        "event_title": "Counter-Strike: A vs B",
+                        "conviction_tier": "conviction",
+                        "conviction_ratio": 3.25,
+                        "signal_stake": 5,
+                        "created_at": 100,
+                        "legs": [{"stake": 5}, {"stake": 1}],
+                    }
+                ],
+                result_events=[],
+                performance={"wallets": {}, "total": {}},
+            )
+
+            page = build_follows(data_dir, page=1, size=10)
+            detail = build_follow_detail(data_dir, "m1")
+
+            row = page["follows"][0]
+            self.assertEqual(row["conviction_tier_counts"], {"conviction": 1})
+            self.assertEqual(row["signal_stake_min"], 5.0)
+            self.assertEqual(row["signal_stake_max"], 5.0)
+            self.assertEqual(detail["wallets"][0]["signals"][0]["conviction_tier"], "conviction")
+            self.assertEqual(detail["wallets"][0]["signals"][0]["signal_stake"], 5)
 
     def test_dashboard_rows_include_cached_team_logos(self):
         with TemporaryDirectory() as tmp:
@@ -5964,6 +6391,11 @@ class CoreTest(unittest.TestCase):
                 {
                     "wallet": "0xsssssssssssssssssssssssssssssssssssssss1".replace("s", hex(index + 10)[2]),
                     "category": "sports",
+                    "league": "nba" if index < 2 else "ufc",
+                    "league_label": "NBA" if index < 2 else "UFC",
+                    "participation_rate": 0.5 + index * 0.1,
+                    "participated_events": 5 + index,
+                    "eligible_event_count": 10,
                     "grade": "A",
                     "esports_win_count": 8,
                     "esports_loss_count": 0,
@@ -5988,6 +6420,14 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(ranks_by_category["sports"], [1, 2, 3])
             self.assertEqual(wallets["by_category"]["esports"]["count"], 3)
             self.assertEqual(wallets["by_category"]["sports"]["count"], 3)
+            first_sports = next(row for row in wallets["wallets"] if row["category"] == "sports")
+            self.assertEqual(first_sports["league"], "nba")
+            self.assertEqual(first_sports["league_label"], "NBA")
+            self.assertEqual(first_sports["game"], "nba")
+            self.assertEqual(first_sports["game_label"], "NBA")
+            self.assertEqual(first_sports["participated_events"], 5)
+            self.assertEqual(first_sports["eligible_event_count"], 10)
+            self.assertEqual(first_sports["participation_rate"], 0.5)
 
     def test_dashboard_events_marks_outcome_index_zero_contested(self):
         with TemporaryDirectory() as tmp:
@@ -6062,6 +6502,39 @@ class CoreTest(unittest.TestCase):
             events = build_events(data_dir)
 
             self.assertEqual([row["condition_id"] for row in events["events"]], ["early", "late"])
+
+    def test_dashboard_events_include_sports_plus_zero_timezone_starts(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now_ts = int(time.time())
+            start = datetime.fromtimestamp(now_ts + 3600, timezone.utc).isoformat().replace("+00:00", "+00")
+            write_json(
+                data_dir / "follow" / "active_market_cache.json",
+                {
+                    "updated_at": now_ts,
+                    "markets": [
+                        {
+                            "condition_id": "sports_mlb",
+                            "category": "sports",
+                            "league": "ufc",
+                            "league_label": "UFC",
+                            "title": "Seattle Mariners vs. Baltimore Orioles",
+                            "match_start_time": start,
+                            "market_type": "main_match",
+                            "market_type_label": "主盘",
+                        }
+                    ],
+                },
+            )
+
+            events = build_events(data_dir)
+
+            self.assertEqual(events["count"], 1)
+            self.assertEqual(events["events"][0]["condition_id"], "sports_mlb")
+            self.assertEqual(events["events"][0]["category"], "sports")
+            self.assertEqual(events["events"][0]["league"], "ufc")
+            self.assertEqual(events["events"][0]["league_label"], "UFC")
+            self.assertEqual(events["events"][0]["match_parts"]["game"], "UFC")
 
     def test_dashboard_events_sort_followed_markets_first(self):
         with TemporaryDirectory() as tmp:
@@ -6440,7 +6913,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.discovery_source, "trades")
         self.assertEqual(args.target_markets, 20)
         self.assertIsNone(args.max_markets_per_run)
-        self.assertEqual(args.discovery_lookback_days, 14)
+        self.assertIsNone(args.discovery_lookback_days)
         self.assertEqual(args.market_batch_size, 50)
         self.assertEqual(args.market_batch_count, 2)
         self.assertIsNone(args.market_batch_index)
@@ -6451,7 +6924,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.max_requests_per_second, 10)
         self.assertEqual(args.request_burst, 5)
         self.assertEqual(args.max_retry_after_seconds, 60)
-        self.assertEqual(args.classification_lookback_days, 14)
+        self.assertIsNone(args.classification_lookback_days)
         self.assertEqual(args.max_esports_closed_positions_per_wallet, 100)
         self.assertEqual(args.closed_position_market_chunk_size, 50)
         self.assertEqual(args.user_history_trades_limit, 500)
@@ -6473,6 +6946,18 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(args.command, "collect")
         self.assertEqual(args.max_profiles_per_run, 3)
+
+    def test_rescore_command_is_not_registered(self):
+        parser = build_parser()
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["rescore-wallets"])
+
+    def test_run_does_not_accept_wallet_rescore_interval(self):
+        parser = build_parser()
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["run", "--stake-usdc", "1", "--wallet-rescore-hours", "2"])
 
     def test_collect_command_accepts_batched_discovery_options(self):
         parser = build_parser()
@@ -6524,7 +7009,7 @@ class CoreTest(unittest.TestCase):
                 for index in range(3):
                     self.user_trades.append(
                         {
-                            "conditionId": f"mlb{index}",
+                            "conditionId": f"nba{index}",
                             "outcomeIndex": 0,
                             "side": "BUY",
                             "size": 4000,
@@ -6552,17 +7037,17 @@ class CoreTest(unittest.TestCase):
                     events.append(
                         {
                             "id": f"e{index}",
-                            "slug": f"mlb-a-b-{index}",
-                            "title": f"Atlanta Braves vs. Cincinnati Reds {index}",
+                            "slug": f"nba-a-b-{index}",
+                            "title": f"Los Angeles Lakers vs. Boston Celtics {index}",
                             "closed": True,
                             "startTime": "2026-06-01T00:00:00Z",
                             "endDate": "2026-06-08T00:00:00Z",
-                            "tags": [{"slug": "mlb"}],
+                            "tags": [{"slug": "nba"}],
                             "markets": [
                                 {
-                                    "conditionId": f"mlb{index}",
-                                    "question": f"Atlanta Braves vs. Cincinnati Reds {index}",
-                                    "outcomes": json.dumps(["Atlanta Braves", f"Cincinnati Reds {index}"]),
+                                    "conditionId": f"nba{index}",
+                                    "question": f"Los Angeles Lakers vs. Boston Celtics {index}",
+                                    "outcomes": json.dumps(["Los Angeles Lakers", f"Boston Celtics {index}"]),
                                     "outcomePrices": '["1","0"]',
                                     "volume": 500_000,
                                     "gameStartTime": "2026-06-01 00:00:00+00",
@@ -6618,11 +7103,93 @@ class CoreTest(unittest.TestCase):
                 _command_build_leaderboard_unlocked(args, client=client)
 
             backfill.assert_not_called()
-            self.assertEqual(client.tag_slugs, ("mlb",))
+            self.assertEqual(client.tag_slugs, ("nba", "ufc"))
             self.assertEqual(client.max_end_dates, [None])
             classification = read_json(Path(tmp) / "sports" / "esports_classification_set.json", [])
             self.assertEqual(len(classification), 3)
             self.assertTrue(all(row["end_date"] == "2026-06-01T03:00:00Z" for row in classification))
+
+    def test_sports_collect_honors_explicit_fourteen_day_lookback(self):
+        now = datetime.now(timezone.utc)
+        recent_end = (now - timedelta(days=7)).isoformat()
+        old_end = (now - timedelta(days=30)).isoformat()
+
+        class FakeClient:
+            def list_events_paginated(self, **kwargs):
+                self.tag_slugs = kwargs.get("tag_slugs")
+                return [
+                    {
+                        "id": "recent",
+                        "slug": "recent",
+                        "title": "Los Angeles Lakers vs. Boston Celtics",
+                        "closed": True,
+                        "endDate": recent_end,
+                        "tags": [{"slug": "nba"}],
+                        "markets": [
+                            {
+                                "conditionId": "recent",
+                                "question": "Los Angeles Lakers vs. Boston Celtics",
+                                "outcomes": json.dumps(["Los Angeles Lakers", "Boston Celtics"]),
+                                "outcomePrices": '["1","0"]',
+                                "volume": 500_000,
+                            }
+                        ],
+                    },
+                    {
+                        "id": "old",
+                        "slug": "old",
+                        "title": "Denver Nuggets vs. Miami Heat",
+                        "closed": True,
+                        "endDate": old_end,
+                        "tags": [{"slug": "nba"}],
+                        "markets": [
+                            {
+                                "conditionId": "old",
+                                "question": "Denver Nuggets vs. Miami Heat",
+                                "outcomes": json.dumps(["Denver Nuggets", "Miami Heat"]),
+                                "outcomePrices": '["1","0"]',
+                                "volume": 500_000,
+                            }
+                        ],
+                    },
+                ]
+
+            def trades_for_market(self, condition_id, *, limit, offset, min_trade_cash):
+                return []
+
+            def trades_for_user(self, wallet, *, limit=500, offset=0):
+                return []
+
+            def positions(self, wallet, *, limit=100):
+                return []
+
+        with TemporaryDirectory() as tmp:
+            args = build_parser().parse_args(
+                [
+                    "--data-dir",
+                    str(Path(tmp) / "sports"),
+                    "collect",
+                    "--category",
+                    "sports",
+                    "--classification-lookback-days",
+                    "14",
+                    "--discovery-lookback-days",
+                    "14",
+                    "--max-workers",
+                    "1",
+                    "--max-profiles-per-run",
+                    "0",
+                    "--target-markets",
+                    "10",
+                    "--max-markets-per-run",
+                    "10",
+                ]
+            )
+
+            _command_build_leaderboard_unlocked(args, client=FakeClient())
+
+            classification = read_json(Path(tmp) / "sports" / "esports_classification_set.json", [])
+            self.assertEqual([row["condition_id"] for row in classification], ["recent"])
 
     def test_follow_command_uses_paper_defaults(self):
         parser = build_parser()
@@ -6636,7 +7203,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.event_gate_horizon_hours, 24)
         self.assertEqual(args.observe_window_hours, 24)
         self.assertEqual(args.max_slippage_over_entry, 0.05)
-        self.assertTrue(args.require_pre_match)
+        self.assertFalse(args.require_pre_match)
         self.assertEqual(args.run_log_retention_days, 7)
         self.assertEqual(args.results_retention_days, 0)
         self.assertEqual(args.resolution_cache_ttl_seconds, 60)
@@ -6652,6 +7219,9 @@ class CoreTest(unittest.TestCase):
         self.assertTrue(args.consensus_block_opposite)
         self.assertEqual(args.conflict_policy, "dual_follow")
         self.assertEqual(args.quarantine_sell_frac, 0.2)
+
+        pre_match_args = parser.parse_args(["follow", "--stake-usdc", "25", "--require-pre-match"])
+        self.assertTrue(pre_match_args.require_pre_match)
 
     def test_run_command_uses_v2_loop_defaults(self):
         parser = build_parser()
@@ -6672,13 +7242,17 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.max_consecutive_error_seconds, 600)
         self.assertEqual(args.resolution_cache_ttl_seconds, 60)
         self.assertEqual(args.resolution_gamma_pages, 2)
-        self.assertEqual(args.discovery_lookback_days, 14)
+        self.assertIsNone(args.discovery_lookback_days)
         self.assertEqual(args.market_batch_size, 50)
         self.assertEqual(args.market_batch_count, 2)
         self.assertEqual(args.consensus_min_same_side, 1)
         self.assertTrue(args.consensus_block_opposite)
         self.assertEqual(args.conflict_policy, "dual_follow")
         self.assertEqual(args.quarantine_sell_frac, 0.2)
+        self.assertFalse(args.require_pre_match)
+
+        pre_match_args = parser.parse_args(["run", "--stake-usdc", "1", "--require-pre-match"])
+        self.assertTrue(pre_match_args.require_pre_match)
 
     def test_serve_command_uses_dashboard_defaults(self):
         parser = build_parser()
@@ -6746,7 +7320,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(follow.call_count, 2)
         self.assertEqual(sleep.call_args_list[0].args[0], 180)
 
-    def test_run_full_refresh_pauses_new_signals_and_skips_rescore(self):
+    def test_run_full_refresh_pauses_new_signals(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             parser = build_parser()
@@ -6762,8 +7336,6 @@ class CoreTest(unittest.TestCase):
                     "1",
                     "--pool-refresh-hours",
                     "24",
-                    "--wallet-rescore-hours",
-                    "2",
                 ]
             )
             real_datetime = datetime
@@ -6790,7 +7362,7 @@ class CoreTest(unittest.TestCase):
 
             with patch("poly_fight.cli.datetime", FakeDateTime), patch("poly_fight.cli.build_client", return_value=object()), patch(
                 "poly_fight.cli.command_build_leaderboard", side_effect=fake_build
-            ) as build, patch("poly_fight.cli.command_rescore_wallets", side_effect=AssertionError("rescore should not run")), patch(
+            ) as build, patch(
                 "poly_fight.cli.command_follow", side_effect=fake_follow
             ):
                 from poly_fight.cli import command_run
