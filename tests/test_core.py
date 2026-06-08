@@ -7518,12 +7518,10 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.execution_mode, "paper")
         self.assertEqual(args.stake_usdc, 25)
         self.assertEqual(args.follow_recency_days, 30)
-        self.assertEqual(args.event_gate_horizon_hours, 24)
         self.assertEqual(args.observe_window_hours, 24)
         self.assertEqual(args.max_slippage_over_entry, 0.05)
         self.assertFalse(args.require_pre_match)
         self.assertEqual(args.run_log_retention_days, 7)
-        self.assertEqual(args.results_retention_days, 0)
         self.assertEqual(args.resolution_cache_ttl_seconds, 60)
         self.assertEqual(args.resolution_gamma_pages, 2)
         self.assertEqual(args.user_trades_limit, 100)
@@ -7533,7 +7531,6 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.min_tick_seconds, 180)
         self.assertEqual(args.max_tick_seconds, 900)
         self.assertEqual(args.max_workers, 8)
-        self.assertEqual(args.consensus_min_same_side, 1)
         self.assertTrue(args.consensus_block_opposite)
         self.assertEqual(args.conflict_policy, "dual_follow")
         self.assertEqual(args.quarantine_sell_frac, 0.2)
@@ -7563,7 +7560,6 @@ class CoreTest(unittest.TestCase):
         self.assertIsNone(args.discovery_lookback_days)
         self.assertEqual(args.market_batch_size, 50)
         self.assertEqual(args.market_batch_count, 2)
-        self.assertEqual(args.consensus_min_same_side, 1)
         self.assertTrue(args.consensus_block_opposite)
         self.assertEqual(args.conflict_policy, "dual_follow")
         self.assertEqual(args.quarantine_sell_frac, 0.2)
@@ -7571,6 +7567,22 @@ class CoreTest(unittest.TestCase):
 
         pre_match_args = parser.parse_args(["run", "--stake-usdc", "1", "--require-pre-match"])
         self.assertTrue(pre_match_args.require_pre_match)
+
+    def test_follow_commands_reject_removed_dead_options(self):
+        parser = build_parser()
+
+        removed_options = [
+            ["follow", "--stake-usdc", "1", "--event-gate-horizon-hours", "24"],
+            ["follow", "--stake-usdc", "1", "--results-retention-days", "0"],
+            ["follow", "--stake-usdc", "1", "--consensus-min-same-side", "1"],
+            ["run", "--stake-usdc", "1", "--event-gate-horizon-hours", "24"],
+            ["run", "--stake-usdc", "1", "--results-retention-days", "0"],
+            ["run", "--stake-usdc", "1", "--consensus-min-same-side", "1"],
+        ]
+        for argv in removed_options:
+            with self.subTest(argv=argv):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(argv)
 
     def test_serve_command_uses_dashboard_defaults(self):
         parser = build_parser()

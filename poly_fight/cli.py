@@ -56,14 +56,12 @@ from .follow import (
     apply_contested_flags,
     bootstrap_position_trades,
     contested_markets,
-    current_position_keys,
     desired_tick_interval,
     detect_new_positions,
     eligible_follow_wallets,
     esports_match_imminent,
     evaluate_slippage,
     market_current_price,
-    position_key,
     process_follow_trades,
     qualify_follow,
     select_new_trades,
@@ -3267,7 +3265,6 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--conviction-gate", dest="conviction_gate", action="store_true", default=True)
         subparser.add_argument("--no-conviction-gate", dest="conviction_gate", action="store_false")
         subparser.add_argument("--follow-recency-days", type=int, default=30)
-        subparser.add_argument("--event-gate-horizon-hours", type=float, default=24)
         subparser.add_argument("--observe-window-hours", type=float, default=24)
         subparser.add_argument("--event-cache-ttl-minutes", type=int, default=15)
         subparser.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
@@ -3278,7 +3275,6 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
         subparser.add_argument("--execution-mode", choices=["paper", "live"], default="paper")
         subparser.add_argument("--run-log-retention-days", type=int, default=7)
-        subparser.add_argument("--results-retention-days", type=int, default=0)
         subparser.add_argument("--gamma-pages", type=int, default=3)
         subparser.add_argument("--positions-limit", type=int, default=100)
         subparser.add_argument("--user-trades-limit", type=int, default=100)
@@ -3291,7 +3287,6 @@ def build_parser() -> argparse.ArgumentParser:
         # Fixed polling cadence (seconds). >0 overrides the adaptive min/max curve so every
         # wallet is checked on one steady interval; 0 restores the start-time-aware backoff.
         subparser.add_argument("--tick-seconds", type=int, default=120)
-        subparser.add_argument("--consensus-min-same-side", type=int, default=1)
         subparser.add_argument("--consensus-block-opposite", dest="consensus_block_opposite", action="store_true", default=True)
         subparser.add_argument("--no-consensus-block-opposite", dest="consensus_block_opposite", action="store_false")
         subparser.add_argument("--conflict-policy", choices=["dual_follow", "exit_on_opposite"], default="dual_follow")
@@ -3336,7 +3331,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--conviction-gate", dest="conviction_gate", action="store_true", default=True)
     run.add_argument("--no-conviction-gate", dest="conviction_gate", action="store_false")
     run.add_argument("--follow-recency-days", type=int, default=30)
-    run.add_argument("--event-gate-horizon-hours", type=float, default=24)
     run.add_argument("--observe-window-hours", type=float, default=24)
     run.add_argument("--event-cache-ttl-minutes", type=int, default=15)
     run.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
@@ -3347,7 +3341,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
     run.add_argument("--execution-mode", choices=["paper", "live"], default="paper")
     run.add_argument("--run-log-retention-days", type=int, default=7)
-    run.add_argument("--results-retention-days", type=int, default=0)
     run.add_argument("--positions-limit", type=int, default=100)
     run.add_argument("--user-trades-limit", type=int, default=100)
     run.add_argument("--user-trades-max-pages", type=int, default=3)
@@ -3358,7 +3351,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-tick-seconds", type=int, default=900)
     # Fixed polling cadence (seconds). >0 overrides the adaptive min/max curve; 0 = adaptive.
     run.add_argument("--tick-seconds", type=int, default=120)
-    run.add_argument("--consensus-min-same-side", type=int, default=1)
     run.add_argument("--consensus-block-opposite", dest="consensus_block_opposite", action="store_true", default=True)
     run.add_argument("--no-consensus-block-opposite", dest="consensus_block_opposite", action="store_false")
     run.add_argument("--conflict-policy", choices=["dual_follow", "exit_on_opposite"], default="dual_follow")

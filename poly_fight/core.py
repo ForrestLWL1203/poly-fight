@@ -121,10 +121,6 @@ def event_tags(event: dict[str, Any]) -> set[str]:
     return tags
 
 
-def is_esports_event(event: dict[str, Any]) -> bool:
-    return event_category(event) == "esports"
-
-
 def event_category(event: dict[str, Any]) -> str | None:
     tags = event_tags(event)
     if tags & ESPORTS_CATEGORY_TAGS:

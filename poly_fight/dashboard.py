@@ -1256,13 +1256,6 @@ def _load_team_logo_cache(data_dir: Path) -> dict[str, str]:
     return logos
 
 
-def _team_logos_for_title(title: str, logo_cache: dict[str, str]) -> dict[str, str]:
-    if not title or not logo_cache:
-        return {}
-    parts = _match_title_parts(title)
-    return _team_logos_for_parts(parts, logo_cache)
-
-
 def _team_logos_for_parts(parts: dict[str, str] | None, logo_cache: dict[str, str]) -> dict[str, str]:
     if not parts:
         return {}
