@@ -320,36 +320,53 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(event_to_market_records(nba_prop), [])
 
     def test_sports_moneyline_uses_actual_close_time_not_week_later_end_date(self):
-        event = {
-            "id": "e1",
-            "slug": "nba-lakers-celtics-2026-06-07",
-            "title": "Los Angeles Lakers vs. Boston Celtics",
-            "closed": True,
-            "startTime": "2026-06-07T20:10:00Z",
-            "endDate": "2026-06-14T20:10:00Z",
-            "closedTime": "2026-06-08T00:13:19Z",
-            "finishedTimestamp": "2026-06-07T23:08:19.040393Z",
-            "tags": [{"slug": "nba"}],
-            "markets": [
-                {
-                    "conditionId": "moneyline",
-                    "question": "Los Angeles Lakers vs. Boston Celtics",
-                    "outcomes": '["Los Angeles Lakers","Boston Celtics"]',
-                    "outcomePrices": '["1","0"]',
-                    "volume": "1005821.89",
-                    "gameStartTime": "2026-06-07 20:10:00+00",
+        cases = [
+            (
+                "nba",
+                "nba-lakers-celtics-2026-06-07",
+                "Los Angeles Lakers vs. Boston Celtics",
+                '["Los Angeles Lakers","Boston Celtics"]',
+            ),
+            (
+                "ufc",
+                "ufc-fighter-a-fighter-b-2026-06-07",
+                "Fighter A vs Fighter B",
+                '["Fighter A","Fighter B"]',
+            ),
+        ]
+        for league, slug, title, outcomes in cases:
+            with self.subTest(league=league):
+                event = {
+                    "id": f"{league}-e1",
+                    "slug": slug,
+                    "title": title,
+                    "closed": True,
+                    "startTime": "2026-06-07T20:10:00Z",
                     "endDate": "2026-06-14T20:10:00Z",
-                    "umaEndDate": "2026-06-07T23:27:48Z",
-                    "closedTime": "2026-06-07 23:27:48+00",
+                    "closedTime": "2026-06-08T00:13:19Z",
+                    "finishedTimestamp": "2026-06-07T23:08:19.040393Z",
+                    "tags": [{"slug": league}],
+                    "markets": [
+                        {
+                            "conditionId": f"{league}-moneyline",
+                            "question": title,
+                            "outcomes": outcomes,
+                            "outcomePrices": '["1","0"]',
+                            "volume": "1005821.89",
+                            "gameStartTime": "2026-06-07 20:10:00+00",
+                            "endDate": "2026-06-14T20:10:00Z",
+                            "umaEndDate": "2026-06-07T23:27:48Z",
+                            "closedTime": "2026-06-07 23:27:48+00",
+                        }
+                    ],
                 }
-            ],
-        }
 
-        record = event_to_market_records(event)[0]
+                record = event_to_market_records(event)[0]
 
-        self.assertEqual(record["match_start_time"], "2026-06-07 20:10:00+00")
-        self.assertEqual(record["market_start_time"], "2026-06-07 20:10:00+00")
-        self.assertEqual(record["end_date"], "2026-06-07T23:27:48Z")
+                self.assertEqual(record["match_start_time"], "2026-06-07 20:10:00+00")
+                self.assertEqual(record["market_start_time"], "2026-06-07 20:10:00+00")
+                self.assertEqual(record["end_date"], "2026-06-07T23:27:48Z")
+                self.assertEqual(record["league"], league)
         self.assertEqual(parse_dt("2026-06-07 20:10:00+00"), datetime(2026, 6, 7, 20, 10, tzinfo=timezone.utc))
 
     def test_sports_classifier_rejects_spread_totals_props_and_futures(self):
@@ -3938,6 +3955,71 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(signals[0]["market_type"], "game_winner")
         self.assertEqual(signals[0]["market_type_label"], "单局")
 
+    def test_follow_v2_gates_sports_new_signals_by_league(self):
+        now = 1000
+        trade = {
+            "id": "b1",
+            "proxyWallet": "0xA",
+            "market": "ufc1",
+            "outcomeIndex": 0,
+            "side": "BUY",
+            "price": 0.40,
+            "size": 10,
+            "timestamp": now,
+        }
+        ufc_market = {
+            "condition_id": "ufc1",
+            "category": "sports",
+            "league": "ufc",
+            "outcomes": ["Fighter A", "Fighter B"],
+            "outcome_prices": [0.45, 0.55],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "market_type": "main_match",
+        }
+        nba_market = {
+            "condition_id": "nba1",
+            "category": "sports",
+            "league": "nba",
+            "outcomes": ["Team A", "Team B"],
+            "outcome_prices": [0.45, 0.55],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "market_type": "main_match",
+        }
+
+        signals, stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=[trade],
+            markets_by_condition={"ufc1": ufc_market},
+            now_ts=now,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.05,
+            eligible_category="sports",
+            eligible_market_types={"main_match"},
+            eligible_leagues={"nba"},
+        )
+
+        self.assertEqual(signals, [])
+        self.assertEqual(stats["league_not_eligible_count"], 1)
+
+        signals, stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=[{**trade, "market": "nba1"}],
+            markets_by_condition={"nba1": nba_market},
+            now_ts=now,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.05,
+            eligible_category="sports",
+            eligible_market_types={"main_match"},
+            eligible_leagues={"nba"},
+        )
+
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]["league"], "nba")
+
     def test_follow_v4_dust_sell_mirror_exits_without_quarantine(self):
         now = 1000
         market = {
@@ -4937,6 +5019,97 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(snapshot["results"][0]["our_realized_pnl"], 0.2)
             self.assertTrue(snapshot["results"][0]["wallet_behavior"]["wallet_sold_before_resolution"])
             self.assertNotIn("m2", {row.get("condition_id") for row in snapshot["open_signals"]})
+
+    def test_follow_tick_uses_sports_wallet_league_scope(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now = datetime.now(timezone.utc)
+            start = now + timedelta(hours=2)
+            write_json(
+                data_dir / "sports" / "smart_wallet_leaderboard.json",
+                [
+                    {
+                        "wallet": "0xa",
+                        "category": "sports",
+                        "league": "nba",
+                        "grade": "A",
+                        "eligible_market_types": ["main_match"],
+                        "last_esports_trade_at": int(now.timestamp()),
+                    }
+                ],
+            )
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={"sports:0xa": {"last_trade_cursor": {"timestamp": 10, "id": "old"}, "last_seen_at": 10}},
+                open_signals=[],
+                result_events=[],
+                performance={},
+            )
+            wallets = []
+
+            class FakeClient:
+                def list_events_paginated(self, **kwargs):
+                    tags = tuple(kwargs.get("tag_slugs") or ())
+                    if tags != ("nba", "ufc"):
+                        return []
+                    return [
+                        {
+                            "id": "nba1",
+                            "slug": "nba1",
+                            "title": "Los Angeles Lakers vs. Boston Celtics",
+                            "tags": [{"slug": "nba"}],
+                            "startTime": start.isoformat(),
+                            "markets": [
+                                {
+                                    "conditionId": "nba1",
+                                    "question": "Los Angeles Lakers vs. Boston Celtics",
+                                    "outcomes": ["Los Angeles Lakers", "Boston Celtics"],
+                                    "outcomePrices": ["0.50", "0.50"],
+                                    "active": True,
+                                    "closed": False,
+                                    "volume": 100000,
+                                    "startTime": start.isoformat(),
+                                }
+                            ],
+                        },
+                        {
+                            "id": "ufc1",
+                            "slug": "ufc1",
+                            "title": "Fighter A vs Fighter B",
+                            "tags": [{"slug": "ufc"}],
+                            "startTime": start.isoformat(),
+                            "markets": [
+                                {
+                                    "conditionId": "ufc1",
+                                    "question": "Fighter A vs Fighter B",
+                                    "outcomes": ["Fighter A", "Fighter B"],
+                                    "outcomePrices": ["0.50", "0.50"],
+                                    "active": True,
+                                    "closed": False,
+                                    "volume": 100000,
+                                    "startTime": start.isoformat(),
+                                }
+                            ],
+                        },
+                    ]
+
+                def trades_for_user(self, wallet, **_kwargs):
+                    wallets.append(wallet)
+                    return [
+                        {"id": "ufc-buy", "timestamp": 20, "market": "ufc1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 10},
+                        {"id": "nba-buy", "timestamp": 30, "market": "nba1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 10},
+                    ]
+
+            parser = build_parser()
+            args = parser.parse_args(["--data-dir", str(data_dir), "follow", "--stake-usdc", "1", "--max-workers", "1"])
+
+            summary = command_follow(args, client=FakeClient(), emit=False)
+            snapshot = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_snapshot()
+
+            self.assertEqual(wallets, ["0xa"])
+            self.assertEqual(summary["new_signal_count"], 1, summary)
+            self.assertEqual(summary["ignored_trade_count"], 1)
+            self.assertEqual(snapshot["open_signals"][0]["condition_id"], "nba1")
+            self.assertEqual(snapshot["open_signals"][0]["league"], "nba")
 
     def test_follow_tick_dual_follows_opposite_wallet_buys(self):
         with TemporaryDirectory() as tmp:

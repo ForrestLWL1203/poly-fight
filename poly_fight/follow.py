@@ -158,6 +158,7 @@ def bootstrap_position_trades(
     max_slippage: float,
     eligible_market_types: set[str] | None = None,
     eligible_category: str | None = None,
+    eligible_leagues: set[str] | None = None,
     require_pre_match: bool = True,
 ) -> list[dict[str, Any]]:
     wallet = normalize_wallet(wallet)
@@ -166,6 +167,9 @@ def bootstrap_position_trades(
         condition_id = position_condition_id(position)
         market = markets_by_condition.get(condition_id)
         if eligible_category and str((market or {}).get("category") or "esports").lower() != str(eligible_category).lower():
+            continue
+        market_league = str((market or {}).get("league") or "").lower()
+        if eligible_leagues is not None and market_league not in eligible_leagues:
             continue
         market_type = str((market or {}).get("market_type") or "main_match")
         if eligible_market_types is not None and market_type not in eligible_market_types:
@@ -474,6 +478,7 @@ def process_follow_trades(
     quarantine_sell_frac: float = 0.2,
     eligible_market_types: set[str] | None = None,
     eligible_category: str | None = None,
+    eligible_leagues: set[str] | None = None,
     conflict_policy: str = "dual_follow",
     wallet_row: dict[str, Any] | None = None,
     conviction_stake_usdc: float | None = None,
@@ -490,6 +495,7 @@ def process_follow_trades(
         "hedge_event_count": 0,
         "ignored_trade_count": 0,
         "market_type_not_eligible_count": 0,
+        "league_not_eligible_count": 0,
         "opposite_blocked_count": 0,
         "insufficient_balance_count": 0,
         "quarantine_events": [],
@@ -589,6 +595,11 @@ def process_follow_trades(
         if not existing and eligible_market_types is not None and market_type not in eligible_market_types:
             stats["ignored_trade_count"] += 1
             stats["market_type_not_eligible_count"] += 1
+            continue
+        market_league = str(market.get("league") or "").lower()
+        if not existing and eligible_leagues is not None and market_league not in eligible_leagues:
+            stats["ignored_trade_count"] += 1
+            stats["league_not_eligible_count"] += 1
             continue
 
         wallet_fill_price = trade_price(trade)

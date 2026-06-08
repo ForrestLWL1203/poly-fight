@@ -2652,6 +2652,11 @@ def command_follow(
         f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}": {str(value) for value in (row.get("eligible_market_types") or []) if value}
         for row in eligible_wallet_rows
     }
+    eligible_leagues_by_wallet = {
+        f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}": {str(row.get("league") or "").lower()}
+        for row in eligible_wallet_rows
+        if str(row.get("category") or "esports").lower() == "sports" and str(row.get("league") or "").strip()
+    }
     wallet_row_by_scope = {
         f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}": row
         for row in eligible_wallet_rows
@@ -2800,6 +2805,7 @@ def command_follow(
                         max_slippage=args.max_slippage_over_entry,
                         eligible_market_types=eligible_market_types_by_wallet.get(scope_key),
                         eligible_category=category,
+                        eligible_leagues=eligible_leagues_by_wallet.get(scope_key),
                         require_pre_match=args.require_pre_match,
                     )
                     before_ids = {signal.get("signal_id") for signal in open_signals}
@@ -2817,6 +2823,7 @@ def command_follow(
                         quarantine_sell_frac=args.quarantine_sell_frac,
                         eligible_market_types=eligible_market_types_by_wallet.get(scope_key),
                         eligible_category=category,
+                        eligible_leagues=eligible_leagues_by_wallet.get(scope_key),
                         conflict_policy=args.conflict_policy,
                         wallet_row=wallet_row_by_scope.get(scope_key),
                         conviction_stake_usdc=args.conviction_stake_usdc,
@@ -2870,6 +2877,7 @@ def command_follow(
                 quarantine_sell_frac=args.quarantine_sell_frac,
                 eligible_market_types=eligible_market_types_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 eligible_category=category if wallet_can_open_new else None,
+                eligible_leagues=eligible_leagues_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 conflict_policy=args.conflict_policy,
                 wallet_row=wallet_row_by_scope.get(scope_key),
                 conviction_stake_usdc=args.conviction_stake_usdc,
