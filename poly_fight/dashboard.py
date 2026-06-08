@@ -966,6 +966,7 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
         market = _active_market_by_condition(data_dir, str(row.get("condition_id") or ""))
         row["match_start_time"] = row.get("match_start_time") or market.get("match_start_time") or market.get("market_start_time")
         row["end_date"] = row.get("end_date") or market.get("end_date")
+        _attach_follow_unrealized_pnl(row, market)
         row["match_parts"] = _match_parts_for_row(row)
         row["team_logos"] = _team_logos_for_parts(row.get("match_parts"), logo_cache)
     return {
@@ -977,6 +978,37 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
         "follows": rows,
         "db_ready": bool(result.get("db_ready")),
     }
+
+
+def _attach_follow_unrealized_pnl(row: dict[str, Any], market: dict[str, Any]) -> None:
+    prices = [_to_float(value) for value in (market.get("outcome_prices") or market.get("outcomePrices") or [])]
+    open_legs = row.get("open_pnl_legs") if isinstance(row.get("open_pnl_legs"), list) else []
+    unrealized = 0.0
+    priced_count = 0
+    current_prices = []
+    for leg in open_legs:
+        if not isinstance(leg, dict):
+            continue
+        outcome_index = int(leg.get("outcome_index") or 0)
+        if outcome_index < 0 or outcome_index >= len(prices):
+            continue
+        current_price = prices[outcome_index]
+        stake = _to_float(leg.get("stake"))
+        entry = _to_float(leg.get("our_entry_price"))
+        if stake <= 0 or entry <= 0:
+            continue
+        unrealized += stake * (current_price - entry) / entry
+        priced_count += 1
+        current_prices.append(current_price)
+    if priced_count:
+        row["current_price"] = round(sum(current_prices) / len(current_prices), 8)
+        row["unrealized_pnl"] = round(unrealized, 8)
+    else:
+        row["current_price"] = None
+        row["unrealized_pnl"] = None
+    row["display_pnl"] = row["unrealized_pnl"] if row.get("status") == "open" and row["unrealized_pnl"] is not None else row.get("our_realized_pnl")
+    row["display_pnl_kind"] = "unrealized" if row.get("status") == "open" and row["unrealized_pnl"] is not None else "realized"
+    row.pop("open_pnl_legs", None)
 
 
 def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
@@ -1904,6 +1936,7 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                 "signal_stakes": [],
                 "stake_mode_counts": {},
                 "status_counts": {},
+                "open_pnl_legs": [],
                 "our_realized_pnl": 0.0,
                 "wallet_basis_realized_pnl": 0.0,
                 "last_activity_at": 0,
@@ -1930,6 +1963,17 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
         bucket["stake_mode_counts"][mode] = bucket["stake_mode_counts"].get(mode, 0) + 1
         status = str(signal.get("status") or "open")
         bucket["status_counts"][status] = bucket["status_counts"].get(status, 0) + 1
+        if status == "open":
+            outcome_index = int(signal.get("outcome_index") or 0)
+            for leg in legs:
+                if isinstance(leg, dict):
+                    bucket["open_pnl_legs"].append(
+                        {
+                            "outcome_index": outcome_index,
+                            "stake": _to_float(leg.get("stake")),
+                            "our_entry_price": _to_float(leg.get("our_entry_price")),
+                        }
+                    )
         bucket["our_realized_pnl"] += _signal_our_pnl(signal)
         bucket["wallet_basis_realized_pnl"] += _signal_wallet_pnl(signal)
         if signal.get("contested"):

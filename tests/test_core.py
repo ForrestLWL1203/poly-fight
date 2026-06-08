@@ -6914,6 +6914,55 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(detail["wallets"][0]["signals"][0]["stake_mode"], "proportional")
             self.assertEqual(detail["wallets"][0]["signals"][0]["signal_stake"], 5)
 
+    def test_dashboard_follows_calculates_unrealized_pnl_from_active_cache(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_json(
+                data_dir / "follow" / "active_market_cache.json",
+                {
+                    "updated_at": 200,
+                    "markets": [
+                        {
+                            "condition_id": "m1",
+                            "outcomes": ["A", "B"],
+                            "outcome_prices": [0.6, 0.4],
+                        }
+                    ],
+                },
+            )
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "sig-open-a",
+                        "wallet": "0xabc",
+                        "condition_id": "m1",
+                        "outcome_index": 0,
+                        "status": "open",
+                        "created_at": 100,
+                        "legs": [{"stake": 10, "our_entry_price": 0.5}],
+                    },
+                    {
+                        "signal_id": "sig-open-b",
+                        "wallet": "0xdef",
+                        "condition_id": "m1",
+                        "outcome_index": 0,
+                        "status": "open",
+                        "created_at": 101,
+                        "legs": [{"stake": 5, "our_entry_price": 0.4}],
+                    },
+                ],
+                result_events=[],
+                performance={},
+            )
+
+            row = build_follows(data_dir, page=1, size=10)["follows"][0]
+
+            self.assertEqual(row["current_price"], 0.6)
+            self.assertEqual(row["unrealized_pnl"], 4.5)
+            self.assertEqual(row["display_pnl"], 4.5)
+            self.assertEqual(row["display_pnl_kind"], "unrealized")
+
     def test_dashboard_rows_include_cached_team_logos(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -8465,6 +8514,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.run_log_retention_days, 7)
         self.assertEqual(args.resolution_cache_ttl_seconds, 60)
         self.assertEqual(args.resolution_gamma_pages, 2)
+        self.assertEqual(args.event_cache_ttl_minutes, 10)
         self.assertEqual(args.user_trades_limit, 100)
         self.assertEqual(args.user_trades_max_pages, 3)
         self.assertTrue(args.bootstrap_current_positions)
@@ -8497,6 +8547,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.max_follow_legs, 10)
         self.assertEqual(args.error_retry_seconds, 180)
         self.assertEqual(args.max_consecutive_error_seconds, 600)
+        self.assertEqual(args.event_cache_ttl_minutes, 10)
         self.assertEqual(args.resolution_cache_ttl_seconds, 60)
         self.assertEqual(args.resolution_gamma_pages, 2)
         self.assertIsNone(args.discovery_lookback_days)

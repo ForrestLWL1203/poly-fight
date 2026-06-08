@@ -944,6 +944,12 @@ createApp({
       if (!Number.isFinite(max) || max <= 0 || Math.abs(max - min) < 0.000001) return this.money(min);
       return `${this.money(min)}-${this.money(max)}`;
     },
+    followListPnl(row) {
+      const display = Number(row?.display_pnl);
+      if (Number.isFinite(display)) return display;
+      const realized = Number(row?.our_realized_pnl);
+      return Number.isFinite(realized) ? realized : null;
+    },
     percent(value) {
       const num = Number(value);
       if (!Number.isFinite(num)) return "-";

@@ -314,7 +314,6 @@
                     <th>钱包数</th>
                     <th>单数</th>
                     <th>投入</th>
-                    <th>档位</th>
                     <th>盈亏</th>
                     <th>质量</th>
                   </tr>
@@ -353,17 +352,14 @@
                     <td>{{ follow.wallet_count }}</td>
                     <td>{{ follow.leg_count }}</td>
                     <td>{{ money(follow.stake) }}</td>
-                    <td>
-                      <span class="tier-chip" :class="stakeModeClass(primaryStakeMode(follow))">
-                        {{ stakeModeSummary(follow) }}
-                      </span>
-                      <small v-if="signalStakeRange(follow)" class="tier-stake-range">{{ signalStakeRange(follow) }}</small>
+                    <td :class="pnlClass(followListPnl(follow))">
+                      <div>{{ money(followListPnl(follow)) }}</div>
+                      <small v-if="follow.display_pnl_kind === 'unrealized'" class="subtle">未实现</small>
                     </td>
-                    <td :class="pnlClass(follow.our_realized_pnl)">{{ money(follow.our_realized_pnl) }}</td>
                     <td><span class="badge" :class="follow.contested_signal_count ? 'badge-error badge-outline' : 'badge-success badge-outline'">{{ follow.contested_signal_count ? "双边" : "单边" }}</span></td>
                   </tr>
                   <tr v-if="!(follows.follows || []).length">
-                    <td colspan="8" class="empty-cell">暂无跟单记录</td>
+                    <td colspan="7" class="empty-cell">暂无跟单记录</td>
                   </tr>
                 </tbody>
               </table>
