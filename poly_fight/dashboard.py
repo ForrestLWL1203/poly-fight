@@ -34,6 +34,7 @@ FAILED_LOGINS: dict[str, list[float]] = {}
 _TRADES_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _TRADES_CACHE_LOCK = threading.Lock()
 _MATCH_TITLE_RE = re.compile(r"^([^:]+):\s+(.+?)\s+vs\s+(.+?)(\s+\([^)]+\))?\s+-\s+(.+)$", re.IGNORECASE)
+_SPORTS_TITLE_RE = re.compile(r"^(.+?)\s+vs\.?\s+(.+?)(?:\s+-\s+(.+))?$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -904,7 +905,8 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
         market = _active_market_by_condition(data_dir, str(row.get("condition_id") or ""))
         row["match_start_time"] = row.get("match_start_time") or market.get("match_start_time") or market.get("market_start_time")
         row["end_date"] = row.get("end_date") or market.get("end_date")
-        row["team_logos"] = _team_logos_for_title(str(row.get("title") or row.get("question") or ""), logo_cache)
+        row["match_parts"] = _match_parts_for_row(row)
+        row["team_logos"] = _team_logos_for_parts(row.get("match_parts"), logo_cache)
     return {
         "page": page,
         "size": size,
@@ -963,6 +965,14 @@ def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
     market_type = market_type or str(market.get("market_type") or "")
     market_type_label = market_type_label or str(market.get("market_type_label") or "")
     category = category or normalize_category(str(market.get("category") or "")) or "esports"
+    match_parts = _match_parts_for_row(
+        {
+            "title": title,
+            "question": question,
+            "category": category,
+            "market_type_label": market_type_label,
+        }
+    )
     return {
         "condition_id": condition_id,
         "category": category,
@@ -974,7 +984,8 @@ def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
         "event_url": f"https://polymarket.com/event/{event_slug}" if event_slug else "",
         "market_type": market_type,
         "market_type_label": market_type_label,
-        "team_logos": _team_logos_for_title(title or question, logo_cache),
+        "match_parts": match_parts,
+        "team_logos": _team_logos_for_parts(match_parts, logo_cache),
         "outcomes": market.get("outcomes"),
         "outcome_prices": market.get("outcome_prices") or market.get("outcomePrices"),
         "wallets": list(by_wallet.values()),
@@ -1092,13 +1103,15 @@ def build_events(
         if (start_ts and recent_start_cutoff <= start_ts <= window_end) or open_signals:
             open_signals = open_by_condition.get(condition_id, [])
             results = results_by_condition.get(condition_id, [])
+            match_parts = _match_parts_for_row(market)
             events.append(
                 {
                     "condition_id": condition_id,
                     "category": normalize_category(str(market.get("category") or "")) or "esports",
                     "title": market.get("title"),
                     "question": market.get("question"),
-                    "team_logos": _team_logos_for_title(str(market.get("title") or market.get("question") or ""), logo_cache),
+                    "match_parts": match_parts,
+                    "team_logos": _team_logos_for_parts(match_parts, logo_cache),
                     "match_start_time": market.get("match_start_time") or market.get("market_start_time") or market.get("startTime"),
                     "end_date": market.get("end_date") or market.get("endDate"),
                     "outcomes": market.get("outcomes"),
@@ -1142,19 +1155,30 @@ def build_events(
             (result.get("end_date") for result in results if isinstance(result, dict)),
             None,
         )
+        category = normalize_category(str(market.get("category") or next((result.get("category") for result in results if isinstance(result, dict)), "") or "")) or "esports"
+        market_type_label = market.get("market_type_label") or next((result.get("market_type_label") for result in results if isinstance(result, dict)), None)
+        match_parts = _match_parts_for_row(
+            {
+                "title": title,
+                "question": question,
+                "category": category,
+                "market_type_label": market_type_label,
+            }
+        )
         archived_events.append(
             {
                 "condition_id": condition_id,
-                "category": normalize_category(str(market.get("category") or next((result.get("category") for result in results if isinstance(result, dict)), "") or "")) or "esports",
+                "category": category,
                 "title": title,
                 "question": question,
-                "team_logos": _team_logos_for_title(str(title or question or ""), logo_cache),
+                "match_parts": match_parts,
+                "team_logos": _team_logos_for_parts(match_parts, logo_cache),
                 "match_start_time": match_start_time,
                 "end_date": end_date,
                 "outcomes": market.get("outcomes"),
                 "outcome_prices": market.get("outcome_prices") or market.get("outcomePrices"),
                 "market_type": market.get("market_type") or next((result.get("market_type") for result in results if isinstance(result, dict)), None),
-                "market_type_label": market.get("market_type_label") or next((result.get("market_type_label") for result in results if isinstance(result, dict)), None),
+                "market_type_label": market_type_label,
                 "open_signals": [],
                 "results": results,
                 "settled_count": sum(1 for result in results if result.get("status") == "settled"),
@@ -1199,6 +1223,10 @@ def _team_logos_for_title(title: str, logo_cache: dict[str, str]) -> dict[str, s
     if not title or not logo_cache:
         return {}
     parts = _match_title_parts(title)
+    return _team_logos_for_parts(parts, logo_cache)
+
+
+def _team_logos_for_parts(parts: dict[str, str] | None, logo_cache: dict[str, str]) -> dict[str, str]:
     if not parts:
         return {}
     team_a = parts.get("teamA") or ""
@@ -1227,6 +1255,26 @@ def _match_title_parts(title: str) -> dict[str, str] | None:
         "teamA": match.group(2).strip(),
         "teamB": match.group(3).strip(),
         "meta": f"{(match.group(4) or '').strip()} {match.group(5).strip()}".strip(),
+    }
+
+
+def _match_parts_for_row(row: dict[str, Any]) -> dict[str, str] | None:
+    title = str(row.get("title") or row.get("question") or "")
+    parts = _match_title_parts(title)
+    if parts:
+        return parts
+    category = normalize_category(str(row.get("category") or ""))
+    if category != "sports":
+        return None
+    match = _SPORTS_TITLE_RE.match(title)
+    if not match:
+        return None
+    meta = str(row.get("market_type_label") or match.group(3) or "").strip()
+    return {
+        "game": "MLB",
+        "teamA": match.group(1).strip(),
+        "teamB": match.group(2).strip(),
+        "meta": meta,
     }
 
 
@@ -1686,6 +1734,7 @@ def start_wallet_refresh(
         "collect",
         "--category",
         category,
+        "--refresh-classification",
         "--max-profiles-per-run",
         "1000",
     ]

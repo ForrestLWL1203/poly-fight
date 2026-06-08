@@ -42,6 +42,7 @@ from poly_fight.dashboard import (
     StreamSignal,
     verify_session_token,
 )
+from poly_fight import dashboard as dashboard_module
 from poly_fight.control import read_follow_control, write_follow_control
 from poly_fight.storage import FollowStore
 from poly_fight.cli import (
@@ -95,6 +96,7 @@ from poly_fight.core import (
     event_to_market_record,
     event_to_market_records,
     normalize_wallet,
+    parse_dt,
     profile_candidate_wallet,
     reconstruct_closed_positions,
     summarize_closed_positions,
@@ -207,6 +209,39 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(records[0]["category"], "sports")
         self.assertEqual(records[0]["league"], "mlb")
         self.assertEqual(records[0]["market_type"], "main_match")
+
+    def test_mlb_moneyline_uses_actual_close_time_not_week_later_end_date(self):
+        event = {
+            "id": "e1",
+            "slug": "mlb-nym-sd-2026-06-07",
+            "title": "New York Mets vs. San Diego Padres",
+            "closed": True,
+            "startTime": "2026-06-07T20:10:00Z",
+            "endDate": "2026-06-14T20:10:00Z",
+            "closedTime": "2026-06-08T00:13:19Z",
+            "finishedTimestamp": "2026-06-07T23:08:19.040393Z",
+            "tags": [{"slug": "mlb"}],
+            "markets": [
+                {
+                    "conditionId": "moneyline",
+                    "question": "New York Mets vs. San Diego Padres",
+                    "outcomes": '["New York Mets","San Diego Padres"]',
+                    "outcomePrices": '["1","0"]',
+                    "volume": "1005821.89",
+                    "gameStartTime": "2026-06-07 20:10:00+00",
+                    "endDate": "2026-06-14T20:10:00Z",
+                    "umaEndDate": "2026-06-07T23:27:48Z",
+                    "closedTime": "2026-06-07 23:27:48+00",
+                }
+            ],
+        }
+
+        record = event_to_market_records(event)[0]
+
+        self.assertEqual(record["match_start_time"], "2026-06-07 20:10:00+00")
+        self.assertEqual(record["market_start_time"], "2026-06-07 20:10:00+00")
+        self.assertEqual(record["end_date"], "2026-06-07T23:27:48Z")
+        self.assertEqual(parse_dt("2026-06-07 20:10:00+00"), datetime(2026, 6, 7, 20, 10, tzinfo=timezone.utc))
 
     def test_mlb_classifier_rejects_spread_totals_props_and_futures(self):
         event = {
@@ -2579,13 +2614,37 @@ class CoreTest(unittest.TestCase):
                 "pre_match_entry_rate": 1.0,
                 "candidate": {"participated_market_count": 1, "avg_market_cash": 2_000, "two_sided_market_count": 0, "tail_entry_market_count": 0},
             },
+            "0xsportscapedge": {
+                "wallet": "0xsportscapedge",
+                "category": "sports",
+                "grade": "A",
+                "eligible_market_types": ["main_match"],
+                "per_type": {
+                    "main_match": {
+                        "entry_edge": -0.02,
+                        "capital_weighted_edge": 0.12,
+                        "pre_match_entry_rate": 0.8,
+                    }
+                },
+                "per_type_grades": {"main_match": {"grade": "A"}},
+                "last_esports_trade_at": now,
+                "positive_market_rate": 0.8,
+                "wilson_win_rate_lower_bound": 0.7,
+                "entry_edge": -0.02,
+                "capital_weighted_edge": 0.12,
+                "median_market_roi": 0.8,
+                "esports_roi": 0.8,
+                "pre_match_entry_rate": 0.8,
+                "candidate": {"participated_market_count": 1, "avg_market_cash": 2_000, "two_sided_market_count": 0, "tail_entry_market_count": 0},
+            },
         }
 
         ranked = build_leaderboard_from_profiles(profiles, now_ts=now, min_participated_markets=3)
         by_wallet = {row["wallet"]: row for row in ranked}
 
         self.assertEqual(by_wallet["0xpass"]["eligible_market_types"], ["main_match"])
-        self.assertIn("0xsportslate", by_wallet)
+        self.assertIn("0xsportscapedge", by_wallet)
+        self.assertNotIn("0xsportslate", by_wallet)
         self.assertNotIn("0xsportsnegedge", by_wallet)
         self.assertNotIn("0xlowroi", by_wallet)
         self.assertNotIn("0xnegcapedge", by_wallet)
@@ -3288,6 +3347,16 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(desired_tick_interval([post], [], now_ts=now), 180)
         self.assertEqual(desired_tick_interval([], [{"status": "open"}], now_ts=now), 180)
 
+    def test_follow_v2_fixed_tick_interval_overrides_curve(self):
+        now = 1000
+        far = {"condition_id": "m1", "match_start_time": datetime.fromtimestamp(now + 24 * 3600, timezone.utc).isoformat()}
+        # fixed cadence ignores the adaptive curve and open-signal shortcut alike
+        self.assertEqual(desired_tick_interval([far], [], now_ts=now, fixed_tick_seconds=120), 120)
+        self.assertEqual(desired_tick_interval([], [], now_ts=now, fixed_tick_seconds=120), 120)
+        self.assertEqual(desired_tick_interval([], [{"status": "open"}], now_ts=now, fixed_tick_seconds=120), 120)
+        # 0 falls back to the adaptive curve
+        self.assertEqual(desired_tick_interval([far], [], now_ts=now, fixed_tick_seconds=0), 900)
+
     def test_watched_markets_only_include_future_starts(self):
         now = 1000
         markets = {
@@ -3372,7 +3441,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual([row["id"] for row in trades], ["t2", "t1"])
         self.assertEqual(client.calls, [0])
 
-    def test_follow_v2_buy_legs_sell_records_behavior_without_exit_by_default(self):
+    def test_follow_v2_buy_legs_sell_mirror_exits_by_default(self):
         now = 1000
         market = {
             "condition_id": "m1",
@@ -3416,27 +3485,12 @@ class CoreTest(unittest.TestCase):
             max_slippage=0.05,
         )
 
-        self.assertEqual(stats["exited_signal_count"], 0)
-        self.assertEqual(signals[0]["status"], "open")
+        self.assertEqual(stats["exited_signal_count"], 1)
+        self.assertEqual(signals[0]["status"], "exited")
         self.assertEqual(signals[0]["wallet_sell_size"], 15)
         self.assertTrue(wallet_behavior_summary(signals[0])["sold_before_resolution"])
-
-        mirror_signals, mirror_stats = process_follow_trades(
-            signals,
-            wallet="0xA",
-            trades=[{"id": "s2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.61, "size": 15, "timestamp": now + 3}],
-            markets_by_condition={"m1": sell_market},
-            now_ts=now + 3,
-            stake_usdc=1,
-            max_follow_legs=10,
-            max_slippage=0.05,
-            mirror_wallet_sells=True,
-        )
-
-        self.assertEqual(mirror_stats["exited_signal_count"], 1)
-        self.assertEqual(mirror_signals[0]["status"], "exited")
-        self.assertEqual(mirror_signals[0]["exit_price"], 0.6)
-        self.assertGreater(mirror_signals[0]["our_realized_pnl"], 0)
+        self.assertEqual(signals[0]["exit_price"], 0.6)
+        self.assertGreater(signals[0]["our_realized_pnl"], 0)
 
     def test_follow_records_pre_start_trade_detected_after_start_within_grace(self):
         start = 1000
@@ -3566,7 +3620,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(signals[0]["market_type"], "game_winner")
         self.assertEqual(signals[0]["market_type_label"], "单局")
 
-    def test_follow_v4_dust_sell_does_not_mirror_exit(self):
+    def test_follow_v4_dust_sell_mirror_exits_without_quarantine(self):
         now = 1000
         market = {
             "condition_id": "m1",
@@ -3597,9 +3651,9 @@ class CoreTest(unittest.TestCase):
             quarantine_sell_frac=0.2,
         )
 
-        self.assertEqual(stats["exited_signal_count"], 0)
+        self.assertEqual(stats["exited_signal_count"], 1)
         self.assertEqual(stats["quarantine_events"], [])
-        self.assertEqual(signals[0]["status"], "open")
+        self.assertEqual(signals[0]["status"], "exited")
         self.assertEqual(signals[0]["wallet_sell_size"], 5)
 
     def test_follow_v4_cumulative_sells_can_trigger_quarantine(self):
@@ -4229,6 +4283,106 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(calls[0][0], data_dir)
             self.assertEqual(calls[0][1]["max_workers"], 3)
 
+    def test_dashboard_events_parse_sports_matchups_and_team_logos(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            start = datetime.now(timezone.utc) + timedelta(hours=2)
+            write_json(
+                data_dir / "follow" / "active_market_cache.json",
+                {
+                    "updated_at": int(time.time()),
+                    "markets": [
+                        {
+                            "condition_id": "mlb1",
+                            "category": "sports",
+                            "title": "Los Angeles Dodgers vs. San Diego Padres",
+                            "question": "Los Angeles Dodgers vs. San Diego Padres",
+                            "match_start_time": start.isoformat(),
+                            "end_date": (start + timedelta(hours=3)).isoformat(),
+                            "market_type_label": "Moneyline",
+                        }
+                    ],
+                },
+            )
+            with patch.object(
+                dashboard_module,
+                "_load_team_logo_cache",
+                return_value={
+                    "mlb los angeles dodgers": "/team_logos/dodgers.png",
+                    "mlb san diego padres": "/team_logos/padres.png",
+                },
+            ):
+                events = build_events(data_dir)
+
+            self.assertEqual(events["events"][0]["category"], "sports")
+            self.assertEqual(
+                events["events"][0]["match_parts"],
+                {
+                    "game": "MLB",
+                    "teamA": "Los Angeles Dodgers",
+                    "teamB": "San Diego Padres",
+                    "meta": "Moneyline",
+                },
+            )
+            self.assertEqual(events["events"][0]["team_logos"]["teamA"], "/team_logos/dodgers.png")
+            self.assertEqual(events["events"][0]["team_logos"]["teamB"], "/team_logos/padres.png")
+
+    def test_sports_watched_events_missing_logos_trigger_refresh_scan(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            logo_dir = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "team_logos"
+            logo_path = logo_dir / "team_logos.json"
+            before_json = logo_path.read_bytes() if logo_path.exists() else None
+            before_files = set(logo_dir.glob("*")) if logo_dir.exists() else set()
+            start = datetime.now(timezone.utc) + timedelta(hours=2)
+            try:
+                write_json(
+                    data_dir / "follow" / "active_market_cache.json",
+                    {
+                        "updated_at": int(time.time()),
+                        "markets": [
+                            {
+                                "condition_id": "mlb1",
+                                "category": "sports",
+                                "event_slug": "pytest-bears-kings-2026-06-08",
+                                "title": "Pytest Expansion Bears vs. Pytest Sample Kings",
+                                "match_start_time": start.isoformat(),
+                            }
+                        ],
+                    },
+                )
+                calls = []
+
+                def fake_fetch_html(slug):
+                    calls.append(slug)
+                    return (
+                        "url=https%3A%2F%2Fpolymarket-upload.s3.us-east-2.amazonaws.com%2F"
+                        "team_logos%2Fmlb_pytest-expansion-bears.png"
+                    )
+
+                def fake_fetch_logo_bytes(_url, _timeout_seconds):
+                    return b"logo"
+
+                summary = refresh_team_logo_cache_from_active_markets(
+                    data_dir,
+                    now_ts=int(time.time()),
+                    fetch_html=fake_fetch_html,
+                    fetch_logo_bytes=fake_fetch_logo_bytes,
+                )
+                logo_cache = read_json(Path(summary["path"]), {})
+                local_url = logo_cache["teams"]["pytest expansion bears"]
+
+                self.assertEqual(summary["watched_event_count"], 1)
+                self.assertEqual(calls, ["pytest-bears-kings-2026-06-08"])
+                self.assertEqual(logo_cache["teams"]["mlb pytest expansion bears"], local_url)
+            finally:
+                if before_json is None:
+                    logo_path.unlink(missing_ok=True)
+                else:
+                    logo_path.write_bytes(before_json)
+                for path in set(logo_dir.glob("*")) - before_files:
+                    path.unlink(missing_ok=True)
+
     def test_follow_tick_excludes_quarantined_wallets_before_fetching(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -4341,11 +4495,14 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(client.wallets, ["0xold"])
             self.assertEqual(summary["follow_wallet_count"], 1)
             self.assertEqual(summary["lifecycle_follow_wallet_count"], 1)
-            self.assertEqual(summary["exited_signal_count"], 0)
-            self.assertEqual(summary["open_signal_count"], 1)
-            self.assertEqual(len(snapshot["results"]), 0)
-            self.assertEqual(snapshot["open_signals"][0]["condition_id"], "m1")
-            self.assertTrue(snapshot["open_signals"][0]["wallet_behavior"]["wallet_sold_before_resolution"])
+            self.assertEqual(summary["exited_signal_count"], 1)
+            self.assertEqual(summary["open_signal_count"], 0)
+            self.assertEqual(len(snapshot["results"]), 1)
+            self.assertEqual(snapshot["results"][0]["condition_id"], "m1")
+            self.assertEqual(snapshot["results"][0]["status"], "exited")
+            self.assertEqual(snapshot["results"][0]["exit_price"], 0.6)
+            self.assertEqual(snapshot["results"][0]["our_realized_pnl"], 0.2)
+            self.assertTrue(snapshot["results"][0]["wallet_behavior"]["wallet_sold_before_resolution"])
             self.assertNotIn("m2", {row.get("condition_id") for row in snapshot["open_signals"]})
 
     def test_follow_pause_new_signals_keeps_open_signal_lifecycle(self):
@@ -4445,9 +4602,14 @@ class CoreTest(unittest.TestCase):
             snapshot = FollowStore(follow_dir / "follow.db").load_dashboard_snapshot()
 
             self.assertEqual(summary["new_signal_count"], 0)
-            self.assertEqual(summary["open_signal_count"], 1)
-            self.assertEqual(snapshot["open_signals"][0]["condition_id"], "m1")
-            self.assertTrue(snapshot["open_signals"][0]["wallet_behavior"]["wallet_sold_before_resolution"])
+            self.assertEqual(summary["exited_signal_count"], 1)
+            self.assertEqual(summary["open_signal_count"], 0)
+            self.assertEqual(len(snapshot["results"]), 1)
+            self.assertEqual(snapshot["results"][0]["condition_id"], "m1")
+            self.assertEqual(snapshot["results"][0]["status"], "exited")
+            self.assertEqual(snapshot["results"][0]["exit_price"], 0.6)
+            self.assertEqual(snapshot["results"][0]["our_realized_pnl"], 0.2)
+            self.assertTrue(snapshot["results"][0]["wallet_behavior"]["wallet_sold_before_resolution"])
             self.assertNotIn("m2", {row.get("condition_id") for row in snapshot["open_signals"]})
 
     def test_follow_tick_dual_follows_opposite_wallet_buys(self):
@@ -5155,6 +5317,8 @@ class CoreTest(unittest.TestCase):
                 while status["status"].get("esports", {}).get("status") == "running" and time.time() < deadline:
                     time.sleep(0.01)
                     status = build_wallet_refresh_status(data_dir)
+                command = status["status"]["esports"]["command"]
+                self.assertIn("--refresh-classification", command)
                 self.assertEqual(status["status"]["esports"]["status"], "succeeded")
                 self.assertEqual(status["status"]["esports"]["returncode"], 0)
                 self.assertEqual(read_follow_control(data_dir)["wallet_refresh"]["esports"]["status"], "succeeded")
@@ -6355,6 +6519,7 @@ class CoreTest(unittest.TestCase):
     def test_sports_collect_skips_esports_submarket_backfill(self):
         class FakeClient:
             def __init__(self):
+                self.max_end_dates = []
                 self.user_trades = []
                 for index in range(3):
                     self.user_trades.append(
@@ -6381,6 +6546,7 @@ class CoreTest(unittest.TestCase):
 
             def list_events_paginated(self, **kwargs):
                 self.tag_slugs = kwargs.get("tag_slugs")
+                self.max_end_dates.append(kwargs.get("max_end_date"))
                 events = []
                 for index in range(3):
                     events.append(
@@ -6389,7 +6555,8 @@ class CoreTest(unittest.TestCase):
                             "slug": f"mlb-a-b-{index}",
                             "title": f"Atlanta Braves vs. Cincinnati Reds {index}",
                             "closed": True,
-                            "endDate": "2026-06-01T00:00:00Z",
+                            "startTime": "2026-06-01T00:00:00Z",
+                            "endDate": "2026-06-08T00:00:00Z",
                             "tags": [{"slug": "mlb"}],
                             "markets": [
                                 {
@@ -6398,6 +6565,10 @@ class CoreTest(unittest.TestCase):
                                     "outcomes": json.dumps(["Atlanta Braves", f"Cincinnati Reds {index}"]),
                                     "outcomePrices": '["1","0"]',
                                     "volume": 500_000,
+                                    "gameStartTime": "2026-06-01 00:00:00+00",
+                                    "endDate": "2026-06-08T00:00:00Z",
+                                    "umaEndDate": "2026-06-01T03:00:00Z",
+                                    "closedTime": "2026-06-01 03:00:00+00",
                                 }
                             ],
                         }
@@ -6448,6 +6619,10 @@ class CoreTest(unittest.TestCase):
 
             backfill.assert_not_called()
             self.assertEqual(client.tag_slugs, ("mlb",))
+            self.assertEqual(client.max_end_dates, [None])
+            classification = read_json(Path(tmp) / "sports" / "esports_classification_set.json", [])
+            self.assertEqual(len(classification), 3)
+            self.assertTrue(all(row["end_date"] == "2026-06-01T03:00:00Z" for row in classification))
 
     def test_follow_command_uses_paper_defaults(self):
         parser = build_parser()

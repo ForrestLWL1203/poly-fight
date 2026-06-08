@@ -72,6 +72,8 @@ def parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
     text = value.replace("Z", "+00:00")
+    if len(text) >= 3 and text[-3] in "+-" and text[-2:].isdigit():
+        text = f"{text}:00"
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
@@ -338,7 +340,19 @@ def event_to_market_records(
         market_type = classify_market_type(event, market)
         if not market_type or (allowed_market_types is not None and market_type not in allowed_market_types):
             continue
-        match_start_time = market.get("eventStartTime") or event.get("startTime") or market.get("gameStartTime")
+        if category == "sports":
+            match_start_time = market.get("gameStartTime") or market.get("eventStartTime") or event.get("startTime")
+            end_date = (
+                market.get("umaEndDate")
+                or market.get("closedTime")
+                or event.get("finishedTimestamp")
+                or event.get("closedTime")
+                or market.get("endDate")
+                or event.get("endDate")
+            )
+        else:
+            match_start_time = market.get("eventStartTime") or event.get("startTime") or market.get("gameStartTime")
+            end_date = event.get("endDate") or market.get("endDate")
         condition_id = str(market.get("conditionId")).lower()
         records[condition_id] = {
             "condition_id": condition_id,
@@ -348,7 +362,7 @@ def event_to_market_records(
             "question": market.get("question"),
             "outcomes": parse_jsonish(market.get("outcomes"), []),
             "outcome_prices": [to_float(v) for v in parse_jsonish(market.get("outcomePrices"), [])],
-            "end_date": event.get("endDate") or market.get("endDate"),
+            "end_date": end_date,
             "match_start_time": match_start_time,
             "market_start_time": market.get("gameStartTime") or market.get("eventStartTime") or event.get("startTime"),
             "volume": to_float(market.get("volume") or event.get("volume")),

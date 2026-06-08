@@ -312,25 +312,25 @@
                 <tbody>
                   <tr v-for="follow in follows.follows" :key="follow.condition_id" class="click-row" @click="openFollowDetail(follow.condition_id)" tabindex="0" @keydown.enter="openFollowDetail(follow.condition_id)">
                     <td>
-                      <div class="follow-match-title event-match-title" v-if="matchParts(followTitle(follow))">
-                        <span class="event-game-line">{{ matchParts(followTitle(follow)).game }}</span>
+                      <div class="follow-match-title event-match-title" v-if="matchParts(follow)">
+                        <span class="event-game-line">{{ matchParts(follow).game }}</span>
                         <div class="event-title-row">
                           <span class="team team-a">
-                            <img v-if="teamLogo(follow, 'teamA')" class="team-logo" :src="teamLogo(follow, 'teamA')" :alt="matchParts(followTitle(follow)).teamA" loading="lazy">
-                            <span>{{ matchParts(followTitle(follow)).teamA }}</span>
+                            <img v-if="teamLogo(follow, 'teamA')" class="team-logo" :src="teamLogo(follow, 'teamA')" :alt="matchParts(follow).teamA" loading="lazy">
+                            <span>{{ matchParts(follow).teamA }}</span>
                           </span>
                           <span class="vs-pill">VS</span>
                           <span class="team team-b">
-                            <img v-if="teamLogo(follow, 'teamB')" class="team-logo" :src="teamLogo(follow, 'teamB')" :alt="matchParts(followTitle(follow)).teamB" loading="lazy">
-                            <span>{{ matchParts(followTitle(follow)).teamB }}</span>
+                            <img v-if="teamLogo(follow, 'teamB')" class="team-logo" :src="teamLogo(follow, 'teamB')" :alt="matchParts(follow).teamB" loading="lazy">
+                            <span>{{ matchParts(follow).teamB }}</span>
                           </span>
-                          <span class="match-meta">{{ matchParts(followTitle(follow)).meta }}</span>
+                          <span class="match-meta">{{ matchParts(follow).meta }}</span>
                           <span v-if="follow.market_type_label" class="event-type-chip">{{ follow.market_type_label }}</span>
                         </div>
                       </div>
                       <div v-else class="market-title">{{ followTitle(follow) }}</div>
                       <div class="subtle follow-time-row">
-                        <span v-if="follow.market_type_label && !matchParts(followTitle(follow))" class="event-type-chip">{{ follow.market_type_label }}</span>
+                        <span v-if="follow.market_type_label && !matchParts(follow)" class="event-type-chip">{{ follow.market_type_label }}</span>
                         <span class="follow-time-label">开始</span>
                         <span>{{ formatTime(follow.match_start_time) }}</span>
                         <span class="follow-time-label">结束</span>
@@ -410,25 +410,25 @@
             <div class="event-grid">
               <article v-for="event in eventPageRows" :key="event.condition_id" class="event-row">
                 <div class="event-main">
-                  <div class="event-match-title" v-if="matchParts(event.title || event.question || shortId(event.condition_id))">
-                    <span class="event-game-line">{{ matchParts(event.title || event.question || shortId(event.condition_id)).game }}</span>
+                  <div class="event-match-title" v-if="matchParts(event)">
+                    <span class="event-game-line">{{ matchParts(event).game }}</span>
                     <div class="event-title-row">
                       <span class="team team-a">
-                        <img v-if="teamLogo(event, 'teamA')" class="team-logo" :src="teamLogo(event, 'teamA')" :alt="matchParts(event.title || event.question || shortId(event.condition_id)).teamA" loading="lazy">
-                        <span>{{ matchParts(event.title || event.question || shortId(event.condition_id)).teamA }}</span>
+                        <img v-if="teamLogo(event, 'teamA')" class="team-logo" :src="teamLogo(event, 'teamA')" :alt="matchParts(event).teamA" loading="lazy">
+                        <span>{{ matchParts(event).teamA }}</span>
                       </span>
                       <span class="vs-pill">VS</span>
                       <span class="team team-b">
-                        <img v-if="teamLogo(event, 'teamB')" class="team-logo" :src="teamLogo(event, 'teamB')" :alt="matchParts(event.title || event.question || shortId(event.condition_id)).teamB" loading="lazy">
-                        <span>{{ matchParts(event.title || event.question || shortId(event.condition_id)).teamB }}</span>
+                        <img v-if="teamLogo(event, 'teamB')" class="team-logo" :src="teamLogo(event, 'teamB')" :alt="matchParts(event).teamB" loading="lazy">
+                        <span>{{ matchParts(event).teamB }}</span>
                       </span>
-                      <span class="match-meta">{{ matchParts(event.title || event.question || shortId(event.condition_id)).meta }}</span>
+                      <span class="match-meta">{{ matchParts(event).meta }}</span>
                       <span v-if="event.market_type_label" class="event-type-chip">{{ event.market_type_label }}</span>
                     </div>
                   </div>
                   <div v-else class="market-title">{{ event.title || event.question || shortId(event.condition_id) }}</div>
                   <div class="subtle event-time-row">
-                    <span v-if="event.market_type_label && !matchParts(event.title || event.question || shortId(event.condition_id))" class="event-type-chip">{{ event.market_type_label }}</span>
+                    <span v-if="event.market_type_label && !matchParts(event)" class="event-type-chip">{{ event.market_type_label }}</span>
                     <span class="event-time-label">开始</span>
                     <span>{{ formatTime(event.match_start_time) }}</span>
                     <span class="event-time-label">结束</span>
@@ -475,31 +475,31 @@
           <button class="btn btn-sm btn-circle btn-ghost absolute right-3 top-3" aria-label="关闭详情" @click="closeDetail">×</button>
           <div class="detail-hero">
             <div class="detail-hero-main">
-              <div class="match-title detail-match-title" v-if="matchParts(detailTitle())">
-                <span class="match-game">{{ matchParts(detailTitle()).game }}</span>
+              <div class="match-title detail-match-title" v-if="matchParts(followDetail)">
+                <span class="match-game">{{ matchParts(followDetail).game }}</span>
                 <a v-if="detailEventUrl()" class="match-line detail-match-link" :href="detailEventUrl()" target="_blank" rel="noreferrer">
                   <span class="team team-a">
-                    <img v-if="teamLogo(followDetail, 'teamA')" class="team-logo detail-team-logo" :src="teamLogo(followDetail, 'teamA')" :alt="matchParts(detailTitle()).teamA" loading="lazy">
-                    <span>{{ matchParts(detailTitle()).teamA }}</span>
+                    <img v-if="teamLogo(followDetail, 'teamA')" class="team-logo detail-team-logo" :src="teamLogo(followDetail, 'teamA')" :alt="matchParts(followDetail).teamA" loading="lazy">
+                    <span>{{ matchParts(followDetail).teamA }}</span>
                   </span>
                   <span class="vs-pill">VS</span>
                   <span class="team team-b">
-                    <img v-if="teamLogo(followDetail, 'teamB')" class="team-logo detail-team-logo" :src="teamLogo(followDetail, 'teamB')" :alt="matchParts(detailTitle()).teamB" loading="lazy">
-                    <span>{{ matchParts(detailTitle()).teamB }}</span>
+                    <img v-if="teamLogo(followDetail, 'teamB')" class="team-logo detail-team-logo" :src="teamLogo(followDetail, 'teamB')" :alt="matchParts(followDetail).teamB" loading="lazy">
+                    <span>{{ matchParts(followDetail).teamB }}</span>
                   </span>
                 </a>
                 <div v-else class="match-line">
                   <span class="team team-a">
-                    <img v-if="teamLogo(followDetail, 'teamA')" class="team-logo detail-team-logo" :src="teamLogo(followDetail, 'teamA')" :alt="matchParts(detailTitle()).teamA" loading="lazy">
-                    <span>{{ matchParts(detailTitle()).teamA }}</span>
+                    <img v-if="teamLogo(followDetail, 'teamA')" class="team-logo detail-team-logo" :src="teamLogo(followDetail, 'teamA')" :alt="matchParts(followDetail).teamA" loading="lazy">
+                    <span>{{ matchParts(followDetail).teamA }}</span>
                   </span>
                   <span class="vs-pill">VS</span>
                   <span class="team team-b">
-                    <img v-if="teamLogo(followDetail, 'teamB')" class="team-logo detail-team-logo" :src="teamLogo(followDetail, 'teamB')" :alt="matchParts(detailTitle()).teamB" loading="lazy">
-                    <span>{{ matchParts(detailTitle()).teamB }}</span>
+                    <img v-if="teamLogo(followDetail, 'teamB')" class="team-logo detail-team-logo" :src="teamLogo(followDetail, 'teamB')" :alt="matchParts(followDetail).teamB" loading="lazy">
+                    <span>{{ matchParts(followDetail).teamB }}</span>
                   </span>
                 </div>
-                <span class="match-meta">{{ matchParts(detailTitle()).meta }}</span>
+                <span class="match-meta">{{ matchParts(followDetail).meta }}</span>
               </div>
               <h3 v-else>
                 <a v-if="detailEventUrl()" :href="detailEventUrl()" target="_blank" rel="noreferrer">{{ detailTitle() }}</a>

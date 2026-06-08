@@ -202,7 +202,12 @@ def desired_tick_interval(
     observe_window_hours: float = 24,
     min_tick_seconds: int = 180,
     max_tick_seconds: int = 900,
+    fixed_tick_seconds: int = 0,
 ) -> int:
+    # Few wallets to watch → a single fixed cadence beats the start-time-aware backoff
+    # when the goal is to spot every wallet action promptly. 0 keeps the adaptive curve.
+    if fixed_tick_seconds and int(fixed_tick_seconds) > 0:
+        return int(fixed_tick_seconds)
     if any((signal.get("status") or "open") == "open" for signal in open_signals):
         return int(min_tick_seconds)
     intervals: list[int] = []
@@ -411,7 +416,6 @@ def process_follow_trades(
     eligible_market_types: set[str] | None = None,
     eligible_category: str | None = None,
     conflict_policy: str = "dual_follow",
-    mirror_wallet_sells: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     wallet = normalize_wallet(wallet)
     stats: dict[str, Any] = {
@@ -452,7 +456,7 @@ def process_follow_trades(
                 stats["quarantine_events"].append(
                     {"wallet": wallet, "category": market_category, "reason": reason, "timestamp": now_ts, "condition_id": condition_id}
                 )
-            if not existing or reason != "material_sell" or not mirror_wallet_sells:
+            if not existing:
                 continue
             existing["status"] = "exited"
             existing["exit_price"] = current_price

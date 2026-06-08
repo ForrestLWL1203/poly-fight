@@ -84,9 +84,10 @@ class BuildLockUnavailable(RuntimeError):
 
 
 ESPORTS_LEADERBOARD_MIN_TYPE_ROI = 0.12
-ESPORTS_LEADERBOARD_MIN_TYPE_ENTRY_EDGE = 0.0
+ESPORTS_LEADERBOARD_MIN_TYPE_CAPITAL_EDGE = 0.0
 ESPORTS_LEADERBOARD_MIN_TYPE_PRE_MATCH_RATE = 0.20
-SPORTS_LEADERBOARD_MIN_ENTRY_EDGE = 0.0
+SPORTS_LEADERBOARD_MIN_CAPITAL_EDGE = 0.0
+SPORTS_LEADERBOARD_MIN_PRE_MATCH_RATE = 0.20
 CATEGORY_REFRESH_OUTPUT_FILES = {
     "smart_wallet_leaderboard.json",
     "wallet_profiles.json",
@@ -1099,6 +1100,7 @@ TEAM_LOGO_URL_RE = re.compile(
     r"url=(https%3A%2F%2Fpolymarket-upload\.s3\.us-east-2\.amazonaws\.com%2Fteam_logos%2F[^&\"<>]+?\.png)"
 )
 MATCH_TITLE_TEAMS_RE = re.compile(r"^([^:]+):\s+(.+?)\s+vs\s+(.+?)(\s+\([^)]+\))?\s+-\s+(.+)$", re.IGNORECASE)
+SPORTS_TITLE_TEAMS_RE = re.compile(r"^(.+?)\s+vs\.?\s+(.+?)(?:\s+-\s+(.+))?$", re.IGNORECASE)
 
 
 def refresh_team_logo_cache_from_active_markets(
@@ -1246,9 +1248,12 @@ def _fetch_team_logo_bytes(url: str, timeout_seconds: int) -> bytes:
 
 def _match_title_teams(title: str) -> tuple[str, str, str]:
     match = MATCH_TITLE_TEAMS_RE.match(title)
-    if not match:
-        return "", "", ""
-    return match.group(1).strip(), match.group(2).strip(), match.group(3).strip()
+    if match:
+        return match.group(1).strip(), match.group(2).strip(), match.group(3).strip()
+    sports_match = SPORTS_TITLE_TEAMS_RE.match(title)
+    if sports_match:
+        return "MLB", sports_match.group(1).strip(), sports_match.group(2).strip()
+    return "", "", ""
 
 
 def _team_logo_key_from_url(logo_url: str, *, game: str, title_teams: list[str]) -> str:
@@ -1259,6 +1264,7 @@ def _team_logo_key_from_url(logo_url: str, *, game: str, title_teams: list[str])
         game,
         game.replace(" ", "-"),
         game.replace(" ", "_"),
+        "mlb",
         "counter-strike",
         "cs2",
         "cs-go",
@@ -1270,6 +1276,11 @@ def _team_logo_key_from_url(logo_url: str, *, game: str, title_teams: list[str])
         if prefix and base.lower().startswith(prefix.lower() + "_"):
             base = base[len(prefix) + 1 :]
             break
+    candidate = _normalize_team_logo_key(base)
+    for team in title_teams:
+        title_key = _normalize_team_logo_key(team)
+        if title_key and (candidate == title_key or candidate.endswith(f" {title_key}") or title_key in candidate.split()):
+            return title_key
     if "-" in base:
         first, rest = base.split("-", 1)
         if re.search(r"\d", rest) or len(rest) >= 6:
@@ -1628,7 +1639,7 @@ def _with_esports_followable_market_types(profile: dict[str, Any]) -> dict[str, 
     if not eligible_market_types:
         if _esports_followable_roi(profile) < ESPORTS_LEADERBOARD_MIN_TYPE_ROI:
             return None
-        if _followable_capital_edge(profile) < ESPORTS_LEADERBOARD_MIN_TYPE_ENTRY_EDGE:
+        if _followable_capital_edge(profile) < ESPORTS_LEADERBOARD_MIN_TYPE_CAPITAL_EDGE:
             return None
         pre_match_rate = profile.get("pre_match_entry_rate")
         if pre_match_rate is not None and to_float(pre_match_rate) < ESPORTS_LEADERBOARD_MIN_TYPE_PRE_MATCH_RATE:
@@ -1646,7 +1657,7 @@ def _with_esports_followable_market_types(profile: dict[str, Any]) -> dict[str, 
             metrics.update(per_type_grades[market_type])
         if _esports_followable_roi(metrics) < ESPORTS_LEADERBOARD_MIN_TYPE_ROI:
             continue
-        if _followable_capital_edge(metrics) < ESPORTS_LEADERBOARD_MIN_TYPE_ENTRY_EDGE:
+        if _followable_capital_edge(metrics) < ESPORTS_LEADERBOARD_MIN_TYPE_CAPITAL_EDGE:
             continue
         pre_match_rate = metrics.get("pre_match_entry_rate")
         if pre_match_rate is not None and to_float(pre_match_rate) < ESPORTS_LEADERBOARD_MIN_TYPE_PRE_MATCH_RATE:
@@ -1667,7 +1678,10 @@ def _with_esports_followable_market_types(profile: dict[str, Any]) -> dict[str, 
 def _with_sports_followable_market_types(profile: dict[str, Any]) -> dict[str, Any] | None:
     eligible_market_types = [str(value) for value in profile.get("eligible_market_types") or [] if value]
     if not eligible_market_types:
-        if to_float(profile.get("entry_edge")) < SPORTS_LEADERBOARD_MIN_ENTRY_EDGE:
+        if _followable_capital_edge(profile) < SPORTS_LEADERBOARD_MIN_CAPITAL_EDGE:
+            return None
+        pre_match_rate = profile.get("pre_match_entry_rate")
+        if pre_match_rate is not None and to_float(pre_match_rate) < SPORTS_LEADERBOARD_MIN_PRE_MATCH_RATE:
             return None
         return profile
 
@@ -1680,7 +1694,10 @@ def _with_sports_followable_market_types(profile: dict[str, Any]) -> dict[str, A
             metrics.update(per_type[market_type])
         if isinstance(per_type_grades.get(market_type), dict):
             metrics.update(per_type_grades[market_type])
-        if to_float(metrics.get("entry_edge")) < SPORTS_LEADERBOARD_MIN_ENTRY_EDGE:
+        if _followable_capital_edge(metrics) < SPORTS_LEADERBOARD_MIN_CAPITAL_EDGE:
+            continue
+        pre_match_rate = metrics.get("pre_match_entry_rate")
+        if pre_match_rate is not None and to_float(pre_match_rate) < SPORTS_LEADERBOARD_MIN_PRE_MATCH_RATE:
             continue
         followable_types.append(market_type)
     if not followable_types:
@@ -1957,7 +1974,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
             active=None,
             max_pages=args.gamma_pages,
             min_end_date=min_end_date,
-            max_end_date=now_dt,
+            max_end_date=None if category == "sports" else now_dt,
             tag_slugs=tag_slugs,
         )
         classification_set = build_classification_set(
@@ -2631,6 +2648,7 @@ def command_follow(
         observe_window_hours=args.observe_window_hours,
         min_tick_seconds=args.min_tick_seconds,
         max_tick_seconds=args.max_tick_seconds,
+        fixed_tick_seconds=getattr(args, "tick_seconds", 0),
     )
 
     wallet_trade_state = dict(wallet_trade_state or state.get("wallet_trade_state") or {})
@@ -2723,7 +2741,6 @@ def command_follow(
                         eligible_market_types=eligible_market_types_by_wallet.get(scope_key),
                         eligible_category=category,
                         conflict_policy=args.conflict_policy,
-                        mirror_wallet_sells=args.mirror_wallet_sells,
                     )
                     after_ids = {signal.get("signal_id") for signal in open_signals}
                     new_signal_count += len(after_ids - before_ids)
@@ -2771,7 +2788,6 @@ def command_follow(
                 eligible_market_types=eligible_market_types_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 eligible_category=category if wallet_can_open_new else None,
                 conflict_policy=args.conflict_policy,
-                mirror_wallet_sells=args.mirror_wallet_sells,
             )
             after_ids = {signal.get("signal_id") for signal in open_signals}
             new_signal_count += len(after_ids - before_ids)
@@ -3174,11 +3190,13 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--max-follow-legs", type=int, default=10)
         subparser.add_argument("--min-tick-seconds", type=int, default=180)
         subparser.add_argument("--max-tick-seconds", type=int, default=900)
+        # Fixed polling cadence (seconds). >0 overrides the adaptive min/max curve so every
+        # wallet is checked on one steady interval; 0 restores the start-time-aware backoff.
+        subparser.add_argument("--tick-seconds", type=int, default=120)
         subparser.add_argument("--consensus-min-same-side", type=int, default=1)
         subparser.add_argument("--consensus-block-opposite", dest="consensus_block_opposite", action="store_true", default=True)
         subparser.add_argument("--no-consensus-block-opposite", dest="consensus_block_opposite", action="store_false")
         subparser.add_argument("--conflict-policy", choices=["dual_follow", "exit_on_opposite"], default="dual_follow")
-        subparser.add_argument("--mirror-wallet-sells", action="store_true")
         subparser.add_argument("--quarantine-sell-frac", type=float, default=0.2)
         subparser.add_argument("--max-workers", type=int, default=8)
         subparser.add_argument("--max-requests-per-second", type=float, default=10)
@@ -3241,11 +3259,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-follow-legs", type=int, default=10)
     run.add_argument("--min-tick-seconds", type=int, default=180)
     run.add_argument("--max-tick-seconds", type=int, default=900)
+    # Fixed polling cadence (seconds). >0 overrides the adaptive min/max curve; 0 = adaptive.
+    run.add_argument("--tick-seconds", type=int, default=120)
     run.add_argument("--consensus-min-same-side", type=int, default=1)
     run.add_argument("--consensus-block-opposite", dest="consensus_block_opposite", action="store_true", default=True)
     run.add_argument("--no-consensus-block-opposite", dest="consensus_block_opposite", action="store_false")
     run.add_argument("--conflict-policy", choices=["dual_follow", "exit_on_opposite"], default="dual_follow")
-    run.add_argument("--mirror-wallet-sells", action="store_true")
     run.add_argument("--quarantine-sell-frac", type=float, default=0.2)
     run.add_argument("--error-retry-seconds", type=int, default=180)
     run.add_argument("--max-consecutive-error-seconds", type=int, default=600)

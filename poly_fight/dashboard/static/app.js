@@ -790,8 +790,7 @@ createApp({
       return "";
     },
     eventGame(event) {
-      const title = event?.title || event?.question || this.shortId(event?.condition_id);
-      return this.matchParts(title)?.game || "";
+      return this.matchParts(event)?.game || "";
     },
     eventFollowText(event) {
       const parts = this.eventFollowParts(event);
@@ -801,8 +800,7 @@ createApp({
     eventFollowParts(event) {
       const signals = [...(event?.open_signals || []), ...(event?.results || [])];
       const total = signals.length;
-      const title = event?.title || event?.question || this.shortId(event?.condition_id);
-      const parts = this.matchParts(title);
+      const parts = this.matchParts(event);
       const counts = event?.side_counts || {};
       const countFor = (label, index) => {
         const keys = [label, String(index), String(label || "").trim().toLowerCase()];
@@ -1050,8 +1048,13 @@ createApp({
       if (status === "settled") return signal.outcome_won ? "1.000（胜）" : "0.000（负）";
       return "-";
     },
-    matchParts(title) {
-      const text = String(title || "");
+    matchParts(value) {
+      if (value && typeof value === "object") {
+        const parts = value.match_parts;
+        if (parts && typeof parts === "object" && parts.teamA && parts.teamB) return parts;
+        value = value.title || value.question || value.market_title || value.event_title || value.market_question || value.condition_id || "";
+      }
+      const text = String(value || "");
       if (!text) return null;
       if (this.matchTitleCache[text] !== undefined) return this.matchTitleCache[text];
       const match = text.match(/^([^:]+):\s+(.+?)\s+vs\s+(.+?)(\s+\([^)]+\))?\s+-\s+(.+)$/i);
@@ -1074,7 +1077,7 @@ createApp({
     },
     signalOutcomeSide(signal) {
       const outcome = String(signal?.outcome || "").trim().toLowerCase();
-      const parts = this.matchParts(this.detailTitle());
+      const parts = this.matchParts(this.followDetail);
       if (!outcome || !parts) return "";
       if (outcome === String(parts.teamA || "").trim().toLowerCase()) return "teamA";
       if (outcome === String(parts.teamB || "").trim().toLowerCase()) return "teamB";
