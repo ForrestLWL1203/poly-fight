@@ -90,6 +90,11 @@ class BuildLockUnavailable(RuntimeError):
 ESPORTS_LEADERBOARD_MIN_TYPE_ROI = 0.12
 ESPORTS_LEADERBOARD_MIN_TYPE_CAPITAL_EDGE = 0.0
 SPORTS_LEADERBOARD_MIN_CAPITAL_EDGE = 0.0
+SPORTS_FLAT_FOLLOW_MIN_SAMPLE = 8
+SPORTS_FLAT_FOLLOW_MIN_POSITIVE_MARKET_RATE = 0.60
+SPORTS_FLAT_FOLLOW_MIN_WILSON = 0.50
+SPORTS_FLAT_FOLLOW_MIN_MEDIAN_MARKET_ROI = 0.10
+SPORTS_FLAT_FOLLOW_MAX_MEDIAN_ENTRY = 0.68
 CATEGORY_REFRESH_OUTPUT_FILES = {
     "smart_wallet_leaderboard.json",
     "wallet_profiles.json",
@@ -188,6 +193,40 @@ CATEGORY_MARKET_SCOPES = {
     "esports": "cs-dota-lol-main-game-map-winner-v1",
     "sports": "nba-ufc-moneyline-v1",
 }
+ESPORTS_DEFAULT_MAX_PROFILES_PER_RUN = 150
+ESPORTS_DEFAULT_MAX_ESPORTS_CLOSED_POSITIONS_PER_WALLET = 100
+ESPORTS_DEFAULT_USER_HISTORY_TRADES_MAX_PAGES = 3
+SPORTS_DEFAULT_MAX_PROFILES_PER_RUN = 200
+SPORTS_DEFAULT_MAX_ESPORTS_CLOSED_POSITIONS_PER_WALLET = 150
+SPORTS_DEFAULT_USER_HISTORY_TRADES_MAX_PAGES = 8
+
+
+def effective_build_limits(args: argparse.Namespace) -> dict[str, int]:
+    if getattr(args, "category", "esports") != "sports":
+        return {}
+    limits = {
+        "sports_nba_target_markets": int(getattr(args, "sports_nba_target_markets", 80) or 80),
+        "sports_ufc_target_markets": int(getattr(args, "sports_ufc_target_markets", 80) or 80),
+        "max_profiles_per_run": int(getattr(args, "max_profiles_per_run", SPORTS_DEFAULT_MAX_PROFILES_PER_RUN) or 0),
+        "user_history_trades_max_pages": int(
+            getattr(args, "user_history_trades_max_pages", SPORTS_DEFAULT_USER_HISTORY_TRADES_MAX_PAGES) or 0
+        ),
+        "max_esports_closed_positions_per_wallet": int(
+            getattr(
+                args,
+                "max_esports_closed_positions_per_wallet",
+                SPORTS_DEFAULT_MAX_ESPORTS_CLOSED_POSITIONS_PER_WALLET,
+            )
+            or 0
+        ),
+    }
+    if limits["max_profiles_per_run"] == ESPORTS_DEFAULT_MAX_PROFILES_PER_RUN:
+        limits["max_profiles_per_run"] = SPORTS_DEFAULT_MAX_PROFILES_PER_RUN
+    if limits["user_history_trades_max_pages"] == ESPORTS_DEFAULT_USER_HISTORY_TRADES_MAX_PAGES:
+        limits["user_history_trades_max_pages"] = SPORTS_DEFAULT_USER_HISTORY_TRADES_MAX_PAGES
+    if limits["max_esports_closed_positions_per_wallet"] == ESPORTS_DEFAULT_MAX_ESPORTS_CLOSED_POSITIONS_PER_WALLET:
+        limits["max_esports_closed_positions_per_wallet"] = SPORTS_DEFAULT_MAX_ESPORTS_CLOSED_POSITIONS_PER_WALLET
+    return limits
 
 
 def resolve_data_dir(args: argparse.Namespace) -> Path:
@@ -1670,7 +1709,7 @@ def build_leaderboard_from_profiles(
     max_tail_entry_rate: float = 0.34,
     min_pre_match_entry_rate: float = 0.0,
     league_event_counts: dict[str, int] | None = None,
-    min_sports_participation_rate: float = 0.5,
+    min_sports_participation_rate: float = 0.0,
     min_sports_participated_events: int = 5,
 ) -> list[dict[str, Any]]:
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
@@ -1810,7 +1849,10 @@ def _with_sports_followable_market_types(profile: dict[str, Any]) -> dict[str, A
     if not eligible_market_types:
         if _followable_capital_edge(profile) < SPORTS_LEADERBOARD_MIN_CAPITAL_EDGE:
             return None
-        return profile
+        followability = sports_flat_followability(profile)
+        if not followability["flat_followable"]:
+            return None
+        return {**profile, **followability}
 
     per_type = profile.get("per_type") if isinstance(profile.get("per_type"), dict) else {}
     per_type_grades = profile.get("per_type_grades") if isinstance(profile.get("per_type_grades"), dict) else {}
@@ -1823,17 +1865,44 @@ def _with_sports_followable_market_types(profile: dict[str, Any]) -> dict[str, A
             metrics.update(per_type_grades[market_type])
         if _followable_capital_edge(metrics) < SPORTS_LEADERBOARD_MIN_CAPITAL_EDGE:
             continue
+        if not sports_flat_followability(metrics)["flat_followable"]:
+            continue
         followable_types.append(market_type)
     if not followable_types:
         return None
+    followability = {"flat_followable": True, "sports_follow_mode": "flat", "sports_flat_follow_reasons": []}
     if followable_types == eligible_market_types:
-        return profile
+        return {**profile, **followability}
     filtered = dict(profile)
     filtered["eligible_market_types"] = followable_types
     filtered["eligible_market_type_labels"] = [MARKET_TYPE_LABELS.get(value, value) for value in followable_types]
+    filtered.update(followability)
     if isinstance(per_type_grades, dict):
         filtered["per_type_grades"] = {key: value for key, value in per_type_grades.items() if key in followable_types}
     return filtered
+
+
+def sports_flat_followability(metrics: dict[str, Any]) -> dict[str, Any]:
+    reasons: list[str] = []
+    closed_count = int(metrics.get("esports_closed_count") or 0)
+    if closed_count < SPORTS_FLAT_FOLLOW_MIN_SAMPLE:
+        reasons.append("flat_thin_sample")
+    if to_float(metrics.get("positive_market_rate")) < SPORTS_FLAT_FOLLOW_MIN_POSITIVE_MARKET_RATE:
+        reasons.append("flat_low_positive_rate")
+    if to_float(metrics.get("wilson_win_rate_lower_bound")) < SPORTS_FLAT_FOLLOW_MIN_WILSON:
+        reasons.append("flat_low_wilson")
+    if to_float(metrics.get("median_market_roi")) < SPORTS_FLAT_FOLLOW_MIN_MEDIAN_MARKET_ROI:
+        reasons.append("flat_low_median_market_roi")
+    median_entry = to_float(metrics.get("median_entry_price"))
+    if median_entry <= 0 or median_entry > SPORTS_FLAT_FOLLOW_MAX_MEDIAN_ENTRY:
+        reasons.append("flat_high_entry_price")
+    if _followable_capital_edge(metrics) < SPORTS_LEADERBOARD_MIN_CAPITAL_EDGE:
+        reasons.append("flat_low_capital_edge")
+    return {
+        "flat_followable": not reasons,
+        "sports_follow_mode": "flat" if not reasons else "watch",
+        "sports_flat_follow_reasons": reasons,
+    }
 
 
 def _esports_followable_roi(metrics: dict[str, Any]) -> float:
@@ -2060,6 +2129,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
     now_ts = int(datetime.now(timezone.utc).timestamp())
 
     category = getattr(args, "category", "esports")
+    effective_limits = effective_build_limits(args)
     classification_lookback_days = (
         args.classification_lookback_days
         if args.classification_lookback_days is not None
@@ -2147,6 +2217,24 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         game_winner_max_markets_per_run=args.game_winner_max_markets_per_run,
         map_winner_max_markets_per_run=args.map_winner_max_markets_per_run,
         market_offset=market_offset,
+        league_target_markets=(
+            {
+                "nba": effective_limits.get("sports_nba_target_markets", args.sports_nba_target_markets),
+                "ufc": effective_limits.get("sports_ufc_target_markets", args.sports_ufc_target_markets),
+            }
+            if category == "sports"
+            else None
+        ),
+        league_min_market_volumes=(
+            {"nba": args.sports_nba_min_market_volume, "ufc": args.sports_ufc_min_market_volume}
+            if category == "sports"
+            else None
+        ),
+        league_fallback_min_market_volumes=(
+            {"nba": args.sports_nba_fallback_min_market_volume, "ufc": args.sports_ufc_fallback_min_market_volume}
+            if category == "sports"
+            else None
+        ),
     )
     write_json(data_dir / "discovery_slate.json", discovery_slate)
 
@@ -2270,7 +2358,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         existing_profiles,
         now_ts=now_ts,
         ttl_seconds=args.profile_refresh_ttl_days * 86400,
-        max_profiles=args.max_profiles_per_run,
+        max_profiles=effective_limits.get("max_profiles_per_run", args.max_profiles_per_run),
     )
 
     def fetch_raw_user_trades_for_candidate(candidate: dict[str, Any]) -> tuple[str, list[dict]]:
@@ -2279,7 +2367,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
             client,
             wallet,
             page_limit=args.user_history_trades_limit,
-            max_pages=args.user_history_trades_max_pages,
+            max_pages=effective_limits.get("user_history_trades_max_pages", args.user_history_trades_max_pages),
             data_dir=data_dir,
             now_ts=now_ts,
             cache_ttl_days=args.market_trades_cache_ttl_days,
@@ -2335,7 +2423,10 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         return _filter_esports_user_trades(
             raw_user_trades_by_wallet.get(normalize_wallet(wallet), []),
             condition_ids,
-            max_esports_markets=args.max_esports_closed_positions_per_wallet,
+            max_esports_markets=effective_limits.get(
+                "max_esports_closed_positions_per_wallet",
+                args.max_esports_closed_positions_per_wallet,
+            ),
         )
 
     def load_closed_positions(wallet: str) -> list[dict]:
@@ -2343,7 +2434,10 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
             client,
             wallet,
             condition_ids,
-            max_esports_closed_positions=args.max_esports_closed_positions_per_wallet,
+            max_esports_closed_positions=effective_limits.get(
+                "max_esports_closed_positions_per_wallet",
+                args.max_esports_closed_positions_per_wallet,
+            ),
             market_chunk_size=args.closed_position_market_chunk_size,
         )
 
@@ -3098,6 +3192,12 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--max-retry-after-seconds", type=float, default=60)
         subparser.add_argument("--min-market-volume", type=float, default=25_000)
         subparser.add_argument("--sports-event-min-volume", type=float, default=50_000)
+        subparser.add_argument("--sports-nba-target-markets", type=int, default=80)
+        subparser.add_argument("--sports-ufc-target-markets", type=int, default=80)
+        subparser.add_argument("--sports-nba-min-market-volume", type=float, default=250_000)
+        subparser.add_argument("--sports-nba-fallback-min-market-volume", type=float, default=100_000)
+        subparser.add_argument("--sports-ufc-min-market-volume", type=float, default=25_000)
+        subparser.add_argument("--sports-ufc-fallback-min-market-volume", type=float, default=10_000)
         subparser.add_argument("--fallback-min-market-volume", type=float, default=10_000)
         subparser.add_argument("--submarket-min-market-volume", type=float, default=5_000)
         subparser.add_argument("--submarket-fallback-min-market-volume", type=float, default=1_000)

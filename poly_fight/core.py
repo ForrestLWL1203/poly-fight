@@ -467,6 +467,9 @@ def build_discovery_slate(
     game_winner_max_markets_per_run: int | None = None,
     map_winner_max_markets_per_run: int | None = None,
     market_offset: int = 0,
+    league_target_markets: dict[str, int] | None = None,
+    league_min_market_volumes: dict[str, float] | None = None,
+    league_fallback_min_market_volumes: dict[str, float] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     now = now or datetime.now(timezone.utc)
     game_winner_target_markets = int(game_winner_target_markets if game_winner_target_markets is not None else submarket_target_markets)
@@ -478,11 +481,13 @@ def build_discovery_slate(
         map_winner_max_markets_per_run if map_winner_max_markets_per_run is not None else submarket_max_markets_per_run
     )
 
-    def select(days: int, min_volume: float, market_types: set[str]) -> list[dict[str, Any]]:
+    def select(days: int, min_volume: float, market_types: set[str], *, league: str | None = None) -> list[dict[str, Any]]:
         selected = []
         for market in classification_set:
             market_type = str(market.get("market_type") or MAIN_MATCH)
             if market_type not in market_types:
+                continue
+            if league is not None and str(market.get("league") or "").lower() != league:
                 continue
             end = parse_dt(market.get("end_date"))
             if not end:
@@ -502,17 +507,18 @@ def build_discovery_slate(
         primary_min_volume: float,
         fallback_min_volume: float,
         target: int,
+        league: str | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         selected: list[dict[str, Any]] = []
         selected_days = lookback_steps[-1]
         selected_min_volume = primary_min_volume
         for days in lookback_steps:
-            selected = select(days, primary_min_volume, market_types)
+            selected = select(days, primary_min_volume, market_types, league=league)
             selected_days = days
             if len(selected) >= target:
                 break
         if len(selected) < target:
-            selected = select(lookback_steps[-1], fallback_min_volume, market_types)
+            selected = select(lookback_steps[-1], fallback_min_volume, market_types, league=league)
             selected_min_volume = fallback_min_volume
         return selected, {
             "selected_lookback_days": selected_days,
@@ -521,12 +527,42 @@ def build_discovery_slate(
             "total_selected_market_count": len(selected),
         }
 
-    main_selected, main_meta = select_bucket(
-        market_types={MAIN_MATCH},
-        primary_min_volume=min_market_volume,
-        fallback_min_volume=fallback_min_market_volume,
-        target=target_markets,
-    )
+    league_metas: dict[str, dict[str, Any]] = {}
+    league_selected: list[dict[str, Any]] = []
+    if league_target_markets:
+        for league, target in sorted(league_target_markets.items()):
+            normalized_league = str(league or "").lower()
+            if not normalized_league or int(target) <= 0:
+                continue
+            selected, meta = select_bucket(
+                market_types={MAIN_MATCH},
+                primary_min_volume=to_float((league_min_market_volumes or {}).get(normalized_league), min_market_volume),
+                fallback_min_volume=to_float((league_fallback_min_market_volumes or {}).get(normalized_league), fallback_min_market_volume),
+                target=int(target),
+                league=normalized_league,
+            )
+            league_metas[normalized_league] = meta
+            league_selected.extend(selected[: int(target)])
+        main_selected = league_selected
+        main_meta = {
+            "selected_lookback_days": max(
+                (int(meta.get("selected_lookback_days") or 0) for meta in league_metas.values()),
+                default=lookback_steps[-1],
+            ),
+            "selected_min_market_volume": min(
+                (to_float(meta.get("selected_min_market_volume")) for meta in league_metas.values()),
+                default=min_market_volume,
+            ),
+            "target_markets": sum(int(meta.get("target_markets") or 0) for meta in league_metas.values()),
+            "total_selected_market_count": sum(int(meta.get("total_selected_market_count") or 0) for meta in league_metas.values()),
+        }
+    else:
+        main_selected, main_meta = select_bucket(
+            market_types={MAIN_MATCH},
+            primary_min_volume=min_market_volume,
+            fallback_min_volume=fallback_min_market_volume,
+            target=target_markets,
+        )
     game_selected, game_meta = select_bucket(
         market_types={GAME_WINNER},
         primary_min_volume=submarket_min_market_volume,
@@ -540,7 +576,10 @@ def build_discovery_slate(
         target=map_winner_target_markets,
     )
 
-    main_slice = main_selected[market_offset : market_offset + max_markets_per_run]
+    if league_target_markets:
+        main_slice = main_selected
+    else:
+        main_slice = main_selected[market_offset : market_offset + max_markets_per_run]
     game_slice = game_selected[:game_winner_max_markets_per_run]
     map_slice = map_selected[:map_winner_max_markets_per_run]
     merged: dict[str, dict[str, Any]] = {}
@@ -556,17 +595,21 @@ def build_discovery_slate(
 
     type_counts: dict[str, int] = {}
     selected_type_counts: dict[str, int] = {}
+    selected_league_counts: dict[str, int] = {}
     for market in classification_set:
         market_type = str(market.get("market_type") or MAIN_MATCH)
         type_counts[market_type] = type_counts.get(market_type, 0) + 1
     for market in selected:
         market_type = str(market.get("market_type") or MAIN_MATCH)
         selected_type_counts[market_type] = selected_type_counts.get(market_type, 0) + 1
+        league = str(market.get("league") or "").lower()
+        if league:
+            selected_league_counts[league] = selected_league_counts.get(league, 0) + 1
 
     return selected, {
         "selected_lookback_days": main_meta["selected_lookback_days"],
         "selected_min_market_volume": main_meta["selected_min_market_volume"],
-        "target_markets": target_markets,
+        "target_markets": main_meta["target_markets"] if league_target_markets else target_markets,
         "market_offset": market_offset,
         "max_markets_per_run": max_markets_per_run,
         "total_selected_market_count": (
@@ -577,7 +620,9 @@ def build_discovery_slate(
         "market_count": len(selected),
         "market_type_counts": type_counts,
         "selected_by_market_type": selected_type_counts,
+        "selected_by_league": selected_league_counts,
         "main_match": main_meta,
+        "leagues": league_metas,
         "submarkets": {
             "target_markets": game_winner_target_markets + map_winner_target_markets,
             "max_markets_per_run": game_winner_max_markets_per_run + map_winner_max_markets_per_run,
@@ -1452,7 +1497,7 @@ def classify_wallet_bucket(
 def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> dict[str, Any]:
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
     category = str(summary.get("category") or "").lower()
-    classified = classify_wallet_bucket(summary, now_ts=now_ts, min_sample=5 if category == "sports" else 8)
+    classified = classify_wallet_bucket(summary, now_ts=now_ts, min_sample=8)
     per_type = summary.get("per_type") or {}
     if not isinstance(per_type, dict):
         return classified
@@ -1466,7 +1511,7 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
         per_type.items(),
         key=lambda item: MARKET_TYPE_ORDER.get(str(item[0]), 99),
     ):
-        min_sample = 5 if category == "sports" else 8 if market_type == MAIN_MATCH else 10
+        min_sample = 8 if category == "sports" or market_type == MAIN_MATCH else 10
         bucket_input = {
             **bucket_summary,
             "category": summary.get("category", bucket_summary.get("category")),
