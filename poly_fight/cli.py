@@ -69,7 +69,6 @@ from .follow import (
     should_retry_unqualified_position,
     summarize_wallet_fills,
     trade_condition_id,
-    upsert_follow_signal,
     winner_outcome_index,
 )
 from .storage import FollowStore
@@ -1505,54 +1504,6 @@ def fetch_user_trades_until_cursor(
         if found_cursor or len(batch) < limit:
             break
     return trades
-
-
-def refresh_open_signal_fills(
-    client: PolymarketClient,
-    open_signals: list[dict[str, Any]],
-    active_markets: dict[str, dict[str, Any]],
-    *,
-    now_ts: int,
-    max_slippage: float,
-) -> tuple[list[dict[str, Any]], int]:
-    refreshed = 0
-    for signal in open_signals:
-        condition_id = str(signal.get("condition_id") or "").lower()
-        market = active_markets.get(condition_id)
-        if not market:
-            continue
-        start_dt = parse_dt(market.get("match_start_time") or market.get("market_start_time"))
-        if start_dt and now_ts >= int(start_dt.timestamp()):
-            continue
-        outcome_index = int(signal.get("outcome_index") or 0)
-        current_price = market_current_price(market, outcome_index)
-        for trigger in signal.get("triggered_by") or []:
-            wallet = normalize_wallet(trigger.get("wallet"))
-            if not wallet:
-                continue
-            trades = fetch_wallet_market_trades(client, wallet, condition_id)
-            fills_summary = summarize_wallet_fills(trades, wallet=wallet, outcome_index=outcome_index)
-            wallet_avg_price = fills_summary.get("avg_price") or trigger.get("wallet_avg_price") or signal.get("wallet_avg_price")
-            qualification = {
-                "condition_id": condition_id,
-                "outcome_index": outcome_index,
-                "outcome": signal.get("outcome"),
-                "wallet_avg_price": wallet_avg_price,
-                "position_size": trigger.get("position_size") or 0,
-            }
-            open_signals, _created = upsert_follow_signal(
-                open_signals,
-                wallet=wallet,
-                market=market,
-                qualification=qualification,
-                fills_summary=fills_summary,
-                current_price=current_price,
-                max_slippage=max_slippage,
-                stake_usdc=to_float(signal.get("stake_usdc")),
-                now_ts=now_ts,
-            )
-            refreshed += 1
-    return open_signals, refreshed
 
 
 def should_use_cached_profile(cached: dict[str, Any] | None, *, now_ts: int, ttl_seconds: int) -> bool:

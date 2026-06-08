@@ -71,7 +71,6 @@ from poly_fight.cli import (
     observed_performance_quarantine_events,
     prune_profile_store,
     refresh_team_logo_cache_from_active_markets,
-    refresh_open_signal_fills,
     read_json,
     read_jsonl,
     resolve_data_dir,
@@ -126,7 +125,6 @@ from poly_fight.follow import (
     settle_open_signals,
     should_retry_unqualified_position,
     summarize_wallet_fills,
-    upsert_follow_signal,
     wallet_behavior_summary,
 )
 
@@ -4373,7 +4371,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(perf["groups"]["contested"]["signals"], 1)
         self.assertEqual(perf["groups"]["contested"]["wins"], 0)
 
-    def test_follow_fill_summary_slippage_and_signal_dedup(self):
+    def test_follow_fill_summary_and_slippage(self):
         trades = [
             {"proxyWallet": "0xA", "outcomeIndex": 0, "price": 0.4, "size": 10, "timestamp": 1},
             {"proxyWallet": "0xA", "outcomeIndex": 0, "price": 0.5, "size": 30, "timestamp": 2},
@@ -4385,92 +4383,6 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(fills["avg_price"], 0.475)
         self.assertFalse(evaluate_slippage(0.5, 0.65, max_slippage=0.05)["would_follow"])
         self.assertTrue(evaluate_slippage(0.5, 0.53, max_slippage=0.05)["would_follow"])
-
-        market = {"condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [0.53, 0.47], "title": "M"}
-        qualification = {
-            "condition_id": "m1",
-            "outcome_index": 0,
-            "outcome": "A",
-            "wallet_avg_price": 0.475,
-            "position_size": 40,
-        }
-        signals, created = upsert_follow_signal(
-            [],
-            wallet="0xA",
-            market=market,
-            qualification=qualification,
-            fills_summary=fills,
-            current_price=0.53,
-            max_slippage=0.05,
-            stake_usdc=100,
-            now_ts=100,
-        )
-        signals, second_created = upsert_follow_signal(
-            signals,
-            wallet="0xB",
-            market=market,
-            qualification={**qualification, "wallet_avg_price": 0.49},
-            fills_summary=fills,
-            current_price=0.54,
-            max_slippage=0.05,
-            stake_usdc=100,
-            now_ts=110,
-        )
-
-        self.assertTrue(created)
-        self.assertFalse(second_created)
-        self.assertEqual(len(signals), 1)
-        self.assertEqual(len(signals[0]["triggered_by"]), 2)
-        self.assertEqual(signals[0]["our_entry_price"], 0.53)
-        self.assertFalse(signals[0]["would_follow"])
-
-    def test_follow_open_signal_refresh_preserves_entry_and_updates_fills(self):
-        class FakeClient:
-            def trades_for_user_market(self, wallet, condition_id, *, limit=500, offset=0):
-                return [
-                    {"proxyWallet": wallet, "outcomeIndex": 0, "price": 0.4, "size": 10, "timestamp": 1},
-                    {"proxyWallet": wallet, "outcomeIndex": 0, "price": 0.6, "size": 10, "timestamp": 2},
-                ]
-
-        now = 1000
-        start = datetime.fromtimestamp(now + 3600, timezone.utc).isoformat()
-        signals = [
-            {
-                "signal_id": "m1:0",
-                "condition_id": "m1",
-                "outcome_index": 0,
-                "outcome": "A",
-                "wallet_avg_price": 0.4,
-                "our_entry_price": 0.45,
-                "current_price": 0.45,
-                "stake_usdc": 100,
-                "would_follow": True,
-                "slippage_over_wallet_entry": 0.05,
-                "triggered_by": [{"wallet": "0xA", "wallet_avg_price": 0.4, "position_size": 10}],
-            }
-        ]
-        markets = {
-            "m1": {
-                "condition_id": "m1",
-                "outcomes": ["A", "B"],
-                "outcome_prices": [0.7, 0.3],
-                "match_start_time": start,
-            }
-        }
-
-        refreshed, count = refresh_open_signal_fills(
-            FakeClient(),
-            signals,
-            markets,
-            now_ts=now,
-            max_slippage=0.05,
-        )
-
-        self.assertEqual(count, 1)
-        self.assertEqual(refreshed[0]["our_entry_price"], 0.45)
-        self.assertEqual(refreshed[0]["current_price"], 0.7)
-        self.assertTrue(refreshed[0]["would_follow"])
-        self.assertEqual(refreshed[0]["triggered_by"][0]["fills_summary"]["fill_count"], 2)
 
     def test_follow_resolution_lookup_skips_pre_match_signals(self):
         class FakeClient:
@@ -7129,14 +7041,10 @@ class CoreTest(unittest.TestCase):
                 "signal_id": "m1:0",
                 "condition_id": "m1",
                 "outcome_index": 0,
+                "wallet": "0xA",
                 "our_entry_price": 0.6,
-                "stake_usdc": 100,
-                "triggered_by": [
-                    {
-                        "wallet": "0xA",
-                        "wallet_avg_price": 0.5,
-                        "fills_summary": {"fills": [{"price": 0.5, "size": 1}], "avg_price": 0.5},
-                    }
+                "legs": [
+                    {"stake": 100, "wallet_fill_price": 0.5, "our_entry_price": 0.6}
                 ],
             }
         ]
@@ -7147,7 +7055,6 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(remaining, [])
         self.assertEqual(settled[0]["wallet_paper_pnl_by_wallet"]["0xa"], 100)
         self.assertEqual(round(settled[0]["our_paper_pnl"], 8), 66.66666667)
-        self.assertNotIn("fills", settled[0]["triggered_by"][0]["fills_summary"])
         self.assertEqual(perf["wallets"]["0xa"]["signals"], 1)
 
     def test_follow_aggregate_includes_mirror_exits(self):

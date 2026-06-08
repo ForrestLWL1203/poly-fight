@@ -778,10 +778,6 @@ def summarize_wallet_fills(
     }
 
 
-def fill_summary_without_raw(fills_summary: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in fills_summary.items() if key != "fills"}
-
-
 def evaluate_slippage(wallet_avg: float, current_price: float, *, max_slippage: float) -> dict[str, Any]:
     slippage = current_price - wallet_avg
     return {
@@ -879,77 +875,6 @@ def paper_pnl(entry_price: float, outcome_won: bool, stake: float) -> float:
     return round(-stake, 8)
 
 
-def signal_id(condition_id: str, outcome_index: int) -> str:
-    return f"{condition_id.lower()}:{outcome_index}"
-
-
-def upsert_follow_signal(
-    open_signals: list[dict[str, Any]],
-    *,
-    wallet: str,
-    market: dict[str, Any],
-    qualification: dict[str, Any],
-    fills_summary: dict[str, Any],
-    current_price: float,
-    max_slippage: float,
-    stake_usdc: float,
-    now_ts: int,
-) -> tuple[list[dict[str, Any]], bool]:
-    condition_id = qualification["condition_id"]
-    outcome_index = qualification["outcome_index"]
-    sid = signal_id(condition_id, outcome_index)
-    slippage = evaluate_slippage(qualification["wallet_avg_price"], current_price, max_slippage=max_slippage)
-    trigger = {
-        "wallet": normalize_wallet(wallet),
-        "category": str(market.get("category") or "esports").lower(),
-        "wallet_avg_price": qualification["wallet_avg_price"],
-        "position_size": qualification["position_size"],
-        "fills_summary": fills_summary,
-        "updated_at": now_ts,
-    }
-    for signal in open_signals:
-        if signal.get("signal_id") != sid:
-            continue
-        signal["updated_at"] = now_ts
-        signal["current_price"] = current_price
-        triggered = signal.setdefault("triggered_by", [])
-        for index, row in enumerate(triggered):
-            if normalize_wallet(row.get("wallet")) == trigger["wallet"]:
-                triggered[index] = trigger
-                break
-        else:
-            triggered.append(trigger)
-        return open_signals, False
-
-    open_signals.append(
-        {
-            "signal_id": sid,
-            "condition_id": condition_id,
-            "outcome_index": outcome_index,
-            "outcome": qualification.get("outcome"),
-            "event_title": market.get("title"),
-            "category": str(market.get("category") or "esports").lower(),
-            "league": market.get("league"),
-            "event_slug": market.get("event_slug"),
-            "market_question": market.get("question"),
-            "market_type": market.get("market_type"),
-            "market_type_label": market.get("market_type_label"),
-            "end_date": market.get("end_date"),
-            "match_start_time": market.get("match_start_time") or market.get("market_start_time"),
-            "wallet_avg_price": qualification["wallet_avg_price"],
-            "our_entry_price": current_price,
-            "current_price": current_price,
-            "stake_usdc": stake_usdc,
-            "created_at": now_ts,
-            "updated_at": now_ts,
-            "status": "open",
-            "triggered_by": [trigger],
-            **slippage,
-        }
-    )
-    return open_signals, True
-
-
 def winner_outcome_index(market: dict[str, Any]) -> int | None:
     prices = market.get("outcome_prices") or []
     if not prices:
@@ -994,30 +919,6 @@ def settle_open_signals(
             compact["wallet_behavior"] = wallet_behavior_summary(compact)
             settled.append(compact)
             continue
-        stake = to_float(signal.get("stake_usdc"))
-        wallet_pnls = {}
-        compact_triggers = []
-        for trigger in signal.get("triggered_by") or []:
-            wallet = normalize_wallet(trigger.get("wallet"))
-            wallet_entry = to_float(trigger.get("wallet_avg_price") or signal.get("wallet_avg_price"))
-            wallet_pnls[wallet] = paper_pnl(wallet_entry, outcome_won, stake)
-            compact_triggers.append(
-                {
-                    **{key: value for key, value in trigger.items() if key != "fills_summary"},
-                    "fills_summary": fill_summary_without_raw(trigger.get("fills_summary") or {}),
-                }
-            )
-        settled.append(
-            {
-                **{key: value for key, value in signal.items() if key != "triggered_by"},
-                "status": "settled",
-                "settled_at": now_ts,
-                "outcome_won": outcome_won,
-                "wallet_paper_pnl_by_wallet": wallet_pnls,
-                "our_paper_pnl": paper_pnl(to_float(signal.get("our_entry_price")), outcome_won, stake),
-                "triggered_by": compact_triggers,
-            }
-        )
     return remaining, settled
 
 
