@@ -202,17 +202,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._error("not_found", status=HTTPStatus.NOT_FOUND)
 
     def _handle_api_get(self, parsed: urllib.parse.ParseResult) -> None:
+        follow_dir = _follow_dir(self.dashboard_config)
         if parsed.path == "/api/stream":
             self._serve_stream()
             return
         if parsed.path == "/api/health":
-            self._ok(build_health(self.dashboard_config.data_dir, started_at=self.started_at))
+            self._ok(
+                build_health(
+                    self.dashboard_config.data_dir,
+                    started_at=self.started_at,
+                    log_dir=self.dashboard_config.log_dir,
+                    follow_dir=follow_dir,
+                )
+            )
             return
         if parsed.path == "/api/overview":
-            self._ok(build_overview(self.dashboard_config.data_dir))
+            self._ok(build_overview(self.dashboard_config.data_dir, follow_dir=follow_dir))
             return
         if parsed.path == "/api/wallets":
-            self._ok(build_wallets(self.dashboard_config.data_dir))
+            self._ok(build_wallets(self.dashboard_config.data_dir, follow_dir=follow_dir))
             return
         if parsed.path == "/api/wallet-follows":
             query = urllib.parse.parse_qs(parsed.query)
@@ -220,7 +228,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             status = str(query.get("status", [""])[0] or "").lower()
             page = _int_param(query.get("page", ["1"])[0], default=1, minimum=1, maximum=10_000)
             size = _int_param(query.get("size", ["20"])[0], default=20, minimum=1, maximum=200)
-            self._ok(build_wallet_follow_detail(self.dashboard_config.data_dir, wallet, status=status, page=page, size=size))
+            self._ok(
+                build_wallet_follow_detail(
+                    self.dashboard_config.data_dir,
+                    wallet,
+                    status=status,
+                    page=page,
+                    size=size,
+                    follow_dir=follow_dir,
+                )
+            )
             return
         match = re.match(r"^/api/wallets/([^/]+)/follows$", parsed.path)
         if match:
@@ -229,7 +246,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             status = str(query.get("status", [""])[0] or "").lower()
             page = _int_param(query.get("page", ["1"])[0], default=1, minimum=1, maximum=10_000)
             size = _int_param(query.get("size", ["20"])[0], default=20, minimum=1, maximum=200)
-            self._ok(build_wallet_follow_detail(self.dashboard_config.data_dir, wallet, status=status, page=page, size=size))
+            self._ok(
+                build_wallet_follow_detail(
+                    self.dashboard_config.data_dir,
+                    wallet,
+                    status=status,
+                    page=page,
+                    size=size,
+                    follow_dir=follow_dir,
+                )
+            )
             return
         if parsed.path == "/api/follows":
             query = urllib.parse.parse_qs(parsed.query)
@@ -237,17 +263,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
             size = _int_param(query.get("size", ["25"])[0], default=25, minimum=1, maximum=200)
             status = str(query.get("status", [""])[0] or "").lower()
             category = normalize_category(query.get("category", [""])[0])
-            self._ok(build_follows(self.dashboard_config.data_dir, page=page, size=size, status=status, category=category))
+            self._ok(
+                build_follows(
+                    self.dashboard_config.data_dir,
+                    page=page,
+                    size=size,
+                    status=status,
+                    category=category,
+                    follow_dir=follow_dir,
+                )
+            )
             return
         if parsed.path.startswith("/api/follows/"):
             condition_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1]).lower()
-            self._ok(build_follow_detail(self.dashboard_config.data_dir, condition_id))
+            self._ok(build_follow_detail(self.dashboard_config.data_dir, condition_id, follow_dir=follow_dir))
             return
         if parsed.path == "/api/events":
-            self._ok(build_events(self.dashboard_config.data_dir, observe_window_hours=self.dashboard_config.observe_window_hours))
+            self._ok(
+                build_events(
+                    self.dashboard_config.data_dir,
+                    observe_window_hours=self.dashboard_config.observe_window_hours,
+                    follow_dir=follow_dir,
+                )
+            )
             return
         if parsed.path == "/api/wallet-refresh":
-            self._ok(build_wallet_refresh_status(self.dashboard_config.data_dir))
+            self._ok(build_wallet_refresh_status(self.dashboard_config.data_dir, follow_dir=follow_dir))
             return
         if parsed.path == "/api/runner":
             self._ok(build_runner_status(self.dashboard_config))
@@ -256,7 +297,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if match:
             condition_id = urllib.parse.unquote(match.group(1)).lower()
             try:
-                self._ok(fetch_market_prices(self.dashboard_config.data_dir, self.dashboard_config.client, condition_id))
+                self._ok(fetch_market_prices(self.dashboard_config.data_dir, self.dashboard_config.client, condition_id, follow_dir=follow_dir))
             except Exception as exc:
                 self._error(str(exc) or "price_refresh_failed", status=HTTPStatus.BAD_GATEWAY)
             return
@@ -340,7 +381,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             with _TRADES_CACHE_LOCK:
                 _TRADES_CACHE[cache_key] = (now, trades)
-        watched = build_events(self.dashboard_config.data_dir, observe_window_hours=self.dashboard_config.observe_window_hours)
+        watched = build_events(
+            self.dashboard_config.data_dir,
+            observe_window_hours=self.dashboard_config.observe_window_hours,
+            follow_dir=_follow_dir(self.dashboard_config),
+        )
         watched_ids = {str(row.get("condition_id") or "").lower() for row in watched.get("events", [])}
         open_snapshot = FollowStore(_follow_db_path(self.dashboard_config)).load_dashboard_open_signals()
         followed = {
@@ -469,7 +514,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             while True:
                 if conn is None:
                     conn = store.connect_readonly()
-                signal = read_stream_signal(config.data_dir, log_dir=config.log_dir, store=store, conn=conn)
+                signal = read_stream_signal(config.data_dir, log_dir=config.log_dir, follow_dir=_follow_dir(config), store=store, conn=conn)
                 if conn is not None and signal.snapshot_updated_at == 0 and not _follow_db_path(config).exists():
                     conn.close()
                     conn = None
@@ -532,9 +577,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def build_health(data_dir: Path, *, started_at: float, log_dir: Path | None = None) -> dict[str, Any]:
-    rows = _read_follow_run_logs(data_dir, log_dir=log_dir)
-    db_ready = FollowStore(_follow_db_path(data_dir)).dashboard_db_ready()
+def build_health(data_dir: Path, *, started_at: float, log_dir: Path | None = None, follow_dir: Path | None = None) -> dict[str, Any]:
+    rows = _read_follow_run_logs(data_dir, log_dir=log_dir, follow_dir=follow_dir)
+    db_ready = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).dashboard_db_ready()
     last_tick = rows[-1] if rows else {}
     build_summary = _read_json(data_dir / "build_summary.json", {})
     leaderboard_updated_at = max(_category_leaderboard_mtimes(data_dir).values() or [0])
@@ -578,17 +623,19 @@ def read_stream_signal(
     data_dir: Path,
     *,
     log_dir: Path | None = None,
+    follow_dir: Path | None = None,
     store: FollowStore | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> StreamSignal:
-    store = store or FollowStore(_follow_db_path(data_dir))
+    follow_root = _follow_dir_from(data_dir, follow_dir=follow_dir)
+    store = store or FollowStore(_follow_db_file(data_dir, follow_dir=follow_root))
     return StreamSignal(
         snapshot_updated_at=store.read_meta_int("follow_snapshot_updated_at", conn=conn),
         run_log_mtime=max(
             _file_mtime(_follow_run_log_path(data_dir, log_dir=log_dir)),
-            _file_mtime(_legacy_follow_run_log_path(data_dir)),
+            _file_mtime(_legacy_follow_run_log_path(data_dir, follow_dir=follow_root)),
         ),
-        control_mtime=_file_mtime(_follow_dir(data_dir) / "follow_control.json"),
+        control_mtime=_file_mtime(follow_root / "follow_control.json"),
         leaderboard_mtime=max(_category_leaderboard_mtimes(data_dir).values() or [0]),
     )
 
@@ -607,8 +654,8 @@ def stream_dirty_flags(previous: StreamSignal | None, current: StreamSignal) -> 
 def build_stream_header(config: DashboardConfig, *, started_at: float) -> dict[str, Any]:
     control = read_follow_control(_follow_dir(config))
     return {
-        "health": build_health(config.data_dir, started_at=started_at, log_dir=config.log_dir),
-        "overview": build_overview(config.data_dir),
+        "health": build_health(config.data_dir, started_at=started_at, log_dir=config.log_dir, follow_dir=_follow_dir(config)),
+        "overview": build_overview(config.data_dir, follow_dir=_follow_dir(config)),
         "runner": build_runner_status(config),
         "refresh": build_wallet_refresh_status(config.data_dir, follow_dir=_follow_dir(config)).get("status") or {"status": "idle"},
         "pause_follow": control.get("pause_follow") if isinstance(control, dict) else None,
@@ -619,8 +666,8 @@ def build_stream_header(config: DashboardConfig, *, started_at: float) -> dict[s
     }
 
 
-def build_overview(data_dir: Path) -> dict[str, Any]:
-    snapshot = FollowStore(_follow_db_path(data_dir)).load_dashboard_snapshot()
+def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str, Any]:
+    snapshot = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).load_dashboard_snapshot()
     open_signals = snapshot.get("open_signals", [])
     results = snapshot.get("results", [])
     all_signals = [*open_signals, *results]
@@ -780,10 +827,10 @@ def _signal_wallet_trade_at(signal: dict[str, Any]) -> int:
     return max([value for value in [direct, *values] if value] or [0])
 
 
-def build_wallets(data_dir: Path) -> dict[str, Any]:
+def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str, Any]:
     leaderboard_sources = _category_leaderboards(data_dir)
     leaderboard = [row for _category, _dir, rows, _mtime in leaderboard_sources for row in rows]
-    store = FollowStore(_follow_db_path(data_dir))
+    store = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir))
     perf_snapshot = store.load_dashboard_performance()
     follow_snapshot = store.load_dashboard_snapshot()
     quarantine_snapshot = store.load_dashboard_wallet_quarantine()
@@ -964,8 +1011,8 @@ def wallet_leaderboard_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str = "", category: str = "") -> dict[str, Any]:
-    store = FollowStore(_follow_db_path(data_dir))
+def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str = "", category: str = "", follow_dir: Path | None = None) -> dict[str, Any]:
+    store = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir))
     result = store.load_dashboard_follow_rows(page=1, size=10_000)
     logo_cache = _load_team_logo_cache(data_dir)
     allowed_statuses = {"open", "settled", "exited", "mixed"}
@@ -983,7 +1030,7 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
     start = (page - 1) * size
     rows = rows[start : start + size]
     for row in rows:
-        market = _active_market_by_condition(data_dir, str(row.get("condition_id") or ""))
+        market = _active_market_by_condition(data_dir, str(row.get("condition_id") or ""), follow_dir=follow_dir)
         row["match_start_time"] = row.get("match_start_time") or market.get("match_start_time") or market.get("market_start_time")
         row["end_date"] = row.get("end_date") or market.get("end_date")
         _attach_follow_unrealized_pnl(row, market)
@@ -1031,11 +1078,11 @@ def _attach_follow_unrealized_pnl(row: dict[str, Any], market: dict[str, Any]) -
     row.pop("open_pnl_legs", None)
 
 
-def build_follow_detail(data_dir: Path, condition_id: str) -> dict[str, Any]:
+def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path | None = None) -> dict[str, Any]:
     condition_id = condition_id.lower()
-    result = FollowStore(_follow_db_path(data_dir)).load_dashboard_follow_detail(condition_id)
+    result = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).load_dashboard_follow_detail(condition_id)
     signals = result.get("signals", [])
-    market = _active_market_by_condition(data_dir, condition_id)
+    market = _active_market_by_condition(data_dir, condition_id, follow_dir=follow_dir)
     logo_cache = _load_team_logo_cache(data_dir)
     leaderboard_ranks = _leaderboard_rank_by_wallet(data_dir)
     by_wallet: dict[str, dict[str, Any]] = {}
@@ -1140,6 +1187,7 @@ def build_wallet_follow_detail(
     status: str = "",
     page: int = 1,
     size: int = 20,
+    follow_dir: Path | None = None,
 ) -> dict[str, Any]:
     wallet = wallet.lower()
     if not re.fullmatch(r"0x[a-f0-9]{40}", wallet):
@@ -1156,7 +1204,7 @@ def build_wallet_follow_detail(
     allowed_statuses = {"open", "settled", "exited", "closed"}
     status_filter = status if status in allowed_statuses else ""
     statuses = {"settled", "exited"} if status_filter == "closed" else ({status_filter} if status_filter else set())
-    result = FollowStore(_follow_db_path(data_dir)).load_dashboard_wallet_follow_detail(wallet, statuses=statuses)
+    result = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).load_dashboard_wallet_follow_detail(wallet, statuses=statuses)
     signals = result.get("signals", [])
     signals = sorted(
         [signal for signal in signals if isinstance(signal, dict)],
@@ -1215,8 +1263,9 @@ def build_events(
     *,
     observe_window_hours: float = 24.0,
     post_start_grace_seconds: int = 900,
+    follow_dir: Path | None = None,
 ) -> dict[str, Any]:
-    cache_path = _follow_dir(data_dir) / "active_market_cache.json"
+    cache_path = _follow_dir_from(data_dir, follow_dir=follow_dir) / "active_market_cache.json"
     cached = _read_json(cache_path, {})
     logo_cache = _load_team_logo_cache(data_dir)
     updated_at = int(cached.get("updated_at") or 0) if isinstance(cached, dict) else 0
@@ -1236,7 +1285,7 @@ def build_events(
     window_end = now_ts + int(observe_window_hours * 3600)
     recent_start_cutoff = now_ts - max(0, int(post_start_grace_seconds))
     events = []
-    follow_snapshot = FollowStore(_follow_db_path(data_dir)).load_dashboard_snapshot()
+    follow_snapshot = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).load_dashboard_snapshot()
     open_by_condition: dict[str, list[dict[str, Any]]] = {}
     for signal in follow_snapshot.get("open_signals", []):
         open_by_condition.setdefault(str(signal.get("condition_id") or "").lower(), []).append(signal)
@@ -1444,8 +1493,8 @@ def _normalize_logo_key(value: str) -> str:
     return re.sub(r"\s+", " ", normalized)
 
 
-def _active_market_by_condition(data_dir: Path, condition_id: str) -> dict[str, Any]:
-    cached = _read_json(_follow_dir(data_dir) / "active_market_cache.json", {})
+def _active_market_by_condition(data_dir: Path, condition_id: str, *, follow_dir: Path | None = None) -> dict[str, Any]:
+    cached = _read_json(_follow_dir_from(data_dir, follow_dir=follow_dir) / "active_market_cache.json", {})
     markets = cached.get("markets") if isinstance(cached, dict) else []
     if isinstance(markets, dict):
         rows = markets.values()
@@ -1462,7 +1511,7 @@ def _active_market_by_condition(data_dir: Path, condition_id: str) -> dict[str, 
     return {}
 
 
-def fetch_market_prices(data_dir: Path, client: Any, condition_id: str) -> dict[str, Any]:
+def fetch_market_prices(data_dir: Path, client: Any, condition_id: str, *, follow_dir: Path | None = None) -> dict[str, Any]:
     if client is None:
         raise RuntimeError("polymarket client unavailable")
     condition_id = condition_id.lower()
@@ -1473,7 +1522,7 @@ def fetch_market_prices(data_dir: Path, client: Any, condition_id: str) -> dict[
     record = _market_price_record(market)
     if not record.get("outcomes") or not record.get("outcome_prices"):
         raise RuntimeError("market_prices_unavailable")
-    _update_active_market_price_cache(data_dir, condition_id, record)
+    _update_active_market_price_cache(data_dir, condition_id, record, follow_dir=follow_dir)
     return record
 
 
@@ -1490,8 +1539,8 @@ def _market_price_record(market: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _update_active_market_price_cache(data_dir: Path, condition_id: str, record: dict[str, Any]) -> None:
-    cache_path = _follow_dir(data_dir) / "active_market_cache.json"
+def _update_active_market_price_cache(data_dir: Path, condition_id: str, record: dict[str, Any], *, follow_dir: Path | None = None) -> None:
+    cache_path = _follow_dir_from(data_dir, follow_dir=follow_dir) / "active_market_cache.json"
     cached = _read_json(cache_path, {})
     markets = cached.get("markets") if isinstance(cached, dict) else []
     if isinstance(markets, dict):
@@ -1557,8 +1606,16 @@ def _follow_dir(config_or_data_dir: DashboardConfig | Path) -> Path:
     return data_dir if data_dir.name == "follow" else data_dir / "follow"
 
 
+def _follow_dir_from(data_dir: Path, *, follow_dir: Path | None = None) -> Path:
+    return Path(follow_dir) if follow_dir is not None else _follow_dir(data_dir)
+
+
 def _follow_db_path(config_or_data_dir: DashboardConfig | Path) -> Path:
     return _follow_dir(config_or_data_dir) / "follow.db"
+
+
+def _follow_db_file(data_dir: Path, *, follow_dir: Path | None = None) -> Path:
+    return _follow_dir_from(data_dir, follow_dir=follow_dir) / "follow.db"
 
 
 class WalletRefreshAlreadyRunning(RuntimeError):
@@ -2128,12 +2185,12 @@ def _follow_run_log_path(data_dir: Path, *, log_dir: Path | None = None) -> Path
     return _follow_log_dir(data_dir, log_dir=log_dir) / "follow_run_log.jsonl"
 
 
-def _legacy_follow_run_log_path(data_dir: Path) -> Path:
-    return data_dir / "follow" / "follow_run_log.jsonl"
+def _legacy_follow_run_log_path(data_dir: Path, *, follow_dir: Path | None = None) -> Path:
+    return _follow_dir_from(data_dir, follow_dir=follow_dir) / "follow_run_log.jsonl"
 
 
-def _read_follow_run_logs(data_dir: Path, *, log_dir: Path | None = None) -> list[dict[str, Any]]:
-    rows = _read_jsonl(_legacy_follow_run_log_path(data_dir))
+def _read_follow_run_logs(data_dir: Path, *, log_dir: Path | None = None, follow_dir: Path | None = None) -> list[dict[str, Any]]:
+    rows = _read_jsonl(_legacy_follow_run_log_path(data_dir, follow_dir=follow_dir))
     rows.extend(_read_jsonl(_follow_run_log_path(data_dir, log_dir=log_dir)))
     return sorted(rows, key=lambda row: int(row.get("created_at") or 0))
 

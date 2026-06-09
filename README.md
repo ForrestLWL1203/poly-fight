@@ -46,20 +46,25 @@ python3 -m poly_fight.cli analyze-event --condition-id 0x...
 Run one paper follow tick:
 
 ```bash
-python3 -m poly_fight.cli follow --stake-usdc 1
-python3 -m poly_fight.cli follow --stake-usdc 1 --quarantine-sell-frac 0.2 --consensus-block-opposite
+python3 -m poly_fight.cli follow --stake-usdc 1 --stake-ratio-percent 10 --bankroll-usdc 1000
+python3 -m poly_fight.cli follow --stake-usdc 1 --stake-ratio-percent 10 --bankroll-usdc 1000 --quarantine-sell-frac 0.2 --consensus-block-opposite
 ```
 
 Run the paper follow loop:
 
 ```bash
-python3 -m poly_fight.cli run --stake-usdc 1
+python3 -m poly_fight.cli run --stake-usdc 1 --stake-ratio-percent 10 --bankroll-usdc 1000
 ```
 
 `run` is the recommended stage-two entrypoint. It builds/refeshes the smart
 wallet leaderboard, then keeps running follow ticks with adaptive sleep. The
 default observation window starts 24 hours before match start and continues
 until settlement.
+
+`--stake-usdc` is the minimum paper stake per BUY leg. `--stake-ratio-percent`
+is the target-wallet cash replication ratio, and `--bankroll-usdc` caps total
+open paper exposure. If the bankroll is too small for the proportional stake,
+the leg is capped or skipped and recorded in follow diagnostics.
 
 Follow detection is trade-centric. Each tick pulls recent
 `trades?user=<wallet>` pages for A wallets, advances a local per-wallet cursor,

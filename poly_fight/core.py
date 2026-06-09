@@ -357,7 +357,6 @@ def event_to_market_records(
         if not market_type or (allowed_market_types is not None and market_type not in allowed_market_types):
             continue
         if category == "sports":
-            match_start_time = market.get("gameStartTime") or market.get("eventStartTime") or event.get("startTime")
             end_date = (
                 market.get("umaEndDate")
                 or market.get("closedTime")
@@ -366,9 +365,20 @@ def event_to_market_records(
                 or market.get("endDate")
                 or event.get("endDate")
             )
+            match_start_time = (
+                market.get("eventStartTime")
+                or event.get("startTime")
+                or market.get("gameStartTime")
+                or end_date
+            )
         else:
             match_start_time = market.get("eventStartTime") or event.get("startTime") or market.get("gameStartTime")
             end_date = event.get("endDate") or market.get("endDate")
+        market_start_time = (
+            match_start_time
+            if category == "sports"
+            else market.get("gameStartTime") or market.get("eventStartTime") or event.get("startTime")
+        )
         condition_id = str(market.get("conditionId")).lower()
         records[condition_id] = {
             "condition_id": condition_id,
@@ -380,7 +390,7 @@ def event_to_market_records(
             "outcome_prices": [to_float(v) for v in parse_jsonish(market.get("outcomePrices"), [])],
             "end_date": end_date,
             "match_start_time": match_start_time,
-            "market_start_time": market.get("gameStartTime") or market.get("eventStartTime") or event.get("startTime"),
+            "market_start_time": market_start_time,
             "volume": to_float(market.get("volume") or event.get("volume")),
             "volume24hr": to_float(market.get("volume24hr") or event.get("volume24hr")),
             "liquidity": to_float(market.get("liquidity") or event.get("liquidity")),

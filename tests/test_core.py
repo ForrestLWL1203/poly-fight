@@ -368,8 +368,8 @@ class CoreTest(unittest.TestCase):
 
                 record = event_to_market_records(event)[0]
 
-                self.assertEqual(record["match_start_time"], "2026-06-07 20:10:00+00")
-                self.assertEqual(record["market_start_time"], "2026-06-07 20:10:00+00")
+                self.assertEqual(record["match_start_time"], "2026-06-07T20:10:00Z")
+                self.assertEqual(record["market_start_time"], "2026-06-07T20:10:00Z")
                 self.assertEqual(record["end_date"], "2026-06-07T23:27:48Z")
                 self.assertEqual(record["league"], league)
         self.assertEqual(parse_dt("2026-06-07 20:10:00+00"), datetime(2026, 6, 7, 20, 10, tzinfo=timezone.utc))
@@ -771,6 +771,31 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual({row["condition_id"] for row in rows}, {"nba-high", "ufc-high"})
         self.assertEqual({row["league"] for row in rows}, {"nba", "ufc"})
+
+    def test_sports_market_start_prefers_event_start_time_before_game_start_time(self):
+        record = event_to_market_records(
+            {
+                "id": "sports-start",
+                "slug": "sports-start",
+                "title": "Los Angeles Lakers vs. Boston Celtics",
+                "startTime": "2026-06-01T11:00:00Z",
+                "tags": [{"slug": "nba"}],
+                "markets": [
+                    {
+                        "conditionId": "sports-start-market",
+                        "question": "Los Angeles Lakers vs. Boston Celtics",
+                        "outcomes": json.dumps(["Los Angeles Lakers", "Boston Celtics"]),
+                        "outcomePrices": '["0.5","0.5"]',
+                        "volume": 500_000,
+                        "gameStartTime": "2026-06-01T10:00:00Z",
+                        "eventStartTime": "2026-06-01T12:00:00Z",
+                        "endDate": "2026-06-01T14:00:00Z",
+                    }
+                ],
+            }
+        )[0]
+
+        self.assertEqual(record["match_start_time"], "2026-06-01T12:00:00Z")
 
     def test_discovery_slate_uses_progressive_window(self):
         markets = [market(f"m{i}", days_ago=10, volume=30_000) for i in range(35)]
@@ -2703,6 +2728,36 @@ class CoreTest(unittest.TestCase):
         self.assertIn(("nba", "ufc"), client.tag_calls)
         self.assertEqual(markets["esports-m1"]["category"], "esports")
         self.assertEqual(markets["sports-m1"]["category"], "sports")
+
+    def test_active_market_cache_accepts_dict_shaped_markets(self):
+        with TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "active_market_cache.json"
+            write_json(
+                cache_path,
+                {
+                    "updated_at": 100,
+                    "markets": {
+                        "e1": {"condition_id": "e1", "category": "esports"},
+                        "s1": {"condition_id": "s1", "category": "sports"},
+                    },
+                },
+            )
+
+            class FakeClient:
+                def list_events_paginated(self, **_kwargs):
+                    raise AssertionError("fresh dict cache should be used")
+
+            markets, _state, source = load_active_market_cache(
+                FakeClient(),
+                {},
+                cache_path=cache_path,
+                now_ts=120,
+                gamma_pages=1,
+                ttl_seconds=900,
+            )
+
+            self.assertEqual(source, "cache")
+            self.assertEqual(set(markets), {"e1", "s1"})
 
     def test_profile_candidate_filter_keeps_only_clean_active_wallets(self):
         candidates = [
@@ -6163,6 +6218,61 @@ class CoreTest(unittest.TestCase):
             finally:
                 if conn is not None:
                     conn.close()
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_api_uses_configured_follow_dir(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            follow_dir = Path(tmp) / "custom-follow"
+            FollowStore(follow_dir / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "sig-custom",
+                        "wallet": "0xabc",
+                        "condition_id": "m1",
+                        "status": "open",
+                        "created_at": 100,
+                        "legs": [{"stake": 1}],
+                    }
+                ],
+                result_events=[],
+                performance={"wallets": {}, "total": {}},
+            )
+            server = create_server(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    follow_dir=follow_dir,
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                token = make_session_token("admin", "secret", now=int(datetime.now(timezone.utc).timestamp()))
+                cookie = f"poly_fight_session={token}"
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/api/overview", headers={"Cookie": cookie})
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["data"]["open_signal_count"], 1)
+
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/api/follows", headers={"Cookie": cookie})
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["data"]["total"], 1)
+            finally:
                 server.shutdown()
                 server.server_close()
 

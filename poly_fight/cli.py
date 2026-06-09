@@ -1223,14 +1223,19 @@ def market_records_from_events(events: list[dict[str, Any]]) -> dict[str, dict[s
     return records
 
 
-def active_cache_categories(cached: dict[str, Any]) -> set[str]:
+def active_cache_market_rows(cached: dict[str, Any]) -> list[dict[str, Any]]:
     markets = cached.get("markets") if isinstance(cached, dict) else []
     if isinstance(markets, dict):
-        rows = markets.values()
+        rows = list(markets.values())
     elif isinstance(markets, list):
         rows = markets
     else:
         rows = []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def active_cache_categories(cached: dict[str, Any]) -> set[str]:
+    rows = active_cache_market_rows(cached)
     return {str(row.get("category") or "").lower() for row in rows if isinstance(row, dict) and row.get("category")}
 
 
@@ -1252,11 +1257,19 @@ def load_active_market_cache(
     if cache_path and legacy_cached:
         write_json(cache_path, legacy_cached)
         if now_ts - int(legacy_cached.get("updated_at") or 0) < ttl_seconds and active_cache_has_required_categories(legacy_cached):
-            markets = {row["condition_id"]: row for row in legacy_cached.get("markets") or []}
+            markets = {
+                str(row.get("condition_id") or row.get("conditionId") or "").lower(): row
+                for row in active_cache_market_rows(legacy_cached)
+                if row.get("condition_id") or row.get("conditionId")
+            }
             return markets, state, "legacy_state_cache"
     cached = read_json(cache_path, {}) if cache_path else {}
     if cached and now_ts - int(cached.get("updated_at") or 0) < ttl_seconds and active_cache_has_required_categories(cached):
-        markets = {row["condition_id"]: row for row in cached.get("markets") or []}
+        markets = {
+            str(row.get("condition_id") or row.get("conditionId") or "").lower(): row
+            for row in active_cache_market_rows(cached)
+            if row.get("condition_id") or row.get("conditionId")
+        }
         return markets, state, "cache"
     markets: dict[str, dict[str, Any]] = {}
     fetched_categories: list[str] = []
@@ -1602,25 +1615,6 @@ def fetch_resolutions_for_open_signals(
             if winner is not None:
                 resolutions[condition_id] = winner
     return resolutions
-
-
-def fetch_wallet_market_trades(
-    client: PolymarketClient,
-    wallet: str,
-    condition_id: str,
-    *,
-    page_limit: int = 500,
-) -> list[dict]:
-    try:
-        return client.trades_for_user_market(wallet, condition_id, limit=page_limit)
-    except RuntimeError:
-        trades = client.trades_for_market(condition_id, limit=page_limit, min_trade_cash=0)
-        wallet = normalize_wallet(wallet)
-        return [
-            trade
-            for trade in trades
-            if normalize_wallet(trade.get("proxyWallet") or trade.get("wallet") or trade.get("user")) == wallet
-        ]
 
 
 def fetch_user_trades_until_cursor(
@@ -3991,9 +3985,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_follow_arguments(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--follow-dir")
-        subparser.add_argument("--stake-usdc", type=float, required=True)
-        subparser.add_argument("--stake-ratio-percent", type=float, default=10.0)
-        subparser.add_argument("--bankroll-usdc", type=float, default=1000.0)
+        subparser.add_argument("--stake-usdc", type=float, required=True, help="minimum paper stake per followed BUY leg")
+        subparser.add_argument("--stake-ratio-percent", type=float, default=10.0, help="target-wallet cash replication ratio per BUY leg")
+        subparser.add_argument("--bankroll-usdc", type=float, default=1000.0, help="paper bankroll cap for total open exposure")
         subparser.add_argument("--follow-recency-days", type=int, default=30)
         subparser.add_argument("--observe-window-hours", type=float, default=24)
         subparser.add_argument("--event-cache-ttl-minutes", type=int, default=10)
@@ -4053,9 +4047,9 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="run paper follow loop with scheduled pool refresh")
     add_build_arguments(run)
     run.add_argument("--follow-dir")
-    run.add_argument("--stake-usdc", type=float, required=True)
-    run.add_argument("--stake-ratio-percent", type=float, default=10.0)
-    run.add_argument("--bankroll-usdc", type=float, default=1000.0)
+    run.add_argument("--stake-usdc", type=float, required=True, help="minimum paper stake per followed BUY leg")
+    run.add_argument("--stake-ratio-percent", type=float, default=10.0, help="target-wallet cash replication ratio per BUY leg")
+    run.add_argument("--bankroll-usdc", type=float, default=1000.0, help="paper bankroll cap for total open exposure")
     run.add_argument("--follow-recency-days", type=int, default=30)
     run.add_argument("--observe-window-hours", type=float, default=24)
     run.add_argument("--event-cache-ttl-minutes", type=int, default=10)

@@ -237,6 +237,12 @@ esports wallets: eligible market_type set only
 sports wallets: category=sports + market_type=main_match + own league
 ```
 
+Current paper-follow new-signal creation is intentionally esports-only. Sports
+collection, scoring, leaderboard, and dashboard display may exist, but sports
+wallets should not open new paper follow signals unless this policy is
+explicitly changed. Keep the sports eligibility rule above as the intended scope
+if sports follow is later enabled.
+
 NBA wallets follow NBA only. UFC wallets follow UFC only. Wallets no longer
 eligible can only affect already-open signal markets.
 
@@ -290,9 +296,13 @@ Allowed dashboard mutations only:
 POST /api/wallet-refresh
 POST /api/runner/start
 POST /api/runner/stop
+POST /api/reset-data
 ```
 
-These write process/control state only, not follow signal state. The only live
+`wallet-refresh` and runner controls write process/control state only, not
+follow signal state. `reset-data` is an explicit personal-use destructive
+operation for clearing generated category/follow/log state; it must stay behind
+authenticated dashboard access and must not be called implicitly. The only live
 external Data API request from dashboard is `/api/wallets/{addr}/trades`;
 validate wallet addresses first.
 
