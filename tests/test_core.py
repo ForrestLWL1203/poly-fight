@@ -43,6 +43,7 @@ from poly_fight.dashboard import (
     verify_session_token,
 )
 from poly_fight import dashboard as dashboard_module
+from poly_fight import storage as storage_module
 from poly_fight.control import read_follow_control, write_follow_control
 from poly_fight.storage import FollowStore
 from poly_fight.cli import (
@@ -75,6 +76,7 @@ from poly_fight.cli import (
     migrate_category_follow_dbs,
     observed_performance_quarantine_events,
     prune_profile_store,
+    read_category_leaderboards,
     refresh_team_logo_cache_from_active_markets,
     read_json,
     read_jsonl,
@@ -7226,6 +7228,122 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(detail["signal_count"], 1)
             self.assertEqual(detail["wallets"][0]["wallet"], "0xabc")
 
+    def test_dashboard_follow_detail_rank_matches_visible_wallet_list(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            visible_a = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            hidden = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            visible_b = "0xcccccccccccccccccccccccccccccccccccccccc"
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [
+                    {
+                        "wallet": visible_a,
+                        "grade": "A",
+                        "best_bucket_score": 90,
+                        "esports_win_count": 12,
+                        "esports_loss_count": 0,
+                        "positive_market_rate": 1.0,
+                        "wilson_win_rate_lower_bound": 0.90,
+                        "entry_edge": 0.30,
+                        "esports_roi": 0.80,
+                    },
+                    {
+                        "wallet": hidden,
+                        "grade": "A",
+                        "best_bucket_score": 89,
+                        "esports_win_count": 12,
+                        "esports_loss_count": 0,
+                        "positive_market_rate": 0.10,
+                        "wilson_win_rate_lower_bound": 0.89,
+                        "entry_edge": 0.29,
+                        "esports_roi": 0.79,
+                    },
+                    {
+                        "wallet": visible_b,
+                        "grade": "A",
+                        "best_bucket_score": 88,
+                        "esports_win_count": 12,
+                        "esports_loss_count": 0,
+                        "positive_market_rate": 1.0,
+                        "wilson_win_rate_lower_bound": 0.88,
+                        "entry_edge": 0.28,
+                        "esports_roi": 0.78,
+                    },
+                ],
+            )
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "sig-rank",
+                        "wallet": visible_b,
+                        "condition_id": "m1",
+                        "status": "open",
+                        "category": "esports",
+                        "created_at": 100,
+                        "legs": [{"stake": 1}],
+                    }
+                ],
+                result_events=[],
+                performance={"wallets": {}, "total": {}},
+            )
+
+            wallets = build_wallets(data_dir)["wallets"]
+            detail = build_follow_detail(data_dir, "m1")
+
+            self.assertEqual([row["wallet"] for row in wallets], [visible_a, visible_b])
+            self.assertEqual(detail["wallets"][0]["leaderboard_rank"], 2)
+
+    def test_dashboard_wallet_follow_detail_merges_closed_statuses_and_paginates(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            result_events = []
+            for index in range(25):
+                status = "exited" if index % 2 else "settled"
+                result_events.append(
+                    {
+                        "signal_id": f"closed-{index:02d}",
+                        "wallet": wallet,
+                        "condition_id": f"m{index}",
+                        "status": status,
+                        "created_at": 100 + index,
+                        "settled_at": 500 + index if status == "settled" else 0,
+                        "exit_at": 500 + index if status == "exited" else 0,
+                        "legs": [{"stake": 1}],
+                    }
+                )
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "open-1",
+                        "wallet": wallet,
+                        "condition_id": "open-market",
+                        "status": "open",
+                        "created_at": 999,
+                        "legs": [{"stake": 1}],
+                    }
+                ],
+                result_events=result_events,
+                performance={"wallets": {}, "total": {}},
+            )
+
+            detail = build_wallet_follow_detail(data_dir, wallet, status="closed", page=2, size=20)
+
+            self.assertEqual(detail["status"], "closed")
+            self.assertEqual(detail["total"], 25)
+            self.assertEqual(detail["count"], 25)
+            self.assertEqual(detail["page"], 2)
+            self.assertEqual(detail["size"], 20)
+            self.assertEqual(len(detail["signals"]), 5)
+            self.assertEqual({row["status"] for row in detail["signals"]}, {"settled", "exited"})
+            self.assertEqual(
+                {row["settlement_type"] for row in detail["signals"]},
+                {"auto_settlement", "manual_exit"},
+            )
+
     def test_dashboard_wallets_expose_quarantine_state(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -7238,6 +7356,49 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(wallets["quarantined_count"], 1)
             self.assertTrue(wallets["wallets"][0]["quarantined"])
             self.assertEqual(wallets["wallets"][0]["quarantine"]["reason"], "material_sell")
+
+    def test_dashboard_wallets_prefer_sqlite_leaderboard_over_legacy_json(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [{"wallet": "0xlegacy", "grade": "A", "positive_market_rate": 1.0}],
+            )
+            storage_module.LeaderboardStore(data_dir / "leaderboard.db").replace_leaderboard(
+                [
+                    {
+                        "wallet": "0xsqlite",
+                        "grade": "A",
+                        "esports_win_count": 8,
+                        "esports_loss_count": 0,
+                        "positive_market_rate": 1.0,
+                        "wilson_win_rate_lower_bound": 0.8,
+                        "entry_edge": 0.3,
+                        "esports_roi": 0.5,
+                    }
+                ],
+                category="esports",
+                updated_at=123,
+            )
+
+            wallets = build_wallets(data_dir)
+
+            self.assertEqual([row["wallet"] for row in wallets["wallets"]], ["0xsqlite"])
+            self.assertEqual(wallets["leaderboard_updated_at"], 123)
+
+    def test_follow_reader_uses_sqlite_leaderboard(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            storage_module.LeaderboardStore(root / "esports" / "leaderboard.db").replace_leaderboard(
+                [{"wallet": "0xsqlite", "grade": "A"}],
+                category="esports",
+                updated_at=456,
+            )
+
+            rows, mtimes = read_category_leaderboards(root)
+
+            self.assertEqual(rows, [{"wallet": "0xsqlite", "grade": "A", "category": "esports"}])
+            self.assertEqual(mtimes["esports"], 456)
 
     def test_dashboard_wallets_use_observed_follow_trade_time(self):
         with TemporaryDirectory() as tmp:

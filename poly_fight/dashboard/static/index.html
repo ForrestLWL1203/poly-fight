@@ -202,7 +202,6 @@
                   <th>专精类型</th>
                   <th>已结算</th>
                   <th>持仓中</th>
-                  <th>已退出</th>
                   <th>跟单胜负</th>
                   <th>跟单 PnL</th>
                   <th>最后交易时间</th>
@@ -241,11 +240,11 @@
                   </td>
                   <td>
                     <button
-                      v-if="walletObservedSettled(wallet) > 0"
+                      v-if="walletObservedClosed(wallet) > 0"
                       class="metric-link"
                       type="button"
-                      @click="openWalletFollowDetail(wallet, 'settled')"
-                    >{{ walletObservedSettled(wallet) }}</button>
+                      @click="openWalletFollowDetail(wallet, 'closed')"
+                    >{{ walletObservedClosed(wallet) }}</button>
                     <span v-else>0</span>
                   </td>
                   <td>
@@ -255,15 +254,6 @@
                       type="button"
                       @click="openWalletFollowDetail(wallet, 'open')"
                     >{{ walletObservedOpen(wallet) }}</button>
-                    <span v-else>0</span>
-                  </td>
-                  <td>
-                    <button
-                      v-if="walletObservedExited(wallet) > 0"
-                      class="metric-link"
-                      type="button"
-                      @click="openWalletFollowDetail(wallet, 'exited')"
-                    >{{ walletObservedExited(wallet) }}</button>
                     <span v-else>0</span>
                   </td>
                   <td>{{ walletObservedRecord(wallet) }}</td>
@@ -586,7 +576,6 @@
                         <th>目标购入金额</th>
                         <th>跟单时间</th>
                         <th>跟单额</th>
-                        <th>比例</th>
                         <th>跟单价格</th>
                         <th>买入均价</th>
                         <th>滑点</th>
@@ -600,7 +589,6 @@
                         <td>{{ money(legWalletTradeCash(leg)) }}</td>
                         <td>{{ formatTime(leg.leg_at || leg.created_at) }}</td>
                         <td>{{ money(leg.stake) }}</td>
-                        <td><span class="tier-chip tier-chip-xs" :class="stakeModeClass(leg.stake_mode || signal.stake_mode)">{{ stakeModeLabel(leg.stake_mode || signal.stake_mode) }}</span></td>
                         <td>{{ price(leg.our_entry_price) }}</td>
                         <td>{{ price(leg.wallet_fill_price || leg.wallet_avg_price) }}</td>
                         <td :class="pnlClass(-(legSlippageValue(leg) || 0))">{{ legSlippageText(leg) }}</td>
@@ -609,7 +597,7 @@
                         </td>
                       </tr>
                       <tr v-if="!(signal.legs || []).length">
-                        <td colspan="10" class="empty-cell">暂无跟单记录</td>
+                        <td colspan="9" class="empty-cell">暂无跟单记录</td>
                       </tr>
                     </tbody>
                   </table>
@@ -632,7 +620,7 @@
           <button class="btn btn-sm btn-circle btn-ghost absolute right-3 top-3" aria-label="关闭钱包跟单详情" @click="closeWalletFollowDetail">×</button>
           <div class="simple-modal-head">
             <h3>跟单明细</h3>
-            <span>{{ walletFollowModalTitle() }} · {{ walletFollowDetail.count || 0 }} 笔</span>
+            <span>{{ walletFollowModalTitle() }} · {{ walletFollowDetail.total || walletFollowDetail.count || 0 }} 笔</span>
           </div>
           <div v-if="walletFollowModal.loading" class="modal-loading"><span class="loading loading-spinner"></span></div>
           <div v-else class="detail-stack">
@@ -642,10 +630,11 @@
                   <tr>
                     <th>跟单时间</th>
                     <th>跟单赛事</th>
-                    <th>买入哪方</th>
+                    <th>买入方向</th>
                     <th>买入均价</th>
                     <th>状态</th>
                     <th>结算价</th>
+                    <th>结算类型</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -659,12 +648,18 @@
                     <td>{{ price(signalAverageEntry(signal)) }}</td>
                     <td><span class="badge badge-outline">{{ signalStatusText(signal) }}</span></td>
                     <td>{{ signalSettlementText(signal) }}</td>
+                    <td>{{ signalSettlementTypeText(signal) }}</td>
                   </tr>
                   <tr v-if="!(walletFollowDetail.signals || []).length">
-                    <td colspan="6" class="empty-cell">暂无跟单明细</td>
+                    <td colspan="7" class="empty-cell">暂无跟单明细</td>
                   </tr>
                 </tbody>
               </table>
+            </div>
+            <div v-if="walletFollowPageCount > 1" class="pagination-actions panel-pagination">
+              <button class="btn btn-xs" :disabled="walletFollowPage <= 1" @click="setWalletFollowPage(walletFollowPage - 1)">上一页</button>
+              <span>第 {{ walletFollowPage }} / {{ walletFollowPageCount }} 页</span>
+              <button class="btn btn-xs" :disabled="walletFollowPage >= walletFollowPageCount" @click="setWalletFollowPage(walletFollowPage + 1)">下一页</button>
             </div>
           </div>
         </div>

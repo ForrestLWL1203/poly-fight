@@ -31,6 +31,8 @@ createApp({
       pauseFollow: null,
       walletPage: 1,
       walletSize: 10,
+      walletFollowPage: 1,
+      walletFollowSize: 20,
       followPage: 1,
       followSize: 10,
       followStatusFilter: "",
@@ -142,6 +144,10 @@ createApp({
     followPageCount() {
       const count = Number(this.follows.total || 0);
       return Math.max(1, Math.ceil(count / this.followSize));
+    },
+    walletFollowPageCount() {
+      const count = Number(this.walletFollowDetail.total || this.walletFollowDetail.count || 0);
+      return Math.max(1, Math.ceil(count / this.walletFollowSize));
     },
     eventPageCount() {
       const count = this.eventFilteredRows.length;
@@ -668,19 +674,41 @@ createApp({
       if (!walletAddr) return;
       this.walletFollowModal = { open: true, loading: true, wallet: walletAddr, status };
       this.walletFollowDetail = { signals: [] };
+      this.walletFollowPage = 1;
+      await this.loadWalletFollowDetail();
+    },
+    async loadWalletFollowDetail() {
+      if (!this.walletFollowModal.wallet) return;
+      this.walletFollowModal.loading = true;
       try {
-        const query = new URLSearchParams({ wallet: walletAddr, status });
+        const query = new URLSearchParams({
+          wallet: this.walletFollowModal.wallet,
+          status: this.walletFollowModal.status || "",
+          page: String(this.walletFollowPage),
+          size: String(this.walletFollowSize),
+        });
         try {
           this.walletFollowDetail = await this.request(`/api/wallet-follows?${query.toString()}`);
         } catch (error) {
           if (error.message !== "not_found") throw error;
-          this.walletFollowDetail = await this.request(`/api/wallets/${encodeURIComponent(walletAddr)}/follows?status=${encodeURIComponent(status)}`);
+          const params = new URLSearchParams({
+            status: this.walletFollowModal.status || "",
+            page: String(this.walletFollowPage),
+            size: String(this.walletFollowSize),
+          });
+          this.walletFollowDetail = await this.request(`/api/wallets/${encodeURIComponent(this.walletFollowModal.wallet)}/follows?${params.toString()}`);
         }
       } catch (error) {
         this.showToast(`钱包跟单详情加载失败: ${error.message}`, "error");
       } finally {
         this.walletFollowModal.loading = false;
       }
+    },
+    async setWalletFollowPage(page) {
+      const next = Math.min(Math.max(1, page), this.walletFollowPageCount);
+      if (next === this.walletFollowPage) return;
+      this.walletFollowPage = next;
+      await this.loadWalletFollowDetail();
     },
     closeWalletFollowDetail() {
       this.walletFollowModal.open = false;
@@ -1125,6 +1153,9 @@ createApp({
       const signals = Number(observed.signals || 0);
       return Number.isFinite(signals) ? signals : 0;
     },
+    walletObservedClosed(wallet) {
+      return this.walletObservedSettled(wallet) + this.walletObservedExited(wallet);
+    },
     walletObservedOpen(wallet) {
       const observed = wallet?.observed || {};
       const open = Number(observed.open || 0);
@@ -1152,7 +1183,7 @@ createApp({
       return this.money(pnl);
     },
     walletFollowModalTitle() {
-      const map = { settled: "已结算跟单", open: "持仓中跟单", exited: "提前退出跟单" };
+      const map = { settled: "已结算跟单", closed: "已结算跟单", open: "持仓中跟单", exited: "提前退出跟单" };
       const label = map[this.walletFollowModal.status] || "钱包跟单";
       const addr = this.walletFollowDetail.short_addr || this.shortId(this.walletFollowModal.wallet);
       return `${addr} · ${label}`;
@@ -1189,6 +1220,15 @@ createApp({
       if (status === "open") return "未结算";
       if (status === "exited") return this.price(signal.exit_price);
       if (status === "settled") return signal.outcome_won ? "1.000（胜）" : "0.000（负）";
+      return "-";
+    },
+    signalSettlementTypeText(signal) {
+      const type = String(signal.settlement_type || "");
+      if (type === "manual_exit") return "主动退出";
+      if (type === "auto_settlement") return "自动结算";
+      const status = String(signal.status || "");
+      if (status === "exited") return "主动退出";
+      if (status === "settled") return "自动结算";
       return "-";
     },
     matchParts(value) {

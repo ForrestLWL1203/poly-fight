@@ -26,7 +26,7 @@ from typing import Any
 from .control import read_follow_control, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
 from .core import LEAGUE_LABELS, MIN_A_POSITIVE_MARKET_RATE, parse_dt, parse_jsonish, to_float
 from .cli import enrich_esports_bucket_scores, prepare_category_refresh_dir
-from .storage import FollowStore
+from .storage import FollowStore, LeaderboardStore
 
 
 COOKIE_NAME = "poly_fight_session"
@@ -218,14 +218,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             wallet = str(query.get("wallet", [""])[0] or "").lower()
             status = str(query.get("status", [""])[0] or "").lower()
-            self._ok(build_wallet_follow_detail(self.dashboard_config.data_dir, wallet, status=status))
+            page = _int_param(query.get("page", ["1"])[0], default=1, minimum=1, maximum=10_000)
+            size = _int_param(query.get("size", ["20"])[0], default=20, minimum=1, maximum=200)
+            self._ok(build_wallet_follow_detail(self.dashboard_config.data_dir, wallet, status=status, page=page, size=size))
             return
         match = re.match(r"^/api/wallets/([^/]+)/follows$", parsed.path)
         if match:
             wallet = urllib.parse.unquote(match.group(1)).lower()
             query = urllib.parse.parse_qs(parsed.query)
             status = str(query.get("status", [""])[0] or "").lower()
-            self._ok(build_wallet_follow_detail(self.dashboard_config.data_dir, wallet, status=status))
+            page = _int_param(query.get("page", ["1"])[0], default=1, minimum=1, maximum=10_000)
+            size = _int_param(query.get("size", ["20"])[0], default=20, minimum=1, maximum=200)
+            self._ok(build_wallet_follow_detail(self.dashboard_config.data_dir, wallet, status=status, page=page, size=size))
             return
         if parsed.path == "/api/follows":
             query = urllib.parse.parse_qs(parsed.query)
@@ -533,8 +537,7 @@ def build_health(data_dir: Path, *, started_at: float, log_dir: Path | None = No
     db_ready = FollowStore(_follow_db_path(data_dir)).dashboard_db_ready()
     last_tick = rows[-1] if rows else {}
     build_summary = _read_json(data_dir / "build_summary.json", {})
-    leaderboard_path = data_dir / "smart_wallet_leaderboard.json"
-    leaderboard_updated_at = int(leaderboard_path.stat().st_mtime) if leaderboard_path.exists() else 0
+    leaderboard_updated_at = max(_category_leaderboard_mtimes(data_dir).values() or [0])
     last_tick_at = int(last_tick.get("created_at") or 0)
     interval = int(last_tick.get("desired_next_interval_seconds") or 900)
     now_ts = int(time.time())
@@ -586,7 +589,7 @@ def read_stream_signal(
             _file_mtime(_legacy_follow_run_log_path(data_dir)),
         ),
         control_mtime=_file_mtime(_follow_dir(data_dir) / "follow_control.json"),
-        leaderboard_mtime=max(_file_mtime(path / "smart_wallet_leaderboard.json") for path in category_data_dirs(data_dir).values()),
+        leaderboard_mtime=max(_category_leaderboard_mtimes(data_dir).values() or [0]),
     )
 
 
@@ -735,6 +738,11 @@ def _observed_market_types(row: dict[str, Any]) -> list[str]:
 def _category_leaderboards(root: Path) -> list[tuple[str, Path, list[dict[str, Any]], int]]:
     rows: list[tuple[str, Path, list[dict[str, Any]], int]] = []
     for category, data_dir in category_data_dirs(root).items():
+        db_rows, db_mtimes = LeaderboardStore(data_dir / "leaderboard.db").load_leaderboard(category=category)
+        if db_rows:
+            leaderboard = [{**row, "category": category} for row in db_rows if isinstance(row, dict)]
+            rows.append((category, data_dir, leaderboard, int(db_mtimes.get(category) or 0)))
+            continue
         path = data_dir / "smart_wallet_leaderboard.json"
         value = _read_json(path, [])
         leaderboard = []
@@ -743,11 +751,23 @@ def _category_leaderboards(root: Path) -> list[tuple[str, Path, list[dict[str, A
                 leaderboard.append({**row, "category": category})
         rows.append((category, data_dir, leaderboard, int(path.stat().st_mtime) if path.exists() else 0))
     legacy_path = root / "smart_wallet_leaderboard.json"
+    if not any(leaderboard for _, _, leaderboard, _ in rows):
+        legacy_db_rows, legacy_db_mtimes = LeaderboardStore(root / "leaderboard.db").load_leaderboard(category="esports")
+        if legacy_db_rows:
+            legacy_db = [{**row, "category": "esports"} for row in legacy_db_rows if isinstance(row, dict)]
+            rows.append(("esports", root, legacy_db, int(legacy_db_mtimes.get("esports") or 0)))
     if not any(leaderboard for _, _, leaderboard, _ in rows) and legacy_path.exists():
         value = _read_json(legacy_path, [])
         legacy = [{**row, "category": "esports"} for row in value if isinstance(row, dict)]
         rows.append(("esports", root, legacy, int(legacy_path.stat().st_mtime)))
     return rows
+
+
+def _category_leaderboard_mtimes(root: Path) -> dict[str, int]:
+    mtimes = {}
+    for category, data_dir, _rows, mtime in _category_leaderboards(root):
+        mtimes[category] = int(mtime or 0)
+    return mtimes
 
 
 def _signal_wallet_trade_at(signal: dict[str, Any]) -> int:
@@ -1099,6 +1119,8 @@ def _leaderboard_rank_by_wallet(data_dir: Path) -> dict[str, int]:
             category = normalize_category(str(row.get("category") or source_category or "")) or "esports"
             row = enrich_esports_bucket_scores(row, now_ts=int(time.time())) if category != "sports" else row
             metrics = _eligible_display_metrics(row)
+            if "positive_market_rate" in metrics and to_float(metrics.get("positive_market_rate")) < MIN_A_POSITIVE_MARKET_RATE:
+                continue
             merged = {**row, **metrics, "wallet": wallet, "category": category}
             rows_by_category.setdefault(category, []).append(merged)
     ranks: dict[str, int] = {}
@@ -1111,12 +1133,29 @@ def _leaderboard_rank_by_wallet(data_dir: Path) -> dict[str, int]:
     return ranks
 
 
-def build_wallet_follow_detail(data_dir: Path, wallet: str, *, status: str = "") -> dict[str, Any]:
+def build_wallet_follow_detail(
+    data_dir: Path,
+    wallet: str,
+    *,
+    status: str = "",
+    page: int = 1,
+    size: int = 20,
+) -> dict[str, Any]:
     wallet = wallet.lower()
     if not re.fullmatch(r"0x[a-f0-9]{40}", wallet):
-        return {"wallet": wallet, "short_addr": short_addr(wallet), "signals": [], "count": 0, "db_ready": False}
-    allowed_statuses = {"open", "settled", "exited"}
-    statuses = {status} if status in allowed_statuses else set()
+        return {
+            "wallet": wallet,
+            "short_addr": short_addr(wallet),
+            "signals": [],
+            "count": 0,
+            "total": 0,
+            "page": max(1, int(page or 1)),
+            "size": max(1, int(size or 20)),
+            "db_ready": False,
+        }
+    allowed_statuses = {"open", "settled", "exited", "closed"}
+    status_filter = status if status in allowed_statuses else ""
+    statuses = {"settled", "exited"} if status_filter == "closed" else ({status_filter} if status_filter else set())
     result = FollowStore(_follow_db_path(data_dir)).load_dashboard_wallet_follow_detail(wallet, statuses=statuses)
     signals = result.get("signals", [])
     signals = sorted(
@@ -1124,14 +1163,33 @@ def build_wallet_follow_detail(data_dir: Path, wallet: str, *, status: str = "")
         key=lambda signal: _signal_activity_at(signal),
         reverse=True,
     )
+    for signal in signals:
+        signal["settlement_type"] = _signal_settlement_type(signal)
+    total = len(signals)
+    page = max(1, int(page or 1))
+    size = max(1, int(size or 20))
+    start = (page - 1) * size
+    page_signals = signals[start : start + size]
     return {
         "wallet": wallet,
         "short_addr": short_addr(wallet),
-        "status": status if status in allowed_statuses else "",
-        "signals": signals,
-        "count": len(signals),
+        "status": status_filter,
+        "signals": page_signals,
+        "count": total,
+        "total": total,
+        "page": page,
+        "size": size,
         "db_ready": bool(result.get("db_ready")),
     }
+
+
+def _signal_settlement_type(signal: dict[str, Any]) -> str:
+    status = str(signal.get("status") or "")
+    if status == "exited":
+        return "manual_exit"
+    if status == "settled":
+        return "auto_settlement"
+    return ""
 
 
 def _signal_activity_at(signal: dict[str, Any]) -> int:
@@ -2025,7 +2083,7 @@ def _file_mtime(path: Path) -> int:
 
 
 def _latest_scoring_version(data_dir: Path) -> int | None:
-    leaderboard = _read_json(data_dir / "smart_wallet_leaderboard.json", [])
+    leaderboard = [row for _category, _dir, rows, _mtime in _category_leaderboards(data_dir) for row in rows]
     versions = [int(row.get("scoring_version") or 0) for row in leaderboard if isinstance(row, dict)]
     version = max(versions or [0])
     return version or None

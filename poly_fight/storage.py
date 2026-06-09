@@ -35,6 +35,112 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+class LeaderboardStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    def connect_readonly(self) -> sqlite3.Connection | None:
+        if not self.path.exists():
+            return None
+        try:
+            conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=1")
+            conn.execute("PRAGMA busy_timeout=5000")
+            return conn
+        except sqlite3.Error:
+            return None
+
+    def init_db(self) -> None:
+        with self.connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS leaderboard_wallets (
+                    category TEXT NOT NULL,
+                    wallet TEXT NOT NULL,
+                    rank INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    PRIMARY KEY (category, wallet)
+                );
+                CREATE INDEX IF NOT EXISTS idx_leaderboard_wallets_category_rank
+                    ON leaderboard_wallets(category, rank);
+                """
+            )
+
+    def replace_leaderboard(self, rows: list[dict[str, Any]], *, category: str, updated_at: int) -> None:
+        category = str(category or "esports").lower()
+        updated_at = int(updated_at or time.time())
+        self.init_db()
+        with self.connect() as conn:
+            conn.execute("BEGIN")
+            conn.execute("DELETE FROM leaderboard_wallets WHERE category = ?", (category,))
+            for index, row in enumerate(rows, start=1):
+                if not isinstance(row, dict):
+                    continue
+                wallet = str(row.get("wallet") or "").lower()
+                if not wallet:
+                    continue
+                payload = dict(row)
+                payload.setdefault("category", category)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO leaderboard_wallets(category, wallet, rank, updated_at, raw_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (category, wallet, index, updated_at, _dumps(payload)),
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                (f"{category}:updated_at", str(updated_at)),
+            )
+            conn.execute("COMMIT")
+
+    def load_leaderboard(self, *, category: str | None = None) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        conn = self.connect_readonly()
+        if conn is None:
+            return [], {}
+        try:
+            params: tuple[Any, ...] = ()
+            where = ""
+            if category:
+                where = "WHERE category = ?"
+                params = (str(category).lower(),)
+            rows = conn.execute(
+                f"SELECT category, raw_json FROM leaderboard_wallets {where} ORDER BY category, rank",
+                params,
+            ).fetchall()
+            values = []
+            mtimes: dict[str, int] = {}
+            for row in rows:
+                row_category = str(row["category"] or "").lower()
+                payload = _loads(row["raw_json"], {})
+                if isinstance(payload, dict):
+                    payload.setdefault("category", row_category)
+                    values.append(payload)
+            meta_rows = conn.execute("SELECT key, value FROM meta").fetchall()
+            for row in meta_rows:
+                key = str(row["key"] or "")
+                if key.endswith(":updated_at"):
+                    mtimes[key.split(":", 1)[0]] = int(row["value"] or 0)
+            return values, mtimes
+        finally:
+            conn.close()
+
+
 class FollowStore:
     def __init__(self, path: Path) -> None:
         self.path = path

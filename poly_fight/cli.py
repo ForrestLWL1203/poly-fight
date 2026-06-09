@@ -73,7 +73,7 @@ from .follow import (
     trade_condition_id,
     winner_outcome_index,
 )
-from .storage import FollowStore
+from .storage import FollowStore, LeaderboardStore
 from .control import read_follow_control, set_pause_new_signals
 
 try:
@@ -98,6 +98,7 @@ SPORTS_FLAT_FOLLOW_MIN_WILSON = 0.50
 SPORTS_FLAT_FOLLOW_MIN_MEDIAN_MARKET_ROI = 0.10
 SPORTS_FLAT_FOLLOW_MAX_MEDIAN_ENTRY = 0.68
 CATEGORY_REFRESH_OUTPUT_FILES = {
+    "leaderboard.db",
     "smart_wallet_leaderboard.json",
     "wallet_profiles.json",
     "candidate_wallets.json",
@@ -396,6 +397,11 @@ def read_category_leaderboards(root: Path) -> tuple[list[dict[str, Any]], dict[s
     rows: list[dict[str, Any]] = []
     mtimes: dict[str, int] = {}
     for category, data_dir in category_data_dirs(root).items():
+        db_rows, db_mtimes = LeaderboardStore(data_dir / "leaderboard.db").load_leaderboard(category=category)
+        if db_rows:
+            rows.extend({**row, "category": category} for row in db_rows if isinstance(row, dict))
+            mtimes[category] = int(db_mtimes.get(category) or 0)
+            continue
         path = data_dir / "smart_wallet_leaderboard.json"
         leaderboard = read_json(path, [])
         mtimes[category] = int(path.stat().st_mtime) if path.exists() else 0
@@ -403,6 +409,10 @@ def read_category_leaderboards(root: Path) -> tuple[list[dict[str, Any]], dict[s
             if isinstance(row, dict):
                 rows.append({**row, "category": category})
     legacy_path = root / "smart_wallet_leaderboard.json"
+    legacy_db_rows, legacy_db_mtimes = LeaderboardStore(root / "leaderboard.db").load_leaderboard(category="esports")
+    if not rows and legacy_db_rows:
+        rows.extend({**row, "category": "esports"} for row in legacy_db_rows if isinstance(row, dict))
+        mtimes["esports"] = int(legacy_db_mtimes.get("esports") or 0)
     if not rows and legacy_path.exists():
         legacy = read_json(legacy_path, [])
         mtimes["esports"] = int(legacy_path.stat().st_mtime)
@@ -3216,7 +3226,11 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         max_age_days=args.profile_store_max_age_days,
     )
     write_json(data_dir / "wallet_profiles.json", list(profiles_by_wallet.values()))
-    write_json(data_dir / "smart_wallet_leaderboard.json", leaderboard)
+    LeaderboardStore(data_dir / "leaderboard.db").replace_leaderboard(
+        leaderboard,
+        category=category,
+        updated_at=now_ts,
+    )
     write_json(data_dir / "leaderboard_wallet_overlap.json", overlap_report)
 
     summary = {
@@ -3294,7 +3308,7 @@ def find_active_market(client: PolymarketClient, args: argparse.Namespace) -> di
 def command_analyze_event(args: argparse.Namespace) -> int:
     client = build_client(args)
     data_dir = resolve_data_dir(args)
-    leaderboard_rows = read_json(data_dir / "smart_wallet_leaderboard.json", [])
+    leaderboard_rows, _mtimes = read_category_leaderboards(data_dir)
     leaderboard = {normalize_wallet(row.get("wallet")): row for row in leaderboard_rows}
 
     market = find_active_market(client, args)
