@@ -6960,6 +6960,53 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(sports_page["total"], 1)
             self.assertEqual(sports_page["follows"][0]["condition_id"], "m2")
 
+    def test_dashboard_follows_merges_exited_into_settled_status_with_settlement_type(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[],
+                result_events=[
+                    {
+                        "signal_id": "auto",
+                        "wallet": "0xabc",
+                        "condition_id": "m1",
+                        "status": "settled",
+                        "settled_at": 200,
+                        "legs": [{"stake": 1}],
+                    },
+                    {
+                        "signal_id": "exit",
+                        "wallet": "0xdef",
+                        "condition_id": "m1",
+                        "status": "exited",
+                        "exit_at": 300,
+                        "legs": [{"stake": 1}],
+                    },
+                    {
+                        "signal_id": "exit-only",
+                        "wallet": "0xghi",
+                        "condition_id": "m2",
+                        "status": "exited",
+                        "exit_at": 400,
+                        "legs": [{"stake": 1}],
+                    },
+                ],
+                performance={},
+            )
+
+            page = build_follows(data_dir, page=1, size=10)
+            settled_page = build_follows(data_dir, page=1, size=10, status="settled")
+            exited_page = build_follows(data_dir, page=1, size=10, status="exited")
+
+            by_condition = {row["condition_id"]: row for row in page["follows"]}
+            self.assertEqual(by_condition["m1"]["status"], "settled")
+            self.assertEqual(by_condition["m1"]["settlement_type"], "auto_and_manual")
+            self.assertEqual(by_condition["m2"]["status"], "settled")
+            self.assertEqual(by_condition["m2"]["settlement_type"], "manual_exit")
+            self.assertEqual({row["condition_id"] for row in settled_page["follows"]}, {"m1", "m2"})
+            self.assertEqual(exited_page["status"], "")
+
     def test_dashboard_follows_expose_readable_market_fields(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -7403,6 +7450,67 @@ class CoreTest(unittest.TestCase):
             detail = build_follow_detail(data_dir, "m1")
 
             self.assertEqual([row["wallet"] for row in wallets], [visible_a, visible_b])
+            self.assertEqual(detail["wallets"][0]["leaderboard_rank"], 2)
+
+    def test_dashboard_follow_detail_rank_respects_quarantine_sorting(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            clean_top = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            quarantined = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            target = "0xcccccccccccccccccccccccccccccccccccccccc"
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [
+                    {
+                        "wallet": clean_top,
+                        "grade": "A",
+                        "best_bucket_score": 90,
+                        "positive_market_rate": 1.0,
+                        "wilson_win_rate_lower_bound": 0.90,
+                        "entry_edge": 0.30,
+                    },
+                    {
+                        "wallet": quarantined,
+                        "grade": "A",
+                        "best_bucket_score": 89,
+                        "positive_market_rate": 1.0,
+                        "wilson_win_rate_lower_bound": 0.89,
+                        "entry_edge": 0.29,
+                    },
+                    {
+                        "wallet": target,
+                        "grade": "A",
+                        "best_bucket_score": 88,
+                        "positive_market_rate": 1.0,
+                        "wilson_win_rate_lower_bound": 0.88,
+                        "entry_edge": 0.28,
+                    },
+                ],
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "sig-rank",
+                        "wallet": target,
+                        "condition_id": "m1",
+                        "status": "open",
+                        "category": "esports",
+                        "created_at": 100,
+                        "legs": [{"stake": 1}],
+                    }
+                ],
+                result_events=[],
+                performance={"wallets": {}, "total": {}},
+            )
+            store.upsert_wallet_quarantine(quarantined, reason="material_sell", ts=100)
+
+            wallets = build_wallets(data_dir)["wallets"]
+            detail = build_follow_detail(data_dir, "m1")
+
+            self.assertEqual([row["wallet"] for row in wallets], [clean_top, target, quarantined])
+            self.assertEqual([row["rank"] for row in wallets], [1, 2, 3])
             self.assertEqual(detail["wallets"][0]["leaderboard_rank"], 2)
 
     def test_dashboard_wallet_follow_detail_merges_closed_statuses_and_paginates(self):

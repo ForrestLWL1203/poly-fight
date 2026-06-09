@@ -1015,7 +1015,7 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
     store = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir))
     result = store.load_dashboard_follow_rows(page=1, size=10_000)
     logo_cache = _load_team_logo_cache(data_dir)
-    allowed_statuses = {"open", "settled", "exited", "mixed"}
+    allowed_statuses = {"open", "settled"}
     status_filter = status if status in allowed_statuses else ""
     category_filter = normalize_category(category)
     groups = _follow_groups_from_signals(result.get("signals", []))
@@ -1084,7 +1084,7 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
     signals = result.get("signals", [])
     market = _active_market_by_condition(data_dir, condition_id, follow_dir=follow_dir)
     logo_cache = _load_team_logo_cache(data_dir)
-    leaderboard_ranks = _leaderboard_rank_by_wallet(data_dir)
+    leaderboard_ranks = _leaderboard_rank_by_wallet(data_dir, follow_dir=follow_dir)
     by_wallet: dict[str, dict[str, Any]] = {}
     title = ""
     question = ""
@@ -1154,8 +1154,10 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
     }
 
 
-def _leaderboard_rank_by_wallet(data_dir: Path) -> dict[str, int]:
+def _leaderboard_rank_by_wallet(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str, int]:
     rows_by_category: dict[str, list[dict[str, Any]]] = {category: [] for category in CATEGORIES}
+    quarantine_snapshot = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).load_dashboard_wallet_quarantine()
+    quarantine = quarantine_snapshot.get("wallet_quarantine") or {}
     for source_category, _dir, leaderboard, _mtime in _category_leaderboards(data_dir):
         for row in leaderboard if isinstance(leaderboard, list) else []:
             if not isinstance(row, dict):
@@ -1168,7 +1170,14 @@ def _leaderboard_rank_by_wallet(data_dir: Path) -> dict[str, int]:
             metrics = _eligible_display_metrics(row)
             if "positive_market_rate" in metrics and to_float(metrics.get("positive_market_rate")) < MIN_A_POSITIVE_MARKET_RATE:
                 continue
-            merged = {**row, **metrics, "wallet": wallet, "category": category}
+            quarantine_key = f"{category}:{wallet}"
+            merged = {
+                **row,
+                **metrics,
+                "wallet": wallet,
+                "category": category,
+                "quarantined": quarantine_key in quarantine or wallet in quarantine,
+            }
             rows_by_category.setdefault(category, []).append(merged)
     ranks: dict[str, int] = {}
     for category, rows in rows_by_category.items():
@@ -2051,6 +2060,7 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                 "signal_stakes": [],
                 "stake_mode_counts": {},
                 "status_counts": {},
+                "settlement_type_counts": {},
                 "open_pnl_legs": [],
                 "our_realized_pnl": 0.0,
                 "wallet_basis_realized_pnl": 0.0,
@@ -2078,6 +2088,9 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
         bucket["stake_mode_counts"][mode] = bucket["stake_mode_counts"].get(mode, 0) + 1
         status = str(signal.get("status") or "open")
         bucket["status_counts"][status] = bucket["status_counts"].get(status, 0) + 1
+        settlement_type = _signal_settlement_type(signal)
+        if settlement_type:
+            bucket["settlement_type_counts"][settlement_type] = bucket["settlement_type_counts"].get(settlement_type, 0) + 1
         if status == "open":
             outcome_index = int(signal.get("outcome_index") or 0)
             for leg in legs:
@@ -2105,10 +2118,17 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
         bucket["wallets"] = sorted(bucket["wallets"])
         if bucket["status_counts"].get("open"):
             bucket["status"] = "open"
-        elif len(bucket["status_counts"]) == 1:
-            bucket["status"] = next(iter(bucket["status_counts"]))
         else:
-            bucket["status"] = "mixed"
+            bucket["status"] = "settled"
+        settlement_types = set(bucket.get("settlement_type_counts") or {})
+        if "auto_settlement" in settlement_types and "manual_exit" in settlement_types:
+            bucket["settlement_type"] = "auto_and_manual"
+        elif "manual_exit" in settlement_types:
+            bucket["settlement_type"] = "manual_exit"
+        elif "auto_settlement" in settlement_types:
+            bucket["settlement_type"] = "auto_settlement"
+        else:
+            bucket["settlement_type"] = ""
         bucket["roi"] = bucket["our_realized_pnl"] / bucket["stake"] if bucket["stake"] else None
         bucket["avg_wallet_clv"] = bucket["clv_sum"] / bucket["clv_count"] if bucket["clv_count"] else None
         signal_stakes = [value for value in bucket.get("signal_stakes") or [] if value > 0]

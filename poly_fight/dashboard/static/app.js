@@ -40,8 +40,6 @@ createApp({
         { value: "", label: "全部状态" },
         { value: "open", label: "跟单中" },
         { value: "settled", label: "已结算" },
-        { value: "exited", label: "已退出" },
-        { value: "mixed", label: "混合" },
       ],
       eventPage: 1,
       eventSize: 10,
@@ -781,8 +779,7 @@ createApp({
         waiting_for_runner: "等待脚本",
         open: "跟单中",
         settled: "已结算",
-        exited: "已退出",
-        mixed: "混合",
+        exited: "已结算",
         idle: "空闲",
         succeeded: "已完成",
         failed: "失败",
@@ -1211,9 +1208,17 @@ createApp({
     signalStatusText(signal) {
       const status = String(signal.status || "");
       if (status === "settled") return "已结算";
-      if (status === "exited") return "提前退出";
+      if (status === "exited") return "已结算";
       if (status === "open") return "持仓中";
       return this.statusText(status);
+    },
+    followSettlementTypeText(follow) {
+      const type = String(follow?.settlement_type || "");
+      if (type === "manual_exit") return "提前退出";
+      if (type === "auto_settlement") return "自动结算";
+      if (type === "auto_and_manual") return "自动+提前";
+      if (String(follow?.status || "") === "open") return "-";
+      return "-";
     },
     signalSettlementText(signal) {
       const status = String(signal.status || "");

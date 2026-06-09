@@ -301,6 +301,7 @@
                   <tr>
                     <th>赛事</th>
                     <th>状态</th>
+                    <th>结算类型</th>
                     <th>钱包数</th>
                     <th>单数</th>
                     <th>投入</th>
@@ -339,6 +340,7 @@
                       </div>
                     </td>
                     <td><span class="follow-status-pill" :class="`is-${follow.status || 'unknown'}`">{{ statusText(follow.status) }}</span></td>
+                    <td>{{ followSettlementTypeText(follow) }}</td>
                     <td>{{ follow.wallet_count }}</td>
                     <td>{{ follow.leg_count }}</td>
                     <td>{{ money(follow.stake) }}</td>
@@ -349,7 +351,7 @@
                     <td><span class="badge" :class="follow.contested_signal_count ? 'badge-error badge-outline' : 'badge-success badge-outline'">{{ follow.contested_signal_count ? "双边" : "单边" }}</span></td>
                   </tr>
                   <tr v-if="!(follows.follows || []).length">
-                    <td colspan="7" class="empty-cell">暂无跟单记录</td>
+                    <td colspan="8" class="empty-cell">暂无跟单记录</td>
                   </tr>
                 </tbody>
               </table>
