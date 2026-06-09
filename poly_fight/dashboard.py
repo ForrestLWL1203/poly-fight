@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .control import read_follow_control, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
-from .core import LEAGUE_LABELS, MIN_A_POSITIVE_MARKET_RATE, parse_dt, parse_jsonish, to_float
+from .core import LEAGUE_LABELS, MIN_A_POSITIVE_MARKET_RATE, bucket_label, parse_dt, parse_jsonish, to_float
 from .cli import enrich_esports_bucket_scores, prepare_category_refresh_dir
 from .storage import FollowStore, LeaderboardStore
 
@@ -755,10 +755,18 @@ def _eligible_display_metrics(row: dict[str, Any]) -> dict[str, Any]:
     back to the overall row for legacy profiles that predate per-type grading.
     """
     enriched = enrich_esports_bucket_scores(row, now_ts=int(time.time()))
+    best_bucket = str(enriched.get("best_bucket") or "")
     best_market_type = str(enriched.get("best_market_type") or "")
     bucket_scores = enriched.get("bucket_scores") if isinstance(enriched.get("bucket_scores"), dict) else {}
+    if best_bucket and isinstance(bucket_scores.get(best_bucket), dict):
+        return bucket_scores[best_bucket]
     if best_market_type and isinstance(bucket_scores.get(best_market_type), dict):
         return bucket_scores[best_market_type]
+    eligible_buckets = enriched.get("eligible_buckets") or []
+    per_game_type = row.get("per_game_type_grades") or row.get("per_game_type") or {}
+    buckets = [per_game_type[key] for key in eligible_buckets if isinstance(per_game_type.get(key), dict)]
+    if buckets:
+        return max(buckets, key=lambda bucket: int(bucket.get("esports_closed_count") or 0))
     eligible = enriched.get("eligible_market_types") or []
     per_type = row.get("per_type_grades") or {}
     buckets = [per_type[market_type] for market_type in eligible if isinstance(per_type.get(market_type), dict)]
@@ -780,6 +788,14 @@ def _observed_market_types(row: dict[str, Any]) -> list[str]:
     per_type = row.get("per_type_grades") or row.get("per_type") or {}
     order = {"main_match": 0, "game_winner": 1, "map_winner": 2}
     return sorted((str(value) for value in per_type if value), key=lambda value: order.get(value, 99))
+
+
+def _observed_buckets(row: dict[str, Any]) -> list[str]:
+    observed = [str(value) for value in (row.get("observed_buckets") or []) if value]
+    if observed:
+        return sorted(set(observed))
+    per_game_type = row.get("per_game_type_grades") or row.get("per_game_type") or {}
+    return sorted(str(value) for value in per_game_type if value)
 
 
 def _category_leaderboards(root: Path) -> list[tuple[str, Path, list[dict[str, Any]], int]]:
@@ -864,6 +880,7 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
         quarantine_key = f"{category}:{wallet}"
         observed = wallet_observed_performance(performance.get(wallet, {}), open_count=len(open_by_wallet.get(wallet, [])))
         observed_market_types = _observed_market_types(row)
+        observed_buckets = _observed_buckets(row)
         last_trade_at = max(_parse_timestamp(row.get("last_esports_trade_at")), observed_trade_at_by_wallet.get(wallet, 0))
         rows.append(
             {
@@ -878,6 +895,9 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
                 "last_esports_trade_at": last_trade_at or row.get("last_esports_trade_at"),
                 "best_market_type": row.get("best_market_type"),
                 "best_market_type_label": row.get("best_market_type_label"),
+                "best_bucket": row.get("best_bucket"),
+                "best_bucket_label": row.get("best_bucket_label"),
+                "best_game_family": row.get("best_game_family"),
                 "best_bucket_score": row.get("best_bucket_score"),
                 "bucket_scores": row.get("bucket_scores") or {},
                 "overall_esports_roi": row.get("overall_esports_roi", row.get("esports_roi")),
@@ -917,9 +937,16 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
                 "two_sided_trade_market_rate": row.get("two_sided_trade_market_rate"),
                 "eligible_market_types": row.get("eligible_market_types") or [],
                 "eligible_market_type_labels": row.get("eligible_market_type_labels") or [],
+                "eligible_buckets": row.get("eligible_buckets") or [],
+                "eligible_bucket_labels": row.get("eligible_bucket_labels") or [],
+                "eligible_game_families": row.get("eligible_game_families") or [],
+                "eligible_game_family_labels": row.get("eligible_game_family_labels") or [],
                 "observed_market_types": observed_market_types,
                 "observed_market_type_labels": row.get("observed_market_type_labels") or _market_type_labels(observed_market_types),
+                "observed_buckets": observed_buckets,
+                "observed_bucket_labels": row.get("observed_bucket_labels") or [bucket_label(value) for value in observed_buckets],
                 "per_type_grades": row.get("per_type_grades") or {},
+                "per_game_type_grades": row.get("per_game_type_grades") or {},
                 "participation_rate": row.get("participation_rate"),
                 "participated_events": row.get("participated_events"),
                 "eligible_event_count": row.get("eligible_event_count"),
@@ -1019,7 +1046,15 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
     status_filter = status if status in allowed_statuses else ""
     category_filter = normalize_category(category)
     groups = _follow_groups_from_signals(result.get("signals", []))
-    rows = sorted(groups.values(), key=lambda row: row.get("last_activity_at") or 0, reverse=True)
+    rows = sorted(
+        groups.values(),
+        key=lambda row: (
+            int(row.get("last_follow_action_at") or 0),
+            int(row.get("last_activity_at") or 0),
+            str(row.get("condition_id") or ""),
+        ),
+        reverse=True,
+    )
     if status_filter:
         rows = [row for row in rows if str(row.get("status") or "") == status_filter]
     if category_filter:
@@ -1265,6 +1300,22 @@ def _signal_activity_at(signal: dict[str, Any]) -> int:
         if isinstance(leg, dict)
     ]
     return max([value for value in leg_times if value] or [0])
+
+
+def _signal_follow_action_at(signal: dict[str, Any]) -> int:
+    direct = _parse_timestamp(signal.get("wallet_trade_at") or signal.get("last_trade_at"))
+    leg_times = [
+        _parse_timestamp(
+            leg.get("wallet_trade_at")
+            or leg.get("trade_at")
+            or leg.get("leg_at")
+            or leg.get("created_at")
+        )
+        for leg in signal.get("legs") or []
+        if isinstance(leg, dict)
+    ]
+    fallback = _parse_timestamp(signal.get("created_at"))
+    return max([value for value in [direct, fallback, *leg_times] if value] or [0])
 
 
 def build_events(
@@ -2065,6 +2116,7 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                 "our_realized_pnl": 0.0,
                 "wallet_basis_realized_pnl": 0.0,
                 "last_activity_at": 0,
+                "last_follow_action_at": 0,
                 "contested_signal_count": 0,
                 "clv_sum": 0.0,
                 "clv_count": 0,
@@ -2112,6 +2164,10 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
         bucket["last_activity_at"] = max(
             int(bucket["last_activity_at"] or 0),
             int(signal.get("updated_at") or signal.get("settled_at") or signal.get("exit_at") or signal.get("created_at") or 0),
+        )
+        bucket["last_follow_action_at"] = max(
+            int(bucket["last_follow_action_at"] or 0),
+            _signal_follow_action_at(signal),
         )
     for bucket in groups.values():
         bucket["wallet_count"] = len(bucket["wallets"])

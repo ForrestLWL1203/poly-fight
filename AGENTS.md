@@ -35,8 +35,8 @@ python3 -m poly_fight.cli --data-dir data_smoke build-leaderboard
 Batched discovery shares cache/profile state across batches:
 
 ```bash
-python3 -m poly_fight.cli collect --discovery-lookback-days 15 --market-batch-size 50 --market-batch-index 0
-python3 -m poly_fight.cli collect --discovery-lookback-days 15 --market-batch-size 50 --market-batch-index 1
+python3 -m poly_fight.cli collect --classification-lookback-days 15 --market-batch-size 50 --market-batch-index 0
+python3 -m poly_fight.cli collect --classification-lookback-days 15 --market-batch-size 50 --market-batch-index 1
 ```
 
 ## Current Workflow
@@ -63,7 +63,7 @@ to find active candidates.
 Allowed esports:
 
 ```text
-LOL / CS2 / Dota2 only
+LOL / CS2 / Dota2
 main_match: full match winner
 game_winner: Dota2/LOL Game N Winner
 map_winner: CS2 Map N Winner
@@ -154,7 +154,11 @@ raw_market_trades cache ttl = 7d unless --refresh-market-trades
 max_workers = 8
 max_requests_per_second = 10
 request_burst = 5
-classification_lookback_days = 14 by default
+classification_lookback_days = 60 by default
+esports discovery buckets:
+  main_match = LOL 100 / CS2 100 / Dota2 100
+  game_winner = LOL 50 / Dota2 50
+  map_winner = CS2 50
 market_batch_size = 50
 market_batch_count = 2
 max_pages_per_market = 3

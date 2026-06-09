@@ -164,7 +164,7 @@ Wallet history is capped for scoring: each profile queries closed positions
 directly within the current market scope, for example
 `closed-positions?user=<wallet>&market=<csv esports conditionIds>`. ConditionIds
 come from the recent esports classification scope
-(`--classification-lookback-days`, default 14) and are chunked in batches of 50
+(`--classification-lookback-days`, default 60) and are chunked in batches of 50
 by default to keep URLs modest. The scorer merges and dedupes those responses,
 then scores at most the latest 50 closed esports main markets. Wilson lower
 bound uses 80% confidence (`z=1.28`) for ranking so strong wallets with a few

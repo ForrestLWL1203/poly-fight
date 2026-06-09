@@ -198,7 +198,7 @@
                   <th>专精 ROI</th>
                   <th>专精胜率</th>
                   <th>场均交易额</th>
-                  <th>近期表现</th>
+                  <th>近期</th>
                   <th>专精类型</th>
                   <th>已结算</th>
                   <th>持仓中</th>
@@ -230,12 +230,17 @@
                   <td class="metric-strong" :title="money(wallet.avg_market_cash)">{{ compactMoney(wallet.avg_market_cash) }}</td>
                   <td>
                     <div :class="pnlClass(wallet.recent_bucket_roi)">{{ recentBucketText(wallet) }}</div>
-                    <small v-if="recentBucketSubtext(wallet)" class="subtle">{{ recentBucketSubtext(wallet) }}</small>
+                    <small v-for="line in recentBucketSubtext(wallet)" :key="line" class="subtle">{{ line }}</small>
                   </td>
                   <td>
-                    <div class="type-row">
-                      <span v-for="label in walletScopeLabels(wallet)" :key="`eligible-${label}`" class="badge badge-neutral badge-sm mr-1">{{ label }}</span>
-                      <span v-if="!walletScopeLabels(wallet).length" class="subtle">-</span>
+                    <div class="scope-list">
+                      <div v-for="scope in walletScopeItems(wallet)" :key="scope.key" class="scope-item" :title="scope.title || scope.marketLabel">
+                        <img v-if="scope.icon" class="scope-icon" :src="scope.icon" :alt="scope.gameLabel" loading="lazy">
+                        <span v-if="scope.gameLabel && !scope.icon" class="scope-game-text">{{ scope.gameLabel }}</span>
+                        <span v-if="scope.gameLabel || scope.icon" class="scope-separator">-</span>
+                        <span class="scope-market badge badge-neutral badge-sm">{{ scope.marketLabel }}</span>
+                      </div>
+                      <span v-if="!walletScopeItems(wallet).length" class="subtle">-</span>
                     </div>
                   </td>
                   <td>
@@ -259,8 +264,7 @@
                   <td>{{ walletObservedRecord(wallet) }}</td>
                   <td :class="pnlClass((wallet.observed || {}).our_pnl)">{{ walletObservedPnl(wallet) }}</td>
                   <td class="trade-time-cell">
-                    <span>{{ formatTime(wallet.last_esports_trade_at) }}</span>
-                    <small>{{ timeAgo(wallet.last_esports_trade_at) }}</small>
+                    <span>{{ timeAgo(wallet.last_esports_trade_at) }}</span>
                   </td>
                 </tr>
                 <tr v-if="!walletPageRows.length">
@@ -313,7 +317,10 @@
                   <tr v-for="follow in follows.follows" :key="follow.condition_id" class="click-row" @click="openFollowDetail(follow.condition_id)" tabindex="0" @keydown.enter="openFollowDetail(follow.condition_id)">
                     <td>
                       <div class="follow-match-title event-match-title" v-if="matchParts(follow)">
-                        <span class="event-game-line">{{ matchParts(follow).game }}</span>
+                        <span class="event-game-line" :class="{ 'has-game-icon': gameIconForRow(follow) }">
+                          <img v-if="gameIconForRow(follow)" class="event-game-icon" :src="gameIconForRow(follow)" :alt="matchParts(follow).game" loading="lazy">
+                          <span>{{ matchParts(follow).game }}</span>
+                        </span>
                         <div class="event-title-row">
                           <span class="team team-a">
                             <img v-if="teamLogo(follow, 'teamA')" class="team-logo" :src="teamLogo(follow, 'teamA')" :alt="matchParts(follow).teamA" loading="lazy">
@@ -326,6 +333,8 @@
                             <span v-else class="team-logo team-logo-fallback">{{ teamInitials(matchParts(follow).teamB) }}</span>
                             <span>{{ matchParts(follow).teamB }}</span>
                           </span>
+                        </div>
+                        <div v-if="matchMeta(follow) || showMarketTypeChip(follow)" class="event-extra-line">
                           <span v-if="matchMeta(follow)" class="match-meta">{{ matchMeta(follow) }}</span>
                           <span v-if="showMarketTypeChip(follow)" class="event-type-chip">{{ follow.market_type_label }}</span>
                         </div>
@@ -402,54 +411,79 @@
                 </div>
               </div>
             </div>
-            <div class="event-grid">
-              <article v-for="event in eventPageRows" :key="event.condition_id" class="event-row">
-                <div class="event-main">
-                  <div class="event-match-title" v-if="matchParts(event)">
-                    <span class="event-game-line">{{ matchParts(event).game }}</span>
-                    <div class="event-title-row">
-                      <span class="team team-a">
-                        <img v-if="teamLogo(event, 'teamA')" class="team-logo" :src="teamLogo(event, 'teamA')" :alt="matchParts(event).teamA" loading="lazy">
-                        <span v-else class="team-logo team-logo-fallback">{{ teamInitials(matchParts(event).teamA) }}</span>
-                        <span>{{ matchParts(event).teamA }}</span>
-                      </span>
-                      <span class="vs-pill">VS</span>
-                      <span class="team team-b">
-                        <img v-if="teamLogo(event, 'teamB')" class="team-logo" :src="teamLogo(event, 'teamB')" :alt="matchParts(event).teamB" loading="lazy">
-                        <span v-else class="team-logo team-logo-fallback">{{ teamInitials(matchParts(event).teamB) }}</span>
-                        <span>{{ matchParts(event).teamB }}</span>
-                      </span>
-                      <span v-if="matchMeta(event)" class="match-meta">{{ matchMeta(event) }}</span>
-                      <span v-if="showMarketTypeChip(event)" class="event-type-chip">{{ event.market_type_label }}</span>
-                    </div>
-                  </div>
-                  <div v-else class="market-title">{{ event.title || event.question || shortId(event.condition_id) }}</div>
-                  <div class="subtle event-time-row">
-                    <span v-if="event.market_type_label && !matchParts(event)" class="event-type-chip">{{ event.market_type_label }}</span>
-                    <span class="event-time-label">开始</span>
-                    <span>{{ formatTime(event.match_start_time) }}</span>
-                    <span class="event-time-label">结束</span>
-                    <span>{{ formatTime(event.end_date) }}</span>
-                  </div>
-                </div>
-                <div class="event-status-cell">
-                  <span class="follow-status-pill" :class="`is-${eventStatus(event)}`">{{ eventStatusText(event) }}</span>
-                  <span v-if="eventCountdownText(event)" class="event-countdown">{{ eventCountdownText(event) }}</span>
-                </div>
-                <div class="event-meta">
-                  <span v-if="eventView === 'archive'" class="event-pnl" :class="pnlClass(event.our_realized_pnl)">{{ money(event.our_realized_pnl) }}</span>
-                  <div v-if="eventFollowParts(event).total" class="event-follow-summary" :title="eventFollowText(event)">
-                    <span v-for="side in eventFollowParts(event).sides" :key="side.label" class="event-follow-side" :class="side.tone">
-                      <span class="event-follow-logo-wrap">
-                        <img v-if="side.logo" class="event-follow-logo" :src="side.logo" :alt="side.label" loading="lazy">
-                        <span v-else class="event-follow-logo-fallback">{{ side.label.slice(0, 1) }}</span>
-                      </span>
-                      <strong>{{ side.count }}</strong>
-                    </span>
-                  </div>
-                </div>
-              </article>
-              <p v-if="!eventFilteredRows.length" class="empty-text">{{ eventView === "archive" ? "暂无已结算跟单赛事" : "当前窗口暂无监控赛事" }}</p>
+            <div class="table-wrap event-table-wrap">
+              <table class="table table-sm dense-table event-table">
+                <thead>
+                  <tr>
+                    <th>赛事</th>
+                    <th>状态</th>
+                    <th>跟单情况</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="event in eventPageRows" :key="event.condition_id" class="event-table-row">
+                    <td>
+                      <div class="event-main">
+                        <div class="event-match-title" v-if="matchParts(event)">
+                          <span class="event-game-line" :class="{ 'has-game-icon': gameIconForRow(event) }">
+                            <img v-if="gameIconForRow(event)" class="event-game-icon" :src="gameIconForRow(event)" :alt="matchParts(event).game" loading="lazy">
+                            <span>{{ matchParts(event).game }}</span>
+                          </span>
+                          <div class="event-title-row">
+                            <span class="team team-a">
+                              <img v-if="teamLogo(event, 'teamA')" class="team-logo" :src="teamLogo(event, 'teamA')" :alt="matchParts(event).teamA" loading="lazy">
+                              <span v-else class="team-logo team-logo-fallback">{{ teamInitials(matchParts(event).teamA) }}</span>
+                              <span>{{ matchParts(event).teamA }}</span>
+                            </span>
+                            <span class="vs-pill">VS</span>
+                            <span class="team team-b">
+                              <img v-if="teamLogo(event, 'teamB')" class="team-logo" :src="teamLogo(event, 'teamB')" :alt="matchParts(event).teamB" loading="lazy">
+                              <span v-else class="team-logo team-logo-fallback">{{ teamInitials(matchParts(event).teamB) }}</span>
+                              <span>{{ matchParts(event).teamB }}</span>
+                            </span>
+                          </div>
+                          <div v-if="matchMeta(event) || showMarketTypeChip(event)" class="event-extra-line">
+                            <span v-if="matchMeta(event)" class="match-meta">{{ matchMeta(event) }}</span>
+                            <span v-if="showMarketTypeChip(event)" class="event-type-chip">{{ event.market_type_label }}</span>
+                          </div>
+                        </div>
+                        <div v-else class="market-title">{{ event.title || event.question || shortId(event.condition_id) }}</div>
+                        <div class="subtle event-time-row">
+                          <span v-if="event.market_type_label && !matchParts(event)" class="event-type-chip">{{ event.market_type_label }}</span>
+                          <span class="event-time-label">开始</span>
+                          <span>{{ formatTime(event.match_start_time) }}</span>
+                          <span class="event-time-label">结束</span>
+                          <span>{{ formatTime(event.end_date) }}</span>
+                        </div>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="event-status-cell">
+                        <span class="follow-status-pill" :class="`is-${eventStatus(event)}`">{{ eventStatusText(event) }}</span>
+                        <span v-if="eventCountdownText(event)" class="event-countdown">{{ eventCountdownText(event) }}</span>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="event-meta">
+                        <span v-if="eventView === 'archive'" class="event-pnl" :class="pnlClass(event.our_realized_pnl)">{{ money(event.our_realized_pnl) }}</span>
+                        <div v-if="eventFollowParts(event).total" class="event-follow-summary" :title="eventFollowText(event)">
+                          <span v-for="side in eventFollowParts(event).sides" :key="side.label" class="event-follow-side" :class="side.tone">
+                            <span class="event-follow-logo-wrap">
+                              <img v-if="side.logo" class="event-follow-logo" :src="side.logo" :alt="side.label" loading="lazy">
+                              <span v-else class="event-follow-logo-fallback">{{ side.label.slice(0, 1) }}</span>
+                            </span>
+                            <strong>{{ side.count }}</strong>
+                          </span>
+                        </div>
+                        <span v-if="!eventFollowParts(event).total && eventView !== 'archive'" class="subtle">-</span>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr v-if="!eventFilteredRows.length">
+                    <td colspan="3" class="empty-cell">{{ eventView === "archive" ? "暂无已结算跟单赛事" : "当前窗口暂无监控赛事" }}</td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
             <div class="pagination-actions panel-pagination">
               <span>共 {{ eventFilteredRows.length }} 场</span>

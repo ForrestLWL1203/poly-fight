@@ -313,6 +313,22 @@ class PolymarketClient:
     def positions(self, wallet: str, *, limit: int = 100) -> list[dict]:
         return self.data("/positions", user=wallet, limit=limit)
 
+    def market_positions(
+        self,
+        condition_id: str,
+        *,
+        limit: int = 20,
+        sort_by: str = "TOTAL_PNL",
+        sort_direction: str = "DESC",
+    ) -> list[dict]:
+        return self.data(
+            "/v1/market-positions",
+            market=condition_id,
+            limit=limit,
+            sortBy=sort_by,
+            sortDirection=sort_direction,
+        )
+
     def holders(self, condition_id: str, *, limit: int = 10) -> list[dict]:
         return self.data("/holders", market=condition_id, limit=limit, minBalance=1)
 

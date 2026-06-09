@@ -998,14 +998,14 @@ createApp({
       if (!Number.isFinite(count) || count < 3 || !Number.isFinite(windowDays) || windowDays <= 0) {
         return "样本不足";
       }
-      return `${windowDays}D ${this.percent(row?.recent_bucket_roi)}`;
+      return `ROI: ${this.percent(row?.recent_bucket_roi)}`;
     },
     recentBucketSubtext(row) {
       const count = Number(row?.recent_bucket_market_count);
       const windowDays = Number(row?.recent_bucket_window_days);
-      if (!Number.isFinite(count) || count <= 0) return "";
-      if (!Number.isFinite(windowDays) || windowDays <= 0 || count < 3) return `${count} 场`;
-      return `${count} 场 / ${this.percent(row?.recent_bucket_positive_rate)}`;
+      if (!Number.isFinite(count) || count <= 0) return [];
+      if (!Number.isFinite(windowDays) || windowDays <= 0 || count < 3) return [`${count} 场`];
+      return [`${count} 场`, `胜率: ${this.percent(row?.recent_bucket_positive_rate)}`];
     },
     signedPctPoints(value) {
       const num = Number(value);
@@ -1055,12 +1055,18 @@ createApp({
     timeAgo(value) {
       const ts = this.normalizeTs(value);
       if (!ts) return "-";
-      const delta = Math.round((Date.now() / 1000 - ts) / 60);
-      if (Math.abs(delta) < 1) return "now";
-      if (delta >= 0 && delta < 60) return `${delta}m ago`;
-      if (delta >= 0) return `${Math.round(delta / 60)}h ago`;
-      const future = Math.abs(delta);
-      return future < 60 ? `in ${future}m` : `in ${Math.round(future / 60)}h`;
+      const deltaSeconds = Math.floor(Date.now() / 1000 - ts);
+      const formatDuration = (seconds) => {
+        const minutes = Math.floor(seconds / 60);
+        if (minutes < 1) return "now";
+        if (minutes < 60) return `${minutes}m`;
+        const hours = Math.floor(minutes / 60);
+        if (hours < 24) return `${hours}h`;
+        const days = Math.floor(hours / 24);
+        return `${days}d${hours % 24}h`;
+      };
+      if (deltaSeconds >= 0) return `${formatDuration(deltaSeconds)} ago`;
+      return `in ${formatDuration(Math.abs(deltaSeconds))}`;
     },
     normalizeTs(value) {
       if (value == null || value === "") return 0;
@@ -1075,19 +1081,84 @@ createApp({
     followTitle(follow) {
       return follow.title || follow.question || "未命名赛事";
     },
+    marketTypeLabel(type) {
+      const map = { main_match: "主盘", game_winner: "单局", map_winner: "地图" };
+      return map[type] || type || "";
+    },
     marketTypeLabels(row) {
       const labels = row?.eligible_market_type_labels;
       if (Array.isArray(labels) && labels.length) return labels;
-      const map = { main_match: "主盘", game_winner: "单局", map_winner: "地图" };
       const types = row?.eligible_market_types || [];
-      return Array.isArray(types) ? types.map((type) => map[type] || type).filter(Boolean) : [];
+      return Array.isArray(types) ? types.map((type) => this.marketTypeLabel(type)).filter(Boolean) : [];
     },
-    walletScopeLabels(row) {
+    gameFamilyLabel(game) {
+      const map = {
+        cs2: "CS2",
+        "counter-strike 2": "CS2",
+        "counter-strike": "CS2",
+        "counter-strike-2": "CS2",
+        dota2: "Dota 2",
+        "dota 2": "Dota 2",
+        "dota-2": "Dota 2",
+        lol: "LoL",
+        "league of legends": "LoL",
+        "league-of-legends": "LoL",
+      };
+      return map[String(game || "").toLowerCase()] || game || "";
+    },
+    gameFamilyIcon(game) {
+      const map = {
+        cs2: "/icons/esports/cs2.png",
+        "counter-strike 2": "/icons/esports/cs2.png",
+        "counter-strike": "/icons/esports/cs2.png",
+        "counter-strike-2": "/icons/esports/cs2.png",
+        dota2: "/icons/esports/dota2.png",
+        "dota 2": "/icons/esports/dota2.png",
+        "dota-2": "/icons/esports/dota2.png",
+        lol: "/icons/esports/lol.png",
+        "league of legends": "/icons/esports/lol.png",
+        "league-of-legends": "/icons/esports/lol.png",
+      };
+      return map[String(game || "").toLowerCase()] || "";
+    },
+    gameIconForRow(row) {
+      const parts = this.matchParts(row);
+      return this.gameFamilyIcon(row?.best_game_family || row?.game || row?.league || parts?.game || "");
+    },
+    splitBucketKey(bucket) {
+      const [game, marketType] = String(bucket || "").split(":");
+      return { game: game || "", marketType: marketType || "" };
+    },
+    walletScopeItems(row) {
       if ((row?.category || "esports") === "sports") {
         const label = row?.game_label || row?.league_label || (row?.league ? String(row.league).toUpperCase() : "");
-        return label ? [`${label} Moneyline`] : [];
+        return label ? [{ key: `sports-${label}`, icon: "", gameLabel: label, marketLabel: "Moneyline", title: `${label} Moneyline` }] : [];
       }
-      return this.marketTypeLabels(row);
+      const buckets = Array.isArray(row?.eligible_buckets) ? row.eligible_buckets : [];
+      if (buckets.length) {
+        return buckets.map((bucket) => {
+          const { game, marketType } = this.splitBucketKey(bucket);
+          const gameLabel = this.gameFamilyLabel(game);
+          const marketLabel = this.marketTypeLabel(marketType);
+          return {
+            key: `bucket-${bucket}`,
+            icon: this.gameFamilyIcon(game),
+            gameLabel,
+            marketLabel,
+            title: [gameLabel, marketLabel].filter(Boolean).join(" - "),
+          };
+        }).filter((scope) => scope.marketLabel);
+      }
+      return this.marketTypeLabels(row).map((label) => ({
+        key: `type-${label}`,
+        icon: "",
+        gameLabel: "",
+        marketLabel: label,
+        title: label,
+      }));
+    },
+    walletScopeLabels(row) {
+      return this.walletScopeItems(row).map((scope) => scope.title || scope.marketLabel).filter(Boolean);
     },
     sportsParticipationText(row) {
       const participated = Number(row?.participated_events);

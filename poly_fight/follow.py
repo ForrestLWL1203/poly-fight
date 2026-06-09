@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from statistics import median
 from typing import Any
 
-from .core import SECONDS_PER_DAY, normalize_wallet, parse_dt, to_float, to_int
+from .core import SECONDS_PER_DAY, bucket_key, bucket_label, normalize_wallet, parse_dt, to_float, to_int
 
 
 def eligible_follow_wallets(
@@ -24,6 +24,7 @@ def eligible_follow_wallets(
         if allowed_categories is not None and category not in allowed_categories:
             continue
         eligible_market_types = [str(value) for value in (row.get("eligible_market_types") or []) if value]
+        eligible_buckets = [str(value) for value in (row.get("eligible_buckets") or []) if value]
         if row.get("grade") == "A" and not eligible_market_types:
             eligible_market_types = ["main_match"]
         if row.get("grade") != "A" and not eligible_market_types:
@@ -33,7 +34,13 @@ def eligible_follow_wallets(
             continue
         last_trade = to_int(row.get("last_esports_trade_at"))
         if wallet and last_trade >= cutoff:
-            rows.append({**row, "wallet": wallet, "category": category, "eligible_market_types": eligible_market_types})
+            rows.append({
+                **row,
+                "wallet": wallet,
+                "category": category,
+                "eligible_market_types": eligible_market_types,
+                "eligible_buckets": eligible_buckets,
+            })
     return rows
 
 
@@ -160,7 +167,9 @@ def bootstrap_position_trades(
     markets_by_condition: dict[str, dict[str, Any]],
     now_ts: int,
     max_slippage: float,
+    min_wallet_entry_price: float = 0.4,
     eligible_market_types: set[str] | None = None,
+    eligible_buckets: set[str] | None = None,
     eligible_category: str | None = None,
     eligible_leagues: set[str] | None = None,
     require_pre_match: bool = True,
@@ -176,7 +185,10 @@ def bootstrap_position_trades(
         if eligible_leagues is not None and market_league not in eligible_leagues:
             continue
         market_type = str((market or {}).get("market_type") or "main_match")
-        if eligible_market_types is not None and market_type not in eligible_market_types:
+        market_bucket = bucket_key(str((market or {}).get("game_family") or market_league or "unknown"), market_type)
+        if eligible_buckets is not None and market_bucket not in eligible_buckets:
+            continue
+        if eligible_buckets is None and eligible_market_types is not None and market_type not in eligible_market_types:
             continue
         qualification = qualify_follow(position, market, now_ts=now_ts, require_pre_match=require_pre_match)
         if not qualification.get("qualified"):
@@ -184,6 +196,8 @@ def bootstrap_position_trades(
         outcome_index = int(qualification["outcome_index"])
         current_price = market_current_price(market, outcome_index, position)
         wallet_avg_price = to_float(qualification.get("wallet_avg_price"))
+        if min_wallet_entry_price > 0 and wallet_avg_price < min_wallet_entry_price:
+            continue
         if not evaluate_slippage(wallet_avg_price, current_price, max_slippage=max_slippage).get("would_follow"):
             continue
         trades.append(
@@ -445,11 +459,13 @@ def process_follow_trades(
     stake_usdc: float,
     max_follow_legs: int,
     max_slippage: float,
+    min_wallet_entry_price: float = 0.4,
     stake_ratio_percent: float = 10.0,
     require_pre_match: bool = True,
     post_start_grace_seconds: int = 0,
     quarantine_sell_frac: float = 0.2,
     eligible_market_types: set[str] | None = None,
+    eligible_buckets: set[str] | None = None,
     eligible_category: str | None = None,
     eligible_leagues: set[str] | None = None,
     conflict_policy: str = "dual_follow",
@@ -464,6 +480,7 @@ def process_follow_trades(
         "market_type_not_eligible_count": 0,
         "league_not_eligible_count": 0,
         "opposite_blocked_count": 0,
+        "low_entry_price_blocked_count": 0,
         "insufficient_balance_count": 0,
         "quarantine_events": [],
     }
@@ -559,11 +576,16 @@ def process_follow_trades(
             stats["ignored_trade_count"] += 1
             continue
         market_type = str(market.get("market_type") or "main_match")
-        if not existing and eligible_market_types is not None and market_type not in eligible_market_types:
+        market_league = str(market.get("league") or "").lower()
+        market_bucket = bucket_key(str(market.get("game_family") or market_league or "unknown"), market_type)
+        if not existing and eligible_buckets is not None and market_bucket not in eligible_buckets:
             stats["ignored_trade_count"] += 1
             stats["market_type_not_eligible_count"] += 1
             continue
-        market_league = str(market.get("league") or "").lower()
+        if not existing and eligible_buckets is None and eligible_market_types is not None and market_type not in eligible_market_types:
+            stats["ignored_trade_count"] += 1
+            stats["market_type_not_eligible_count"] += 1
+            continue
         if not existing and eligible_leagues is not None and market_league not in eligible_leagues:
             stats["ignored_trade_count"] += 1
             stats["league_not_eligible_count"] += 1
@@ -571,6 +593,13 @@ def process_follow_trades(
 
         wallet_fill_price = trade_price(trade)
         slippage = evaluate_slippage(wallet_fill_price, current_price, max_slippage=max_slippage)
+        follow_block_reasons = []
+        if min_wallet_entry_price > 0 and wallet_fill_price < min_wallet_entry_price:
+            slippage["would_follow"] = False
+            follow_block_reasons.append("low_entry_price")
+            stats["low_entry_price_blocked_count"] += 1
+        if not slippage["would_follow"] and slippage["slippage_over_wallet_entry"] > max_slippage:
+            follow_block_reasons.append("slippage_over_entry")
         stake_mode = None
         stake_ratio = None
         wallet_cash = round(trade_size(trade) * wallet_fill_price, 8)
@@ -593,6 +622,7 @@ def process_follow_trades(
             "wallet_fill_price": wallet_fill_price,
             "slippage_over_wallet_entry": slippage["slippage_over_wallet_entry"],
             "would_follow": slippage["would_follow"],
+            "min_wallet_entry_price": round(min_wallet_entry_price, 8),
             "stake": leg_stake,
             "trade_id": trade_id(trade),
             "leg_at": now_ts,
@@ -602,6 +632,9 @@ def process_follow_trades(
             "stake_mode": stake_mode,
             "stake_ratio_percent": round(stake_ratio_percent, 8),
         }
+        if follow_block_reasons:
+            leg["follow_block_reason"] = follow_block_reasons[0]
+            leg["follow_block_reasons"] = follow_block_reasons
         if detected_after_start:
             leg["detected_after_start"] = True
         if existing:
@@ -627,6 +660,9 @@ def process_follow_trades(
                 "market_question": market.get("question"),
                 "market_type": market_type,
                 "market_type_label": market.get("market_type_label"),
+                "game_family": market.get("game_family"),
+                "bucket_key": market_bucket,
+                "bucket_label": bucket_label(market_bucket),
                 "end_date": market.get("end_date"),
                 "match_start_time": market.get("match_start_time") or market.get("market_start_time"),
                 "status": "open",

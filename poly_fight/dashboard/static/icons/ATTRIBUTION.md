@@ -16,3 +16,10 @@ require attribution.
 - Delete database icon: https://www.flaticon.com/free-icon/delete-database_5126069 by juicy_fish
 - Stop icon: https://www.flaticon.com/free-icon/stop_567389 from Flaticon
 - Clock icon: https://www.flaticon.com/free-icon/clock_754186 from Flaticon
+
+Esports leaderboard icons are stored locally so the dashboard can render wallet
+specializations without external image requests at runtime.
+
+- Dota 2 icon: Polymarket upload used on https://polymarket.com/zh/esports/dota-2/games
+- CS2 icon: Polymarket upload used on https://polymarket.com/zh/esports/counter-strike/games
+- League of Legends icon: https://wiki.leagueoflegends.com/en-us/File:League_of_Legends_icon.png

@@ -8,7 +8,7 @@ from typing import Any, Iterable
 
 
 SECONDS_PER_DAY = 86400
-SCORING_VERSION = 13
+SCORING_VERSION = 14
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 TRADE_BEHAVIOR_EXCLUDE_RATE = 0.5
@@ -27,6 +27,8 @@ ESPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE = 0.08
 SPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE = 0.10
 # actual_minus_hold_pnl_rate 超过此值 = 利润主要靠盘中卖出（我们复制不了）→ 软标记
 SWING_DEPENDENT_RATE = 0.2
+# 卖出赢家侧且价格已经接近 1.0，大多是赛果基本确定后的释放资金，不按波段/提前卖出处理。
+NEAR_RESOLVED_WINNER_SELL_PRICE = 0.95
 # 单市场成交 >=20 笔记为 high churn。high_churn 市场占比超过此值 = 机器人/高频/做市
 # （盈利来自微观价差和速度，复制不了）→ 直接排除出 leaderboard。
 MAX_HIGH_CHURN_MARKET_RATE = 0.5
@@ -53,11 +55,44 @@ MARKET_TYPE_LABELS = {
     GAME_WINNER: "单局",
     MAP_WINNER: "地图",
 }
+ESPORTS_DISCOVERY_GAME_MARKET_TYPE_LIMITS = {
+    "lol:main_match": 100,
+    "cs2:main_match": 100,
+    "dota2:main_match": 100,
+    "lol:game_winner": 50,
+    "dota2:game_winner": 50,
+    "cs2:map_winner": 50,
+}
 MARKET_TYPE_ORDER = {
     MAIN_MATCH: 0,
     GAME_WINNER: 1,
     MAP_WINNER: 2,
 }
+GAME_FAMILY_LABELS = {
+    "cs2": "CS2",
+    "dota2": "Dota2",
+    "lol": "LoL",
+}
+
+
+def bucket_key(game_family: str | None, market_type: str | None) -> str:
+    return f"{str(game_family or 'unknown').lower()}:{str(market_type or MAIN_MATCH)}"
+
+
+def split_bucket_key(value: str | None) -> tuple[str, str]:
+    text = str(value or "")
+    if ":" not in text:
+        return "", text or MAIN_MATCH
+    game_family, market_type = text.split(":", 1)
+    return game_family, market_type or MAIN_MATCH
+
+
+def bucket_label(value: str | None) -> str:
+    game_family, market_type = split_bucket_key(value)
+    game_label = GAME_FAMILY_LABELS.get(game_family, game_family.upper() if game_family else "")
+    market_label = MARKET_TYPE_LABELS.get(market_type, market_type)
+    return f"{game_label} {market_label}".strip()
+
 
 def normalize_wallet(wallet: str | None) -> str:
     return (wallet or "").strip().lower()
@@ -487,13 +522,22 @@ def build_discovery_slate(
         map_winner_max_markets_per_run if map_winner_max_markets_per_run is not None else submarket_max_markets_per_run
     )
 
-    def select(days: int, min_volume: float, market_types: set[str], *, league: str | None = None) -> list[dict[str, Any]]:
+    def select(
+        days: int,
+        min_volume: float,
+        market_types: set[str],
+        *,
+        league: str | None = None,
+        game_family: str | None = None,
+    ) -> list[dict[str, Any]]:
         selected = []
         for market in classification_set:
             market_type = str(market.get("market_type") or MAIN_MATCH)
             if market_type not in market_types:
                 continue
             if league is not None and str(market.get("league") or "").lower() != league:
+                continue
+            if game_family is not None and str(market.get("game_family") or "").lower() != game_family:
                 continue
             end = parse_dt(market.get("end_date"))
             if not end:
@@ -528,23 +572,39 @@ def build_discovery_slate(
         fallback_min_volume: float,
         target: int,
         league: str | None = None,
+        game_family: str | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         selected: list[dict[str, Any]] = []
         selected_days = lookback_steps[-1]
         selected_min_volume = primary_min_volume
         for days in lookback_steps:
-            selected = select(days, primary_min_volume, market_types, league=league)
+            selected = select(days, primary_min_volume, market_types, league=league, game_family=game_family)
             selected_days = days
             if len(selected) >= target:
                 break
         if len(selected) < target:
-            selected = select(lookback_steps[-1], fallback_min_volume, market_types, league=league)
+            selected = select(lookback_steps[-1], fallback_min_volume, market_types, league=league, game_family=game_family)
             selected_min_volume = fallback_min_volume
         return selected, {
             "selected_lookback_days": selected_days,
             "selected_min_market_volume": selected_min_volume,
             "target_markets": target,
             "total_selected_market_count": len(selected),
+        }
+
+    def aggregate_metas(metas: list[dict[str, Any]], *, default_target: int, default_min_volume: float) -> dict[str, Any]:
+        target_total = sum(int(meta.get("target_markets") or 0) for meta in metas)
+        return {
+            "selected_lookback_days": max(
+                (int(meta.get("selected_lookback_days") or 0) for meta in metas),
+                default=lookback_steps[-1],
+            ),
+            "selected_min_market_volume": min(
+                (to_float(meta.get("selected_min_market_volume")) for meta in metas),
+                default=default_min_volume,
+            ),
+            "target_markets": target_total if target_total > 0 else default_target,
+            "total_selected_market_count": sum(int(meta.get("total_selected_market_count") or 0) for meta in metas),
         }
 
     league_metas: dict[str, dict[str, Any]] = {}
@@ -577,24 +637,89 @@ def build_discovery_slate(
             "total_selected_market_count": sum(int(meta.get("total_selected_market_count") or 0) for meta in league_metas.values()),
         }
     else:
-        main_selected, main_meta = select_bucket(
-            market_types={MAIN_MATCH},
-            primary_min_volume=min_market_volume,
-            fallback_min_volume=fallback_min_market_volume,
-            target=target_markets,
+        esports_bucket_mode = any(
+            str(row.get("category") or "") == "esports" and str(row.get("game_family") or "").lower() in ALLOWED_GAME_FAMILIES
+            for row in classification_set
         )
-    game_selected, game_meta = select_bucket(
-        market_types={GAME_WINNER},
-        primary_min_volume=submarket_min_market_volume,
-        fallback_min_volume=submarket_fallback_min_market_volume,
-        target=game_winner_target_markets,
-    )
-    map_selected, map_meta = select_bucket(
-        market_types={MAP_WINNER},
-        primary_min_volume=submarket_min_market_volume,
-        fallback_min_volume=submarket_fallback_min_market_volume,
-        target=map_winner_target_markets,
-    )
+        if esports_bucket_mode:
+            bucket_selected_by_type: dict[str, list[dict[str, Any]]] = {
+                MAIN_MATCH: [],
+                GAME_WINNER: [],
+                MAP_WINNER: [],
+            }
+            bucket_metas: dict[str, dict[str, Any]] = {}
+            for key, limit in ESPORTS_DISCOVERY_GAME_MARKET_TYPE_LIMITS.items():
+                game_family, market_type = split_bucket_key(key)
+                is_main = market_type == MAIN_MATCH
+                selected, meta = select_bucket(
+                    market_types={market_type},
+                    primary_min_volume=min_market_volume if is_main else submarket_min_market_volume,
+                    fallback_min_volume=fallback_min_market_volume if is_main else submarket_fallback_min_market_volume,
+                    target=limit,
+                    game_family=game_family,
+                )
+                bucket_selected_by_type[market_type].extend(selected[:limit])
+                bucket_metas[key] = {
+                    **meta,
+                    "game_family": game_family,
+                    "market_type": market_type,
+                    "max_markets_per_run": limit,
+                }
+            main_selected = bucket_selected_by_type[MAIN_MATCH]
+            game_selected = bucket_selected_by_type[GAME_WINNER]
+            map_selected = bucket_selected_by_type[MAP_WINNER]
+            main_meta = aggregate_metas(
+                [meta for key, meta in bucket_metas.items() if key.endswith(f":{MAIN_MATCH}")],
+                default_target=target_markets,
+                default_min_volume=min_market_volume,
+            )
+            game_meta = aggregate_metas(
+                [meta for key, meta in bucket_metas.items() if key.endswith(f":{GAME_WINNER}")],
+                default_target=game_winner_target_markets,
+                default_min_volume=submarket_min_market_volume,
+            )
+            map_meta = aggregate_metas(
+                [meta for key, meta in bucket_metas.items() if key.endswith(f":{MAP_WINNER}")],
+                default_target=map_winner_target_markets,
+                default_min_volume=submarket_min_market_volume,
+            )
+            max_markets_per_run = main_meta["target_markets"]
+            game_winner_max_markets_per_run = game_meta["target_markets"]
+            map_winner_max_markets_per_run = map_meta["target_markets"]
+        else:
+            main_selected, main_meta = select_bucket(
+                market_types={MAIN_MATCH},
+                primary_min_volume=min_market_volume,
+                fallback_min_volume=fallback_min_market_volume,
+                target=target_markets,
+            )
+            game_selected, game_meta = select_bucket(
+                market_types={GAME_WINNER},
+                primary_min_volume=submarket_min_market_volume,
+                fallback_min_volume=submarket_fallback_min_market_volume,
+                target=game_winner_target_markets,
+            )
+            map_selected, map_meta = select_bucket(
+                market_types={MAP_WINNER},
+                primary_min_volume=submarket_min_market_volume,
+                fallback_min_volume=submarket_fallback_min_market_volume,
+                target=map_winner_target_markets,
+            )
+            bucket_metas = {}
+    if league_target_markets:
+        game_selected, game_meta = select_bucket(
+            market_types={GAME_WINNER},
+            primary_min_volume=submarket_min_market_volume,
+            fallback_min_volume=submarket_fallback_min_market_volume,
+            target=game_winner_target_markets,
+        )
+        map_selected, map_meta = select_bucket(
+            market_types={MAP_WINNER},
+            primary_min_volume=submarket_min_market_volume,
+            fallback_min_volume=submarket_fallback_min_market_volume,
+            target=map_winner_target_markets,
+        )
+        bucket_metas = {}
 
     if league_target_markets:
         main_slice = main_selected
@@ -610,6 +735,7 @@ def build_discovery_slate(
     type_counts: dict[str, int] = {}
     selected_type_counts: dict[str, int] = {}
     selected_league_counts: dict[str, int] = {}
+    selected_game_market_type_counts: dict[str, int] = {}
     for market in classification_set:
         market_type = str(market.get("market_type") or MAIN_MATCH)
         type_counts[market_type] = type_counts.get(market_type, 0) + 1
@@ -619,6 +745,10 @@ def build_discovery_slate(
         league = str(market.get("league") or "").lower()
         if league:
             selected_league_counts[league] = selected_league_counts.get(league, 0) + 1
+        game_family = str(market.get("game_family") or "").lower()
+        if str(market.get("category") or "") == "esports" and game_family:
+            key = bucket_key(game_family, market_type)
+            selected_game_market_type_counts[key] = selected_game_market_type_counts.get(key, 0) + 1
 
     return selected, {
         "selected_lookback_days": main_meta["selected_lookback_days"],
@@ -635,6 +765,8 @@ def build_discovery_slate(
         "market_type_counts": type_counts,
         "selected_by_market_type": selected_type_counts,
         "selected_by_league": selected_league_counts,
+        "selected_by_game_market_type": selected_game_market_type_counts,
+        "game_market_buckets": bucket_metas,
         "main_match": main_meta,
         "leagues": league_metas,
         "submarkets": {
@@ -662,6 +794,7 @@ def build_candidate_wallets(
     trades_by_market: dict[str, list[dict[str, Any]]],
     *,
     market_type_by_id: dict[str, str] | None = None,
+    market_game_family_by_id: dict[str, str] | None = None,
     market_end_times: dict[str, int] | None = None,
     market_start_times: dict[str, int] | None = None,
     min_trade_cash: float = 50,
@@ -671,6 +804,8 @@ def build_candidate_wallets(
     single_market_cash_threshold: float = 1_000,
     max_candidate_wallets: int = 300,
     candidate_wallets_per_market_type: int | None = None,
+    candidate_wallets_per_game_family: int | None = None,
+    candidate_game_family_thresholds: dict[str, dict[str, float]] | None = None,
     tail_entry_price_threshold: float = 0.75,
 ) -> list[dict[str, Any]]:
     wallets: dict[str, dict[str, Any]] = {}
@@ -683,6 +818,11 @@ def build_candidate_wallets(
     market_last_trade_by_wallet: dict[str, dict[str, int]] = {}
     market_last_buy_by_wallet: dict[str, dict[str, int]] = {}
     market_type_by_id = {str(key).lower(): str(value) for key, value in (market_type_by_id or {}).items()}
+    market_game_family_by_id = {
+        str(key).lower(): str(value)
+        for key, value in (market_game_family_by_id or {}).items()
+        if value
+    }
     market_end_times = market_end_times or {}
     market_start_times = market_start_times or {}
     for condition_id, trades in trades_by_market.items():
@@ -798,12 +938,39 @@ def build_candidate_wallets(
         global_metrics = metrics_for_market_ids(wallet, set(row["participated_markets"]), row)
         per_type_candidate: dict[str, dict[str, Any]] = {}
         market_ids_by_type: dict[str, set[str]] = {}
+        per_game_family_candidate: dict[str, dict[str, Any]] = {}
+        market_ids_by_game_family: dict[str, set[str]] = {}
+        per_game_type_candidate: dict[str, dict[str, Any]] = {}
+        market_ids_by_game_type: dict[str, set[str]] = {}
         for condition_id in row["participated_markets"]:
-            market_type = market_type_by_id.get(str(condition_id).lower(), MAIN_MATCH)
+            condition_key = str(condition_id).lower()
+            market_type = market_type_by_id.get(condition_key, MAIN_MATCH)
             market_ids_by_type.setdefault(market_type, set()).add(condition_id)
+            game_family = market_game_family_by_id.get(condition_key)
+            if game_family:
+                market_ids_by_game_family.setdefault(game_family, set()).add(condition_id)
+                market_ids_by_game_type.setdefault(bucket_key(game_family, market_type), set()).add(condition_id)
         for market_type, market_ids in sorted(market_ids_by_type.items()):
             per_type_candidate[market_type] = metrics_for_market_ids(wallet, market_ids, row)
-        rows.append({"wallet": wallet, **global_metrics, "per_type_candidate": per_type_candidate})
+        for game_family, market_ids in sorted(market_ids_by_game_family.items()):
+            per_game_family_candidate[game_family] = metrics_for_market_ids(wallet, market_ids, row)
+        for key, market_ids in sorted(market_ids_by_game_type.items()):
+            game_family, market_type = split_bucket_key(key)
+            per_game_type_candidate[key] = {
+                **metrics_for_market_ids(wallet, market_ids, row),
+                "bucket_key": key,
+                "bucket_label": bucket_label(key),
+                "game_family": game_family,
+                "game_family_label": GAME_FAMILY_LABELS.get(game_family, game_family.upper()),
+                "market_type": market_type,
+                "market_type_label": MARKET_TYPE_LABELS.get(market_type, market_type),
+            }
+        row_payload = {"wallet": wallet, **global_metrics, "per_type_candidate": per_type_candidate}
+        if per_game_family_candidate:
+            row_payload["per_game_family_candidate"] = per_game_family_candidate
+        if per_game_type_candidate:
+            row_payload["per_game_type_candidate"] = per_game_type_candidate
+        rows.append(row_payload)
 
     rows.sort(key=lambda row: (row["participated_market_count"], row["total_cash_volume"]), reverse=True)
     top_wallets = {
@@ -822,6 +989,23 @@ def build_candidate_wallets(
             or row["max_single_market_cash"] >= single_market_cash_threshold
         ):
             reasons.append("large_size")
+        per_game_family = (
+            row.get("per_game_family_candidate")
+            if isinstance(row.get("per_game_family_candidate"), dict)
+            else {}
+        )
+        for game_family, thresholds in (candidate_game_family_thresholds or {}).items():
+            metrics = per_game_family.get(game_family)
+            if not isinstance(metrics, dict):
+                continue
+            if int(metrics.get("participated_market_count") or 0) < int(
+                thresholds.get("min_participated_markets") or 0
+            ):
+                continue
+            if to_float(metrics.get("avg_market_cash")) < to_float(thresholds.get("min_avg_market_cash")):
+                continue
+            reasons.append(f"{game_family}_qualified_size")
+            break
         if reasons:
             candidates.append({**row, "candidate_reasons": reasons})
     candidates.sort(
@@ -833,24 +1017,50 @@ def build_candidate_wallets(
         ),
         reverse=True,
     )
-    if candidate_wallets_per_market_type and candidate_wallets_per_market_type > 0:
+    if (
+        (candidate_wallets_per_market_type and candidate_wallets_per_market_type > 0)
+        or (candidate_wallets_per_game_family and candidate_wallets_per_game_family > 0)
+    ):
         by_wallet: dict[str, dict[str, Any]] = {}
-        for market_type in sorted({key for row in candidates for key in (row.get("per_type_candidate") or {})}):
-            bucket = [
-                row
+        if candidate_wallets_per_market_type and candidate_wallets_per_market_type > 0:
+            for market_type in sorted({key for row in candidates for key in (row.get("per_type_candidate") or {})}):
+                bucket = [
+                    row
+                    for row in candidates
+                    if isinstance((row.get("per_type_candidate") or {}).get(market_type), dict)
+                ]
+                bucket.sort(
+                    key=lambda row: (
+                        to_float(row["per_type_candidate"][market_type].get("max_single_market_cash")),
+                        to_float(row["per_type_candidate"][market_type].get("total_cash_volume")),
+                        int(row["per_type_candidate"][market_type].get("participated_market_count") or 0),
+                    ),
+                    reverse=True,
+                )
+                for row in bucket[:candidate_wallets_per_market_type]:
+                    by_wallet.setdefault(row["wallet"], row)
+        if candidate_wallets_per_game_family and candidate_wallets_per_game_family > 0:
+            game_families = {
+                key
                 for row in candidates
-                if isinstance((row.get("per_type_candidate") or {}).get(market_type), dict)
-            ]
-            bucket.sort(
-                key=lambda row: (
-                    to_float(row["per_type_candidate"][market_type].get("max_single_market_cash")),
-                    to_float(row["per_type_candidate"][market_type].get("total_cash_volume")),
-                    int(row["per_type_candidate"][market_type].get("participated_market_count") or 0),
-                ),
-                reverse=True,
-            )
-            for row in bucket[:candidate_wallets_per_market_type]:
-                by_wallet.setdefault(row["wallet"], row)
+                for key in (row.get("per_game_family_candidate") or {})
+            }
+            for game_family in sorted(game_families):
+                bucket = [
+                    row
+                    for row in candidates
+                    if isinstance((row.get("per_game_family_candidate") or {}).get(game_family), dict)
+                ]
+                bucket.sort(
+                    key=lambda row: (
+                        to_float(row["per_game_family_candidate"][game_family].get("max_single_market_cash")),
+                        to_float(row["per_game_family_candidate"][game_family].get("total_cash_volume")),
+                        int(row["per_game_family_candidate"][game_family].get("participated_market_count") or 0),
+                    ),
+                    reverse=True,
+                )
+                for row in bucket[:candidate_wallets_per_game_family]:
+                    by_wallet.setdefault(row["wallet"], row)
         return [row for row in candidates if row["wallet"] in by_wallet]
     return candidates[:max_candidate_wallets]
 
@@ -956,23 +1166,33 @@ def summarize_closed_positions(
     esports_condition_ids: set[str],
     *,
     condition_type_by_id: dict[str, str] | None = None,
+    condition_game_family_by_id: dict[str, str] | None = None,
     now_ts: int | None = None,
     bot_like_score: int = 0,
 ) -> dict[str, Any]:
     condition_type_by_id = {str(key).lower(): value for key, value in (condition_type_by_id or {}).items()}
+    condition_game_family_by_id = {
+        str(key).lower(): str(value)
+        for key, value in (condition_game_family_by_id or {}).items()
+        if value
+    }
     rows = []
     neutral_market_count_by_type: dict[str, int] = {}
+    neutral_market_count_by_game_type: dict[str, int] = {}
     for position in positions:
         condition_id = str(position.get("conditionId") or position.get("condition_id") or "").lower()
         if condition_id not in esports_condition_ids:
             continue
         market_type = condition_type_by_id.get(condition_id, MAIN_MATCH)
+        game_family = condition_game_family_by_id.get(condition_id, "unknown")
+        game_type_key = bucket_key(game_family, market_type)
         total_bought = to_float(position.get("totalBought") or position.get("total_bought"))
         realized_pnl = to_float(position.get("realizedPnl") or position.get("realized_pnl"))
         if total_bought <= 0:
             continue
         if realized_pnl == 0:
             neutral_market_count_by_type[market_type] = neutral_market_count_by_type.get(market_type, 0) + 1
+            neutral_market_count_by_game_type[game_type_key] = neutral_market_count_by_game_type.get(game_type_key, 0) + 1
             continue
         avg_price = to_float(position.get("avgPrice") or position.get("avg_price"))
         cost_basis = total_bought * avg_price if avg_price > 0 else total_bought
@@ -982,6 +1202,8 @@ def summarize_closed_positions(
             {
                 "condition_id": condition_id,
                 "market_type": market_type,
+                "game_family": game_family,
+                "bucket_key": game_type_key,
                 "pre_match_entry": position.get("preMatchEntry"),
                 "total_bought": total_bought,
                 "cost_basis": cost_basis,
@@ -1141,8 +1363,29 @@ def summarize_closed_positions(
             "market_type": market_type,
             "market_type_label": MARKET_TYPE_LABELS.get(market_type, market_type),
         }
+    per_game_type: dict[str, dict[str, Any]] = {}
+    for key in sorted({row["bucket_key"] for row in rows} | set(neutral_market_count_by_game_type)):
+        game_family, market_type = split_bucket_key(key)
+        bucket_rows = [row for row in rows if row["bucket_key"] == key]
+        per_game_type[key] = {
+            **summarize_bucket(
+                bucket_rows,
+                neutral_market_count=neutral_market_count_by_game_type.get(key, 0),
+            ),
+            "bucket_key": key,
+            "bucket_label": bucket_label(key),
+            "game_family": game_family,
+            "game_family_label": GAME_FAMILY_LABELS.get(game_family, game_family.upper() if game_family else ""),
+            "market_type": market_type,
+            "market_type_label": MARKET_TYPE_LABELS.get(market_type, market_type),
+        }
     summary = summarize_bucket(rows, neutral_market_count=sum(neutral_market_count_by_type.values()))
-    return {**summary, "per_type": per_type, "data_quality": {"source": "closed_positions", "reliable_losses": False}}
+    return {
+        **summary,
+        "per_type": per_type,
+        "per_game_type": per_game_type,
+        "data_quality": {"source": "closed_positions", "reliable_losses": False},
+    }
 
 
 def winning_outcome_index(record: dict[str, Any]) -> int | None:
@@ -1178,6 +1421,7 @@ def reconstruct_closed_positions(
         buy_cost_by_outcome: dict[int, float] = {}
         sell_size_by_outcome: dict[int, float] = {}
         sell_proceeds_by_outcome: dict[int, float] = {}
+        material_sell_size_by_outcome: dict[int, float] = {}
         last_ts = 0
         last_buy_ts = 0
         for trade in market_trades:
@@ -1204,6 +1448,11 @@ def reconstruct_closed_positions(
             elif side == "SELL":
                 sell_size_by_outcome[outcome_index] = sell_size_by_outcome.get(outcome_index, 0.0) + size
                 sell_proceeds_by_outcome[outcome_index] = sell_proceeds_by_outcome.get(outcome_index, 0.0) + cash
+                near_resolved_winner_exit = outcome_index == winner_index and price >= NEAR_RESOLVED_WINNER_SELL_PRICE
+                if not near_resolved_winner_exit:
+                    material_sell_size_by_outcome[outcome_index] = (
+                        material_sell_size_by_outcome.get(outcome_index, 0.0) + size
+                    )
 
         bought_outcomes = {outcome for outcome, size in buy_size_by_outcome.items() if size > 0}
         if not bought_outcomes:
@@ -1217,7 +1466,7 @@ def reconstruct_closed_positions(
         has_material_sell = any(
             buy_size_by_outcome.get(outcome_index, 0.0) > 0
             and sell_size / buy_size_by_outcome.get(outcome_index, 0.0) > material_sell_frac
-            for outcome_index, sell_size in sell_size_by_outcome.items()
+            for outcome_index, sell_size in material_sell_size_by_outcome.items()
         )
         two_sided = len(bought_outcomes) >= 2
         total_bought = sum(buy_size_by_outcome.values())
@@ -1275,6 +1524,9 @@ def reconstruct_closed_positions(
             "two_sided": two_sided,
             "buy_size_by_outcome": {str(k): round(v, 8) for k, v in sorted(buy_size_by_outcome.items())},
             "sell_size_by_outcome": {str(k): round(v, 8) for k, v in sorted(sell_size_by_outcome.items())},
+            "material_sell_size_by_outcome": {
+                str(k): round(v, 8) for k, v in sorted(material_sell_size_by_outcome.items())
+            },
         }
     return positions, behavior_by_market
 
@@ -1300,10 +1552,15 @@ def summarize_trade_reconstructed_positions(
         condition_id: str(record.get("market_type") or MAIN_MATCH)
         for condition_id, record in markets.items()
     }
+    condition_game_family_by_id = {
+        condition_id: str(record.get("game_family") or "unknown")
+        for condition_id, record in markets.items()
+    }
     summary = summarize_closed_positions(
         positions,
         esports_condition_ids,
         condition_type_by_id=condition_type_by_id,
+        condition_game_family_by_id=condition_game_family_by_id,
         now_ts=now_ts,
         bot_like_score=bot_like_score,
     )
@@ -1312,8 +1569,10 @@ def summarize_trade_reconstructed_positions(
     two_sided_trade_market_count = sum(1 for row in behavior_by_market.values() if row.get("two_sided"))
 
     per_type_behavior: dict[str, dict[str, int]] = {}
+    per_game_type_behavior: dict[str, dict[str, int]] = {}
     for condition_id, behavior_row in behavior_by_market.items():
         market_type = condition_type_by_id.get(condition_id, MAIN_MATCH)
+        game_type_key = bucket_key(condition_game_family_by_id.get(condition_id, "unknown"), market_type)
         bucket = per_type_behavior.setdefault(
             market_type,
             {
@@ -1327,12 +1586,49 @@ def summarize_trade_reconstructed_positions(
             bucket["sold_before_resolution_market_count"] += 1
         if behavior_row.get("two_sided"):
             bucket["two_sided_trade_market_count"] += 1
+        game_bucket = per_game_type_behavior.setdefault(
+            game_type_key,
+            {
+                "historical_trade_behavior_market_count": 0,
+                "sold_before_resolution_market_count": 0,
+                "two_sided_trade_market_count": 0,
+            },
+        )
+        game_bucket["historical_trade_behavior_market_count"] += 1
+        if behavior_row.get("sold_before_resolution"):
+            game_bucket["sold_before_resolution_market_count"] += 1
+        if behavior_row.get("two_sided"):
+            game_bucket["two_sided_trade_market_count"] += 1
 
     per_type = dict(summary.get("per_type") or {})
+    per_game_type = dict(summary.get("per_game_type") or {})
     for market_type, behavior in per_type_behavior.items():
         behavior_count = to_int(behavior.get("historical_trade_behavior_market_count"))
         per_type[market_type] = {
             **(per_type.get(market_type) or {}),
+            **behavior,
+            "sold_before_resolution_market_rate": round(
+                to_int(behavior.get("sold_before_resolution_market_count")) / behavior_count,
+                8,
+            )
+            if behavior_count
+            else 0.0,
+            "two_sided_trade_market_rate": round(
+                to_int(behavior.get("two_sided_trade_market_count")) / behavior_count,
+                8,
+            )
+            if behavior_count
+            else 0.0,
+        }
+    for key, metrics in list(per_game_type.items()):
+        if not isinstance(metrics, dict):
+            continue
+        behavior = per_game_type_behavior.get(key)
+        if not isinstance(behavior, dict):
+            continue
+        behavior_count = to_int(behavior.get("historical_trade_behavior_market_count"))
+        per_game_type[key] = {
+            **metrics,
             **behavior,
             "sold_before_resolution_market_rate": round(
                 to_int(behavior.get("sold_before_resolution_market_count")) / behavior_count,
@@ -1362,6 +1658,7 @@ def summarize_trade_reconstructed_positions(
         "two_sided_trade_market_rate": round(two_sided_trade_market_count / behavior_market_count, 8)
         if behavior_market_count
         else 0.0,
+        "per_game_type": per_game_type,
     }
 
 
@@ -1600,11 +1897,14 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
     category = str(summary.get("category") or "").lower()
     classified = classify_wallet_bucket(summary, now_ts=now_ts, min_sample=8)
     per_type = summary.get("per_type") or {}
+    per_game_type = summary.get("per_game_type") or {}
     if not isinstance(per_type, dict):
         return classified
 
     per_type_grades: dict[str, dict[str, Any]] = {}
+    per_game_type_grades: dict[str, dict[str, Any]] = {}
     eligible_market_types: list[str] = []
+    eligible_buckets: list[str] = []
     grade_rank = {"A": 5, "B": 4, "C": 3, "stale": 2, "excluded": 1, "unknown": 0}
     best_grade = classified.get("grade") or "unknown"
     best_rank = grade_rank.get(str(best_grade), 0)
@@ -1648,7 +1948,83 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
             best_grade = bucket_classified.get("grade")
             best_rank = bucket_rank
 
-    if eligible_market_types:
+    if isinstance(per_game_type, dict):
+        for key, bucket_summary in sorted(
+            per_game_type.items(),
+            key=lambda item: (
+                GAME_FAMILY_LABELS.get(split_bucket_key(str(item[0]))[0], split_bucket_key(str(item[0]))[0]),
+                MARKET_TYPE_ORDER.get(split_bucket_key(str(item[0]))[1], 99),
+            ),
+        ):
+            game_family, market_type = split_bucket_key(key)
+            min_sample = 8 if category == "sports" or market_type == MAIN_MATCH else 10
+            bucket_input = {
+                **bucket_summary,
+                "category": summary.get("category", bucket_summary.get("category")),
+                "bot_like_score": summary.get("bot_like_score", bucket_summary.get("bot_like_score", 0)),
+                "sold_before_resolution_market_count": bucket_summary.get(
+                    "sold_before_resolution_market_count",
+                    summary.get("sold_before_resolution_market_count", 0),
+                ),
+                "sold_before_resolution_market_rate": bucket_summary.get(
+                    "sold_before_resolution_market_rate",
+                    summary.get("sold_before_resolution_market_rate", 0.0),
+                ),
+                "two_sided_trade_market_count": bucket_summary.get(
+                    "two_sided_trade_market_count",
+                    summary.get("two_sided_trade_market_count", 0),
+                ),
+                "two_sided_trade_market_rate": bucket_summary.get(
+                    "two_sided_trade_market_rate",
+                    summary.get("two_sided_trade_market_rate", 0.0),
+                ),
+                "historical_trade_behavior_market_count": bucket_summary.get(
+                    "historical_trade_behavior_market_count",
+                    summary.get("historical_trade_behavior_market_count", 0),
+                ),
+            }
+            bucket_classified = classify_wallet_bucket(bucket_input, now_ts=now_ts, min_sample=min_sample)
+            bucket_classified.update(
+                {
+                    "min_sample": min_sample,
+                    "bucket_key": key,
+                    "bucket_label": bucket_label(key),
+                    "game_family": game_family,
+                    "game_family_label": GAME_FAMILY_LABELS.get(
+                        game_family,
+                        game_family.upper() if game_family else "",
+                    ),
+                    "market_type": market_type,
+                    "market_type_label": MARKET_TYPE_LABELS.get(market_type, market_type),
+                }
+            )
+            per_game_type_grades[key] = bucket_classified
+            if bucket_classified.get("grade") == "A":
+                eligible_buckets.append(key)
+            bucket_rank = grade_rank.get(str(bucket_classified.get("grade")), 0)
+            if bucket_rank > best_rank:
+                best_grade = bucket_classified.get("grade")
+                best_rank = bucket_rank
+
+    if eligible_buckets:
+        eligible_buckets = sorted(
+            set(eligible_buckets),
+            key=lambda value: (
+                GAME_FAMILY_LABELS.get(split_bucket_key(value)[0], split_bucket_key(value)[0]),
+                MARKET_TYPE_ORDER.get(split_bucket_key(value)[1], 99),
+            ),
+        )
+        eligible_market_types = sorted(
+            {split_bucket_key(value)[1] for value in eligible_buckets},
+            key=lambda value: MARKET_TYPE_ORDER.get(value, 99),
+        )
+        classified = {
+            **classified,
+            "grade": "A",
+            "profile_state": "qualified",
+            "reasons": [reason for reason in classified.get("reasons", []) if reason != "thin_sample"],
+        }
+    elif eligible_market_types and not per_game_type_grades:
         eligible_market_types = sorted(
             set(eligible_market_types),
             key=lambda value: MARKET_TYPE_ORDER.get(value, 99),
@@ -1660,6 +2036,7 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
             "reasons": [reason for reason in classified.get("reasons", []) if reason != "thin_sample"],
         }
     else:
+        eligible_market_types = []
         classified = {**classified, "grade": best_grade}
     observed_market_types = sorted(
         (str(value) for value in per_type_grades if value),
@@ -1669,6 +2046,15 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
         **classified,
         "per_type": per_type,
         "per_type_grades": per_type_grades,
+        "per_game_type": per_game_type,
+        "per_game_type_grades": per_game_type_grades,
+        "eligible_buckets": eligible_buckets,
+        "eligible_bucket_labels": [bucket_label(value) for value in eligible_buckets],
+        "eligible_game_families": sorted({split_bucket_key(value)[0] for value in eligible_buckets if split_bucket_key(value)[0]}),
+        "eligible_game_family_labels": [
+            GAME_FAMILY_LABELS.get(value, value.upper())
+            for value in sorted({split_bucket_key(bucket)[0] for bucket in eligible_buckets if split_bucket_key(bucket)[0]})
+        ],
         "eligible_market_types": eligible_market_types,
         "eligible_market_type_labels": [MARKET_TYPE_LABELS.get(value, value) for value in eligible_market_types],
         "observed_market_types": observed_market_types,
@@ -1695,6 +2081,7 @@ def profile_candidate_wallet(
     *,
     market_records_by_id: dict[str, dict[str, Any]] | None = None,
     condition_type_by_id: dict[str, str] | None = None,
+    condition_game_family_by_id: dict[str, str] | None = None,
     user_trades_loader=None,
     closed_positions_loader=None,
     current_positions_loader,
@@ -1721,6 +2108,7 @@ def profile_candidate_wallet(
                 closed_positions,
                 esports_condition_ids,
                 condition_type_by_id=condition_type_by_id,
+                condition_game_family_by_id=condition_game_family_by_id,
                 now_ts=now_ts,
                 bot_like_score=bot_score,
             )
