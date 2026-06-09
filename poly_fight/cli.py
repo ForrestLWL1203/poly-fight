@@ -3490,6 +3490,19 @@ def resolve_collect_experimental_output_dir(args: argparse.Namespace, *, collect
     return root / f"collector_{collector_version}" / "esports"
 
 
+def resolve_collect_experimental_profile_wallet_limit(
+    args: argparse.Namespace,
+    *,
+    collector_version: str,
+) -> int:
+    explicit = getattr(args, "max_profile_wallets", None)
+    if explicit is None:
+        explicit = getattr(args, "max_profiles_per_run", None)
+    if explicit is None:
+        explicit = 700 if collector_version == "v3" else 500
+    return int(explicit or 0)
+
+
 def build_v2_profile_candidate_from_trades(
     seed_candidate: dict[str, Any],
     raw_trades: list[dict[str, Any]],
@@ -4393,9 +4406,13 @@ def _command_collect_experimental(
 
     seed_wallets = aggregate_v2_seed_wallets(seed_positions)
     write_json(output_dir / f"{prefix}_seed_wallets.json", list(seed_wallets.values()))
+    max_profile_wallets = resolve_collect_experimental_profile_wallet_limit(
+        args,
+        collector_version=collector_version,
+    )
     profile_wallets = filter_v2_profile_wallets(
         seed_wallets,
-        max_wallets=getattr(args, "max_profile_wallets", 500),
+        max_wallets=max_profile_wallets,
     )
     write_json(output_dir / f"{prefix}_profile_wallets.json", profile_wallets)
     mark_stage("seed_wallet_filter")
@@ -4546,6 +4563,7 @@ def _command_collect_experimental(
         "seed_position_count": len(seed_positions),
         "seed_wallet_count": len(seed_wallets),
         "profile_wallet_count": len(profile_wallets),
+        "max_profile_wallets": max_profile_wallets,
         "profiled_wallet_count": len(profiles_by_wallet),
         "leaderboard_wallet_count": len(leaderboard),
         "market_position_api_fetches": market_position_api_fetches,
@@ -4579,6 +4597,18 @@ def _command_collect_experimental(
                 "high_churn_hard_excluded": False,
             }
         )
+    if collector_version == "v3" and not getattr(args, "no_dashboard_publish", False):
+        dashboard_publish = publish_collector_v3_dashboard_outputs(
+            output_dir,
+            resolve_data_dir(args),
+            summary=summary,
+            now_ts=now_ts,
+        )
+        summary["dashboard_publish"] = dashboard_publish
+        write_json(
+            resolve_data_dir(args) / "build_summary.json",
+            {**summary, "dashboard_publish": dashboard_publish},
+        )
     write_json(output_dir / f"{prefix}_build_summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
@@ -4588,8 +4618,66 @@ def command_collect_v2(args: argparse.Namespace, client: PolymarketClient | None
     return _command_collect_experimental(args, client=client, collector_version="v2")
 
 
+def publish_collector_v3_dashboard_outputs(
+    collector_output_dir: Path,
+    data_dir: Path,
+    *,
+    summary: dict[str, Any] | None = None,
+    now_ts: int | None = None,
+) -> dict[str, Any]:
+    collector_output_dir = Path(collector_output_dir)
+    data_dir = Path(data_dir)
+    now_ts = int(now_ts or time.time())
+    leaderboard_value = read_json(collector_output_dir / "v3_leaderboard.json", [])
+    profiles_value = read_json(collector_output_dir / "v3_wallet_rawdata.json", [])
+    leaderboard = [row for row in leaderboard_value if isinstance(row, dict)] if isinstance(leaderboard_value, list) else []
+    profiles = [row for row in profiles_value if isinstance(row, dict)] if isinstance(profiles_value, list) else []
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    write_json(data_dir / "smart_wallet_leaderboard.json", leaderboard)
+    write_json(data_dir / "wallet_profiles.json", profiles)
+    LeaderboardStore(data_dir / "leaderboard.db").replace_leaderboard(
+        leaderboard,
+        category="esports",
+        updated_at=now_ts,
+    )
+    publish_summary = {
+        "published": True,
+        "collector_version": "v3",
+        "category": "esports",
+        "collector_output_dir": str(collector_output_dir),
+        "data_dir": str(data_dir),
+        "leaderboard_wallet_count": len(leaderboard),
+        "profile_wallet_count": len(profiles),
+        "updated_at": now_ts,
+    }
+    dashboard_summary = dict(summary) if isinstance(summary, dict) else {}
+    dashboard_summary.update(
+        {
+            "collector_version": "v3",
+            "category": "esports",
+            "leaderboard_wallet_count": len(leaderboard),
+            "profiled_wallet_count": len(profiles),
+            "dashboard_publish": publish_summary,
+        }
+    )
+    write_json(data_dir / "build_summary.json", dashboard_summary)
+    return publish_summary
+
+
 def command_collect_v3(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
     return _command_collect_experimental(args, client=client, collector_version="v3")
+
+
+def command_collect(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
+    category = str(getattr(args, "category", "esports") or "esports").lower()
+    if category == "esports":
+        if client is None:
+            return command_collect_v3(args)
+        return command_collect_v3(args, client=client)
+    if client is None:
+        return command_build_leaderboard(args)
+    return command_build_leaderboard(args, client=client)
 
 
 def command_build_leaderboard(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
@@ -5627,7 +5715,7 @@ def command_run(args: argparse.Namespace) -> int:
                         max_lookback_days=category_refresh_cache_retention_days(args),
                         now_ts=now_ts,
                     )
-                    command_build_leaderboard(category_args(category), client=client)
+                    command_collect(category_args(category), client=client)
                 finally:
                     set_pause_new_signals(follow_dir, category, None)
             now_done = int(datetime.now(timezone.utc).timestamp())
@@ -5864,6 +5952,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     collect = subparsers.add_parser("collect", help="one-shot wallet collection and leaderboard build")
     add_build_arguments(collect, include_category=True)
+    collect.add_argument("--output-dir", default=None)
+    collect.add_argument("--lookback-days", type=int, default=30)
+    collect.add_argument("--bucket-market-limit", type=int, default=50)
+    collect.add_argument("--positions-per-market", type=int, default=20)
+    collect.add_argument("--seed-sort-by", choices=["TOTAL_PNL", "REALIZED_PNL", "CASH_PNL", "TOKENS"], default="TOTAL_PNL")
+    collect.add_argument("--max-profile-wallets", type=int, default=None)
+    collect.add_argument("--max-core-wallets", type=int, default=20)
+    collect.add_argument("--max-momentum-wallets", type=int, default=10)
+    collect.add_argument("--max-watchlist-wallets", type=int, default=50)
+    collect.add_argument("--max-esports-markets-per-wallet", type=int, default=100)
+    collect.add_argument("--user-trades-cache-ttl-days", type=int, default=1)
+    collect.add_argument("--refresh-user-trades", action="store_true")
+    collect.add_argument("--no-user-trades-cache", action="store_true")
+    collect.add_argument("--no-dashboard-publish", action="store_true")
+    collect.set_defaults(func=command_collect)
 
     collect_v2 = subparsers.add_parser("collect-v2", help="experimental market-position wallet collector")
     collect_v2.add_argument("--category", choices=["esports"], default="esports")
@@ -5905,6 +6008,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect_v3.add_argument("--user-trades-cache-ttl-days", type=int, default=1)
     collect_v3.add_argument("--refresh-user-trades", action="store_true")
     collect_v3.add_argument("--no-user-trades-cache", action="store_true")
+    collect_v3.add_argument("--no-dashboard-publish", action="store_true")
     collect_v3.add_argument("--max-workers", type=int, default=8)
     collect_v3.add_argument("--max-requests-per-second", type=float, default=10)
     collect_v3.add_argument("--request-burst", type=int, default=5)

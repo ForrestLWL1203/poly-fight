@@ -59,6 +59,7 @@ from poly_fight.cli import (
     aggregate_v2_seed_wallets,
     build_v2_leaderboard,
     collect_v2_seed_positions,
+    command_collect,
     command_collect_v2,
     ESPORTS_CANDIDATE_MARKET_TYPE_THRESHOLDS,
     ESPORTS_CANDIDATE_GAME_FAMILY_THRESHOLDS,
@@ -87,6 +88,7 @@ from poly_fight.cli import (
     merge_profiles_with_candidates,
     migrate_category_follow_dbs,
     observed_performance_quarantine_events,
+    publish_collector_v3_dashboard_outputs,
     prune_profile_store,
     read_category_leaderboards,
     refresh_team_logo_cache_from_active_markets,
@@ -101,6 +103,7 @@ from poly_fight.cli import (
     write_jsonl,
     prepare_category_refresh_dir,
     select_v2_target_markets,
+    resolve_collect_experimental_profile_wallet_limit,
 )
 from poly_fight.core import (
     ALLOWED_GAME_FAMILIES,
@@ -214,6 +217,51 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(resolve_data_dir(esports_args), Path("data/esports"))
         self.assertEqual(resolve_data_dir(follow_args), Path("data/esports"))
         self.assertEqual(resolve_data_dir(explicit_args), Path("custom_dir"))
+
+    def test_collect_dispatches_esports_to_latest_collector_and_keeps_sports_v1(self):
+        parser = build_parser()
+        esports_args = parser.parse_args(["collect"])
+        sports_args = parser.parse_args(["collect", "--category", "sports"])
+
+        with (
+            patch("poly_fight.cli.command_collect_v3", return_value=31) as collect_v3,
+            patch("poly_fight.cli.command_build_leaderboard", return_value=17) as build_v1,
+        ):
+            self.assertEqual(command_collect(esports_args), 31)
+            self.assertEqual(command_collect(sports_args), 17)
+
+        collect_v3.assert_called_once_with(esports_args)
+        build_v1.assert_called_once_with(sports_args)
+
+    def test_collect_accepts_latest_collector_tuning_flags(self):
+        args = build_parser().parse_args(
+            [
+                "collect",
+                "--bucket-market-limit",
+                "7",
+                "--positions-per-market",
+                "9",
+                "--max-profile-wallets",
+                "11",
+                "--max-core-wallets",
+                "13",
+                "--no-dashboard-publish",
+            ]
+        )
+
+        self.assertIs(args.func, command_collect)
+        self.assertEqual(args.bucket_market_limit, 7)
+        self.assertEqual(args.positions_per_market, 9)
+        self.assertEqual(args.max_profile_wallets, 11)
+        self.assertEqual(args.max_core_wallets, 13)
+        self.assertTrue(args.no_dashboard_publish)
+
+        legacy_budget_args = build_parser().parse_args(["collect", "--max-profiles-per-run", "44"])
+        self.assertIsNone(legacy_budget_args.max_profile_wallets)
+        self.assertEqual(
+            resolve_collect_experimental_profile_wallet_limit(legacy_budget_args, collector_version="v3"),
+            44,
+        )
 
     def test_category_data_dirs_use_fixed_dashboard_root_mapping(self):
         root = Path("/tmp/poly-data")
@@ -8139,6 +8187,50 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(rows, [{"wallet": "0xsqlite", "grade": "A", "category": "esports"}])
             self.assertEqual(mtimes["esports"], 456)
 
+    def test_v3_dashboard_publish_writes_standard_outputs_for_dashboard_and_follow(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            collector_dir = root / "collector_v3" / "esports"
+            data_dir = root / "esports"
+            collector_dir.mkdir(parents=True)
+            leaderboard = [
+                {
+                    "wallet": "0xV3",
+                    "grade": "A",
+                    "v3_lane": "core",
+                    "eligible_buckets": ["cs2:main_match"],
+                    "eligible_market_types": ["main_match"],
+                }
+            ]
+            profiles = [
+                {
+                    "wallet": "0xV3",
+                    "grade": "A",
+                    "per_game_type": {"cs2:main_match": {"esports_roi": 0.31}},
+                }
+            ]
+            summary = {"collector_version": "v3", "leaderboard_wallet_count": 1}
+            write_json(collector_dir / "v3_leaderboard.json", leaderboard)
+            write_json(collector_dir / "v3_wallet_rawdata.json", profiles)
+
+            publish = publish_collector_v3_dashboard_outputs(
+                collector_dir,
+                data_dir,
+                summary=summary,
+                now_ts=789,
+            )
+
+            self.assertEqual(publish["leaderboard_wallet_count"], 1)
+            self.assertEqual(read_json(data_dir / "smart_wallet_leaderboard.json", []), leaderboard)
+            self.assertEqual(read_json(data_dir / "wallet_profiles.json", []), profiles)
+            rows, mtimes = read_category_leaderboards(root)
+            self.assertEqual(rows[0]["wallet"], "0xV3")
+            self.assertEqual(rows[0]["v3_lane"], "core")
+            self.assertEqual(mtimes["esports"], 789)
+            dashboard_summary = read_json(data_dir / "build_summary.json", {})
+            self.assertEqual(dashboard_summary["collector_version"], "v3")
+            self.assertEqual(dashboard_summary["dashboard_publish"]["collector_output_dir"], str(collector_dir))
+
     def test_dashboard_wallets_use_observed_follow_trade_time(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -11030,8 +11122,8 @@ class CoreTest(unittest.TestCase):
                 return {"desired_next_interval_seconds": 900}
 
             with patch("poly_fight.cli.datetime", FakeDateTime), patch("poly_fight.cli.build_client", return_value=object()), patch(
-                "poly_fight.cli.command_build_leaderboard", side_effect=fake_build
-            ) as build, patch(
+                "poly_fight.cli.command_collect", side_effect=fake_build
+            ) as collect, patch("poly_fight.cli.command_build_leaderboard") as old_build, patch(
                 "poly_fight.cli.command_follow", side_effect=fake_follow
             ):
                 from poly_fight.cli import command_run
@@ -11039,7 +11131,8 @@ class CoreTest(unittest.TestCase):
                 with redirect_stdout(StringIO()):
                     self.assertEqual(command_run(args), 0)
 
-            self.assertEqual(build.call_count, 1)
+            self.assertEqual(collect.call_count, 1)
+            old_build.assert_not_called()
             self.assertEqual(set(paused_categories), {"esports"})
 
     def test_run_loop_stops_after_consecutive_error_window(self):
