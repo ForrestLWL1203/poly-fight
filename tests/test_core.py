@@ -233,6 +233,23 @@ class CoreTest(unittest.TestCase):
         collect_v3.assert_called_once_with(esports_args)
         build_v1.assert_called_once_with(sports_args)
 
+    def test_build_leaderboard_dispatches_esports_to_latest_collector_and_keeps_sports_v1(self):
+        parser = build_parser()
+        esports_args = parser.parse_args(["build-leaderboard"])
+        sports_args = parser.parse_args(["build-leaderboard", "--category", "sports"])
+
+        self.assertIs(esports_args.func, command_collect)
+        self.assertIs(sports_args.func, command_collect)
+        with (
+            patch("poly_fight.cli.command_collect_v3", return_value=31) as collect_v3,
+            patch("poly_fight.cli.command_build_leaderboard", return_value=17) as build_v1,
+        ):
+            self.assertEqual(esports_args.func(esports_args), 31)
+            self.assertEqual(sports_args.func(sports_args), 17)
+
+        collect_v3.assert_called_once_with(esports_args)
+        build_v1.assert_called_once_with(sports_args)
+
     def test_collect_accepts_latest_collector_tuning_flags(self):
         args = build_parser().parse_args(
             [
@@ -262,6 +279,29 @@ class CoreTest(unittest.TestCase):
             resolve_collect_experimental_profile_wallet_limit(legacy_budget_args, collector_version="v3"),
             44,
         )
+
+    def test_build_leaderboard_accepts_latest_collector_tuning_flags(self):
+        args = build_parser().parse_args(
+            [
+                "build-leaderboard",
+                "--bucket-market-limit",
+                "7",
+                "--positions-per-market",
+                "9",
+                "--max-profile-wallets",
+                "11",
+                "--max-core-wallets",
+                "13",
+                "--no-dashboard-publish",
+            ]
+        )
+
+        self.assertIs(args.func, command_collect)
+        self.assertEqual(args.bucket_market_limit, 7)
+        self.assertEqual(args.positions_per_market, 9)
+        self.assertEqual(args.max_profile_wallets, 11)
+        self.assertEqual(args.max_core_wallets, 13)
+        self.assertTrue(args.no_dashboard_publish)
 
     def test_category_data_dirs_use_fixed_dashboard_root_mapping(self):
         root = Path("/tmp/poly-data")
