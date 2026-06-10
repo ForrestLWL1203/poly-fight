@@ -1445,6 +1445,7 @@ createApp({
       const label = String(row?.market_type_label || "").trim();
       if (!label) return false;
       if (/^\d+\s*盘口$/.test(label)) return false;
+      if (["主盘", "moneyline"].includes(label.toLowerCase())) return false;
       const parts = this.matchParts(row);
       const meta = String(parts?.meta || "").trim();
       return !parts || meta !== label;
