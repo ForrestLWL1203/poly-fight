@@ -2931,8 +2931,10 @@ class CoreTest(unittest.TestCase):
             self.assertNotIn("active_market_cache", new_state)
             self.assertTrue(cache_path.exists())
 
-    def test_active_market_cache_fetches_esports_and_sports_tags(self):
-        start = datetime.now(timezone.utc) + timedelta(hours=3)
+    def test_active_market_cache_fetches_only_esports_follow_window(self):
+        now = datetime(2026, 6, 10, tzinfo=timezone.utc)
+        start = now + timedelta(hours=3)
+        far_start = now + timedelta(hours=48)
 
         class FakeClient:
             def __init__(self):
@@ -2982,34 +2984,64 @@ class CoreTest(unittest.TestCase):
                                 "startTime": start.isoformat(),
                             }
                         ],
-                    }
+                    },
+                    {
+                        "id": "esports2",
+                        "slug": "esports2",
+                        "title": "Dota 2: C vs D (BO3)",
+                        "tags": [{"slug": "dota-2"}],
+                        "startTime": far_start.isoformat(),
+                        "markets": [
+                            {
+                                "conditionId": "esports-far",
+                                "question": "Dota 2: C vs D (BO3)",
+                                "outcomes": '["C","D"]',
+                                "outcomePrices": '["0.50","0.50"]',
+                                "active": True,
+                                "closed": False,
+                                "volume": 100000,
+                                "startTime": far_start.isoformat(),
+                            }
+                        ],
+                    },
                 ]
 
         client = FakeClient()
-        markets, _state, source = load_active_market_cache(
-            client,
-            {},
-            now_ts=int(time.time()),
-            gamma_pages=1,
-            ttl_seconds=900,
-        )
+        with TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "active_market_cache.json"
+            markets, _state, source = load_active_market_cache(
+                client,
+                {},
+                cache_path=cache_path,
+                now_ts=int(now.timestamp()),
+                gamma_pages=1,
+                ttl_seconds=900,
+                observe_window_hours=24,
+            )
+            cached = read_json(cache_path, {})
 
         self.assertEqual(source, "api")
         self.assertIn(("counter-strike-2", "league-of-legends", "dota-2"), client.tag_calls)
-        self.assertIn(("nba", "ufc"), client.tag_calls)
+        self.assertNotIn(("nba", "ufc"), client.tag_calls)
         self.assertEqual(markets["esports-m1"]["category"], "esports")
-        self.assertEqual(markets["sports-m1"]["category"], "sports")
+        self.assertNotIn("sports-m1", markets)
+        self.assertNotIn("esports-far", markets)
+        self.assertEqual([row["condition_id"] for row in cached["markets"]], ["esports-m1"])
+        self.assertEqual(cached["categories"], ["esports"])
 
     def test_active_market_cache_accepts_dict_shaped_markets(self):
         with TemporaryDirectory() as tmp:
             cache_path = Path(tmp) / "active_market_cache.json"
+            now = datetime(2026, 6, 10, tzinfo=timezone.utc)
+            start = now + timedelta(hours=3)
             write_json(
                 cache_path,
                 {
-                    "updated_at": 100,
+                    "updated_at": int(now.timestamp()),
+                    "categories": ["esports"],
                     "markets": {
-                        "e1": {"condition_id": "e1", "category": "esports"},
-                        "s1": {"condition_id": "s1", "category": "sports"},
+                        "e1": {"condition_id": "e1", "category": "esports", "match_start_time": start.isoformat()},
+                        "s1": {"condition_id": "s1", "category": "sports", "match_start_time": start.isoformat()},
                     },
                 },
             )
@@ -3022,13 +3054,13 @@ class CoreTest(unittest.TestCase):
                 FakeClient(),
                 {},
                 cache_path=cache_path,
-                now_ts=120,
+                now_ts=int(now.timestamp()),
                 gamma_pages=1,
                 ttl_seconds=900,
             )
 
             self.assertEqual(source, "cache")
-            self.assertEqual(set(markets), {"e1", "s1"})
+            self.assertEqual(set(markets), {"e1"})
 
     def test_profile_candidate_filter_keeps_only_clean_active_wallets(self):
         candidates = [

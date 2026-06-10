@@ -1327,13 +1327,67 @@ def active_cache_market_rows(cached: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def active_cache_categories(cached: dict[str, Any]) -> set[str]:
+    explicit = {
+        str(value).lower()
+        for value in (cached.get("categories") or [])
+        if value
+    }
     rows = active_cache_market_rows(cached)
-    return {str(row.get("category") or "").lower() for row in rows if isinstance(row, dict) and row.get("category")}
+    return explicit | {str(row.get("category") or "").lower() for row in rows if isinstance(row, dict) and row.get("category")}
 
 
 def active_cache_has_required_categories(cached: dict[str, Any]) -> bool:
     categories = active_cache_categories(cached)
-    return {"esports", "sports"}.issubset(categories)
+    return set(FOLLOW_SIGNAL_CATEGORIES).issubset(categories)
+
+
+def active_market_cache_in_follow_scope(
+    market: dict[str, Any],
+    *,
+    now_ts: int,
+    observe_window_hours: float,
+    post_start_grace_seconds: int,
+    allowed_categories: set[str],
+    preserve_condition_ids: set[str] | None = None,
+) -> bool:
+    condition_id = str(market.get("condition_id") or market.get("conditionId") or "").lower()
+    if preserve_condition_ids and condition_id in preserve_condition_ids:
+        return True
+    category = str(market.get("category") or "esports").lower()
+    if category not in allowed_categories:
+        return False
+    start_dt = parse_dt(market.get("match_start_time") or market.get("market_start_time") or market.get("startTime"))
+    if not start_dt:
+        return False
+    start_ts = int(start_dt.timestamp())
+    window_end = now_ts + int(max(1.0, float(observe_window_hours)) * 3600)
+    grace_start = now_ts - max(0, int(post_start_grace_seconds))
+    return grace_start <= start_ts <= window_end
+
+
+def scoped_active_market_cache_rows(
+    rows: list[dict[str, Any]],
+    *,
+    now_ts: int,
+    observe_window_hours: float,
+    post_start_grace_seconds: int,
+    allowed_categories: set[str] | None = None,
+    preserve_condition_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    allowed = {str(value).lower() for value in (allowed_categories or set(FOLLOW_SIGNAL_CATEGORIES))}
+    return [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and active_market_cache_in_follow_scope(
+            row,
+            now_ts=now_ts,
+            observe_window_hours=observe_window_hours,
+            post_start_grace_seconds=post_start_grace_seconds,
+            allowed_categories=allowed,
+            preserve_condition_ids=preserve_condition_ids,
+        )
+    ]
 
 
 def load_active_market_cache(
@@ -1344,28 +1398,53 @@ def load_active_market_cache(
     now_ts: int,
     gamma_pages: int,
     ttl_seconds: int,
+    observe_window_hours: float = 24.0,
+    post_start_grace_seconds: int = 0,
+    allowed_categories: set[str] | None = None,
+    preserve_condition_ids: set[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any], str]:
-    legacy_cached = state.pop("active_market_cache", None) or {}
-    if cache_path and legacy_cached:
-        write_json(cache_path, legacy_cached)
-        if now_ts - int(legacy_cached.get("updated_at") or 0) < ttl_seconds and active_cache_has_required_categories(legacy_cached):
-            markets = {
-                str(row.get("condition_id") or row.get("conditionId") or "").lower(): row
-                for row in active_cache_market_rows(legacy_cached)
-                if row.get("condition_id") or row.get("conditionId")
-            }
-            return markets, state, "legacy_state_cache"
-    cached = read_json(cache_path, {}) if cache_path else {}
-    if cached and now_ts - int(cached.get("updated_at") or 0) < ttl_seconds and active_cache_has_required_categories(cached):
-        markets = {
+    allowed = {str(value).lower() for value in (allowed_categories or set(FOLLOW_SIGNAL_CATEGORIES))}
+    preserve_ids = {str(value).lower() for value in (preserve_condition_ids or set()) if value}
+
+    def rows_to_markets(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        scoped_rows = scoped_active_market_cache_rows(
+            rows,
+            now_ts=now_ts,
+            observe_window_hours=observe_window_hours,
+            post_start_grace_seconds=post_start_grace_seconds,
+            allowed_categories=allowed,
+            preserve_condition_ids=preserve_ids,
+        )
+        return {
             str(row.get("condition_id") or row.get("conditionId") or "").lower(): row
-            for row in active_cache_market_rows(cached)
+            for row in scoped_rows
             if row.get("condition_id") or row.get("conditionId")
         }
+
+    legacy_cached = state.pop("active_market_cache", None) or {}
+    if cache_path and legacy_cached:
+        if now_ts - int(legacy_cached.get("updated_at") or 0) < ttl_seconds and active_cache_has_required_categories(legacy_cached):
+            markets = rows_to_markets(active_cache_market_rows(legacy_cached))
+            write_json(
+                cache_path,
+                {"updated_at": legacy_cached.get("updated_at") or now_ts, "categories": sorted(allowed), "markets": list(markets.values())},
+            )
+            return markets, state, "legacy_state_cache"
+        write_json(cache_path, legacy_cached)
+    cached = read_json(cache_path, {}) if cache_path else {}
+    if cached and now_ts - int(cached.get("updated_at") or 0) < ttl_seconds and active_cache_has_required_categories(cached):
+        markets = rows_to_markets(active_cache_market_rows(cached))
+        if cache_path and len(markets) != len(active_cache_market_rows(cached)):
+            write_json(
+                cache_path,
+                {"updated_at": cached.get("updated_at") or now_ts, "categories": sorted(allowed), "markets": list(markets.values())},
+            )
         return markets, state, "cache"
     markets: dict[str, dict[str, Any]] = {}
     fetched_categories: list[str] = []
     for category, tag_slugs in CATEGORY_TAG_SLUGS.items():
+        if category not in allowed:
+            continue
         events = client.list_events_paginated(
             closed=False,
             active=True,
@@ -1375,16 +1454,17 @@ def load_active_market_cache(
         )
         markets.update(market_records_from_events(events))
         fetched_categories.append(category)
+    scoped_markets = rows_to_markets(list(markets.values()))
     cache_value = {
         "updated_at": now_ts,
         "categories": fetched_categories,
-        "markets": list(markets.values()),
+        "markets": list(scoped_markets.values()),
     }
     if cache_path:
         write_json(cache_path, cache_value)
     else:
         state["active_market_cache"] = cache_value
-    return markets, state, "api"
+    return scoped_markets, state, "api"
 
 
 TEAM_LOGO_URL_RE = re.compile(
@@ -5339,6 +5419,11 @@ def command_follow(
             for wallet in lifecycle_wallets
         ),
     ]
+    open_condition_ids = {
+        condition_id
+        for condition_ids in open_condition_ids_by_wallet.values()
+        for condition_id in condition_ids
+    }
 
     active_markets, state, active_source = load_active_market_cache(
         client,
@@ -5347,6 +5432,10 @@ def command_follow(
         now_ts=now_ts,
         gamma_pages=args.gamma_pages,
         ttl_seconds=args.event_cache_ttl_minutes * 60,
+        observe_window_hours=args.observe_window_hours,
+        post_start_grace_seconds=args.post_start_trade_grace_seconds,
+        allowed_categories=set(FOLLOW_SIGNAL_CATEGORIES),
+        preserve_condition_ids=set(open_condition_ids),
     )
     active_markets_for_follow = {
         condition_id: market
