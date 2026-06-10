@@ -121,6 +121,15 @@ CATEGORY_REFRESH_CACHE_DIRS = {
     "raw_user_trades",
     "clob_market_metadata",
 }
+DEFAULT_REFRESH_CACHE_RETENTION_DAYS = {
+    "raw_market_trades": 7,
+    "raw_user_trades": 1,
+    "clob_market_metadata": 30,
+}
+LEGACY_COLLECTOR_CACHE_ROOTS = (
+    Path("collector_v2") / "esports",
+    Path("collector_v3") / "esports",
+)
 
 
 @contextmanager
@@ -148,7 +157,13 @@ def acquire_build_lock(data_dir: Path, *, blocking: bool = True):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def prepare_category_refresh_dir(category_dir: Path, *, max_lookback_days: int = 30, now_ts: int | None = None) -> None:
+def prepare_category_refresh_dir(
+    category_dir: Path,
+    *,
+    max_lookback_days: int = 30,
+    now_ts: int | None = None,
+    cache_retention_days_by_dir: dict[str, int] | None = None,
+) -> None:
     """Clear rebuild outputs while keeping reusable API caches bounded."""
     category_dir.mkdir(parents=True, exist_ok=True)
     for name in CATEGORY_REFRESH_OUTPUT_FILES:
@@ -156,19 +171,29 @@ def prepare_category_refresh_dir(category_dir: Path, *, max_lookback_days: int =
         if path.exists() or path.is_symlink():
             path.unlink()
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
-    cutoff_ts = now_ts - max(0, int(max_lookback_days)) * 86400
-    for dirname in CATEGORY_REFRESH_CACHE_DIRS:
-        cache_dir = category_dir / dirname
-        if not cache_dir.exists():
-            continue
-        for path in cache_dir.rglob("*"):
-            if (path.is_file() or path.is_symlink()) and int(path.stat().st_mtime) < cutoff_ts:
-                path.unlink()
-        for path in sorted((p for p in cache_dir.rglob("*") if p.is_dir()), key=lambda value: len(value.parts), reverse=True):
-            try:
-                path.rmdir()
-            except OSError:
-                pass
+    retention_days = {
+        dirname: min(max(0, int(max_lookback_days)), int(DEFAULT_REFRESH_CACHE_RETENTION_DAYS.get(dirname, max_lookback_days)))
+        for dirname in CATEGORY_REFRESH_CACHE_DIRS
+    }
+    for dirname, days in (cache_retention_days_by_dir or {}).items():
+        if dirname in CATEGORY_REFRESH_CACHE_DIRS:
+            retention_days[dirname] = min(max(0, int(max_lookback_days)), max(0, int(days)))
+
+    cache_roots = [category_dir, *(category_dir / relative for relative in LEGACY_COLLECTOR_CACHE_ROOTS)]
+    for cache_root in cache_roots:
+        for dirname in CATEGORY_REFRESH_CACHE_DIRS:
+            cache_dir = cache_root / dirname
+            if not cache_dir.exists():
+                continue
+            cutoff_ts = now_ts - retention_days[dirname] * 86400
+            for path in cache_dir.rglob("*"):
+                if (path.is_file() or path.is_symlink()) and int(path.stat().st_mtime) < cutoff_ts:
+                    path.unlink()
+            for path in sorted((p for p in cache_dir.rglob("*") if p.is_dir()), key=lambda value: len(value.parts), reverse=True):
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
 
 
 def category_refresh_cache_retention_days(args: argparse.Namespace) -> int:
@@ -177,8 +202,17 @@ def category_refresh_cache_retention_days(args: argparse.Namespace) -> int:
         1,
         effective_defaults["classification_lookback_days"],
         int(getattr(args, "market_trades_cache_ttl_days", 0) or 0),
+        int(getattr(args, "user_trades_cache_ttl_days", 0) or 0),
         30,  # CLOB condition metadata cache default.
     )
+
+
+def category_refresh_cache_retention_days_by_dir(args: argparse.Namespace) -> dict[str, int]:
+    return {
+        "raw_market_trades": max(1, int(getattr(args, "market_trades_cache_ttl_days", 7) or 7)),
+        "raw_user_trades": max(1, int(getattr(args, "user_trades_cache_ttl_days", 1) or 1)),
+        "clob_market_metadata": 30,
+    }
 
 
 def build_client(args: argparse.Namespace) -> PolymarketClient:
@@ -3566,6 +3600,8 @@ def resolve_collect_experimental_output_dir(args: argparse.Namespace, *, collect
     explicit = getattr(args, "output_dir", None)
     if explicit:
         return Path(explicit)
+    if collector_version == "v3":
+        return resolve_data_dir(args)
     root = Path(getattr(args, "data_dir", None) or DATA_DIR)
     return root / f"collector_{collector_version}" / "esports"
 
@@ -5803,6 +5839,7 @@ def command_run(args: argparse.Namespace) -> int:
                         category_dir,
                         max_lookback_days=category_refresh_cache_retention_days(args),
                         now_ts=now_ts,
+                        cache_retention_days_by_dir=category_refresh_cache_retention_days_by_dir(args),
                     )
                     command_collect(category_args(category), client=client)
                 finally:

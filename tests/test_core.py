@@ -7168,14 +7168,31 @@ class CoreTest(unittest.TestCase):
             fresh_cache = category_dir / "raw_market_trades" / "fresh.json"
             old_cache = category_dir / "raw_user_trades" / "old.json"
             old_nested_cache = category_dir / "clob_market_metadata" / "nested" / "old.json"
-            for path in [output_file, profile_file, classification_file, fresh_cache, old_cache, old_nested_cache]:
+            nested_v3_user_cache = category_dir / "collector_v3" / "esports" / "raw_user_trades" / "two_days_old.json"
+            nested_v3_fresh_user_cache = category_dir / "collector_v3" / "esports" / "raw_user_trades" / "fresh.json"
+            nested_v2_market_cache = category_dir / "collector_v2" / "esports" / "raw_market_trades" / "old.json"
+            for path in [
+                output_file,
+                profile_file,
+                classification_file,
+                fresh_cache,
+                old_cache,
+                old_nested_cache,
+                nested_v3_user_cache,
+                nested_v3_fresh_user_cache,
+                nested_v2_market_cache,
+            ]:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(path.name, encoding="utf-8")
             now_ts = 2_000_000
             old_mtime = now_ts - 40 * 86400
+            two_days_old_mtime = now_ts - 2 * 86400
+            eight_days_old_mtime = now_ts - 8 * 86400
             fresh_mtime = now_ts - 5 * 86400
             for path in [old_cache, old_nested_cache]:
                 os.utime(path, (old_mtime, old_mtime))
+            os.utime(nested_v3_user_cache, (two_days_old_mtime, two_days_old_mtime))
+            os.utime(nested_v2_market_cache, (eight_days_old_mtime, eight_days_old_mtime))
             os.utime(fresh_cache, (fresh_mtime, fresh_mtime))
 
             prepare_category_refresh_dir(category_dir, max_lookback_days=14, now_ts=now_ts)
@@ -7186,6 +7203,9 @@ class CoreTest(unittest.TestCase):
             self.assertTrue(fresh_cache.exists())
             self.assertFalse(old_cache.exists())
             self.assertFalse(old_nested_cache.exists())
+            self.assertFalse(nested_v3_user_cache.exists())
+            self.assertTrue(nested_v3_fresh_user_cache.exists())
+            self.assertFalse(nested_v2_market_cache.exists())
 
     def test_dashboard_runner_stop_allows_external_process(self):
         with TemporaryDirectory() as tmp:
@@ -10960,7 +10980,8 @@ class CoreTest(unittest.TestCase):
 
             self.assertIsNone(args.output_dir)
             self.assertEqual(command_collect_v3(args, client=FakeClient()), 0)
-            self.assertTrue((root / "collector_v3" / "esports" / "v3_build_summary.json").exists())
+            self.assertTrue((root / "v3_build_summary.json").exists())
+            self.assertFalse((root / "collector_v3" / "esports").exists())
 
     def test_collect_v3_uses_v1_style_user_history_depth_by_default(self):
         args = build_parser().parse_args(["collect-v3"])
