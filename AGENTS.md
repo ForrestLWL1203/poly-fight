@@ -413,6 +413,29 @@ Operational notes:
 - Do not edit live code directly on the VPS unless explicitly asked. Prefer
   local commit/push, then pull/deploy on the VPS.
 
+VPS deploy/restart checklist:
+
+```text
+1. Read local private ops notes outside git for the login method.
+2. Commit and push local changes to GitHub first.
+3. On the VPS, inspect the existing poly_fight runner/dashboard processes and
+   their cwd/argv before changing anything.
+4. In the live repo directory, fetch origin/main and fast-forward only.
+5. Restart the long-running paper runner with the same data/log/follow dirs,
+   stake settings, and --skip-initial-build shape used by the existing process.
+6. Restart the dashboard serve process with the same data dir, host/port,
+   dashboard user, cookie-secure setting, and runner stake setting.
+7. Update existing pid files to the new live PIDs if the manual restart path
+   owns them.
+8. Verify the repo HEAD, process cwd/argv, dashboard HTTP response, and the
+   latest follow_run_log.jsonl entry before reporting success.
+```
+
+When debugging follower latency on the VPS, check the latest run log for
+`tick_runtime_seconds`, `stage_seconds`, `wallet_trade_fetch_seconds`,
+`observed_trade_delay_seconds`, and `index_lag_lower_bound_seconds`. These
+separate local runner time from Polymarket data/index lag.
+
 ## Git Workflow Preference
 
 When the user asks to submit or push code, commit locally and push directly to
