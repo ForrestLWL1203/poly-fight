@@ -4979,6 +4979,29 @@ class CoreTest(unittest.TestCase):
         self.assertEqual([row["id"] for row in trades], ["t2", "t1"])
         self.assertEqual(client.calls, [0])
 
+    def test_follow_user_trades_can_run_shallow_incremental_poll(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def trades_for_user(self, wallet, *, limit=100, offset=0):
+                self.calls.append((limit, offset))
+                if offset == 0:
+                    return [{"id": f"new-{index}", "timestamp": 100 - index} for index in range(50)]
+                return [{"id": "cursor", "timestamp": 1}]
+
+        client = FakeClient()
+        trades = fetch_user_trades_until_cursor(
+            client,
+            "0xA",
+            previous_cursor={"timestamp": 1, "id": "cursor"},
+            limit=50,
+            max_pages=1,
+        )
+
+        self.assertEqual(len(trades), 50)
+        self.assertEqual(client.calls, [(50, 0)])
+
     def test_follow_stake_uses_wallet_cash_ratio_and_minimum(self):
         stake, tier, ratio = follow_stake_for_signal(
             wallet_trade_cash=3000,
@@ -11040,8 +11063,8 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.resolution_cache_ttl_seconds, 60)
         self.assertEqual(args.resolution_gamma_pages, 2)
         self.assertEqual(args.event_cache_ttl_minutes, 10)
-        self.assertEqual(args.user_trades_limit, 100)
-        self.assertEqual(args.user_trades_max_pages, 3)
+        self.assertEqual(args.user_trades_limit, 50)
+        self.assertEqual(args.user_trades_max_pages, 1)
         self.assertTrue(args.bootstrap_current_positions)
         self.assertEqual(args.max_follow_legs, 10)
         self.assertEqual(args.min_tick_seconds, 180)
@@ -11066,8 +11089,8 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.max_run_ticks, 1)
         self.assertEqual(args.pool_refresh_hours, 24)
         self.assertEqual(args.observe_window_hours, 24)
-        self.assertEqual(args.user_trades_limit, 100)
-        self.assertEqual(args.user_trades_max_pages, 3)
+        self.assertEqual(args.user_trades_limit, 50)
+        self.assertEqual(args.user_trades_max_pages, 1)
         self.assertTrue(args.bootstrap_current_positions)
         self.assertEqual(args.max_follow_legs, 10)
         self.assertEqual(args.error_retry_seconds, 180)
