@@ -29,6 +29,12 @@ ESPORTS_MIN_A_WILSON = 0.57
 SPORTS_MIN_A_WILSON = 0.50
 ESPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE = 0.08
 SPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE = 0.10
+ESPORTS_EMERGING_RECENT_7D_MIN_MARKETS = 3
+ESPORTS_EMERGING_RECENT_7D_MIN_POSITIVE_RATE = 0.80
+ESPORTS_EMERGING_RECENT_7D_MIN_ROI = 0.30
+ESPORTS_EMERGING_MIN_WILSON = ESPORTS_MIN_A_WILSON
+ESPORTS_EMERGING_MIN_CAPITAL_WEIGHTED_EDGE = ESPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE
+ESPORTS_EMERGING_MAX_MEDIAN_ENTRY_PRICE = 0.68
 # actual_minus_hold_pnl_rate 超过此值 = 利润主要靠盘中卖出（我们复制不了）→ 软标记
 SWING_DEPENDENT_RATE = 0.2
 # 卖出赢家侧且价格已经接近 1.0，大多是赛果基本确定后的释放资金，不按波段/提前卖出处理。
@@ -1922,6 +1928,41 @@ def wallet_bucket_min_sample(category: str, market_type: str) -> int:
     return ESPORTS_SUBMARKET_MIN_SAMPLE
 
 
+def emerging_bucket_reject_reasons(summary: dict[str, Any]) -> list[str]:
+    if str(summary.get("category") or "").lower() == "sports":
+        return ["emerging_non_esports"]
+    reasons: list[str] = []
+    if to_int(summary.get("recent_7d_market_count")) < ESPORTS_EMERGING_RECENT_7D_MIN_MARKETS:
+        reasons.append("emerging_recent_count_lt_min")
+    if to_float(summary.get("recent_7d_positive_rate")) < ESPORTS_EMERGING_RECENT_7D_MIN_POSITIVE_RATE:
+        reasons.append("emerging_recent_win_rate_lt_min")
+    if to_float(summary.get("recent_7d_roi")) < ESPORTS_EMERGING_RECENT_7D_MIN_ROI:
+        reasons.append("emerging_recent_roi_lt_min")
+    if to_float(summary.get("wilson_win_rate_lower_bound")) < ESPORTS_EMERGING_MIN_WILSON:
+        reasons.append("emerging_wilson_lt_min")
+    if to_float(summary.get("capital_weighted_edge")) < ESPORTS_EMERGING_MIN_CAPITAL_WEIGHTED_EDGE:
+        reasons.append("emerging_capital_edge_lt_min")
+    median_entry = to_float(summary.get("median_entry_price"))
+    if median_entry <= 0 or median_entry > ESPORTS_EMERGING_MAX_MEDIAN_ENTRY_PRICE:
+        reasons.append("emerging_median_entry_gt_max")
+    if to_float(summary.get("actual_minus_hold_pnl_rate")) > SWING_DEPENDENT_RATE:
+        reasons.append("emerging_swing_dependent")
+    if to_int(summary.get("bot_like_score")) >= 40:
+        reasons.append("emerging_bot_like")
+    behavior_market_count = to_int(summary.get("historical_trade_behavior_market_count"))
+    if (
+        to_int(summary.get("two_sided_trade_market_count")) > 0
+        and behavior_market_count >= TRADE_BEHAVIOR_MIN_MARKETS
+        and to_float(summary.get("two_sided_trade_market_rate")) > TRADE_BEHAVIOR_EXCLUDE_RATE
+    ):
+        reasons.append("emerging_systemic_two_sided")
+    high_churn_count = to_int(summary.get("high_churn_market_count"))
+    market_count = to_int(summary.get("participated_market_count")) or to_int(summary.get("esports_closed_count"))
+    if market_count > 0 and high_churn_count / market_count > MAX_HIGH_CHURN_MARKET_RATE:
+        reasons.append("emerging_high_churn")
+    return sorted(set(reasons))
+
+
 def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> dict[str, Any]:
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
     category = str(summary.get("category") or "").lower()
@@ -1936,6 +1977,8 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
     per_game_type_grades: dict[str, dict[str, Any]] = {}
     eligible_market_types: list[str] = []
     eligible_buckets: list[str] = []
+    eligible_market_type_modes: dict[str, str] = {}
+    eligible_bucket_modes: dict[str, str] = {}
     grade_rank = {"A": 5, "B": 4, "C": 3, "stale": 2, "excluded": 1, "unknown": 0}
     best_grade = classified.get("grade") or "unknown"
     best_rank = grade_rank.get(str(best_grade), 0)
@@ -1973,7 +2016,16 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
         bucket_classified["min_sample"] = min_sample
         per_type_grades[market_type] = bucket_classified
         if bucket_classified.get("grade") == "A":
+            bucket_classified["eligible_mode"] = "mature"
             eligible_market_types.append(market_type)
+            eligible_market_type_modes[market_type] = "mature"
+        else:
+            emerging_reasons = emerging_bucket_reject_reasons(bucket_input)
+            bucket_classified["emerging_reject_reasons"] = emerging_reasons
+            if not emerging_reasons:
+                bucket_classified["eligible_mode"] = "emerging"
+                eligible_market_types.append(market_type)
+                eligible_market_type_modes[market_type] = "emerging"
         bucket_rank = grade_rank.get(str(bucket_classified.get("grade")), 0)
         if bucket_rank > best_rank:
             best_grade = bucket_classified.get("grade")
@@ -2031,7 +2083,16 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
             )
             per_game_type_grades[key] = bucket_classified
             if bucket_classified.get("grade") == "A":
+                bucket_classified["eligible_mode"] = "mature"
                 eligible_buckets.append(key)
+                eligible_bucket_modes[key] = "mature"
+            else:
+                emerging_reasons = emerging_bucket_reject_reasons(bucket_input)
+                bucket_classified["emerging_reject_reasons"] = emerging_reasons
+                if not emerging_reasons:
+                    bucket_classified["eligible_mode"] = "emerging"
+                    eligible_buckets.append(key)
+                    eligible_bucket_modes[key] = "emerging"
             bucket_rank = grade_rank.get(str(bucket_classified.get("grade")), 0)
             if bucket_rank > best_rank:
                 best_grade = bucket_classified.get("grade")
@@ -2068,6 +2129,7 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
         }
     else:
         eligible_market_types = []
+        eligible_market_type_modes = {}
         classified = {**classified, "grade": best_grade}
     observed_market_types = sorted(
         (str(value) for value in per_type_grades if value),
@@ -2080,6 +2142,7 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
         "per_game_type": per_game_type,
         "per_game_type_grades": per_game_type_grades,
         "eligible_buckets": eligible_buckets,
+        "eligible_bucket_modes": {key: eligible_bucket_modes[key] for key in eligible_buckets if key in eligible_bucket_modes},
         "eligible_bucket_labels": [bucket_label(value) for value in eligible_buckets],
         "eligible_game_families": sorted({split_bucket_key(value)[0] for value in eligible_buckets if split_bucket_key(value)[0]}),
         "eligible_game_family_labels": [
@@ -2087,6 +2150,9 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
             for value in sorted({split_bucket_key(bucket)[0] for bucket in eligible_buckets if split_bucket_key(bucket)[0]})
         ],
         "eligible_market_types": eligible_market_types,
+        "eligible_market_type_modes": {
+            key: eligible_market_type_modes[key] for key in eligible_market_types if key in eligible_market_type_modes
+        },
         "eligible_market_type_labels": [MARKET_TYPE_LABELS.get(value, value) for value in eligible_market_types],
         "observed_market_types": observed_market_types,
         "observed_market_type_labels": [MARKET_TYPE_LABELS.get(value, value) for value in observed_market_types],

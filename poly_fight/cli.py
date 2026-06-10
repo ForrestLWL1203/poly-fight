@@ -2210,6 +2210,12 @@ def build_leaderboard_from_profiles(
                 if not followable_buckets:
                     continue
                 profile["eligible_buckets"] = followable_buckets
+                if isinstance(profile.get("eligible_bucket_modes"), dict):
+                    profile["eligible_bucket_modes"] = {
+                        key: profile["eligible_bucket_modes"][key]
+                        for key in followable_buckets
+                        if key in profile["eligible_bucket_modes"]
+                    }
                 profile["eligible_bucket_labels"] = [bucket_label(value) for value in followable_buckets]
                 eligible_market_types = sorted(
                     {split_bucket_key(value)[1] for value in followable_buckets},
@@ -2366,6 +2372,12 @@ def _with_esports_followable_market_types(profile: dict[str, Any]) -> dict[str, 
             return None
         filtered = dict(profile)
         filtered["eligible_buckets"] = followable_buckets
+        if isinstance(profile.get("eligible_bucket_modes"), dict):
+            filtered["eligible_bucket_modes"] = {
+                key: profile["eligible_bucket_modes"][key]
+                for key in followable_buckets
+                if key in profile["eligible_bucket_modes"]
+            }
         filtered["eligible_bucket_labels"] = [bucket_label(value) for value in followable_buckets]
         filtered["eligible_market_types"] = sorted(
             {split_bucket_key(value)[1] for value in followable_buckets},
@@ -2635,6 +2647,7 @@ def esports_bucket_score(
         "max_single_market_cash": to_float(candidate_metrics.get("max_single_market_cash")),
         "tail_entry_rate": round(tail_rate, 8),
         "high_churn_rate": round(high_churn_rate, 8),
+        "eligible_mode": metrics.get("eligible_mode"),
     }
 
 
@@ -3152,6 +3165,15 @@ def _leaderboard_reject_reasons_for_profile(
         reasons.append("old_scoring_version")
     if profile.get("per_type_grades") is not None and not eligible_market_types:
         reasons.append("no_eligible_per_type")
+        if str(profile.get("category") or "esports").lower() == "esports":
+            per_game_type_grades = (
+                profile.get("per_game_type_grades")
+                if isinstance(profile.get("per_game_type_grades"), dict)
+                else {}
+            )
+            for grade_metrics in per_game_type_grades.values():
+                if isinstance(grade_metrics, dict):
+                    reasons.extend(str(value) for value in grade_metrics.get("emerging_reject_reasons") or [] if value)
     if profile.get("grade") != "A" and not eligible_market_types:
         reasons.append("not_A_no_eligible_type")
     if not eligible_market_types and to_float(profile.get("esports_roi")) < 0.30:
@@ -3903,6 +3925,7 @@ def build_collector_diagnostics(
 ) -> dict[str, Any]:
     profile_grade_counts: dict[str, int] = {}
     eligible_bucket_counts: dict[str, int] = {}
+    eligible_bucket_mode_counts: dict[str, int] = {}
     eligible_market_type_counts: dict[str, int] = {}
     qualified_seed_bucket_counts: dict[str, int] = {}
     leaderboard_best_bucket_counts: dict[str, int] = {}
@@ -3936,7 +3959,19 @@ def build_collector_diagnostics(
     for wallet, profile in profiles_by_wallet.items():
         _increment_count(profile_grade_counts, str(profile.get("grade") or "unknown"))
         for bucket in profile.get("eligible_buckets") or []:
-            _increment_count(eligible_bucket_counts, str(bucket))
+            bucket_key_value = str(bucket)
+            _increment_count(eligible_bucket_counts, bucket_key_value)
+            mode = ""
+            if isinstance(profile.get("eligible_bucket_modes"), dict):
+                mode = str(profile["eligible_bucket_modes"].get(bucket_key_value) or "")
+            per_game_type_grades = (
+                profile.get("per_game_type_grades")
+                if isinstance(profile.get("per_game_type_grades"), dict)
+                else {}
+            )
+            if not mode and isinstance(per_game_type_grades.get(bucket_key_value), dict):
+                mode = str(per_game_type_grades[bucket_key_value].get("eligible_mode") or "")
+            _increment_count(eligible_bucket_mode_counts, mode or "unknown")
         for market_type in profile.get("eligible_market_types") or []:
             _increment_count(eligible_market_type_counts, str(market_type))
         if normalize_wallet(wallet or profile.get("wallet")) in leaderboard_wallets:
@@ -3982,6 +4017,7 @@ def build_collector_diagnostics(
         "qualified_seed_bucket_counts": _sorted_count_dict(qualified_seed_bucket_counts),
         "profile_grade_counts": _sorted_count_dict(profile_grade_counts),
         "eligible_bucket_counts": _sorted_count_dict(eligible_bucket_counts),
+        "eligible_bucket_mode_counts": _sorted_count_dict(eligible_bucket_mode_counts),
         "eligible_market_type_counts": _sorted_count_dict(eligible_market_type_counts),
         "leaderboard_best_bucket_counts": _sorted_count_dict(leaderboard_best_bucket_counts),
         "leaderboard_best_game_family_counts": _sorted_count_dict(leaderboard_best_game_family_counts),
@@ -4454,6 +4490,10 @@ def copyable_final_gate_ok(row: dict[str, Any]) -> bool:
     if not copyable_two_sided_behavior_ok(candidate_metrics, metrics):
         return False
     participated = int(candidate_metrics.get("participated_market_count") or 0)
+    if _eligible_bucket_mode(row, bucket_key) == "emerging" and participated > 0:
+        high_churn_rate = int(candidate_metrics.get("high_churn_market_count") or 0) / participated
+        if high_churn_rate > MAX_HIGH_CHURN_MARKET_RATE:
+            return False
     if participated > 0:
         tail_rate = int(candidate_metrics.get("tail_entry_market_count") or 0) / participated
         if tail_rate > MAX_COPYABLE_TAIL_ENTRY_RATE:
@@ -4479,11 +4519,26 @@ def _copyable_reject_reasons(row: dict[str, Any]) -> list[str]:
         reasons.append("two_sided_over_limit")
         reasons.extend(two_sided_reasons)
     participated = int(candidate_metrics.get("participated_market_count") or 0)
+    if _eligible_bucket_mode(row, bucket_key_value) == "emerging" and participated > 0:
+        high_churn_rate = int(candidate_metrics.get("high_churn_market_count") or 0) / participated
+        if high_churn_rate > MAX_HIGH_CHURN_MARKET_RATE:
+            reasons.append("emerging_high_churn")
     if participated > 0:
         tail_rate = int(candidate_metrics.get("tail_entry_market_count") or 0) / participated
         if tail_rate > MAX_COPYABLE_TAIL_ENTRY_RATE:
             reasons.append("tail_entry_over_limit")
     return sorted(set(reasons))
+
+
+def _eligible_bucket_mode(row: dict[str, Any], bucket_key: str) -> str:
+    if isinstance(row.get("eligible_bucket_modes"), dict):
+        mode = str(row["eligible_bucket_modes"].get(bucket_key) or "")
+        if mode:
+            return mode
+    per_game_type_grades = row.get("per_game_type_grades") if isinstance(row.get("per_game_type_grades"), dict) else {}
+    if isinstance(per_game_type_grades.get(bucket_key), dict):
+        return str(per_game_type_grades[bucket_key].get("eligible_mode") or "")
+    return ""
 
 
 def momentum_recent_ok(row: dict[str, Any]) -> bool:

@@ -1799,6 +1799,114 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(rated["per_type_grades"]["game_winner"]["grade"], "A")
         self.assertNotIn("thin_sample", rated["per_type_grades"]["game_winner"]["reasons"])
 
+    def test_main_match_thin_but_strong_recent_bucket_is_emerging_eligible(self):
+        now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
+        positions = [
+            {
+                "conditionId": f"m{i}",
+                "totalBought": 1000,
+                "realizedPnl": 600,
+                "avgPrice": 0.5,
+                "timestamp": now_ts - i * 3600,
+            }
+            for i in range(5)
+        ]
+        summary = summarize_closed_positions(
+            positions,
+            {f"m{i}" for i in range(5)},
+            condition_type_by_id={f"m{i}": "main_match" for i in range(5)},
+            condition_game_family_by_id={f"m{i}": "dota2" for i in range(5)},
+            now_ts=now_ts,
+        )
+
+        rated = classify_wallet(summary, now_ts=now_ts)
+
+        self.assertEqual(rated["eligible_buckets"], ["dota2:main_match"])
+        self.assertEqual(rated["eligible_bucket_modes"], {"dota2:main_match": "emerging"})
+        self.assertEqual(rated["per_game_type_grades"]["dota2:main_match"]["eligible_mode"], "emerging")
+        self.assertIn("thin_sample", rated["per_game_type_grades"]["dota2:main_match"]["reasons"])
+
+    def test_emerging_bucket_rejects_too_few_or_low_quality_recent_samples(self):
+        now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
+
+        def rated_profile(wallet, *, count=3, pnl=600, avg_price=0.5, total_bought=1000, bot_score=0):
+            positions = [
+                {
+                    "conditionId": f"{wallet}-{i}",
+                    "totalBought": total_bought,
+                    "realizedPnl": pnl,
+                    "avgPrice": avg_price,
+                    "timestamp": now_ts - i * 3600,
+                }
+                for i in range(count)
+            ]
+            summary = summarize_closed_positions(
+                positions,
+                {f"{wallet}-{i}".lower() for i in range(count)},
+                condition_type_by_id={f"{wallet}-{i}".lower(): "main_match" for i in range(count)},
+                condition_game_family_by_id={f"{wallet}-{i}".lower(): "cs2" for i in range(count)},
+                now_ts=now_ts,
+                bot_like_score=bot_score,
+            )
+            return classify_wallet(summary, now_ts=now_ts)
+
+        too_few = rated_profile("few", count=2)
+        low_roi = rated_profile("roi", pnl=100)
+        high_entry = rated_profile("entry", avg_price=0.72)
+        weak_edge_positions = [
+            {
+                "conditionId": f"edge-win-{i}",
+                "totalBought": 1000,
+                "realizedPnl": 600,
+                "avgPrice": 0.5,
+                "timestamp": now_ts - i * 3600,
+            }
+            for i in range(4)
+        ] + [
+            {
+                "conditionId": "edge-loss",
+                "totalBought": 10000,
+                "realizedPnl": -100,
+                "avgPrice": 0.5,
+                "timestamp": now_ts - 5 * 3600,
+            }
+        ]
+        weak_edge_summary = summarize_closed_positions(
+            weak_edge_positions,
+            {row["conditionId"].lower() for row in weak_edge_positions},
+            condition_type_by_id={row["conditionId"].lower(): "main_match" for row in weak_edge_positions},
+            condition_game_family_by_id={row["conditionId"].lower(): "cs2" for row in weak_edge_positions},
+            now_ts=now_ts,
+        )
+        weak_edge = classify_wallet(weak_edge_summary, now_ts=now_ts)
+        bot_like = rated_profile("bot", bot_score=45)
+
+        self.assertEqual(too_few["eligible_buckets"], [])
+        self.assertIn(
+            "emerging_recent_count_lt_min",
+            too_few["per_game_type_grades"]["cs2:main_match"]["emerging_reject_reasons"],
+        )
+        self.assertEqual(low_roi["eligible_buckets"], [])
+        self.assertIn(
+            "emerging_recent_roi_lt_min",
+            low_roi["per_game_type_grades"]["cs2:main_match"]["emerging_reject_reasons"],
+        )
+        self.assertEqual(high_entry["eligible_buckets"], [])
+        self.assertIn(
+            "emerging_median_entry_gt_max",
+            high_entry["per_game_type_grades"]["cs2:main_match"]["emerging_reject_reasons"],
+        )
+        self.assertEqual(weak_edge["eligible_buckets"], [])
+        self.assertIn(
+            "emerging_capital_edge_lt_min",
+            weak_edge["per_game_type_grades"]["cs2:main_match"]["emerging_reject_reasons"],
+        )
+        self.assertEqual(bot_like["eligible_buckets"], [])
+        self.assertIn(
+            "emerging_bot_like",
+            bot_like["per_game_type_grades"]["cs2:main_match"]["emerging_reject_reasons"],
+        )
+
     def test_closed_position_wilson_uses_80_percent_confidence(self):
         positions = []
         for index in range(11):
@@ -11152,6 +11260,7 @@ class CoreTest(unittest.TestCase):
             "grade": "A",
             "scoring_version": SCORING_VERSION,
             "eligible_buckets": ["dota2:game_winner"],
+            "eligible_bucket_modes": {"dota2:game_winner": "emerging"},
             "eligible_market_types": ["game_winner"],
             "last_esports_trade_at": now_ts - 3600,
             "esports_roi": 0.20,
@@ -11176,6 +11285,7 @@ class CoreTest(unittest.TestCase):
             "per_game_type_grades": {
                 "dota2:game_winner": {
                     "grade": "A",
+                    "eligible_mode": "emerging",
                     "esports_closed_count": 12,
                     "positive_market_rate": 0.70,
                     "wilson_win_rate_lower_bound": 0.60,
@@ -11221,6 +11331,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(diagnostics["leaderboard_best_bucket_counts"], {"cs2:main_match": 1})
         self.assertEqual(diagnostics["leaderboard_best_game_family_counts"], {"cs2": 1})
         self.assertEqual(diagnostics["qualified_seed_bucket_counts"], {"lol:main_match": 1})
+        self.assertEqual(diagnostics["eligible_bucket_mode_counts"], {"emerging": 1})
         self.assertIn("dota2:game_winner", diagnostics["eligible_bucket_reject_reasons"])
         self.assertEqual(
             diagnostics["copyable_reject_reasons_by_bucket"]["dota2:game_winner"],
@@ -11292,6 +11403,56 @@ class CoreTest(unittest.TestCase):
         leaderboard = build_seeded_leaderboard({"0xa": profile("0xA")}, now_ts=now_ts)
 
         self.assertEqual([row["wallet"] for row in leaderboard], ["0xA"])
+
+    def test_collector_leaderboard_includes_emerging_bucket_wallets(self):
+        now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
+        positions = [
+            {
+                "conditionId": f"emerging{i}",
+                "totalBought": 1000,
+                "realizedPnl": 600,
+                "avgPrice": 0.5,
+                "timestamp": now_ts - i * 3600,
+            }
+            for i in range(5)
+        ]
+        summary = summarize_closed_positions(
+            positions,
+            {f"emerging{i}" for i in range(5)},
+            condition_type_by_id={f"emerging{i}": "main_match" for i in range(5)},
+            condition_game_family_by_id={f"emerging{i}": "dota2" for i in range(5)},
+            now_ts=now_ts,
+        )
+        profile = {
+            **classify_wallet(summary, now_ts=now_ts),
+            "wallet": "0xemerging",
+            "category": "esports",
+            "candidate": {
+                "qualified_buckets": ["dota2:main_match"],
+                "per_game_type_candidate": {
+                    "dota2:main_match": {
+                        "participated_market_count": 5,
+                        "avg_market_cash": 500,
+                        "two_sided_market_count": 0,
+                        "tail_entry_market_count": 0,
+                        "high_churn_market_count": 0,
+                    }
+                },
+            },
+        }
+        churn_profile = json.loads(json.dumps(profile))
+        churn_profile["wallet"] = "0xchurn"
+        churn_profile["candidate"]["per_game_type_candidate"]["dota2:main_match"]["high_churn_market_count"] = 3
+
+        result = build_collector_leaderboard(
+            {"0xemerging": profile, "0xchurn": churn_profile},
+            now_ts=now_ts,
+        )
+
+        self.assertEqual([row["wallet"] for row in result["leaderboard"]], ["0xemerging"])
+        self.assertEqual(result["leaderboard"][0]["best_bucket"], "dota2:main_match")
+        self.assertEqual(result["leaderboard"][0]["eligible_bucket_modes"], {"dota2:main_match": "emerging"})
+        self.assertIn("0xchurn", {row["wallet"] for row in result["watch"]})
 
     def test_strict_final_gate_uses_bucket_metrics_for_specialists(self):
         now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
