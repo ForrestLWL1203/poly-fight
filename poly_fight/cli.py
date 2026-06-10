@@ -37,7 +37,6 @@ from .core import (
     MAP_WINNER,
     analyze_holders,
     build_candidate_wallets,
-    build_candidate_wallets_from_holders,
     build_classification_set,
     build_discovery_slate,
     bucket_key,
@@ -4469,7 +4468,7 @@ def _command_collect_wallets(
             response = client.market_positions(
                 condition_id,
                 limit=getattr(args, "positions_per_market", 20),
-                sort_by=getattr(args, "seed_sort_by", "TOTAL_PNL"),
+                sort_by="TOTAL_PNL",
                 sort_direction="DESC",
             )
             return condition_id, response or [], None
@@ -4556,8 +4555,8 @@ def _command_collect_wallets(
             data_dir=output_dir,
             now_ts=now_ts,
             cache_ttl_days=getattr(args, "user_trades_cache_ttl_days", 1),
-            force_refresh=getattr(args, "refresh_user_trades", False),
-            use_cache=not getattr(args, "no_user_trades_cache", False),
+            force_refresh=False,
+            use_cache=True,
             include_source=True,
         )
         return wallet, trades, source
@@ -4686,18 +4685,17 @@ def _command_collect_wallets(
             "high_churn_hard_excluded": False,
         }
     )
-    if not getattr(args, "no_dashboard_publish", False):
-        dashboard_publish = publish_collector_dashboard_outputs(
-            output_dir,
-            resolve_data_dir(args),
-            summary=summary,
-            now_ts=now_ts,
-        )
-        summary["dashboard_publish"] = dashboard_publish
-        write_json(
-            resolve_data_dir(args) / "build_summary.json",
-            {**summary, "dashboard_publish": dashboard_publish},
-        )
+    dashboard_publish = publish_collector_dashboard_outputs(
+        output_dir,
+        resolve_data_dir(args),
+        summary=summary,
+        now_ts=now_ts,
+    )
+    summary["dashboard_publish"] = dashboard_publish
+    write_json(
+        resolve_data_dir(args) / "build_summary.json",
+        {**summary, "dashboard_publish": dashboard_publish},
+    )
     write_json(output_dir / f"{prefix}_build_summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
@@ -4895,122 +4893,89 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
     mark_stage("discovery_slate")
 
     trades_by_market: dict[str, list[dict]] = {}
-    holders_by_market: dict[str, list[dict]] = {}
-    prices_by_market: dict[str, list[float]] = {}
     partial_markets = []
     market_trades_cache_hits = 0
     market_trades_api_fetches = 0
-    if args.discovery_source == "holders":
-        def fetch_holders_for_market(market: dict[str, Any]) -> tuple[str, list[dict], list[float], bool]:
-            condition_id = market["condition_id"]
-            try:
-                return condition_id, client.holders(condition_id, limit=args.holders_limit), market.get("outcome_prices") or [], False
-            except Exception:
-                return condition_id, [], market.get("outcome_prices") or [], True
+    def fetch_trades_for_market(market: dict[str, Any]) -> tuple[str, list[dict], bool, str]:
+        condition_id = market["condition_id"]
+        try:
+            trades, partial, trades_source = fetch_market_trades_cached(
+                client,
+                condition_id,
+                data_dir=data_dir,
+                now_ts=now_ts,
+                page_limit=args.trades_page_limit,
+                max_pages=args.max_pages_per_market,
+                min_trade_cash=args.min_trade_cash,
+                cache_ttl_days=args.market_trades_cache_ttl_days,
+                force_refresh=args.refresh_market_trades,
+                use_cache=not args.no_market_trades_cache,
+            )
+            return condition_id, trades, partial, trades_source
+        except Exception:
+            return condition_id, [], True, "error"
 
-        holder_results = run_ordered_io_tasks(
-            discovery_slate,
-            fetch_holders_for_market,
-            max_workers=args.max_workers,
-        )
-        for result in holder_results:
-            if isinstance(result, Exception):
-                continue
-            condition_id, holders, prices, partial = result
-            holders_by_market[condition_id] = holders
-            prices_by_market[condition_id] = prices
-            if partial:
-                partial_markets.append(condition_id)
-        candidates = build_candidate_wallets_from_holders(
-            holders_by_market,
-            prices_by_market,
-            participation_threshold=args.participation_threshold,
-            top_participation_count=args.top_participation_count,
-            total_usd_threshold=args.total_cash_threshold,
-            single_market_usd_threshold=args.single_market_cash_threshold,
-            max_candidate_wallets=args.max_candidate_wallets,
-        )
-    else:
-        def fetch_trades_for_market(market: dict[str, Any]) -> tuple[str, list[dict], bool, str]:
-            condition_id = market["condition_id"]
-            try:
-                trades, partial, trades_source = fetch_market_trades_cached(
-                    client,
-                    condition_id,
-                    data_dir=data_dir,
-                    now_ts=now_ts,
-                    page_limit=args.trades_page_limit,
-                    max_pages=args.max_pages_per_market,
-                    min_trade_cash=args.min_trade_cash,
-                    cache_ttl_days=args.market_trades_cache_ttl_days,
-                    force_refresh=args.refresh_market_trades,
-                    use_cache=not args.no_market_trades_cache,
-                )
-                return condition_id, trades, partial, trades_source
-            except Exception:
-                return condition_id, [], True, "error"
-
-        trade_results = run_ordered_io_tasks(
-            discovery_slate,
-            fetch_trades_for_market,
-            max_workers=args.max_workers,
-        )
-        for result in trade_results:
-            if isinstance(result, Exception):
-                continue
-            condition_id, trades, partial, trades_source = result
-            trades_by_market[condition_id] = trades
-            if partial:
-                partial_markets.append(condition_id)
-            if trades_source == "cache":
-                market_trades_cache_hits += 1
-            else:
-                market_trades_api_fetches += 1
-        market_end_times = {}
-        market_start_times = {}
-        for market in discovery_slate:
-            end_dt = parse_dt(market.get("end_date"))
-            if end_dt:
-                market_end_times[market["condition_id"]] = int(end_dt.timestamp())
-            start_dt = parse_dt(market.get("match_start_time") or market.get("market_start_time"))
-            if start_dt:
-                market_start_times[market["condition_id"]] = int(start_dt.timestamp())
-        candidates = build_candidate_wallets(
-            trades_by_market,
-            market_type_by_id={
-                str(market.get("condition_id") or "").lower(): str(market.get("market_type") or "main_match")
-                for market in discovery_slate
-                if market.get("condition_id")
-            },
-            market_game_family_by_id={
-                str(market.get("condition_id") or "").lower(): str(market.get("game_family") or "")
-                for market in discovery_slate
-                if market.get("condition_id") and market.get("game_family")
-            },
-            market_end_times=market_end_times,
-            market_start_times=market_start_times,
-            min_trade_cash=args.min_trade_cash,
-            participation_threshold=args.participation_threshold,
-            top_participation_count=args.top_participation_count,
-            total_cash_threshold=args.total_cash_threshold,
-            single_market_cash_threshold=args.single_market_cash_threshold,
-            max_candidate_wallets=args.max_candidate_wallets,
-            candidate_wallets_per_market_type=(
-                ESPORTS_DEFAULT_CANDIDATE_WALLETS_PER_MARKET_TYPE if category == "esports" else None
-            ),
-            candidate_wallets_per_game_family=(
-                ESPORTS_DEFAULT_CANDIDATE_WALLETS_PER_MARKET_TYPE if category == "esports" else None
-            ),
-            candidate_game_family_thresholds=(
-                ESPORTS_CANDIDATE_GAME_FAMILY_THRESHOLDS if category == "esports" else None
-            ),
-        )
+    trade_results = run_ordered_io_tasks(
+        discovery_slate,
+        fetch_trades_for_market,
+        max_workers=args.max_workers,
+    )
+    for result in trade_results:
+        if isinstance(result, Exception):
+            continue
+        condition_id, trades, partial, trades_source = result
+        trades_by_market[condition_id] = trades
+        if partial:
+            partial_markets.append(condition_id)
+        if trades_source == "cache":
+            market_trades_cache_hits += 1
+        else:
+            market_trades_api_fetches += 1
+    market_end_times = {}
+    market_start_times = {}
+    for market in discovery_slate:
+        end_dt = parse_dt(market.get("end_date"))
+        if end_dt:
+            market_end_times[market["condition_id"]] = int(end_dt.timestamp())
+        start_dt = parse_dt(market.get("match_start_time") or market.get("market_start_time"))
+        if start_dt:
+            market_start_times[market["condition_id"]] = int(start_dt.timestamp())
+    candidates = build_candidate_wallets(
+        trades_by_market,
+        market_type_by_id={
+            str(market.get("condition_id") or "").lower(): str(market.get("market_type") or "main_match")
+            for market in discovery_slate
+            if market.get("condition_id")
+        },
+        market_game_family_by_id={
+            str(market.get("condition_id") or "").lower(): str(market.get("game_family") or "")
+            for market in discovery_slate
+            if market.get("condition_id") and market.get("game_family")
+        },
+        market_end_times=market_end_times,
+        market_start_times=market_start_times,
+        min_trade_cash=args.min_trade_cash,
+        participation_threshold=args.participation_threshold,
+        top_participation_count=args.top_participation_count,
+        total_cash_threshold=args.total_cash_threshold,
+        single_market_cash_threshold=args.single_market_cash_threshold,
+        max_candidate_wallets=args.max_candidate_wallets,
+        candidate_wallets_per_market_type=(
+            ESPORTS_DEFAULT_CANDIDATE_WALLETS_PER_MARKET_TYPE if category == "esports" else None
+        ),
+        candidate_wallets_per_game_family=(
+            ESPORTS_DEFAULT_CANDIDATE_WALLETS_PER_MARKET_TYPE if category == "esports" else None
+        ),
+        candidate_game_family_thresholds=(
+            ESPORTS_CANDIDATE_GAME_FAMILY_THRESHOLDS if category == "esports" else None
+        ),
+    )
     mark_stage("market_trades_fetch")
     profile_candidates = filter_profile_candidates(
         candidates,
         min_participated_markets=effective_defaults["min_profile_participated_markets"],
         min_avg_market_cash=args.min_profile_avg_market_cash,
-        require_clean_discovery=not args.allow_dirty_profile_candidates,
+        require_clean_discovery=True,
         market_type_thresholds=ESPORTS_CANDIDATE_MARKET_TYPE_THRESHOLDS if category == "esports" else None,
         game_family_thresholds=ESPORTS_CANDIDATE_GAME_FAMILY_THRESHOLDS if category == "esports" else None,
     )
@@ -5145,11 +5110,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
                 condition_game_family_by_id=condition_game_family_by_id,
                 user_trades_loader=load_user_trades,
                 closed_positions_loader=load_closed_positions,
-                current_positions_loader=(
-                    (lambda w: client.positions(w, limit=100))
-                    if args.check_current_positions
-                    else (lambda w: [])
-                ),
+                current_positions_loader=lambda _wallet: [],
                 now_ts=now_ts,
             )
         except Exception as exc:
@@ -5202,7 +5163,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         require_tail_entry_field=True,
         require_current_scoring_version=True,
         max_leaderboard_wallets=args.max_leaderboard_wallets,
-        min_pre_match_entry_rate=getattr(args, "min_pre_match_entry_rate", 0.0),
+        min_pre_match_entry_rate=0.0,
         league_event_counts=league_event_counts if category == "sports" else None,
     )
     overlap_report = build_wallet_overlap_report(leaderboard)
@@ -5255,7 +5216,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         "market_trades_cache_hits": market_trades_cache_hits,
         "market_trades_api_fetches": market_trades_api_fetches,
         "partial_market_trades": partial_markets,
-        "discovery_source": args.discovery_source,
+        "discovery_source": "trades",
         "slate": slate_meta,
         "diagnostics": diagnostics,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -5343,8 +5304,6 @@ def command_follow(
     *,
     emit: bool = True,
 ) -> dict[str, Any]:
-    if args.execution_mode != "paper":
-        raise SystemExit("Only paper execution mode is implemented.")
     client = client or build_client(args)
     data_dir = resolve_dashboard_root(args)
     follow_dir = resolve_follow_dir(args, data_dir)
@@ -5526,7 +5485,7 @@ def command_follow(
                     max_pages=args.user_trades_max_pages,
                 )
                 positions = []
-                if scope_key in eligible_wallet_set and previous_cursor is None and args.bootstrap_current_positions:
+                if scope_key in eligible_wallet_set and previous_cursor is None:
                     positions = client.positions(wallet, limit=args.positions_limit)
                 return scope_key, trades, positions
             except Exception:
@@ -5548,7 +5507,7 @@ def command_follow(
             new_trades, next_cursor, cold_start = select_new_trades(trades, previous_cursor)
             if cold_start:
                 cold_start_wallet_count += 1
-                if wallet_can_open_new and args.bootstrap_current_positions:
+                if wallet_can_open_new:
                     bootstrap_position_request_count += 1
                 if positions:
                     bootstrap_trades = bootstrap_position_trades(
@@ -5583,7 +5542,7 @@ def command_follow(
                         eligible_buckets=eligible_buckets_by_wallet.get(scope_key),
                         eligible_category=category,
                         eligible_leagues=eligible_leagues_by_wallet.get(scope_key),
-                        conflict_policy=args.conflict_policy,
+                        conflict_policy="dual_follow",
                         bankroll_usdc=bankroll_usdc,
                     )
                     after_ids = {signal.get("signal_id") for signal in open_signals}
@@ -5637,7 +5596,7 @@ def command_follow(
                 eligible_buckets=eligible_buckets_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 eligible_category=category if wallet_can_open_new else None,
                 eligible_leagues=eligible_leagues_by_wallet.get(scope_key) if wallet_can_open_new else None,
-                conflict_policy=args.conflict_policy,
+                conflict_policy="dual_follow",
                 bankroll_usdc=bankroll_usdc,
             )
             after_ids = {signal.get("signal_id") for signal in open_signals}
@@ -5666,10 +5625,9 @@ def command_follow(
 
     open_signals, clv_stats = apply_closing_line_snapshots(open_signals, active_markets, now_ts=now_ts)
     closing_line_snapshot_count += clv_stats.get("closing_line_snapshot_count", 0)
-    if args.consensus_block_opposite:
-        contested_condition_ids = contested_markets(open_signals, now_ts=now_ts)
-        open_signals, contested_stats = apply_contested_flags(open_signals, contested_condition_ids, now_ts=now_ts)
-        contested_signal_count += contested_stats.get("contested_signal_count", 0)
+    contested_condition_ids = contested_markets(open_signals, now_ts=now_ts)
+    open_signals, contested_stats = apply_contested_flags(open_signals, contested_condition_ids, now_ts=now_ts)
+    contested_signal_count += contested_stats.get("contested_signal_count", 0)
 
     exited_signals = [signal for signal in open_signals if signal.get("status") == "exited"]
     open_signals = [signal for signal in open_signals if signal.get("status") != "exited"]
@@ -5767,8 +5725,6 @@ def command_follow(
 
 
 def command_run(args: argparse.Namespace) -> int:
-    if args.execution_mode != "paper":
-        raise SystemExit("Only paper execution mode is implemented.")
     client = build_client(args)
     now_init = int(datetime.now(timezone.utc).timestamp())
     last_build_at = now_init if args.skip_initial_build else 0
@@ -5985,8 +5941,6 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--market-trades-cache-ttl-days", type=int, default=7)
         subparser.add_argument("--refresh-market-trades", action="store_true")
         subparser.add_argument("--no-market-trades-cache", action="store_true")
-        subparser.add_argument("--discovery-source", choices=["trades", "holders"], default="trades")
-        subparser.add_argument("--holders-limit", type=int, default=20)
         subparser.add_argument("--min-trade-cash", type=float, default=50)
         subparser.add_argument("--participation-threshold", type=int, default=8)
         subparser.add_argument("--top-participation-count", type=int, default=100)
@@ -6005,11 +5959,6 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--leaderboard-min-participated-markets", type=int, default=None)
         subparser.add_argument("--leaderboard-min-avg-market-cash", type=float, default=1_500)
         subparser.add_argument("--max-leaderboard-wallets", type=int, default=30)
-        # Soft followability filter: require this fraction of pre-match (before kickoff)
-        # entries. 0 = off (default). Useful for sports where some alpha is in-game.
-        subparser.add_argument("--min-pre-match-entry-rate", type=float, default=0.0)
-        subparser.add_argument("--allow-dirty-profile-candidates", action="store_true")
-        subparser.add_argument("--check-current-positions", action="store_true")
         subparser.add_argument("--profile-refresh-ttl-days", type=int, default=7)
         subparser.add_argument("--profile-store-max-age-days", type=int, default=180)
         subparser.set_defaults(func=command_build_leaderboard)
@@ -6029,23 +5978,17 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--post-start-trade-grace-seconds", type=int, default=900)
         subparser.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=False)
         subparser.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
-        subparser.add_argument("--execution-mode", choices=["paper", "live"], default="paper")
         subparser.add_argument("--run-log-retention-days", type=int, default=7)
         subparser.add_argument("--gamma-pages", type=int, default=3)
         subparser.add_argument("--positions-limit", type=int, default=100)
         subparser.add_argument("--user-trades-limit", type=int, default=50)
         subparser.add_argument("--user-trades-max-pages", type=int, default=1)
-        subparser.add_argument("--bootstrap-current-positions", dest="bootstrap_current_positions", action="store_true", default=True)
-        subparser.add_argument("--no-bootstrap-current-positions", dest="bootstrap_current_positions", action="store_false")
         subparser.add_argument("--max-follow-legs", type=int, default=10)
         subparser.add_argument("--min-tick-seconds", type=int, default=180)
         subparser.add_argument("--max-tick-seconds", type=int, default=900)
         # Fixed polling cadence (seconds). >0 overrides the adaptive min/max curve so every
         # wallet is checked on one steady interval; 0 restores the start-time-aware backoff.
         subparser.add_argument("--tick-seconds", type=int, default=120)
-        subparser.add_argument("--consensus-block-opposite", dest="consensus_block_opposite", action="store_true", default=True)
-        subparser.add_argument("--no-consensus-block-opposite", dest="consensus_block_opposite", action="store_false")
-        subparser.add_argument("--conflict-policy", choices=["dual_follow", "exit_on_opposite"], default="dual_follow")
         subparser.add_argument("--quarantine-sell-frac", type=float, default=0.2)
         subparser.add_argument("--max-workers", type=int, default=8)
         subparser.add_argument("--max-requests-per-second", type=float, default=10)
@@ -6057,7 +6000,6 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--lookback-days", type=int, default=30)
         subparser.add_argument("--bucket-market-limit", type=int, default=50)
         subparser.add_argument("--positions-per-market", type=int, default=20)
-        subparser.add_argument("--seed-sort-by", choices=["TOTAL_PNL", "REALIZED_PNL", "CASH_PNL", "TOKENS"], default="TOTAL_PNL")
         subparser.add_argument("--max-profile-wallets", type=int, default=None)
         subparser.add_argument("--max-core-wallets", type=int, default=20)
         subparser.add_argument("--max-momentum-wallets", type=int, default=10)
@@ -6065,9 +6007,6 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--max-esports-markets-per-wallet", type=int, default=100)
         subparser.add_argument("--collector-profile-cache-ttl-hours", type=float, default=24)
         subparser.add_argument("--user-trades-cache-ttl-days", type=int, default=1)
-        subparser.add_argument("--refresh-user-trades", action="store_true")
-        subparser.add_argument("--no-user-trades-cache", action="store_true")
-        subparser.add_argument("--no-dashboard-publish", action="store_true")
 
     build = subparsers.add_parser("build-leaderboard")
     add_build_arguments(build, include_category=True)
@@ -6118,21 +6057,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--post-start-trade-grace-seconds", type=int, default=900)
     run.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=False)
     run.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
-    run.add_argument("--execution-mode", choices=["paper", "live"], default="paper")
     run.add_argument("--run-log-retention-days", type=int, default=7)
     run.add_argument("--positions-limit", type=int, default=100)
     run.add_argument("--user-trades-limit", type=int, default=50)
     run.add_argument("--user-trades-max-pages", type=int, default=1)
-    run.add_argument("--bootstrap-current-positions", dest="bootstrap_current_positions", action="store_true", default=True)
-    run.add_argument("--no-bootstrap-current-positions", dest="bootstrap_current_positions", action="store_false")
     run.add_argument("--max-follow-legs", type=int, default=10)
     run.add_argument("--min-tick-seconds", type=int, default=180)
     run.add_argument("--max-tick-seconds", type=int, default=900)
     # Fixed polling cadence (seconds). >0 overrides the adaptive min/max curve; 0 = adaptive.
     run.add_argument("--tick-seconds", type=int, default=120)
-    run.add_argument("--consensus-block-opposite", dest="consensus_block_opposite", action="store_true", default=True)
-    run.add_argument("--no-consensus-block-opposite", dest="consensus_block_opposite", action="store_false")
-    run.add_argument("--conflict-policy", choices=["dual_follow", "exit_on_opposite"], default="dual_follow")
     run.add_argument("--quarantine-sell-frac", type=float, default=0.2)
     run.add_argument("--error-retry-seconds", type=int, default=180)
     run.add_argument("--max-consecutive-error-seconds", type=int, default=600)

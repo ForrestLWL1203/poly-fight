@@ -1907,8 +1907,6 @@ def _process_matches_runner(row: dict[str, Any], data_dir: Path) -> bool:
     tokens = _command_tokens(command)
     if pid <= 0 or not _is_poly_fight_run_command(tokens, command):
         return False
-    if "--execution-mode live" in command:
-        return False
     data_dir_values = _data_dir_values_from_command(tokens)
     if not data_dir_values:
         return _runner_default_data_dir_matches(data_dir)

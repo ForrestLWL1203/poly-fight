@@ -264,7 +264,6 @@ class CoreTest(unittest.TestCase):
                 "11",
                 "--max-core-wallets",
                 "13",
-                "--no-dashboard-publish",
             ]
         )
 
@@ -273,7 +272,6 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.positions_per_market, 9)
         self.assertEqual(args.max_profile_wallets, 11)
         self.assertEqual(args.max_core_wallets, 13)
-        self.assertTrue(args.no_dashboard_publish)
 
         legacy_budget_args = build_parser().parse_args(["collect", "--max-profiles-per-run", "44"])
         self.assertIsNone(legacy_budget_args.max_profile_wallets)
@@ -294,7 +292,6 @@ class CoreTest(unittest.TestCase):
                 "11",
                 "--max-core-wallets",
                 "13",
-                "--no-dashboard-publish",
             ]
         )
 
@@ -303,7 +300,6 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.positions_per_market, 9)
         self.assertEqual(args.max_profile_wallets, 11)
         self.assertEqual(args.max_core_wallets, 13)
-        self.assertTrue(args.no_dashboard_publish)
 
     def test_category_data_dirs_use_fixed_dashboard_root_mapping(self):
         root = Path("/tmp/poly-data")
@@ -9080,7 +9076,6 @@ class CoreTest(unittest.TestCase):
         args = parser.parse_args(["collect"])
 
         self.assertEqual(args.command, "collect")
-        self.assertEqual(args.discovery_source, "trades")
         self.assertIsNone(args.target_markets)
         self.assertIsNone(args.max_markets_per_run)
         self.assertEqual(args.market_batch_size, 50)
@@ -9110,7 +9105,6 @@ class CoreTest(unittest.TestCase):
         self.assertIsNone(args.leaderboard_min_participated_markets)
         self.assertEqual(args.leaderboard_min_avg_market_cash, 1_500)
         self.assertEqual(args.max_leaderboard_wallets, 30)
-        self.assertFalse(args.check_current_positions)
 
     def test_esports_collect_profile_budget_default_and_override(self):
         parser = build_parser()
@@ -10082,8 +10076,11 @@ class CoreTest(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "collector"
+            data_dir = Path(tmp) / "data"
             args = build_parser().parse_args(
                 [
+                    "--data-dir",
+                    str(data_dir),
                     "collect",
                     "--output-dir",
                     str(output_dir),
@@ -10119,7 +10116,9 @@ class CoreTest(unittest.TestCase):
             ]:
                 self.assertTrue((output_dir / name).exists(), name)
             summary = read_json(output_dir / "collector_build_summary.json", {})
+            dashboard_summary = read_json(data_dir / "build_summary.json", {})
             self.assertEqual(summary["collector"], "wallet_collector")
+            self.assertEqual(dashboard_summary["collector"], "wallet_collector")
             self.assertEqual(summary["target_market_count"], 2)
             self.assertEqual(summary["seed_position_count"], 2)
             self.assertEqual(summary["seed_wallet_count"], 1)
@@ -10150,6 +10149,7 @@ class CoreTest(unittest.TestCase):
         class FakeClient:
             def __init__(self):
                 self.trade_calls = []
+                self.position_calls = []
 
             def list_events_paginated(self, **kwargs):
                 markets = []
@@ -10177,6 +10177,7 @@ class CoreTest(unittest.TestCase):
                 return markets
 
             def market_positions(self, condition_id, *, limit=20, sort_by="TOTAL_PNL", sort_direction="DESC"):
+                self.position_calls.append((condition_id, limit, sort_by, sort_direction))
                 return [
                     {
                         "positions": [
@@ -10198,6 +10199,7 @@ class CoreTest(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "collector"
+            data_dir = Path(tmp) / "data"
             output_dir.mkdir()
             write_json(
                 output_dir / "collector_wallet_profiles.json",
@@ -10217,6 +10219,8 @@ class CoreTest(unittest.TestCase):
             )
             args = build_parser().parse_args(
                 [
+                    "--data-dir",
+                    str(data_dir),
                     "collect",
                     "--output-dir",
                     str(output_dir),
@@ -10226,7 +10230,6 @@ class CoreTest(unittest.TestCase):
                     "1",
                     "--max-workers",
                     "1",
-                    "--no-dashboard-publish",
                 ]
             )
             client = FakeClient()
@@ -10237,9 +10240,13 @@ class CoreTest(unittest.TestCase):
 
             profiles = read_json(output_dir / "collector_wallet_profiles.json", [])
             summary = read_json(output_dir / "collector_build_summary.json", {})
+            dashboard_summary = read_json(data_dir / "build_summary.json", {})
 
         self.assertEqual(client.trade_calls, [])
+        self.assertTrue(client.position_calls)
+        self.assertTrue(all(call[2:] == ("TOTAL_PNL", "DESC") for call in client.position_calls))
         self.assertEqual(len(profiles), 1)
+        self.assertEqual(dashboard_summary["collector"], "wallet_collector")
         self.assertEqual(profiles[0]["candidate"]["source"], "collector_market_positions")
         self.assertEqual(profiles[0]["seed"]["seed_win_count"], 2)
         self.assertEqual(summary["profile_cache_hits"], 1)
@@ -10322,6 +10329,7 @@ class CoreTest(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "collector"
+            data_dir = Path(tmp) / "data"
             output_dir.mkdir()
             write_json(
                 output_dir / "collector_wallet_profiles.json",
@@ -10339,6 +10347,8 @@ class CoreTest(unittest.TestCase):
             )
             args = build_parser().parse_args(
                 [
+                    "--data-dir",
+                    str(data_dir),
                     "collect",
                     "--output-dir",
                     str(output_dir),
@@ -10350,7 +10360,6 @@ class CoreTest(unittest.TestCase):
                     "0",
                     "--max-workers",
                     "1",
-                    "--no-dashboard-publish",
                 ]
             )
             client = FakeClient()
@@ -11285,7 +11294,6 @@ class CoreTest(unittest.TestCase):
         args = parser.parse_args(["follow", "--stake-usdc", "25"])
 
         self.assertEqual(args.command, "follow")
-        self.assertEqual(args.execution_mode, "paper")
         self.assertEqual(args.stake_usdc, 25)
         self.assertEqual(args.stake_ratio_percent, 10)
         self.assertEqual(args.bankroll_usdc, 0.0)
@@ -11301,13 +11309,13 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.event_cache_ttl_minutes, 10)
         self.assertEqual(args.user_trades_limit, 50)
         self.assertEqual(args.user_trades_max_pages, 1)
-        self.assertTrue(args.bootstrap_current_positions)
+        self.assertFalse(hasattr(args, "bootstrap_current_positions"))
         self.assertEqual(args.max_follow_legs, 10)
         self.assertEqual(args.min_tick_seconds, 180)
         self.assertEqual(args.max_tick_seconds, 900)
         self.assertEqual(args.max_workers, 8)
-        self.assertTrue(args.consensus_block_opposite)
-        self.assertEqual(args.conflict_policy, "dual_follow")
+        self.assertFalse(hasattr(args, "consensus_block_opposite"))
+        self.assertFalse(hasattr(args, "conflict_policy"))
         self.assertEqual(args.quarantine_sell_frac, 0.2)
 
         pre_match_args = parser.parse_args(["follow", "--stake-usdc", "25", "--require-pre-match"])
@@ -11329,7 +11337,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.observe_window_hours, 24)
         self.assertEqual(args.user_trades_limit, 50)
         self.assertEqual(args.user_trades_max_pages, 1)
-        self.assertTrue(args.bootstrap_current_positions)
+        self.assertFalse(hasattr(args, "bootstrap_current_positions"))
         self.assertEqual(args.max_follow_legs, 10)
         self.assertEqual(args.error_retry_seconds, 180)
         self.assertEqual(args.max_consecutive_error_seconds, 600)
@@ -11339,8 +11347,8 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.resolution_gamma_pages, 2)
         self.assertEqual(args.market_batch_size, 50)
         self.assertEqual(args.market_batch_count, 2)
-        self.assertTrue(args.consensus_block_opposite)
-        self.assertEqual(args.conflict_policy, "dual_follow")
+        self.assertFalse(hasattr(args, "consensus_block_opposite"))
+        self.assertFalse(hasattr(args, "conflict_policy"))
         self.assertEqual(args.quarantine_sell_frac, 0.2)
         self.assertFalse(args.require_pre_match)
 
@@ -11357,6 +11365,32 @@ class CoreTest(unittest.TestCase):
         parser = build_parser()
 
         removed_options = [
+            ["collect", "--seed-sort-by", "REALIZED_PNL"],
+            ["collect", "--refresh-user-trades"],
+            ["collect", "--no-user-trades-cache"],
+            ["collect", "--no-dashboard-publish"],
+            ["collect", "--discovery-source", "holders"],
+            ["collect", "--holders-limit", "50"],
+            ["collect", "--allow-dirty-profile-candidates"],
+            ["collect", "--check-current-positions"],
+            ["collect", "--min-pre-match-entry-rate", "0.8"],
+            ["build-leaderboard", "--seed-sort-by", "REALIZED_PNL"],
+            ["build-leaderboard", "--refresh-user-trades"],
+            ["build-leaderboard", "--no-user-trades-cache"],
+            ["build-leaderboard", "--no-dashboard-publish"],
+            ["build-leaderboard", "--discovery-source", "holders"],
+            ["build-leaderboard", "--holders-limit", "50"],
+            ["build-leaderboard", "--allow-dirty-profile-candidates"],
+            ["build-leaderboard", "--check-current-positions"],
+            ["build-leaderboard", "--min-pre-match-entry-rate", "0.8"],
+            ["follow", "--stake-usdc", "1", "--execution-mode", "live"],
+            ["follow", "--stake-usdc", "1", "--conflict-policy", "exit_on_opposite"],
+            ["follow", "--stake-usdc", "1", "--no-consensus-block-opposite"],
+            ["follow", "--stake-usdc", "1", "--no-bootstrap-current-positions"],
+            ["run", "--stake-usdc", "1", "--execution-mode", "live"],
+            ["run", "--stake-usdc", "1", "--conflict-policy", "exit_on_opposite"],
+            ["run", "--stake-usdc", "1", "--no-consensus-block-opposite"],
+            ["run", "--stake-usdc", "1", "--no-bootstrap-current-positions"],
             ["follow", "--stake-usdc", "1", "--event-gate-horizon-hours", "24"],
             ["follow", "--stake-usdc", "1", "--results-retention-days", "0"],
             ["follow", "--stake-usdc", "1", "--consensus-min-same-side", "1"],
