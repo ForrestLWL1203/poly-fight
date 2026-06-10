@@ -846,25 +846,14 @@ createApp({
     eventGame(event) {
       return this.matchParts(event)?.game || "";
     },
-    eventFollowHeadline(event) {
-      const total = this.eventFollowParts(event).total;
-      if (total) return `${total}笔跟单`;
-      const marketCount = Math.max(1, Number(event?.market_count || (event?.market_breakdown || []).length || 1));
-      return `监控 ${marketCount}盘口`;
-    },
-    eventMarketCountLabel(event) {
-      const marketCount = Math.max(0, Number(event?.market_count || (event?.market_breakdown || []).length || 0));
-      return marketCount > 1 ? `${marketCount}盘口聚合` : "";
-    },
     eventFollowText(event) {
       const rows = this.eventMarketFollowRows(event);
-      const rowText = rows
+      return rows
         .map((row) => {
           const sideText = row.sides.map((side) => `${side.label}: ${side.count}单`).join(" ");
           return sideText ? `${row.label} ${sideText}` : row.label;
         })
         .join(" · ");
-      return rowText ? `${this.eventFollowHeadline(event)} · ${rowText}` : this.eventFollowHeadline(event);
     },
     eventFollowParts(event) {
       const signals = [...(event?.open_signals || []), ...(event?.results || [])];
@@ -935,6 +924,32 @@ createApp({
           sides,
         };
       });
+    },
+    eventMarketFollowTable(event) {
+      const rows = this.eventMarketFollowRows(event);
+      const firstSides = rows.find((row) => (row.sides || []).length)?.sides || [];
+      let headers = firstSides.slice(0, 2);
+      if (!headers.length) {
+        headers = [
+          { label: "A", count: 0, logo: "", tone: "team-a" },
+          { label: "B", count: 0, logo: "", tone: "team-b" },
+        ];
+      }
+      return {
+        headers,
+        rows: rows.map((row) => ({
+          ...row,
+          cells: headers.map((header, index) => {
+            const side = (row.sides || [])[index] || {};
+            return {
+              label: header.label,
+              count: Number(side.count) || 0,
+              logo: header.logo || side.logo || "",
+              tone: header.tone || side.tone || "",
+            };
+          }),
+        })),
+      };
     },
     eventMarketDisplayLabel(market, index) {
       const type = String(market?.market_type || "").trim();

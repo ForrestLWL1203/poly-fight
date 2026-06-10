@@ -2047,45 +2047,29 @@ body {
   flex-wrap: nowrap;
   align-items: flex-start;
   justify-content: flex-start;
-  gap: 0.34rem;
+  gap: 0;
 }
 
-.event-follow-head {
-  display: inline-flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 0.38rem;
-  min-width: 0;
-  color: #dfe9ed;
-  font-size: 0.78rem;
-  line-height: 1.15;
-}
-
-.event-follow-head strong {
-  font-size: 0.84rem;
-  font-weight: 900;
-}
-
-.event-follow-head span {
-  color: #8fa4ad;
-  font-size: 0.7rem;
-  font-weight: 750;
-}
-
-.event-market-follow-list {
+.event-follow-grid {
   display: grid;
-  gap: 0.22rem;
-  width: 100%;
+  gap: 0.18rem;
+  width: max-content;
+  max-width: 100%;
   min-width: 0;
 }
 
+.event-follow-grid-head,
 .event-market-follow-row {
   display: grid;
-  grid-template-columns: minmax(3.1rem, max-content) minmax(0, 1fr);
+  grid-template-columns: minmax(3.1rem, max-content) repeat(2, 2rem);
   align-items: center;
-  column-gap: 0.38rem;
-  min-height: 1.65rem;
+  column-gap: 0.3rem;
+  min-height: 1.38rem;
   min-width: 0;
+}
+
+.event-follow-grid-head {
+  min-height: 1.5rem;
 }
 
 .event-market-follow-label {
@@ -2100,33 +2084,21 @@ body {
   color: #dfe9ed;
 }
 
-.event-follow-side-strip {
-  display: inline-flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.26rem;
-  min-width: 0;
-}
-
-.event-follow-summary {
+.event-follow-head-side {
   display: inline-grid;
-  grid-auto-rows: 1.7rem;
-  grid-template-columns: 2.65rem;
-  align-items: stretch;
-  gap: 0.26rem;
-  min-width: 2.65rem;
+  place-items: center;
+  min-width: 2rem;
 }
 
-.event-follow-side {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.22rem;
-  min-width: 2.65rem;
+.event-follow-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 2rem;
   color: #cbd8dd;
-  font-size: 0.7rem;
+  font-size: 0.76rem;
   font-weight: 900;
   line-height: 1;
+  font-variant-numeric: tabular-nums;
 }
 
 .event-follow-logo-wrap {
@@ -2151,19 +2123,26 @@ body {
   font-weight: 850;
 }
 
-.event-follow-side.team-a .event-follow-logo-wrap {
+.event-follow-head-side.team-a .event-follow-logo-wrap {
   border-color: rgba(255, 138, 154, 0.5);
   background: rgba(255, 138, 154, 0.1);
 }
 
-.event-follow-side.team-b .event-follow-logo-wrap {
+.event-follow-head-side.team-b .event-follow-logo-wrap {
   border-color: rgba(120, 183, 255, 0.5);
   background: rgba(120, 183, 255, 0.1);
 }
 
-.event-follow-side strong {
+.event-follow-count.team-a {
+  color: #ffd3da;
+}
+
+.event-follow-count.team-b {
+  color: #d1e6ff;
+}
+
+.event-market-follow-row.has-signal .event-follow-count {
   color: #eff8fb;
-  font-size: 0.78rem;
 }
 
 .detail-modal {
@@ -2679,10 +2658,6 @@ body {
   .event-meta {
     justify-content: flex-start;
     min-width: 0;
-  }
-
-  .event-follow-summary {
-    max-width: 100%;
   }
 
   .team {
