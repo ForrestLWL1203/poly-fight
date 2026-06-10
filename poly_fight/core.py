@@ -8,10 +8,14 @@ from typing import Any, Iterable
 
 
 SECONDS_PER_DAY = 86400
-SCORING_VERSION = 14
+SCORING_VERSION = 15
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 TRADE_BEHAVIOR_EXCLUDE_RATE = 0.5
+ESPORTS_OVERALL_MIN_SAMPLE = 6
+ESPORTS_MAIN_MATCH_MIN_SAMPLE = 6
+ESPORTS_SUBMARKET_MIN_SAMPLE = 3
+SPORTS_MIN_SAMPLE = 8
 # Thresholds recalibrated for the de-biased trade-reconstruction win rates (v11):
 # real top esports wallets win ~66-81%, not the survivorship-inflated ~90% the old
 # closed_positions floors assumed. See review/scoring analysis.
@@ -1214,6 +1218,7 @@ def summarize_closed_positions(
                 "roi": realized_pnl / cost_basis if cost_basis > 0 else 0.0,
                 "avg_price": avg_price,
                 "timestamp": to_int(position.get("timestamp")),
+                "first_buy_won": position.get("firstBuyWon") if "firstBuyWon" in position else None,
             }
         )
 
@@ -1239,6 +1244,8 @@ def summarize_closed_positions(
         winning_cost = sum(row["cost_basis"] for row in bucket_rows if row["realized_pnl"] > 0)
         pre_match_rows = [row for row in bucket_rows if row.get("pre_match_entry") is not None]
         pre_match_entry_count = sum(1 for row in pre_match_rows if row.get("pre_match_entry"))
+        first_direction_rows = [row for row in bucket_rows if row.get("first_buy_won") is not None]
+        first_direction_wins = sum(1 for row in first_direction_rows if row.get("first_buy_won"))
         capital_weighted_entry_price = total_cost / total_bought if total_bought else 0.0
         capital_weighted_win_rate = winning_cost / total_cost if total_cost else 0.0
 
@@ -1330,6 +1337,11 @@ def summarize_closed_positions(
         "pre_match_entry_count": pre_match_entry_count,
         "pre_match_entry_market_count": len(pre_match_rows),
         "pre_match_entry_rate": round(pre_match_entry_count / len(pre_match_rows), 8) if pre_match_rows else None,
+        "first_direction_market_count": len(first_direction_rows),
+        "first_direction_win_count": first_direction_wins,
+        "first_direction_win_rate": round(first_direction_wins / len(first_direction_rows), 8)
+        if first_direction_rows
+        else None,
         "entry_price_buckets": formatted_buckets,
         "high_price_entry_rate": round(high_price_entries / count, 8) if count else 0.0,
         "low_edge_profit_rate": round(low_edge_profits / count, 8) if count else 0.0,
@@ -1424,6 +1436,8 @@ def reconstruct_closed_positions(
         material_sell_size_by_outcome: dict[int, float] = {}
         last_ts = 0
         last_buy_ts = 0
+        first_buy_sort_key: tuple[int, str] | None = None
+        first_buy_outcome_index: int | None = None
         for trade in market_trades:
             side = str(trade.get("side") or trade.get("type") or "").upper()
             if side not in {"BUY", "SELL"}:
@@ -1443,6 +1457,10 @@ def reconstruct_closed_positions(
             last_ts = max(last_ts, trade_ts)
             if side == "BUY":
                 last_buy_ts = max(last_buy_ts, trade_ts)
+                sort_key = (trade_ts, str(trade.get("transactionHash") or trade.get("transaction_hash") or ""))
+                if first_buy_sort_key is None or sort_key < first_buy_sort_key:
+                    first_buy_sort_key = sort_key
+                    first_buy_outcome_index = outcome_index
                 buy_size_by_outcome[outcome_index] = buy_size_by_outcome.get(outcome_index, 0.0) + size
                 buy_cost_by_outcome[outcome_index] = buy_cost_by_outcome.get(outcome_index, 0.0) + cash
             elif side == "SELL":
@@ -1514,6 +1532,8 @@ def reconstruct_closed_positions(
                     if abs(size) > 0.000001
                 },
                 "winningOutcomeIndex": winner_index,
+                "firstBuyOutcomeIndex": first_buy_outcome_index,
+                "firstBuyWon": first_buy_outcome_index == winner_index if first_buy_outcome_index is not None else None,
                 "soldBeforeResolution": has_material_sell,
                 "twoSidedTrade": two_sided,
             }
@@ -1527,6 +1547,8 @@ def reconstruct_closed_positions(
             "material_sell_size_by_outcome": {
                 str(k): round(v, 8) for k, v in sorted(material_sell_size_by_outcome.items())
             },
+            "first_buy_outcome_index": first_buy_outcome_index,
+            "first_buy_won": first_buy_outcome_index == winner_index if first_buy_outcome_index is not None else None,
         }
     return positions, behavior_by_market
 
@@ -1892,10 +1914,19 @@ def classify_wallet_bucket(
     return {**summary, "entry_edge": round(entry_edge, 8), "grade": grade, "profile_state": state, "reasons": reasons}
 
 
+def wallet_bucket_min_sample(category: str, market_type: str) -> int:
+    if str(category or "").lower() == "sports":
+        return SPORTS_MIN_SAMPLE
+    if str(market_type or MAIN_MATCH) == MAIN_MATCH:
+        return ESPORTS_MAIN_MATCH_MIN_SAMPLE
+    return ESPORTS_SUBMARKET_MIN_SAMPLE
+
+
 def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> dict[str, Any]:
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
     category = str(summary.get("category") or "").lower()
-    classified = classify_wallet_bucket(summary, now_ts=now_ts, min_sample=8)
+    overall_min_sample = SPORTS_MIN_SAMPLE if category == "sports" else ESPORTS_OVERALL_MIN_SAMPLE
+    classified = classify_wallet_bucket(summary, now_ts=now_ts, min_sample=overall_min_sample)
     per_type = summary.get("per_type") or {}
     per_game_type = summary.get("per_game_type") or {}
     if not isinstance(per_type, dict):
@@ -1912,7 +1943,7 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
         per_type.items(),
         key=lambda item: MARKET_TYPE_ORDER.get(str(item[0]), 99),
     ):
-        min_sample = 8 if category == "sports" or market_type == MAIN_MATCH else 10
+        min_sample = wallet_bucket_min_sample(category, market_type)
         bucket_input = {
             **bucket_summary,
             "category": summary.get("category", bucket_summary.get("category")),
@@ -1957,7 +1988,7 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
             ),
         ):
             game_family, market_type = split_bucket_key(key)
-            min_sample = 8 if category == "sports" or market_type == MAIN_MATCH else 10
+            min_sample = wallet_bucket_min_sample(category, market_type)
             bucket_input = {
                 **bucket_summary,
                 "category": summary.get("category", bucket_summary.get("category")),

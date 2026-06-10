@@ -242,6 +242,11 @@ COLLECTOR_MAX_INACTIVE_SECONDS = 5 * 24 * 60 * 60
 MIN_COPYABLE_BUCKET_ROI = 0.15
 MAX_COPYABLE_TWO_SIDED_COUNT = 1
 MAX_COPYABLE_TWO_SIDED_RATE = 0.05
+COPYABLE_TWO_SIDED_MAX_RATE = 0.30
+COPYABLE_TWO_SIDED_MIN_BUCKET_ROI = 0.35
+COPYABLE_TWO_SIDED_MIN_FIRST_DIRECTION_WIN_RATE = 0.70
+COPYABLE_TWO_SIDED_MIN_CLOSED_COUNT = 10
+COPYABLE_TWO_SIDED_PREFILTER_MAX_COUNT = 1_000_000
 MAX_COPYABLE_TAIL_ENTRY_RATE = 0.25
 MOMENTUM_MIN_7D_MARKETS = 10
 MOMENTUM_MIN_7D_POSITIVE_RATE = 0.70
@@ -253,24 +258,17 @@ MOMENTUM_MIN_OVERALL_ROI = 0.02
 MOMENTUM_MIN_CAPITAL_WEIGHTED_EDGE = 0.04
 MOMENTUM_MAX_MEDIAN_ENTRY_PRICE = 0.75
 MOMENTUM_MAX_TWO_SIDED_RATE = 0.05
-FAMILY_SUPPLEMENT_ORDER = ("lol",)
-FAMILY_SUPPLEMENT_CONFIG = {
-    "lol": {
-        "limit": 4,
-        "min_closed_count": 16,
-        "min_bucket_roi": MIN_COPYABLE_BUCKET_ROI,
-        "min_positive_rate": 0.65,
-        "min_wilson": 0.58,
-        "min_capital_edge": 0.08,
-        "max_median_entry_price": 0.78,
-        "min_recent_14d_markets": 10,
-        "min_recent_14d_roi": 0.08,
-        "min_recent_14d_positive_rate": 0.65,
-        "max_two_sided_rate": 0.0,
-        "max_tail_entry_rate": MAX_COPYABLE_TAIL_ENTRY_RATE,
-        "max_high_churn_rate": 0.35,
-    },
-}
+SEED_BUCKET_MIN_HIT_RATE = 0.10
+SEED_BUCKET_MIN_WIN_RATE = SEED_BUCKET_MIN_HIT_RATE
+SEED_BUCKET_MIN_WINS_FLOOR = 0
+SEED_SINGLE_BUCKET_MIN_WINS = 5
+SEED_MULTI_BUCKET_MIN_WINS = 8
+SEED_MAIN_MATCH_MIN_AVG_CASH = 500.0
+SEED_GAME_WINNER_MIN_AVG_CASH = 500.0
+SEED_MAP_WINNER_MIN_AVG_CASH = 300.0
+SEED_MIN_WEIGHTED_ROI = 0.30
+SEED_MAX_MEDIAN_AVG_PRICE = 0.75
+COLLECTOR_PROFILE_LOOKBACK_DAYS = 14
 COLLECTOR_BUCKETS = (
     ("lol", MAIN_MATCH),
     ("lol", GAME_WINNER),
@@ -302,7 +300,10 @@ ESPORTS_CANDIDATE_MARKET_TYPE_THRESHOLDS = {
     "game_winner": {"min_participated_markets": 11, "min_avg_market_cash": 800},
     "map_winner": {"min_participated_markets": 11, "min_avg_market_cash": 500},
 }
-ESPORTS_CANDIDATE_GAME_FAMILY_THRESHOLDS = {}
+ESPORTS_CANDIDATE_GAME_FAMILY_THRESHOLDS = {
+    "lol": {"min_participated_markets": 6, "min_avg_market_cash": 800},
+    "dota2": {"min_participated_markets": 5, "min_avg_market_cash": 800},
+}
 SPORTS_DEFAULT_CLASSIFICATION_LOOKBACK_DAYS = 90
 SPORTS_DEFAULT_MIN_PROFILE_PARTICIPATED_MARKETS = 3
 SPORTS_DEFAULT_LEADERBOARD_MIN_PARTICIPATED_MARKETS = 3
@@ -887,11 +888,14 @@ def fetch_recent_esports_user_trades_for_wallet(
     if not condition_ids:
         return ([], "empty") if include_source else []
     wallet = normalize_wallet(wallet)
+    condition_ids_hash = hashlib.sha256("\n".join(sorted(condition_ids)).encode("utf-8")).hexdigest()
     expected_meta = {
         "wallet": wallet,
         "page_limit": int(page_limit),
         "max_pages": int(max_pages),
         "max_esports_markets": int(max_esports_markets),
+        "condition_id_count": len(condition_ids),
+        "condition_ids_hash": condition_ids_hash,
     }
     cache_path = user_trades_cache_path(data_dir, wallet) if data_dir else None
     if (
@@ -1893,6 +1897,41 @@ def candidate_two_sided_within_limits(
     return two_sided_count <= max_count and two_sided_rate <= max_rate
 
 
+def copyable_two_sided_reject_reasons(
+    candidate_metrics: dict[str, Any],
+    quality_metrics: dict[str, Any],
+) -> list[str]:
+    two_sided_count = int(candidate_metrics.get("two_sided_market_count") or 0)
+    if two_sided_count <= 0:
+        return []
+    participated = int(
+        candidate_metrics.get("participated_market_count")
+        or candidate_metrics.get("historical_trade_behavior_market_count")
+        or 0
+    )
+    two_sided_rate = two_sided_count / participated if participated > 0 else 1.0
+    reasons: list[str] = []
+    if two_sided_rate >= COPYABLE_TWO_SIDED_MAX_RATE:
+        reasons.append("two_sided_rate_gte_max")
+    if int(quality_metrics.get("esports_closed_count") or 0) < COPYABLE_TWO_SIDED_MIN_CLOSED_COUNT:
+        reasons.append("two_sided_closed_count_lt_min")
+    if to_float(quality_metrics.get("esports_roi")) < COPYABLE_TWO_SIDED_MIN_BUCKET_ROI:
+        reasons.append("two_sided_bucket_roi_lt_min")
+    first_direction_rate = quality_metrics.get("first_direction_win_rate")
+    if first_direction_rate is None:
+        reasons.append("first_direction_missing")
+    elif to_float(first_direction_rate) <= COPYABLE_TWO_SIDED_MIN_FIRST_DIRECTION_WIN_RATE:
+        reasons.append("first_direction_win_rate_lte_min")
+    return sorted(set(reasons))
+
+
+def copyable_two_sided_behavior_ok(
+    candidate_metrics: dict[str, Any],
+    quality_metrics: dict[str, Any],
+) -> bool:
+    return not copyable_two_sided_reject_reasons(candidate_metrics, quality_metrics)
+
+
 def filter_profile_candidates(
     candidates: list[dict[str, Any]],
     *,
@@ -2573,6 +2612,9 @@ def esports_bucket_score(
         "esports_win_count": metrics.get("esports_win_count"),
         "esports_loss_count": metrics.get("esports_loss_count"),
         "esports_closed_count": metrics.get("esports_closed_count"),
+        "first_direction_market_count": metrics.get("first_direction_market_count"),
+        "first_direction_win_count": metrics.get("first_direction_win_count"),
+        "first_direction_win_rate": metrics.get("first_direction_win_rate"),
         "median_entry_price": metrics.get("median_entry_price"),
         "last_esports_trade_at": last_trade_at,
         "recent_bucket_market_count": metrics.get("recent_bucket_market_count"),
@@ -3047,6 +3089,29 @@ def _sorted_count_dict(counter: dict[str, int]) -> dict[str, int]:
     }
 
 
+def _sorted_nested_count_dict(counter: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
+    return {
+        key: _sorted_count_dict(counter[key])
+        for key in sorted(counter)
+    }
+
+
+def default_seed_bucket_min_avg_cash() -> dict[str, float]:
+    return {
+        MAIN_MATCH: SEED_MAIN_MATCH_MIN_AVG_CASH,
+        GAME_WINNER: SEED_GAME_WINNER_MIN_AVG_CASH,
+        MAP_WINNER: SEED_MAP_WINNER_MIN_AVG_CASH,
+    }
+
+
+def seed_bucket_market_type(bucket: str, rows: list[dict[str, Any]] | None = None) -> str:
+    for row in rows or []:
+        market_type = str(row.get("market_type") or "")
+        if market_type:
+            return market_type
+    return split_bucket_key(bucket)[1]
+
+
 def _market_record_volume(row: dict[str, Any]) -> float:
     for key in ("volume", "volume_num", "volumeNum", "volume_24hr", "volume24hr"):
         if row.get(key) is not None:
@@ -3077,8 +3142,8 @@ def _leaderboard_reject_reasons_for_profile(
     now_ts: int,
     max_inactive_days: int = ESPORTS_DEFAULT_LEADERBOARD_MAX_INACTIVE_DAYS,
     max_tail_entry_rate: float = 0.34,
-    max_two_sided_market_count: int = 0,
-    max_two_sided_market_rate: float = 0.0,
+    max_two_sided_market_count: int = COPYABLE_TWO_SIDED_PREFILTER_MAX_COUNT,
+    max_two_sided_market_rate: float = COPYABLE_TWO_SIDED_MAX_RATE,
 ) -> list[str]:
     reasons: list[str] = []
     eligible_market_types = [str(value) for value in profile.get("eligible_market_types") or [] if value]
@@ -3277,7 +3342,7 @@ def select_collector_target_markets(
     *,
     now: datetime | None = None,
     lookback_days: int = 30,
-    bucket_market_limit: int = 50,
+    bucket_market_limit: int = 100,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     now = now or datetime.now(timezone.utc)
     cutoff_ts = int(now.timestamp()) - max(0, int(lookback_days)) * 86400
@@ -3322,6 +3387,36 @@ def select_collector_target_markets(
         "target_market_count": len(selected),
         "target_market_capacity": int(bucket_market_limit) * len(COLLECTOR_BUCKETS),
     }
+
+
+def calculate_seed_bucket_min_wins(
+    bucket_counts: dict[str, Any],
+    *,
+    min_rate: float = SEED_BUCKET_MIN_WIN_RATE,
+    floor: int = SEED_BUCKET_MIN_WINS_FLOOR,
+) -> dict[str, int]:
+    thresholds: dict[str, int] = {}
+    for bucket, count in (bucket_counts or {}).items():
+        bucket_count = to_int(count)
+        if bucket_count <= 0:
+            continue
+        thresholds[str(bucket)] = max(int(floor), int(math.ceil(bucket_count * float(min_rate))))
+    return thresholds
+
+
+def effective_seed_bucket_min_wins(
+    seed_bucket_min_wins: dict[str, int] | None,
+    *,
+    seed_single_bucket_min_wins: int = SEED_SINGLE_BUCKET_MIN_WINS,
+) -> dict[str, int]:
+    single_bucket_cap = to_int(seed_single_bucket_min_wins)
+    thresholds: dict[str, int] = {}
+    for bucket, min_wins in (seed_bucket_min_wins or {}).items():
+        raw_min_wins = to_int(min_wins)
+        if raw_min_wins <= 0:
+            continue
+        thresholds[str(bucket)] = min(raw_min_wins, single_bucket_cap) if single_bucket_cap > 0 else raw_min_wins
+    return thresholds
 
 
 def collect_seed_positions(
@@ -3412,14 +3507,40 @@ def aggregate_seed_wallets(seed_positions: list[dict[str, Any]]) -> dict[str, di
         bucket_counts: dict[str, int] = {}
         game_family_counts: dict[str, int] = {}
         market_type_counts: dict[str, int] = {}
+        bucket_rows: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
-            _increment_count(bucket_counts, str(row.get("bucket_key") or "unknown"))
+            bucket = str(row.get("bucket_key") or "unknown")
+            _increment_count(bucket_counts, bucket)
+            bucket_rows.setdefault(bucket, []).append(row)
             _increment_count(game_family_counts, str(row.get("game_family") or "unknown"))
             _increment_count(market_type_counts, str(row.get("market_type") or MAIN_MATCH))
         seed_cost_total = sum(to_float(row.get("seed_cost")) for row in rows)
         seed_pnl_total = sum(to_float(row.get("seed_pnl")) for row in rows)
         avg_prices = [to_float(row.get("avg_price")) for row in rows if to_float(row.get("avg_price")) > 0]
         ranks = [to_float(row.get("seed_rank")) for row in rows if to_float(row.get("seed_rank")) > 0]
+        seed_bucket_stats: dict[str, dict[str, Any]] = {}
+        for bucket, bucket_group in sorted(bucket_rows.items()):
+            bucket_cost = sum(to_float(row.get("seed_cost")) for row in bucket_group)
+            bucket_pnl = sum(to_float(row.get("seed_pnl")) for row in bucket_group)
+            bucket_avg_prices = [
+                to_float(row.get("avg_price"))
+                for row in bucket_group
+                if to_float(row.get("avg_price")) > 0
+            ]
+            game_family, fallback_market_type = split_bucket_key(bucket)
+            market_type = seed_bucket_market_type(bucket, bucket_group) or fallback_market_type
+            seed_bucket_stats[bucket] = {
+                "bucket_key": bucket,
+                "bucket_label": bucket_label(bucket),
+                "game_family": game_family,
+                "market_type": market_type,
+                "seed_market_count": len(bucket_group),
+                "seed_cost_total": round(bucket_cost, 8),
+                "seed_pnl_total": round(bucket_pnl, 8),
+                "seed_weighted_roi": round(bucket_pnl / bucket_cost, 8) if bucket_cost > 0 else 0.0,
+                "avg_seed_cash": round(bucket_cost / len(bucket_group), 8) if bucket_group else 0.0,
+                "median_avg_price": round(_median_float(bucket_avg_prices), 8),
+            }
         wallet_row = {
             "wallet": wallet,
             "seed_position_row_count": len(raw_rows),
@@ -3428,6 +3549,7 @@ def aggregate_seed_wallets(seed_positions: list[dict[str, Any]]) -> dict[str, di
             "seed_condition_ids": sorted(condition_ids),
             "seed_bucket_count": len(bucket_counts),
             "seed_bucket_counts": _sorted_count_dict(bucket_counts),
+            "seed_bucket_stats": seed_bucket_stats,
             "seed_game_family_counts": _sorted_count_dict(game_family_counts),
             "seed_market_type_counts": _sorted_count_dict(market_type_counts),
             "seed_pnl_total": round(seed_pnl_total, 8),
@@ -3473,25 +3595,218 @@ def seed_wallet_score(row: dict[str, Any]) -> float:
     return frequency_score + pnl_score + roi_score + entry_edge_score + cross_bucket_score + rank_score
 
 
+def seed_bucket_stats_for_row(row: dict[str, Any], bucket: str) -> dict[str, Any]:
+    seed_bucket_stats = row.get("seed_bucket_stats") if isinstance(row.get("seed_bucket_stats"), dict) else {}
+    if isinstance(seed_bucket_stats.get(bucket), dict):
+        return dict(seed_bucket_stats[bucket])
+    seed_bucket_counts = row.get("seed_bucket_counts") if isinstance(row.get("seed_bucket_counts"), dict) else {}
+    count = to_int(seed_bucket_counts.get(bucket))
+    return {
+        "bucket_key": bucket,
+        "bucket_label": bucket_label(bucket),
+        "game_family": split_bucket_key(bucket)[0],
+        "market_type": split_bucket_key(bucket)[1],
+        "seed_market_count": count,
+        "seed_cost_total": 0.0,
+        "seed_pnl_total": 0.0,
+        "seed_weighted_roi": 0.0,
+        "avg_seed_cash": 0.0,
+        "median_avg_price": 0.0,
+    }
+
+
+def seed_bucket_quality_reject_reasons(
+    bucket: str,
+    stats: dict[str, Any],
+    *,
+    min_wins: int,
+    min_avg_cash_by_market_type: dict[str, float] | None,
+    min_weighted_roi: float,
+    max_median_avg_price: float,
+) -> list[str]:
+    reasons: list[str] = []
+    market_type = str(stats.get("market_type") or split_bucket_key(bucket)[1])
+    min_avg_cash = to_float((min_avg_cash_by_market_type or default_seed_bucket_min_avg_cash()).get(market_type))
+    if to_int(stats.get("seed_market_count")) < int(min_wins):
+        reasons.append("seed_bucket_win_count_lt_min")
+    if to_float(stats.get("avg_seed_cash")) < min_avg_cash:
+        reasons.append("seed_bucket_avg_cash_lt_min")
+    if to_float(stats.get("seed_weighted_roi")) < float(min_weighted_roi):
+        reasons.append("seed_bucket_roi_lt_min")
+    median_avg_price = to_float(stats.get("median_avg_price"))
+    if median_avg_price <= 0 or median_avg_price > float(max_median_avg_price):
+        reasons.append("seed_bucket_median_avg_price_gt_max")
+    return reasons
+
+
+def evaluate_seed_bucket_qualification(
+    row: dict[str, Any],
+    *,
+    seed_bucket_min_wins: dict[str, int] | None,
+    seed_single_bucket_min_wins: int,
+    seed_multi_bucket_min_wins: int,
+    seed_bucket_min_avg_cash: dict[str, float] | None,
+    seed_min_weighted_roi: float,
+    seed_max_median_avg_price: float,
+) -> dict[str, Any]:
+    bucket_thresholds = effective_seed_bucket_min_wins(
+        seed_bucket_min_wins,
+        seed_single_bucket_min_wins=seed_single_bucket_min_wins,
+    )
+    single_bucket_qualified: list[str] = []
+    single_bucket_stats: dict[str, dict[str, Any]] = {}
+    multi_bucket_candidates: list[str] = []
+    multi_bucket_stats: dict[str, dict[str, Any]] = {}
+    bucket_reject_reasons: dict[str, list[str]] = {}
+    wallet_reject_reasons: list[str] = []
+    for bucket, min_wins in bucket_thresholds.items():
+        stats = seed_bucket_stats_for_row(row, bucket)
+        single_reasons = seed_bucket_quality_reject_reasons(
+            bucket,
+            stats,
+            min_wins=min_wins,
+            min_avg_cash_by_market_type=seed_bucket_min_avg_cash,
+            min_weighted_roi=seed_min_weighted_roi,
+            max_median_avg_price=seed_max_median_avg_price,
+        )
+        if single_reasons:
+            bucket_reject_reasons[bucket] = single_reasons
+        else:
+            single_bucket_qualified.append(bucket)
+            single_bucket_stats[bucket] = stats
+
+        if to_int(stats.get("seed_market_count")) <= 0:
+            continue
+        quality_reasons = seed_bucket_quality_reject_reasons(
+            bucket,
+            stats,
+            min_wins=1,
+            min_avg_cash_by_market_type=seed_bucket_min_avg_cash,
+            min_weighted_roi=seed_min_weighted_roi,
+            max_median_avg_price=seed_max_median_avg_price,
+        )
+        if not quality_reasons:
+            multi_bucket_candidates.append(bucket)
+            multi_bucket_stats[bucket] = stats
+
+    multi_bucket_min_wins = to_int(seed_multi_bucket_min_wins)
+    multi_bucket_win_count = sum(
+        to_int(multi_bucket_stats[bucket].get("seed_market_count"))
+        for bucket in multi_bucket_candidates
+    )
+    multi_bucket_ok = (
+        multi_bucket_min_wins > 0
+        and len(multi_bucket_candidates) >= 2
+        and multi_bucket_win_count >= multi_bucket_min_wins
+    )
+    if single_bucket_qualified:
+        qualified_buckets = list(single_bucket_qualified)
+        qualified_stats = dict(single_bucket_stats)
+        qualification_mode = "single_bucket"
+    elif multi_bucket_ok:
+        qualified_buckets = list(multi_bucket_candidates)
+        qualified_stats = dict(multi_bucket_stats)
+        qualification_mode = "multi_bucket"
+    else:
+        qualified_buckets = []
+        qualified_stats = {}
+        qualification_mode = ""
+        if bucket_thresholds:
+            wallet_reject_reasons.append("seed_bucket_win_count_lt_min")
+            if multi_bucket_min_wins > 0:
+                wallet_reject_reasons.append("seed_multi_bucket_win_count_lt_min")
+
+    qualified_buckets.sort(
+        key=lambda value: (
+            {"lol": 0, "dota2": 1, "cs2": 2}.get(split_bucket_key(value)[0], 99),
+            {"main_match": 0, "game_winner": 1, "map_winner": 2}.get(split_bucket_key(value)[1], 99),
+            value,
+        )
+    )
+    return {
+        "seed_bucket_min_wins": bucket_thresholds,
+        "seed_multi_bucket_min_wins": multi_bucket_min_wins,
+        "multi_bucket_seed_win_count": multi_bucket_win_count,
+        "qualified_seed_buckets": qualified_buckets,
+        "qualified_seed_bucket_stats": {
+            bucket: qualified_stats[bucket]
+            for bucket in qualified_buckets
+        },
+        "seed_bucket_reject_reasons": bucket_reject_reasons,
+        "seed_qualification_mode": qualification_mode,
+        "wallet_reject_reasons": sorted(set(wallet_reject_reasons)),
+    }
+
+
 def filter_profile_seed_wallets(
     seed_wallets: dict[str, dict[str, Any]],
     *,
     max_wallets: int = 500,
     min_seed_win_count: int = 2,
-    min_seed_cost_total: float = 250,
-    max_median_avg_price: float = 0.85,
+    min_seed_cost_total: float = 0,
+    max_median_avg_price: float = SEED_MAX_MEDIAN_AVG_PRICE,
+    seed_bucket_min_wins: dict[str, int] | None = None,
+    seed_bucket_min_avg_cash: dict[str, float] | None = None,
+    seed_min_weighted_roi: float = SEED_MIN_WEIGHTED_ROI,
+    seed_max_median_avg_price: float | None = None,
+    seed_single_bucket_min_wins: int = SEED_SINGLE_BUCKET_MIN_WINS,
+    seed_multi_bucket_min_wins: int = SEED_MULTI_BUCKET_MIN_WINS,
 ) -> list[dict[str, Any]]:
     rows = []
+    bucket_thresholds = effective_seed_bucket_min_wins(
+        seed_bucket_min_wins,
+        seed_single_bucket_min_wins=seed_single_bucket_min_wins,
+    )
+    max_avg_price = float(seed_max_median_avg_price if seed_max_median_avg_price is not None else max_median_avg_price)
     for row in seed_wallets.values():
-        if to_int(row.get("seed_win_count")) < min_seed_win_count:
+        qualification = {}
+        if bucket_thresholds:
+            qualification = evaluate_seed_bucket_qualification(
+                row,
+                seed_bucket_min_wins=seed_bucket_min_wins,
+                seed_single_bucket_min_wins=seed_single_bucket_min_wins,
+                seed_multi_bucket_min_wins=seed_multi_bucket_min_wins,
+                seed_bucket_min_avg_cash=seed_bucket_min_avg_cash,
+                seed_min_weighted_roi=seed_min_weighted_roi,
+                seed_max_median_avg_price=max_avg_price,
+            )
+            if not qualification.get("qualified_seed_buckets"):
+                continue
+        elif to_int(row.get("seed_win_count")) < min_seed_win_count:
             continue
-        if to_float(row.get("seed_cost_total")) < min_seed_cost_total:
-            continue
-        if to_float(row.get("seed_weighted_roi")) <= 0:
-            continue
-        if to_float(row.get("median_avg_price")) > max_median_avg_price:
-            continue
+        if not bucket_thresholds:
+            if to_float(row.get("seed_cost_total")) < min_seed_cost_total:
+                continue
+            if to_float(row.get("seed_weighted_roi")) < seed_min_weighted_roi:
+                continue
+            if to_float(row.get("median_avg_price")) > max_avg_price:
+                continue
         updated = dict(row)
+        if bucket_thresholds:
+            qualified_seed_buckets = list(qualification["qualified_seed_buckets"])
+            updated["qualified_seed_buckets"] = qualified_seed_buckets
+            updated["qualified_seed_bucket_labels"] = [bucket_label(bucket) for bucket in qualified_seed_buckets]
+            updated["qualified_seed_bucket_stats"] = dict(qualification["qualified_seed_bucket_stats"])
+            updated["seed_bucket_min_wins"] = dict(qualification["seed_bucket_min_wins"])
+            updated["seed_multi_bucket_min_wins"] = qualification["seed_multi_bucket_min_wins"]
+            updated["multi_bucket_seed_win_count"] = qualification["multi_bucket_seed_win_count"]
+            updated["seed_qualification_mode"] = qualification["seed_qualification_mode"]
+            updated["seed_bucket_min_avg_cash"] = dict(seed_bucket_min_avg_cash or default_seed_bucket_min_avg_cash())
+            updated["seed_min_weighted_roi"] = float(seed_min_weighted_roi)
+            updated["seed_max_median_avg_price"] = max_avg_price
+            updated["seed_bucket_reject_reasons"] = qualification["seed_bucket_reject_reasons"]
+            candidate = dict(updated.get("candidate") or {})
+            candidate["qualified_seed_buckets"] = qualified_seed_buckets
+            candidate["qualified_seed_bucket_labels"] = updated["qualified_seed_bucket_labels"]
+            candidate["qualified_seed_bucket_stats"] = updated["qualified_seed_bucket_stats"]
+            candidate["seed_bucket_min_wins"] = updated["seed_bucket_min_wins"]
+            candidate["seed_multi_bucket_min_wins"] = updated["seed_multi_bucket_min_wins"]
+            candidate["multi_bucket_seed_win_count"] = updated["multi_bucket_seed_win_count"]
+            candidate["seed_qualification_mode"] = updated["seed_qualification_mode"]
+            candidate["seed_bucket_min_avg_cash"] = updated["seed_bucket_min_avg_cash"]
+            candidate["seed_min_weighted_roi"] = float(seed_min_weighted_roi)
+            candidate["seed_max_median_avg_price"] = max_avg_price
+            updated["candidate"] = candidate
         updated["seed_score"] = round(seed_wallet_score(updated), 8)
         rows.append(updated)
     rows.sort(
@@ -3512,22 +3827,48 @@ def seed_filter_reject_reasons(
     profile_wallets: list[dict[str, Any]],
     *,
     min_seed_win_count: int = 2,
-    min_seed_cost_total: float = 250,
-    max_median_avg_price: float = 0.85,
+    min_seed_cost_total: float = 0,
+    max_median_avg_price: float = SEED_MAX_MEDIAN_AVG_PRICE,
+    seed_bucket_min_wins: dict[str, int] | None = None,
+    seed_bucket_min_avg_cash: dict[str, float] | None = None,
+    seed_min_weighted_roi: float = SEED_MIN_WEIGHTED_ROI,
+    seed_max_median_avg_price: float | None = None,
+    seed_single_bucket_min_wins: int = SEED_SINGLE_BUCKET_MIN_WINS,
+    seed_multi_bucket_min_wins: int = SEED_MULTI_BUCKET_MIN_WINS,
 ) -> dict[str, int]:
     selected_wallets = {normalize_wallet(row.get("wallet")) for row in profile_wallets}
     counts: dict[str, int] = {}
+    bucket_thresholds = effective_seed_bucket_min_wins(
+        seed_bucket_min_wins,
+        seed_single_bucket_min_wins=seed_single_bucket_min_wins,
+    )
+    max_avg_price = float(seed_max_median_avg_price if seed_max_median_avg_price is not None else max_median_avg_price)
     for row in seed_wallets.values():
         wallet = normalize_wallet(row.get("wallet"))
         reasons: list[str] = []
-        if to_int(row.get("seed_win_count")) < min_seed_win_count:
+        if bucket_thresholds:
+            qualification = evaluate_seed_bucket_qualification(
+                row,
+                seed_bucket_min_wins=seed_bucket_min_wins,
+                seed_single_bucket_min_wins=seed_single_bucket_min_wins,
+                seed_multi_bucket_min_wins=seed_multi_bucket_min_wins,
+                seed_bucket_min_avg_cash=seed_bucket_min_avg_cash,
+                seed_min_weighted_roi=seed_min_weighted_roi,
+                seed_max_median_avg_price=max_avg_price,
+            )
+            if not qualification.get("qualified_seed_buckets"):
+                reasons.extend(qualification.get("wallet_reject_reasons") or [])
+                for bucket_reasons in (qualification.get("seed_bucket_reject_reasons") or {}).values():
+                    reasons.extend(bucket_reasons)
+        elif to_int(row.get("seed_win_count")) < min_seed_win_count:
             reasons.append("seed_win_count_lt_min")
-        if to_float(row.get("seed_cost_total")) < min_seed_cost_total:
-            reasons.append("seed_cost_total_lt_min")
-        if to_float(row.get("seed_weighted_roi")) <= 0:
-            reasons.append("seed_weighted_roi_not_positive")
-        if to_float(row.get("median_avg_price")) > max_median_avg_price:
-            reasons.append("median_avg_price_gt_max")
+        if not bucket_thresholds:
+            if to_float(row.get("seed_cost_total")) < min_seed_cost_total:
+                reasons.append("seed_cost_total_lt_min")
+            if to_float(row.get("seed_weighted_roi")) < seed_min_weighted_roi:
+                reasons.append("seed_roi_lt_min")
+            if to_float(row.get("median_avg_price")) > max_avg_price:
+                reasons.append("median_avg_price_gt_max")
         if not reasons and wallet not in selected_wallets:
             reasons.append("profile_wallet_cap")
         for reason in set(reasons):
@@ -3552,12 +3893,45 @@ def build_collector_diagnostics(
     profiles_by_wallet: dict[str, dict[str, Any]],
     leaderboard: list[dict[str, Any]],
     now_ts: int,
+    seed_bucket_min_wins: dict[str, int] | None = None,
+    seed_bucket_min_avg_cash: dict[str, float] | None = None,
+    seed_min_weighted_roi: float = SEED_MIN_WEIGHTED_ROI,
+    seed_max_median_avg_price: float = SEED_MAX_MEDIAN_AVG_PRICE,
+    seed_single_bucket_min_wins: int = SEED_SINGLE_BUCKET_MIN_WINS,
+    seed_multi_bucket_min_wins: int = SEED_MULTI_BUCKET_MIN_WINS,
 ) -> dict[str, Any]:
     profile_grade_counts: dict[str, int] = {}
     eligible_bucket_counts: dict[str, int] = {}
     eligible_market_type_counts: dict[str, int] = {}
+    qualified_seed_bucket_counts: dict[str, int] = {}
+    leaderboard_best_bucket_counts: dict[str, int] = {}
+    leaderboard_best_game_family_counts: dict[str, int] = {}
     leaderboard_wallets = {normalize_wallet(row.get("wallet")) for row in leaderboard}
     leaderboard_reject_reasons: dict[str, int] = {}
+    eligible_bucket_reject_reasons: dict[str, dict[str, int]] = {}
+    copyable_reject_reasons_by_bucket: dict[str, dict[str, int]] = {}
+    for row in profile_wallets:
+        for bucket in row.get("qualified_seed_buckets") or []:
+            _increment_count(qualified_seed_bucket_counts, str(bucket))
+    for row in leaderboard:
+        best_bucket = str(row.get("best_bucket") or "unknown")
+        _increment_count(leaderboard_best_bucket_counts, best_bucket)
+        game_family = str(row.get("best_game_family") or "")
+        if not game_family and ":" in best_bucket:
+            game_family = split_bucket_key(best_bucket)[0]
+        _increment_count(leaderboard_best_game_family_counts, game_family or "unknown")
+
+    def focus_bucket(profile: dict[str, Any], bucket: str) -> dict[str, Any]:
+        game_family, market_type = split_bucket_key(bucket)
+        focused = dict(profile)
+        focused["eligible_buckets"] = [bucket]
+        focused["eligible_bucket_labels"] = [bucket_label(bucket)]
+        focused["eligible_market_types"] = [market_type]
+        focused["eligible_market_type_labels"] = [MARKET_TYPE_LABELS.get(market_type, market_type)]
+        focused["eligible_game_families"] = [game_family]
+        focused["eligible_game_family_labels"] = [GAME_FAMILY_LABELS.get(game_family, game_family.upper())]
+        return enrich_esports_bucket_scores(focused, now_ts=now_ts)
+
     for wallet, profile in profiles_by_wallet.items():
         _increment_count(profile_grade_counts, str(profile.get("grade") or "unknown"))
         for bucket in profile.get("eligible_buckets") or []:
@@ -3571,13 +3945,47 @@ def build_collector_diagnostics(
             reasons.add("strict_quality_gate")
         for reason in reasons:
             _increment_count(leaderboard_reject_reasons, reason)
+        for bucket in profile.get("eligible_buckets") or []:
+            bucket_key_value = str(bucket)
+            focused = focus_bucket(profile, bucket_key_value)
+            bucket_reasons = set(_leaderboard_reject_reasons_for_profile(focused, now_ts=now_ts))
+            if not bucket_reasons and not strict_final_quality_ok(focused):
+                bucket_reasons.add("strict_quality_gate")
+            for reason in bucket_reasons:
+                eligible_bucket_reject_reasons.setdefault(bucket_key_value, {})
+                _increment_count(eligible_bucket_reject_reasons[bucket_key_value], reason)
+            copyable_reasons = _copyable_reject_reasons(focused)
+            if copyable_reasons:
+                copyable_reject_reasons_by_bucket.setdefault(bucket_key_value, {})
+                for reason in copyable_reasons:
+                    _increment_count(copyable_reject_reasons_by_bucket[bucket_key_value], reason)
     return {
-        "seed_filter_reject_reasons": seed_filter_reject_reasons(seed_wallets, profile_wallets),
+        "seed_bucket_min_wins": dict(seed_bucket_min_wins or {}),
+        "seed_single_bucket_min_wins": int(seed_single_bucket_min_wins),
+        "seed_multi_bucket_min_wins": int(seed_multi_bucket_min_wins),
+        "seed_bucket_min_avg_cash": dict(seed_bucket_min_avg_cash or default_seed_bucket_min_avg_cash()),
+        "seed_min_weighted_roi": float(seed_min_weighted_roi),
+        "seed_max_median_avg_price": float(seed_max_median_avg_price),
+        "seed_filter_reject_reasons": seed_filter_reject_reasons(
+            seed_wallets,
+            profile_wallets,
+            seed_bucket_min_wins=seed_bucket_min_wins,
+            seed_bucket_min_avg_cash=seed_bucket_min_avg_cash,
+            seed_min_weighted_roi=seed_min_weighted_roi,
+            seed_max_median_avg_price=seed_max_median_avg_price,
+            seed_single_bucket_min_wins=seed_single_bucket_min_wins,
+            seed_multi_bucket_min_wins=seed_multi_bucket_min_wins,
+        ),
         "bucket_seed_wallet_counts": bucket_seed_wallet_counts(list(seed_wallets.values())),
         "bucket_profile_wallet_counts": bucket_seed_wallet_counts(profile_wallets),
+        "qualified_seed_bucket_counts": _sorted_count_dict(qualified_seed_bucket_counts),
         "profile_grade_counts": _sorted_count_dict(profile_grade_counts),
         "eligible_bucket_counts": _sorted_count_dict(eligible_bucket_counts),
         "eligible_market_type_counts": _sorted_count_dict(eligible_market_type_counts),
+        "leaderboard_best_bucket_counts": _sorted_count_dict(leaderboard_best_bucket_counts),
+        "leaderboard_best_game_family_counts": _sorted_count_dict(leaderboard_best_game_family_counts),
+        "eligible_bucket_reject_reasons": _sorted_nested_count_dict(eligible_bucket_reject_reasons),
+        "copyable_reject_reasons_by_bucket": _sorted_nested_count_dict(copyable_reject_reasons_by_bucket),
         "leaderboard_reject_reasons": _sorted_count_dict(leaderboard_reject_reasons),
     }
 
@@ -3607,13 +4015,30 @@ def seed_age_buckets(profile_wallets: list[dict[str, Any]], *, now_ts: int) -> d
     return {key: value for key, value in counts.items() if value}
 
 
-def collector_cached_profile_usable(profile: dict[str, Any] | None, *, now_ts: int, ttl_seconds: int) -> bool:
+def collector_cached_profile_usable(
+    profile: dict[str, Any] | None,
+    *,
+    now_ts: int,
+    ttl_seconds: int,
+    profile_condition_ids: set[str] | None = None,
+    profile_lookback_days: int | None = None,
+) -> bool:
     if ttl_seconds <= 0:
         return False
     if not should_use_cached_profile(profile, now_ts=now_ts, ttl_seconds=ttl_seconds):
         return False
     if profile_needs_schema_migration(profile):
         return False
+    if profile_lookback_days is not None and to_int(profile.get("profile_lookback_days")) != int(profile_lookback_days):
+        return False
+    if profile_condition_ids is not None:
+        cached_condition_ids = {
+            str(value).lower()
+            for value in (profile.get("esports_condition_ids") or [])
+            if value
+        }
+        if cached_condition_ids != {str(value).lower() for value in profile_condition_ids if value}:
+            return False
     return True
 
 
@@ -3626,7 +4051,18 @@ def collector_seed_candidate(seed_wallet: dict[str, Any]) -> dict[str, Any]:
             "seed_win_count": seed_wallet.get("seed_win_count"),
             "seed_weighted_roi": seed_wallet.get("seed_weighted_roi"),
             "seed_bucket_counts": seed_wallet.get("seed_bucket_counts"),
+            "seed_bucket_stats": seed_wallet.get("seed_bucket_stats"),
             "seed_market_type_counts": seed_wallet.get("seed_market_type_counts"),
+            "qualified_seed_buckets": seed_wallet.get("qualified_seed_buckets"),
+            "qualified_seed_bucket_labels": seed_wallet.get("qualified_seed_bucket_labels"),
+            "qualified_seed_bucket_stats": seed_wallet.get("qualified_seed_bucket_stats"),
+            "seed_bucket_min_wins": seed_wallet.get("seed_bucket_min_wins"),
+            "seed_multi_bucket_min_wins": seed_wallet.get("seed_multi_bucket_min_wins"),
+            "multi_bucket_seed_win_count": seed_wallet.get("multi_bucket_seed_win_count"),
+            "seed_qualification_mode": seed_wallet.get("seed_qualification_mode"),
+            "seed_bucket_min_avg_cash": seed_wallet.get("seed_bucket_min_avg_cash"),
+            "seed_min_weighted_roi": seed_wallet.get("seed_min_weighted_roi"),
+            "seed_max_median_avg_price": seed_wallet.get("seed_max_median_avg_price"),
         }
     )
     return candidate
@@ -3662,6 +4098,8 @@ def build_collector_profile_refresh_plan(
     now_ts: int,
     ttl_seconds: int,
     max_refresh_profiles: int,
+    profile_condition_ids: set[str] | None = None,
+    profile_lookback_days: int | None = None,
 ) -> dict[str, Any]:
     reused_profiles_by_wallet: dict[str, dict[str, Any]] = {}
     refresh_candidates: list[dict[str, Any]] = []
@@ -3673,7 +4111,13 @@ def build_collector_profile_refresh_plan(
         seen.add(wallet)
         normalized_seed = {**seed_wallet, "wallet": wallet}
         cached = existing_profiles.get(wallet)
-        if collector_cached_profile_usable(cached, now_ts=now_ts, ttl_seconds=ttl_seconds):
+        if collector_cached_profile_usable(
+            cached,
+            now_ts=now_ts,
+            ttl_seconds=ttl_seconds,
+            profile_condition_ids=profile_condition_ids,
+            profile_lookback_days=profile_lookback_days,
+        ):
             reused_profiles_by_wallet[wallet] = merge_collector_cached_profile_with_seed(cached or {}, normalized_seed)
         else:
             refresh_candidates.append(normalized_seed)
@@ -3809,6 +4253,24 @@ def _record_timestamp(record: dict[str, Any], *keys: str) -> int:
     return 0
 
 
+def filter_classification_set_by_lookback(
+    classification_set: list[dict[str, Any]],
+    *,
+    now: datetime,
+    lookback_days: int,
+) -> list[dict[str, Any]]:
+    if int(lookback_days) <= 0:
+        return list(classification_set)
+    cutoff = now - timedelta(days=int(lookback_days))
+    rows: list[dict[str, Any]] = []
+    for row in classification_set:
+        end = parse_dt(row.get("end_date"))
+        if not end or end > now or end < cutoff:
+            continue
+        rows.append(row)
+    return rows
+
+
 def resolve_collector_output_dir(args: argparse.Namespace) -> Path:
     explicit = getattr(args, "output_dir", None)
     if explicit:
@@ -3906,7 +4368,7 @@ def build_seeded_leaderboard(
     profiles_by_wallet: dict[str, dict[str, Any]],
     *,
     now_ts: int,
-    max_leaderboard_wallets: int = 30,
+    max_leaderboard_wallets: int = 60,
     require_strict_quality_gate: bool = True,
     max_two_sided_market_count: int = 0,
     max_two_sided_market_rate: float = 0.0,
@@ -3931,16 +4393,25 @@ def build_seeded_leaderboard(
     return rows
 
 
-def strict_final_quality_ok(row: dict[str, Any]) -> bool:
-    if to_float(row.get("esports_roi")) <= STRICT_FINAL_MIN_ROI:
+def strict_final_quality_metrics_ok(metrics: dict[str, Any]) -> bool:
+    if to_float(metrics.get("esports_roi")) <= STRICT_FINAL_MIN_ROI:
         return False
-    if to_float(row.get("positive_market_rate")) < STRICT_FINAL_MIN_POSITIVE_MARKET_RATE:
+    if to_float(metrics.get("positive_market_rate")) < STRICT_FINAL_MIN_POSITIVE_MARKET_RATE:
         return False
-    if to_float(row.get("wilson_win_rate_lower_bound")) < STRICT_FINAL_MIN_WILSON:
+    if to_float(metrics.get("wilson_win_rate_lower_bound")) < STRICT_FINAL_MIN_WILSON:
         return False
-    if to_float(row.get("capital_weighted_edge")) < STRICT_FINAL_MIN_CAPITAL_WEIGHTED_EDGE:
+    if to_float(metrics.get("capital_weighted_edge")) < STRICT_FINAL_MIN_CAPITAL_WEIGHTED_EDGE:
         return False
     return True
+
+
+def strict_final_quality_ok(row: dict[str, Any]) -> bool:
+    metrics = (
+        leaderboard_rank_metrics(row)
+        if row.get("best_bucket") or row.get("eligible_buckets") or row.get("eligible_market_types")
+        else row
+    )
+    return strict_final_quality_metrics_ok(metrics)
 
 
 def recent_health_ok(row: dict[str, Any]) -> bool:
@@ -3979,11 +4450,7 @@ def copyable_final_gate_ok(row: dict[str, Any]) -> bool:
     if not bucket_key:
         return False
     candidate_metrics = _candidate_bucket_metrics(row, bucket_key)
-    if not candidate_two_sided_within_limits(
-        candidate_metrics,
-        max_count=MAX_COPYABLE_TWO_SIDED_COUNT,
-        max_rate=MAX_COPYABLE_TWO_SIDED_RATE,
-    ):
+    if not copyable_two_sided_behavior_ok(candidate_metrics, metrics):
         return False
     participated = int(candidate_metrics.get("participated_market_count") or 0)
     if participated > 0:
@@ -3991,6 +4458,31 @@ def copyable_final_gate_ok(row: dict[str, Any]) -> bool:
         if tail_rate > MAX_COPYABLE_TAIL_ENTRY_RATE:
             return False
     return True
+
+
+def _copyable_reject_reasons(row: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    metrics = leaderboard_rank_metrics(row)
+    if to_float(metrics.get("esports_roi")) < MIN_COPYABLE_BUCKET_ROI:
+        reasons.append("bucket_roi_lt_min")
+    bucket_key_value = str(row.get("best_bucket") or "")
+    if not bucket_key_value:
+        reasons.append("missing_best_bucket")
+        return sorted(set(reasons))
+    candidate_metrics = _candidate_bucket_metrics(row, bucket_key_value)
+    if not candidate_metrics:
+        reasons.append("missing_candidate_bucket")
+        return sorted(set(reasons))
+    two_sided_reasons = copyable_two_sided_reject_reasons(candidate_metrics, metrics)
+    if two_sided_reasons:
+        reasons.append("two_sided_over_limit")
+        reasons.extend(two_sided_reasons)
+    participated = int(candidate_metrics.get("participated_market_count") or 0)
+    if participated > 0:
+        tail_rate = int(candidate_metrics.get("tail_entry_market_count") or 0) / participated
+        if tail_rate > MAX_COPYABLE_TAIL_ENTRY_RATE:
+            reasons.append("tail_entry_over_limit")
+    return sorted(set(reasons))
 
 
 def momentum_recent_ok(row: dict[str, Any]) -> bool:
@@ -4026,11 +4518,7 @@ def momentum_quality_ok(row: dict[str, Any]) -> bool:
     two_sided_rate = to_float(row.get("two_sided_trade_market_rate"))
     if behavior_market_count >= TRADE_BEHAVIOR_MIN_MARKETS and two_sided_rate > MOMENTUM_MAX_TWO_SIDED_RATE:
         return False
-    if not candidate_two_sided_within_limits(
-        candidate_metrics,
-        max_count=MAX_COPYABLE_TWO_SIDED_COUNT,
-        max_rate=MAX_COPYABLE_TWO_SIDED_RATE,
-    ):
+    if not copyable_two_sided_behavior_ok(candidate_metrics, metrics):
         return False
     participated = int(candidate_metrics.get("participated_market_count") or 0)
     if participated > 0:
@@ -4060,118 +4548,6 @@ def momentum_score(row: dict[str, Any]) -> float:
     score += 10.0 * _clamp_float(to_float(row.get("esports_roi")) / 0.30)
     score += 10.0 * _clamp_float(to_float(metrics.get("capital_weighted_edge") or metrics.get("entry_edge")) / 0.20)
     score += 5.0 * _clamp_float((0.75 - to_float(metrics.get("median_entry_price") or row.get("median_entry_price"))) / 0.35)
-    return round(score, 6)
-
-
-def _focus_profile_on_family(row: dict[str, Any], game_family: str, *, now_ts: int) -> dict[str, Any] | None:
-    if str(row.get("category") or "esports").lower() != "esports":
-        return None
-    if int(row.get("scoring_version") or 0) != SCORING_VERSION:
-        return None
-    family_buckets = [
-        str(value)
-        for value in row.get("eligible_buckets") or []
-        if value and split_bucket_key(str(value))[0] == game_family
-    ]
-    if not family_buckets:
-        return None
-    filtered = dict(row)
-    filtered["eligible_buckets"] = family_buckets
-    filtered["eligible_bucket_labels"] = [bucket_label(value) for value in family_buckets]
-    filtered["eligible_market_types"] = sorted(
-        {split_bucket_key(value)[1] for value in family_buckets},
-        key=lambda value: {"main_match": 0, "game_winner": 1, "map_winner": 2}.get(value, 99),
-    )
-    filtered["eligible_market_type_labels"] = [
-        MARKET_TYPE_LABELS.get(value, value)
-        for value in filtered["eligible_market_types"]
-    ]
-    filtered["eligible_game_families"] = [game_family]
-    filtered["eligible_game_family_labels"] = [
-        {
-            "dota2": "Dota2",
-            "lol": "LoL",
-            "cs2": "CS2",
-        }.get(game_family, game_family.upper())
-    ]
-    enriched = enrich_esports_bucket_scores(filtered, now_ts=now_ts)
-    if str(enriched.get("best_game_family") or "") != game_family:
-        return None
-    return enriched
-
-
-def _candidate_bucket_rates(row: dict[str, Any], bucket_key: str) -> dict[str, float]:
-    candidate_metrics = _candidate_bucket_metrics(row, bucket_key)
-    participated = int(candidate_metrics.get("participated_market_count") or 0)
-    if participated <= 0:
-        return {"two_sided": 0.0, "tail_entry": 0.0, "high_churn": 0.0}
-    return {
-        "two_sided": int(candidate_metrics.get("two_sided_market_count") or 0) / participated,
-        "tail_entry": int(candidate_metrics.get("tail_entry_market_count") or 0) / participated,
-        "high_churn": int(candidate_metrics.get("high_churn_market_count") or 0) / participated,
-    }
-
-
-def family_supplement_quality_ok(row: dict[str, Any], game_family: str) -> bool:
-    config = FAMILY_SUPPLEMENT_CONFIG.get(game_family)
-    if not config:
-        return False
-    if str(row.get("best_game_family") or "") != game_family:
-        return False
-    metrics = leaderboard_rank_metrics(row)
-    closed_count = int(metrics.get("esports_closed_count") or 0)
-    if closed_count < int(config["min_closed_count"]):
-        return False
-    if to_float(metrics.get("esports_roi")) < to_float(config["min_bucket_roi"]):
-        return False
-    if to_float(metrics.get("positive_market_rate")) < to_float(config["min_positive_rate"]):
-        return False
-    if to_float(metrics.get("wilson_win_rate_lower_bound")) < to_float(config["min_wilson"]):
-        return False
-    if to_float(metrics.get("capital_weighted_edge") or metrics.get("entry_edge")) < to_float(config["min_capital_edge"]):
-        return False
-    median_entry = to_float(metrics.get("median_entry_price") or row.get("median_entry_price"))
-    if median_entry <= 0 or median_entry > to_float(config["max_median_entry_price"]):
-        return False
-    if int(row.get("recent_14d_market_count") or 0) < int(config["min_recent_14d_markets"]):
-        return False
-    if to_float(row.get("recent_14d_roi")) < to_float(config["min_recent_14d_roi"]):
-        return False
-    if to_float(row.get("recent_14d_positive_rate")) < to_float(config["min_recent_14d_positive_rate"]):
-        return False
-    if int(row.get("recent_7d_market_count") or 0) > 0 and to_float(row.get("recent_7d_roi")) < -0.05:
-        return False
-    if to_float(row.get("actual_minus_hold_pnl_rate")) > SWING_DEPENDENT_RATE:
-        return False
-    behavior_market_count = int(row.get("historical_trade_behavior_market_count") or 0)
-    if behavior_market_count >= TRADE_BEHAVIOR_MIN_MARKETS:
-        if to_float(row.get("two_sided_trade_market_rate")) > to_float(config["max_two_sided_rate"]):
-            return False
-    bucket_key = str(row.get("best_bucket") or "")
-    rates = _candidate_bucket_rates(row, bucket_key)
-    if rates["two_sided"] > to_float(config["max_two_sided_rate"]):
-        return False
-    if rates["tail_entry"] > to_float(config["max_tail_entry_rate"]):
-        return False
-    return True
-
-
-def family_supplement_score(row: dict[str, Any], game_family: str) -> float:
-    metrics = leaderboard_rank_metrics(row)
-    bucket_key = str(row.get("best_bucket") or "")
-    rates = _candidate_bucket_rates(row, bucket_key)
-    score = (
-        34.0 * _clamp_float(to_float(metrics.get("positive_market_rate")))
-        + 22.0 * _clamp_float(to_float(metrics.get("esports_roi")) / 0.50)
-        + 16.0 * _clamp_float(to_float(row.get("recent_14d_roi")) / 0.50)
-        + 10.0 * _clamp_float(to_float(metrics.get("capital_weighted_edge") or metrics.get("entry_edge")) / 0.25)
-        + 8.0 * _clamp_float(int(metrics.get("esports_closed_count") or 0) / 50)
-        + 6.0 * _clamp_float(to_float(row.get("recent_14d_positive_rate")))
-        + 4.0 * _clamp_float((0.75 - to_float(metrics.get("median_entry_price") or row.get("median_entry_price"))) / 0.35)
-        - 8.0 * rates["tail_entry"]
-        - 8.0 * rates["two_sided"]
-        - 4.0 * rates["high_churn"]
-    )
     return round(score, 6)
 
 
@@ -4214,7 +4590,7 @@ def build_collector_leaderboard(
     profiles_by_wallet: dict[str, dict[str, Any]],
     *,
     now_ts: int,
-    max_leaderboard_wallets: int = 30,
+    max_leaderboard_wallets: int = 60,
     max_core_wallets: int = 20,
     max_momentum_wallets: int = 10,
     max_watchlist_wallets: int = 50,
@@ -4226,45 +4602,22 @@ def build_collector_leaderboard(
             now_ts=now_ts,
             max_leaderboard_wallets=0,
             require_strict_quality_gate=True,
-            max_two_sided_market_count=MAX_COPYABLE_TWO_SIDED_COUNT,
-            max_two_sided_market_rate=MAX_COPYABLE_TWO_SIDED_RATE,
+            max_two_sided_market_count=COPYABLE_TWO_SIDED_PREFILTER_MAX_COUNT,
+            max_two_sided_market_rate=COPYABLE_TWO_SIDED_MAX_RATE,
         )
         if core_quality_ok(row)
         and activity_fresh_ok(row, now_ts=now_ts)
         and copyable_final_gate_ok(row)
     ]
-    core = sorted(core_candidates, key=leaderboard_rank_key)[: max(0, int(max_core_wallets))]
+    core_limit = max(0, int(max_leaderboard_wallets)) if max_leaderboard_wallets > 0 else len(core_candidates)
+    core = sorted(core_candidates, key=leaderboard_rank_key)[:core_limit]
     core_wallets = {normalize_wallet(row.get("wallet")) for row in core}
 
-    family_candidates_by_family: dict[str, list[dict[str, Any]]] = {
-        family: [] for family in FAMILY_SUPPLEMENT_ORDER
-    }
-    momentum_candidates: list[dict[str, Any]] = []
     watch_candidates: list[dict[str, Any]] = []
     for profile in profiles_by_wallet.values():
         wallet = normalize_wallet(profile.get("wallet"))
         if not wallet or wallet in core_wallets:
             continue
-        for game_family in FAMILY_SUPPLEMENT_ORDER:
-            focused = _focus_profile_on_family(profile, game_family, now_ts=now_ts)
-            if focused is None:
-                continue
-            if not activity_fresh_ok(focused, now_ts=now_ts):
-                continue
-            if not family_supplement_quality_ok(focused, game_family):
-                continue
-            if not copyable_final_gate_ok(focused):
-                continue
-            score = family_supplement_score(focused, game_family)
-            family_candidates_by_family[game_family].append(
-                {
-                    **focused,
-                    "collector": COLLECTOR_NAME,
-                    "lane": "family_supplement",
-                    "family": game_family,
-                    "family_score": score,
-                }
-            )
         prepared = _prepare_followable_profile(profile, now_ts=now_ts)
         if prepared is None:
             continue
@@ -4289,28 +4642,15 @@ def build_collector_leaderboard(
                 }
             )
             continue
-        if momentum_quality_ok(prepared):
-            score = momentum_score(prepared)
-            momentum_candidates.append({**prepared, "lane": "momentum", "momentum_score": score})
-        elif momentum_recent_ok(prepared) or not recent_health_ok(prepared):
+        if not core_quality_ok(prepared):
             watch_candidates.append(
                 {
                     **prepared,
                     "lane": "watch",
-                    "watch_reasons": _watch_reasons(prepared),
+                    "watch_reasons": sorted(set(_watch_reasons(prepared)) | {"strict_quality_gate"}),
                     "momentum_score": momentum_score(prepared),
                 }
             )
-
-    momentum_candidates.sort(
-        key=lambda row: (
-            -to_float(row.get("momentum_score")),
-            -to_float(row.get("recent_7d_roi")),
-            -to_float(row.get("recent_14d_roi")),
-            -to_float(row.get("positive_market_rate")),
-            normalize_wallet(row.get("wallet")),
-        )
-    )
     watch_candidates.sort(
         key=lambda row: (
             -to_float(row.get("momentum_score")),
@@ -4320,49 +4660,8 @@ def build_collector_leaderboard(
         )
     )
     family_supplements: list[dict[str, Any]] = []
-    family_wallets: set[str] = set()
-    family_slots = (
-        max(0, int(max_leaderboard_wallets) - len(core))
-        if max_leaderboard_wallets > 0
-        else sum(int(FAMILY_SUPPLEMENT_CONFIG[family]["limit"]) for family in FAMILY_SUPPLEMENT_ORDER)
-    )
-    for game_family in FAMILY_SUPPLEMENT_ORDER:
-        candidates = family_candidates_by_family.get(game_family, [])
-        candidates.sort(
-            key=lambda row: (
-                -to_float(row.get("family_score")),
-                -to_float(row.get("recent_14d_roi")),
-                -to_float(row.get("recent_14d_positive_rate")),
-                -int(leaderboard_rank_metrics(row).get("esports_closed_count") or 0),
-                normalize_wallet(row.get("wallet")),
-            )
-        )
-        family_limit = int(FAMILY_SUPPLEMENT_CONFIG[game_family]["limit"])
-        selected_for_family = 0
-        for candidate in candidates:
-            wallet = normalize_wallet(candidate.get("wallet"))
-            if not wallet or wallet in family_wallets:
-                continue
-            if max_leaderboard_wallets > 0 and len(family_supplements) >= family_slots:
-                break
-            if selected_for_family >= family_limit:
-                break
-            family_supplements.append(candidate)
-            family_wallets.add(wallet)
-            selected_for_family += 1
-
-    occupied_wallets = core_wallets | family_wallets
-    momentum_candidates = [
-        row for row in momentum_candidates if normalize_wallet(row.get("wallet")) not in occupied_wallets
-    ]
-    remaining_slots = (
-        max(0, int(max_leaderboard_wallets) - len(core) - len(family_supplements))
-        if max_leaderboard_wallets > 0
-        else int(max_momentum_wallets)
-    )
-    momentum_limit = min(max(0, int(max_momentum_wallets)), remaining_slots) if max_leaderboard_wallets > 0 else max(0, int(max_momentum_wallets))
-    momentum = momentum_candidates[:momentum_limit]
-    leaderboard = core + family_supplements + momentum
+    momentum: list[dict[str, Any]] = []
+    leaderboard = core
     if max_leaderboard_wallets > 0:
         leaderboard = leaderboard[:max_leaderboard_wallets]
     watch = watch_candidates[: max(0, int(max_watchlist_wallets))]
@@ -4457,8 +4756,26 @@ def _command_collect_wallets(
         classification_set,
         now=now_dt,
         lookback_days=lookback_days,
-        bucket_market_limit=getattr(args, "bucket_market_limit", 50),
+        bucket_market_limit=getattr(args, "bucket_market_limit", 100),
     )
+    seed_bucket_min_hit_rate = float(getattr(args, "seed_bucket_min_hit_rate", SEED_BUCKET_MIN_HIT_RATE))
+    raw_seed_bucket_min_wins = calculate_seed_bucket_min_wins(
+        target_meta.get("bucket_counts") or {},
+        min_rate=seed_bucket_min_hit_rate,
+    )
+    seed_single_bucket_min_wins = int(getattr(args, "seed_single_bucket_min_wins", SEED_SINGLE_BUCKET_MIN_WINS) or 0)
+    seed_multi_bucket_min_wins = int(getattr(args, "seed_multi_bucket_min_wins", SEED_MULTI_BUCKET_MIN_WINS) or 0)
+    seed_bucket_min_wins = effective_seed_bucket_min_wins(
+        raw_seed_bucket_min_wins,
+        seed_single_bucket_min_wins=seed_single_bucket_min_wins,
+    )
+    seed_bucket_min_avg_cash = {
+        MAIN_MATCH: float(getattr(args, "seed_main_match_min_avg_cash", SEED_MAIN_MATCH_MIN_AVG_CASH)),
+        GAME_WINNER: float(getattr(args, "seed_game_winner_min_avg_cash", SEED_GAME_WINNER_MIN_AVG_CASH)),
+        MAP_WINNER: float(getattr(args, "seed_map_winner_min_avg_cash", SEED_MAP_WINNER_MIN_AVG_CASH)),
+    }
+    seed_min_weighted_roi = float(getattr(args, "seed_min_weighted_roi", SEED_MIN_WEIGHTED_ROI))
+    seed_max_median_avg_price = float(getattr(args, "seed_max_median_avg_price", SEED_MAX_MEDIAN_AVG_PRICE))
     write_json(output_dir / f"{prefix}_target_markets.json", target_markets)
     mark_stage("target_markets")
 
@@ -4508,18 +4825,35 @@ def _command_collect_wallets(
     profile_wallets = filter_profile_seed_wallets(
         seed_wallets,
         max_wallets=max_profile_wallets,
+        seed_bucket_min_wins=seed_bucket_min_wins,
+        seed_bucket_min_avg_cash=seed_bucket_min_avg_cash,
+        seed_min_weighted_roi=seed_min_weighted_roi,
+        seed_max_median_avg_price=seed_max_median_avg_price,
+        seed_single_bucket_min_wins=seed_single_bucket_min_wins,
+        seed_multi_bucket_min_wins=seed_multi_bucket_min_wins,
     )
     write_json(output_dir / f"{prefix}_profile_wallets.json", profile_wallets)
     mark_stage("seed_wallet_filter")
 
-    condition_ids = {
+    classification_condition_ids = {
         str(row.get("condition_id") or "").lower()
         for row in classification_set
         if row.get("condition_id")
     }
+    profile_lookback_days = int(getattr(args, "profile_lookback_days", COLLECTOR_PROFILE_LOOKBACK_DAYS) or 0)
+    profile_classification_set = filter_classification_set_by_lookback(
+        classification_set,
+        now=now_dt,
+        lookback_days=profile_lookback_days,
+    )
+    condition_ids = {
+        str(row.get("condition_id") or "").lower()
+        for row in profile_classification_set
+        if row.get("condition_id")
+    }
     market_records_by_id = {
         str(row.get("condition_id") or "").lower(): row
-        for row in classification_set
+        for row in profile_classification_set
         if row.get("condition_id")
     }
     condition_type_by_id = {
@@ -4538,6 +4872,8 @@ def _command_collect_wallets(
         now_ts=now_ts,
         ttl_seconds=max(0, int(profile_cache_ttl_hours * 3600)),
         max_refresh_profiles=max_profile_wallets,
+        profile_condition_ids=condition_ids,
+        profile_lookback_days=profile_lookback_days,
     )
     reused_profiles_by_wallet = profile_refresh["reused_profiles_by_wallet"]
     refresh_profile_wallets = profile_refresh["refresh_plan"]
@@ -4603,7 +4939,11 @@ def _command_collect_wallets(
             current_positions_loader=lambda _wallet: [],
             now_ts=now_ts,
         )
-        return {**profile, "seed": collector_seed_payload(seed_wallet)}
+        return {
+            **profile,
+            "profile_lookback_days": profile_lookback_days,
+            "seed": collector_seed_payload(seed_wallet),
+        }
 
     refreshed_profiles = [
         make_retryable_profile(refresh_profile_wallets[index].get("candidate") or refresh_profile_wallets[index], result, now_ts=now_ts)
@@ -4624,7 +4964,7 @@ def _command_collect_wallets(
     collector_result = build_collector_leaderboard(
         profiles_by_wallet,
         now_ts=now_ts,
-        max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", 30),
+        max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", 60),
         max_core_wallets=getattr(args, "max_core_wallets", 20),
         max_momentum_wallets=getattr(args, "max_momentum_wallets", 10),
         max_watchlist_wallets=getattr(args, "max_watchlist_wallets", 50),
@@ -4641,12 +4981,24 @@ def _command_collect_wallets(
         "collector": COLLECTOR_NAME,
         "category": "esports",
         "lookback_days": lookback_days,
+        "profile_lookback_days": profile_lookback_days,
         "classification_market_count": len(classification_set),
+        "classification_condition_id_count": len(classification_condition_ids),
+        "profile_scoring_market_count": len(profile_classification_set),
+        "profile_condition_id_count": len(condition_ids),
         "target_market_count": len(target_markets),
         "seed_position_count": len(seed_positions),
         "seed_wallet_count": len(seed_wallets),
         "profile_wallet_count": len(profile_wallets),
         "max_profile_wallets": max_profile_wallets,
+        "seed_bucket_min_hit_rate": seed_bucket_min_hit_rate,
+        "seed_raw_bucket_min_wins": raw_seed_bucket_min_wins,
+        "seed_bucket_min_wins": seed_bucket_min_wins,
+        "seed_single_bucket_min_wins": seed_single_bucket_min_wins,
+        "seed_multi_bucket_min_wins": seed_multi_bucket_min_wins,
+        "seed_bucket_min_avg_cash": seed_bucket_min_avg_cash,
+        "seed_min_weighted_roi": seed_min_weighted_roi,
+        "seed_max_median_avg_price": seed_max_median_avg_price,
         "profiled_wallet_count": len(profiles_by_wallet),
         "collector_profile_cache_ttl_hours": profile_cache_ttl_hours,
         **profile_refresh["stats"],
@@ -4666,6 +5018,12 @@ def _command_collect_wallets(
             profiles_by_wallet=profiles_by_wallet,
             leaderboard=leaderboard,
             now_ts=now_ts,
+            seed_bucket_min_wins=seed_bucket_min_wins,
+            seed_bucket_min_avg_cash=seed_bucket_min_avg_cash,
+            seed_min_weighted_roi=seed_min_weighted_roi,
+            seed_max_median_avg_price=seed_max_median_avg_price,
+            seed_single_bucket_min_wins=seed_single_bucket_min_wins,
+            seed_multi_bucket_min_wins=seed_multi_bucket_min_wins,
         ),
         "stage_timings": {key: round(float(value), 6) for key, value in sorted(stage_timings.items())},
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -4681,6 +5039,10 @@ def _command_collect_wallets(
             "min_copyable_bucket_roi": MIN_COPYABLE_BUCKET_ROI,
             "max_copyable_two_sided_market_count": MAX_COPYABLE_TWO_SIDED_COUNT,
             "max_copyable_two_sided_market_rate": MAX_COPYABLE_TWO_SIDED_RATE,
+            "copyable_two_sided_max_rate": COPYABLE_TWO_SIDED_MAX_RATE,
+            "copyable_two_sided_min_bucket_roi": COPYABLE_TWO_SIDED_MIN_BUCKET_ROI,
+            "copyable_two_sided_min_first_direction_win_rate": COPYABLE_TWO_SIDED_MIN_FIRST_DIRECTION_WIN_RATE,
+            "copyable_two_sided_min_closed_count": COPYABLE_TWO_SIDED_MIN_CLOSED_COUNT,
             "max_copyable_tail_entry_rate": MAX_COPYABLE_TAIL_ENTRY_RATE,
             "high_churn_hard_excluded": False,
         }
@@ -5958,7 +6320,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--min-profile-avg-market-cash", type=float, default=1_500)
         subparser.add_argument("--leaderboard-min-participated-markets", type=int, default=None)
         subparser.add_argument("--leaderboard-min-avg-market-cash", type=float, default=1_500)
-        subparser.add_argument("--max-leaderboard-wallets", type=int, default=30)
+        subparser.add_argument("--max-leaderboard-wallets", type=int, default=60)
         subparser.add_argument("--profile-refresh-ttl-days", type=int, default=7)
         subparser.add_argument("--profile-store-max-age-days", type=int, default=180)
         subparser.set_defaults(func=command_build_leaderboard)
@@ -5998,8 +6360,17 @@ def build_parser() -> argparse.ArgumentParser:
     def add_collector_arguments(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--output-dir", default=None)
         subparser.add_argument("--lookback-days", type=int, default=30)
-        subparser.add_argument("--bucket-market-limit", type=int, default=50)
+        subparser.add_argument("--profile-lookback-days", type=int, default=COLLECTOR_PROFILE_LOOKBACK_DAYS)
+        subparser.add_argument("--bucket-market-limit", type=int, default=100)
         subparser.add_argument("--positions-per-market", type=int, default=20)
+        subparser.add_argument("--seed-bucket-min-hit-rate", type=float, default=SEED_BUCKET_MIN_HIT_RATE)
+        subparser.add_argument("--seed-single-bucket-min-wins", type=int, default=SEED_SINGLE_BUCKET_MIN_WINS)
+        subparser.add_argument("--seed-multi-bucket-min-wins", type=int, default=SEED_MULTI_BUCKET_MIN_WINS)
+        subparser.add_argument("--seed-main-match-min-avg-cash", type=float, default=SEED_MAIN_MATCH_MIN_AVG_CASH)
+        subparser.add_argument("--seed-game-winner-min-avg-cash", type=float, default=SEED_GAME_WINNER_MIN_AVG_CASH)
+        subparser.add_argument("--seed-map-winner-min-avg-cash", type=float, default=SEED_MAP_WINNER_MIN_AVG_CASH)
+        subparser.add_argument("--seed-min-weighted-roi", type=float, default=SEED_MIN_WEIGHTED_ROI)
+        subparser.add_argument("--seed-max-median-avg-price", type=float, default=SEED_MAX_MEDIAN_AVG_PRICE)
         subparser.add_argument("--max-profile-wallets", type=int, default=None)
         subparser.add_argument("--max-core-wallets", type=int, default=20)
         subparser.add_argument("--max-momentum-wallets", type=int, default=10)
