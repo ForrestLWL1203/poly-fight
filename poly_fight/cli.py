@@ -78,6 +78,7 @@ from .follow import (
     should_retry_unqualified_position,
     summarize_wallet_fills,
     trade_condition_id,
+    trade_timestamp,
     winner_outcome_index,
 )
 from .storage import FollowStore, LeaderboardStore
@@ -5670,6 +5671,8 @@ def command_follow(
     data_dir = resolve_dashboard_root(args)
     follow_dir = resolve_follow_dir(args, data_dir)
     now_ts = int(datetime.now(timezone.utc).timestamp())
+    follow_started_mono = time.monotonic()
+    stage_seconds: dict[str, float] = {}
 
     state_path = follow_dir / "follow_state.json"
     open_path = follow_dir / "follow_signals_open.json"
@@ -5760,6 +5763,7 @@ def command_follow(
         for condition_id in condition_ids
     }
 
+    active_cache_started_mono = time.monotonic()
     active_markets, state, active_source = load_active_market_cache(
         client,
         state,
@@ -5772,11 +5776,13 @@ def command_follow(
         allowed_categories=set(FOLLOW_SIGNAL_CATEGORIES),
         preserve_condition_ids=set(open_condition_ids),
     )
+    stage_seconds["active_market_cache"] = round(time.monotonic() - active_cache_started_mono, 3)
     active_markets_for_follow = {
         condition_id: market
         for condition_id, market in active_markets.items()
         if str(market.get("category") or "esports").lower() in FOLLOW_SIGNAL_CATEGORIES
     }
+    logo_started_mono = time.monotonic()
     try:
         refresh_team_logo_cache_from_active_markets(
             data_dir,
@@ -5788,6 +5794,8 @@ def command_follow(
         )
     except Exception:
         pass
+    finally:
+        stage_seconds["team_logo_refresh"] = round(time.monotonic() - logo_started_mono, 3)
     watched = watched_markets(
         active_markets_for_follow,
         now_ts=now_ts,
@@ -5823,6 +5831,10 @@ def command_follow(
     trade_request_count = 0
     insufficient_balance_count = 0
     low_entry_price_blocked_count = 0
+    wallet_fetch_error_count = 0
+    wallet_fetch_seconds: list[float] = []
+    observed_delay_values: list[int] = []
+    index_lag_lower_bound_values: list[int] = []
     bankroll_usdc = effective_bankroll_usdc(args.bankroll_usdc)
 
     tracked_condition_ids = {str(condition_id).lower() for condition_id in watched}
@@ -5834,10 +5846,17 @@ def command_follow(
     }
 
     if gate_open and follow_wallets:
-        def fetch_trades_for_wallet(row: dict[str, Any]) -> tuple[str, list[dict], list[dict]]:
+        def fetch_trades_for_wallet(row: dict[str, Any]) -> tuple[str, list[dict], list[dict], dict[str, Any]]:
             wallet = normalize_wallet(row.get("wallet"))
             scope_key = str(row.get("scope_key") or f"{str(row.get('category') or 'esports').lower()}:{wallet}")
-            previous_cursor = (wallet_trade_state.get(scope_key) or wallet_trade_state.get(wallet) or {}).get("last_trade_cursor")
+            previous_state = wallet_trade_state.get(scope_key) or wallet_trade_state.get(wallet) or {}
+            previous_cursor = previous_state.get("last_trade_cursor")
+            fetch_started_at = int(datetime.now(timezone.utc).timestamp())
+            fetch_started_mono = time.monotonic()
+            meta = {
+                "fetch_started_at": fetch_started_at,
+                "previous_poll_at": to_int(previous_state.get("last_seen_at")),
+            }
             try:
                 trades = fetch_user_trades_until_cursor(
                     client,
@@ -5849,23 +5868,50 @@ def command_follow(
                 positions = []
                 if scope_key in eligible_wallet_set and previous_cursor is None:
                     positions = client.positions(wallet, limit=args.positions_limit)
-                return scope_key, trades, positions
-            except Exception:
-                return scope_key, [], []
+                meta["fetch_completed_at"] = int(datetime.now(timezone.utc).timestamp())
+                meta["fetch_seconds"] = round(time.monotonic() - fetch_started_mono, 3)
+                return scope_key, trades, positions, meta
+            except Exception as exc:
+                meta["fetch_completed_at"] = int(datetime.now(timezone.utc).timestamp())
+                meta["fetch_seconds"] = round(time.monotonic() - fetch_started_mono, 3)
+                meta["error"] = exc.__class__.__name__
+                return scope_key, [], [], meta
 
+        wallet_fetch_started_mono = time.monotonic()
         trade_results = run_ordered_io_tasks(
             follow_wallets,
             fetch_trades_for_wallet,
             max_workers=args.max_workers,
         )
+        stage_seconds["wallet_trade_fetch"] = round(time.monotonic() - wallet_fetch_started_mono, 3)
         trade_request_count = len(follow_wallets)
+        wallet_process_started_mono = time.monotonic()
+
+        def record_observed_delay(trades: list[dict[str, Any]], *, observed_at: int, previous_poll_at: int) -> None:
+            for trade in trades:
+                trade_ts = trade_timestamp(trade)
+                if not trade_ts:
+                    continue
+                observed_delay_values.append(max(0, observed_at - trade_ts))
+                if previous_poll_at > 0 and trade_ts <= previous_poll_at:
+                    index_lag_lower_bound_values.append(max(0, previous_poll_at - trade_ts))
+
         for result in trade_results:
             if isinstance(result, Exception):
                 continue
-            scope_key, trades, positions = result
+            scope_key, trades, positions, fetch_meta = result
+            fetch_seconds_value = to_float(fetch_meta.get("fetch_seconds")) if isinstance(fetch_meta, dict) else 0.0
+            if fetch_seconds_value > 0:
+                wallet_fetch_seconds.append(fetch_seconds_value)
+            if isinstance(fetch_meta, dict) and fetch_meta.get("error"):
+                wallet_fetch_error_count += 1
             category, wallet = scope_key.split(":", 1)
             wallet_can_open_new = scope_key in eligible_wallet_set and category not in paused_new_signal_categories
             previous_cursor = (wallet_trade_state.get(scope_key) or wallet_trade_state.get(wallet) or {}).get("last_trade_cursor")
+            observed_at = to_int(fetch_meta.get("fetch_completed_at")) if isinstance(fetch_meta, dict) else now_ts
+            if observed_at <= 0:
+                observed_at = now_ts
+            previous_poll_at = to_int(fetch_meta.get("previous_poll_at")) if isinstance(fetch_meta, dict) else 0
             new_trades, next_cursor, cold_start = select_new_trades(trades, previous_cursor)
             if cold_start:
                 cold_start_wallet_count += 1
@@ -5892,6 +5938,8 @@ def command_follow(
                         trades=bootstrap_trades,
                         markets_by_condition=markets_for_follow or watched,
                         now_ts=now_ts,
+                        observed_at=observed_at,
+                        previous_poll_at=previous_poll_at,
                         stake_usdc=args.stake_usdc,
                         max_follow_legs=args.max_follow_legs,
                         max_slippage=args.max_slippage_over_entry,
@@ -5939,6 +5987,7 @@ def command_follow(
             else:
                 wallet_tracked_condition_ids = open_condition_ids_by_wallet.get(scope_key, set())
             watched_trades = [trade for trade in new_trades if trade_condition_id(trade) in wallet_tracked_condition_ids]
+            record_observed_delay(watched_trades, observed_at=observed_at, previous_poll_at=previous_poll_at)
             before_ids = {signal.get("signal_id") for signal in open_signals}
             open_signals, stats = process_follow_trades(
                 open_signals,
@@ -5946,6 +5995,8 @@ def command_follow(
                 trades=watched_trades,
                 markets_by_condition=markets_for_follow or watched,
                 now_ts=now_ts,
+                observed_at=observed_at,
+                previous_poll_at=previous_poll_at,
                 stake_usdc=args.stake_usdc,
                 max_follow_legs=args.max_follow_legs,
                 max_slippage=args.max_slippage_over_entry,
@@ -5981,10 +6032,15 @@ def command_follow(
                 "wallet": wallet,
                 "category": category,
             }
+        stage_seconds["wallet_trade_process"] = round(time.monotonic() - wallet_process_started_mono, 3)
+    else:
+        stage_seconds["wallet_trade_fetch"] = 0.0
+        stage_seconds["wallet_trade_process"] = 0.0
 
     state["wallet_trade_state"] = wallet_trade_state
     state["updated_at"] = now_ts
 
+    settlement_started_mono = time.monotonic()
     open_signals, clv_stats = apply_closing_line_snapshots(open_signals, active_markets, now_ts=now_ts)
     closing_line_snapshot_count += clv_stats.get("closing_line_snapshot_count", 0)
     contested_condition_ids = contested_markets(open_signals, now_ts=now_ts)
@@ -6017,6 +6073,18 @@ def command_follow(
         store.upsert_wallet_quarantine(event["wallet"], reason=event["reason"], ts=int(event["timestamp"]), category=category)
         existing_quarantine.add(key)
         quarantine_event_count += 1
+    stage_seconds["settlement_and_quarantine"] = round(time.monotonic() - settlement_started_mono, 3)
+
+    def summarize_seconds(values: list[int] | list[float]) -> dict[str, Any]:
+        clean = sorted(float(value) for value in values if value is not None and float(value) >= 0)
+        if not clean:
+            return {"count": 0}
+        return {
+            "count": len(clean),
+            "p50": round(clean[int((len(clean) - 1) * 0.50)], 3),
+            "p90": round(clean[int((len(clean) - 1) * 0.90)], 3),
+            "max": round(clean[-1], 3),
+        }
 
     run_log_row = {
         "created_at": now_ts,
@@ -6027,6 +6095,10 @@ def command_follow(
         "active_market_source": active_source,
         "watched_market_count": len(watched),
         "trade_request_count": trade_request_count,
+        "wallet_trade_fetch_error_count": wallet_fetch_error_count,
+        "wallet_trade_fetch_seconds": summarize_seconds(wallet_fetch_seconds),
+        "observed_trade_delay_seconds": summarize_seconds(observed_delay_values),
+        "index_lag_lower_bound_seconds": summarize_seconds(index_lag_lower_bound_values),
         "bootstrap_position_request_count": bootstrap_position_request_count,
         "cold_start_wallet_count": cold_start_wallet_count,
         "bootstrap_position_count": bootstrap_position_count,
@@ -6047,6 +6119,8 @@ def command_follow(
         "open_signal_count": len(open_signals),
         "settled_signal_count": len(settled),
         "desired_next_interval_seconds": next_interval,
+        "tick_runtime_seconds": round(time.monotonic() - follow_started_mono, 3),
+        "stage_seconds": stage_seconds,
         "migration": migration_summary,
         "by_category": {
             category: {
@@ -6117,8 +6191,8 @@ def command_run(args: argparse.Namespace) -> int:
         previous_sigterm = None
 
     def sleep_or_stop(seconds: int) -> None:
-        if not stop_requested["value"]:
-            time.sleep(max(1, int(seconds)))
+        if not stop_requested["value"] and int(seconds) > 0:
+            time.sleep(int(seconds))
 
     def maybe_build(force: bool = False) -> bool:
         nonlocal last_build_at
@@ -6165,6 +6239,7 @@ def command_run(args: argparse.Namespace) -> int:
                 )
                 sleep_or_stop(int(args.error_retry_seconds))
         while not stop_requested["value"]:
+            iteration_started_mono = time.monotonic()
             try:
                 maybe_build(force=False)
                 summary = command_follow(args, client=client, emit=True)
@@ -6205,7 +6280,9 @@ def command_run(args: argparse.Namespace) -> int:
             tick_count += 1
             if args.max_run_ticks and tick_count >= args.max_run_ticks:
                 break
-            sleep_seconds = int(summary.get("desired_next_interval_seconds") or args.max_tick_seconds)
+            target_interval = int(summary.get("desired_next_interval_seconds") or args.max_tick_seconds)
+            iteration_seconds = time.monotonic() - iteration_started_mono
+            sleep_seconds = max(0, int(round(target_interval - iteration_seconds)))
             sleep_or_stop(sleep_seconds)
     except KeyboardInterrupt:
         print(json.dumps({"status": "stopped", "reason": "keyboard_interrupt", "ticks": tick_count}, ensure_ascii=False))

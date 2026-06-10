@@ -1648,7 +1648,7 @@ createApp({
     },
     legFollowDelayText(leg) {
       const targetTs = this.normalizeTs(leg?.wallet_trade_at || leg?.created_at);
-      const followTs = this.normalizeTs(leg?.leg_at || leg?.created_at);
+      const followTs = this.normalizeTs(leg?.observed_at || leg?.leg_at || leg?.created_at);
       if (!targetTs || !followTs) return "-";
       const delta = followTs - targetTs;
       const sign = delta >= 0 ? "+" : "-";

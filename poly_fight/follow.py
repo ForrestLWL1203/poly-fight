@@ -456,6 +456,8 @@ def process_follow_trades(
     trades: list[dict[str, Any]],
     markets_by_condition: dict[str, dict[str, Any]],
     now_ts: int,
+    observed_at: int | None = None,
+    previous_poll_at: int | None = None,
     stake_usdc: float,
     max_follow_legs: int,
     max_slippage: float,
@@ -472,6 +474,8 @@ def process_follow_trades(
     bankroll_usdc: float = float("inf"),
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     wallet = normalize_wallet(wallet)
+    observed_ts = to_int(observed_at) or now_ts
+    previous_poll_ts = to_int(previous_poll_at)
     stats: dict[str, Any] = {
         "new_leg_count": 0,
         "exited_signal_count": 0,
@@ -631,7 +635,14 @@ def process_follow_trades(
             "wallet_trade_cash": wallet_cash,
             "stake_mode": stake_mode,
             "stake_ratio_percent": round(stake_ratio_percent, 8),
+            "observed_at": observed_ts,
         }
+        if trade_ts:
+            leg["observed_delay_seconds"] = max(0, observed_ts - trade_ts)
+        if previous_poll_ts > 0:
+            leg["previous_poll_at"] = previous_poll_ts
+            if trade_ts and trade_ts <= previous_poll_ts:
+                leg["index_lag_lower_bound_seconds"] = max(0, previous_poll_ts - trade_ts)
         if follow_block_reasons:
             leg["follow_block_reason"] = follow_block_reasons[0]
             leg["follow_block_reasons"] = follow_block_reasons

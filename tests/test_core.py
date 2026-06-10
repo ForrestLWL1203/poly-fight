@@ -5248,6 +5248,49 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(signals[0]["legs"][0]["stake"], 300)
         self.assertEqual(signals[0]["legs"][0]["wallet_trade_cash"], 3000)
 
+    def test_process_follow_trades_records_observed_delay_diagnostics(self):
+        now = 1000
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.5, 0.5],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "Match",
+            "market_type": "main_match",
+        }
+        trades = [
+            {
+                "id": "b1",
+                "proxyWallet": "0xA",
+                "market": "m1",
+                "outcomeIndex": 0,
+                "side": "BUY",
+                "price": 0.5,
+                "size": 100,
+                "timestamp": now + 20,
+            }
+        ]
+
+        signals, _ = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=trades,
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            observed_at=now + 125,
+            previous_poll_at=now + 50,
+            stake_usdc=1,
+            stake_ratio_percent=10,
+            max_follow_legs=10,
+            max_slippage=0.05,
+        )
+
+        leg = signals[0]["legs"][0]
+        self.assertEqual(leg["observed_at"], now + 125)
+        self.assertEqual(leg["observed_delay_seconds"], 105)
+        self.assertEqual(leg["previous_poll_at"], now + 50)
+        self.assertEqual(leg["index_lag_lower_bound_seconds"], 30)
+
     def test_process_follow_trades_blocks_low_wallet_entry_price(self):
         now = 1000
         market = {
@@ -12687,6 +12730,28 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(build.call_count, 0)
         self.assertEqual(follow.call_count, 2)
         self.assertEqual(sleep.call_args_list[0].args[0], 180)
+
+    def test_run_loop_subtracts_iteration_runtime_from_sleep(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["run", "--stake-usdc", "1", "--skip-initial-build", "--max-run-ticks", "2", "--tick-seconds", "120"]
+        )
+
+        with patch("poly_fight.cli.build_client", return_value=object()), patch(
+            "poly_fight.cli.command_build_leaderboard"
+        ), patch(
+            "poly_fight.cli.command_follow", return_value={"desired_next_interval_seconds": 120}
+        ) as follow, patch("poly_fight.cli.time.sleep") as sleep, patch(
+            "poly_fight.cli.time.monotonic", side_effect=[0.0, 35.0, 120.0]
+        ):
+            from poly_fight.cli import command_run
+
+            with redirect_stdout(StringIO()):
+                self.assertEqual(command_run(args), 0)
+
+        self.assertEqual(follow.call_count, 2)
+        self.assertEqual(sleep.call_count, 1)
+        self.assertEqual(sleep.call_args.args[0], 85)
 
     def test_run_full_refresh_pauses_new_signals(self):
         with TemporaryDirectory() as tmp:
