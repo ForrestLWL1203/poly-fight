@@ -1318,6 +1318,44 @@ def _signal_follow_action_at(signal: dict[str, Any]) -> int:
     return max([value for value in [direct, fallback, *leg_times] if value] or [0])
 
 
+def _dashboard_event_group_key(market: dict[str, Any], *, start_ts: int) -> tuple[Any, ...]:
+    category = normalize_category(str(market.get("category") or "")) or "esports"
+    event_id = str(market.get("event_id") or market.get("eventId") or "").strip().lower()
+    if event_id:
+        return ("event_id", category, event_id)
+    event_slug = str(market.get("event_slug") or market.get("eventSlug") or "").strip().lower()
+    if event_slug:
+        return ("event_slug", category, event_slug)
+    title = str(market.get("title") or market.get("question") or "").strip().lower()
+    league = normalize_league(market.get("league"))
+    return ("title_start", category, league, title, start_ts)
+
+
+def _dashboard_market_group_rank(market: dict[str, Any]) -> int:
+    market_type = str(market.get("market_type") or "").strip()
+    return {
+        "main_match": 0,
+        "moneyline": 0,
+        "game_winner": 1,
+        "map_winner": 1,
+    }.get(market_type, 9)
+
+
+def _unique_nonempty(values: Any) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
 def build_events(
     data_dir: Path,
     *,
@@ -1354,6 +1392,7 @@ def build_events(
         condition_id = str(result.get("condition_id") or "").lower()
         if condition_id:
             results_by_condition.setdefault(condition_id, []).append(result)
+    grouped_markets: dict[tuple[Any, ...], list[tuple[dict[str, Any], str, int, list[dict[str, Any]], list[dict[str, Any]]]]] = {}
     for market in rows:
         if not isinstance(market, dict):
             continue
@@ -1362,38 +1401,51 @@ def build_events(
         open_signals = open_by_condition.get(condition_id, [])
         results = results_by_condition.get(condition_id, [])
         if (start_ts and recent_start_cutoff <= start_ts <= window_end) or open_signals:
-            open_signals = open_by_condition.get(condition_id, [])
-            results = results_by_condition.get(condition_id, [])
-            match_parts = _match_parts_for_row(market)
-            category = normalize_category(str(market.get("category") or "")) or "esports"
-            league = normalize_league(market.get("league"))
-            row_league_label = str(market.get("league_label") or league_label(league)).strip()
-            events.append(
-                {
-                    "condition_id": condition_id,
-                    "category": category,
-                    "league": league,
-                    "league_label": row_league_label,
-                    "game": league if category == "sports" else "",
-                    "game_label": row_league_label if category == "sports" else "",
-                    "title": market.get("title"),
-                    "question": market.get("question"),
-                    "match_parts": match_parts,
-                    "team_logos": _team_logos_for_parts(match_parts, logo_cache),
-                    "match_start_time": market.get("match_start_time") or market.get("market_start_time") or market.get("startTime"),
-                    "end_date": market.get("end_date") or market.get("endDate"),
-                    "outcomes": market.get("outcomes"),
-                    "outcome_prices": market.get("outcome_prices") or market.get("outcomePrices"),
-                    "market_type": market.get("market_type"),
-                    "market_type_label": market.get("market_type_label"),
-                    "open_signals": open_signals,
-                    "results": results,
-                    "settled_count": sum(1 for result in results if result.get("status") == "settled"),
-                    "exited_count": sum(1 for result in results if result.get("status") == "exited"),
-                    "contested": _signals_contested([*open_signals, *results]),
-                    "side_counts": _signal_side_counts([*open_signals, *results]),
-                }
+            grouped_markets.setdefault(_dashboard_event_group_key(market, start_ts=start_ts), []).append(
+                (market, condition_id, start_ts, open_signals, results)
             )
+    for group_rows in grouped_markets.values():
+        ordered_group = sorted(group_rows, key=lambda row: (_dashboard_market_group_rank(row[0]), row[2] or 0, row[1]))
+        market, condition_id, _start_ts, _open_signals, _results = ordered_group[0]
+        open_signals = [signal for _market, _condition_id, _start, signals, _results in ordered_group for signal in signals]
+        results = [result for _market, _condition_id, _start, _signals, group_results in ordered_group for result in group_results]
+        condition_ids = [row_condition_id for _market, row_condition_id, _start, _signals, _results in ordered_group if row_condition_id]
+        market_types = _unique_nonempty(str(row_market.get("market_type") or "") for row_market, *_rest in ordered_group)
+        market_type_labels = _unique_nonempty(str(row_market.get("market_type_label") or "") for row_market, *_rest in ordered_group)
+        match_parts = _match_parts_for_row(market)
+        category = normalize_category(str(market.get("category") or "")) or "esports"
+        league = normalize_league(market.get("league"))
+        row_league_label = str(market.get("league_label") or league_label(league)).strip()
+        events.append(
+            {
+                "condition_id": condition_id,
+                "condition_ids": condition_ids,
+                "category": category,
+                "league": league,
+                "league_label": row_league_label,
+                "game": league if category == "sports" else "",
+                "game_label": row_league_label if category == "sports" else "",
+                "title": market.get("title"),
+                "question": market.get("question"),
+                "match_parts": match_parts,
+                "team_logos": _team_logos_for_parts(match_parts, logo_cache),
+                "match_start_time": market.get("match_start_time") or market.get("market_start_time") or market.get("startTime"),
+                "end_date": market.get("end_date") or market.get("endDate"),
+                "outcomes": market.get("outcomes"),
+                "outcome_prices": market.get("outcome_prices") or market.get("outcomePrices"),
+                "market_type": market.get("market_type"),
+                "market_type_label": market.get("market_type_label") if len(ordered_group) == 1 else f"{len(ordered_group)}盘口",
+                "market_count": len(ordered_group),
+                "market_types": market_types,
+                "market_type_labels": market_type_labels,
+                "open_signals": open_signals,
+                "results": results,
+                "settled_count": sum(1 for result in results if result.get("status") == "settled"),
+                "exited_count": sum(1 for result in results if result.get("status") == "exited"),
+                "contested": _signals_contested([*open_signals, *results]),
+                "side_counts": _signal_side_counts([*open_signals, *results]),
+            }
+        )
     events.sort(
         key=lambda row: (
             0 if row.get("open_signals") else 1 if row.get("results") else 2,

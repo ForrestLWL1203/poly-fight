@@ -8674,6 +8674,63 @@ class CoreTest(unittest.TestCase):
 
             self.assertEqual([row["condition_id"] for row in events["events"]], ["early", "late"])
 
+    def test_dashboard_events_group_submarkets_by_event_identity(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now_ts = int(time.time())
+            start = datetime.fromtimestamp(now_ts + 3600, timezone.utc).isoformat()
+            end = datetime.fromtimestamp(now_ts + 7200, timezone.utc).isoformat()
+            write_json(
+                data_dir / "follow" / "active_market_cache.json",
+                {
+                    "updated_at": now_ts,
+                    "markets": [
+                        {
+                            "condition_id": "main",
+                            "event_id": "event-1",
+                            "event_slug": "cs2-a-b",
+                            "title": "Counter-Strike: A vs B (BO3) - Cup",
+                            "question": "Counter-Strike: A vs B (BO3) - Cup",
+                            "match_start_time": start,
+                            "end_date": end,
+                            "market_type": "main_match",
+                            "market_type_label": "主盘",
+                        },
+                        {
+                            "condition_id": "map1",
+                            "event_id": "event-1",
+                            "event_slug": "cs2-a-b",
+                            "title": "Counter-Strike: A vs B (BO3) - Cup",
+                            "question": "Counter-Strike: A vs B - Map 1 Winner",
+                            "match_start_time": start,
+                            "end_date": end,
+                            "market_type": "map_winner",
+                            "market_type_label": "地图",
+                        },
+                        {
+                            "condition_id": "other",
+                            "event_id": "event-2",
+                            "event_slug": "lol-c-d",
+                            "title": "LoL: C vs D (BO3) - Cup",
+                            "match_start_time": start,
+                            "end_date": end,
+                            "market_type": "main_match",
+                            "market_type_label": "主盘",
+                        },
+                    ],
+                },
+            )
+
+            events = build_events(data_dir)
+
+            self.assertEqual(events["count"], 2)
+            grouped = events["events"][0]
+            self.assertEqual(grouped["condition_id"], "main")
+            self.assertEqual(grouped["condition_ids"], ["main", "map1"])
+            self.assertEqual(grouped["market_count"], 2)
+            self.assertEqual(grouped["market_types"], ["main_match", "map_winner"])
+            self.assertEqual(grouped["market_type_label"], "2盘口")
+
     def test_dashboard_events_include_sports_plus_zero_timezone_starts(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
