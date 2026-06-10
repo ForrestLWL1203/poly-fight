@@ -16,6 +16,7 @@ require attribution.
 - Delete database icon: https://www.flaticon.com/free-icon/delete-database_5126069 by juicy_fish
 - Stop icon: https://www.flaticon.com/free-icon/stop_567389 from Flaticon
 - Clock icon: https://www.flaticon.com/free-icon/clock_754186 from Flaticon
+- Swords icon: https://www.flaticon.com/free-icon/swords_9342539 from Flaticon
 
 Esports leaderboard icons are stored locally so the dashboard can render wallet
 specializations without external image requests at runtime.

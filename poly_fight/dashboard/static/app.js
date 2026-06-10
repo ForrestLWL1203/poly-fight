@@ -839,7 +839,7 @@ createApp({
       }
       if (status === "live") {
         const end = this.normalizeTs(event?.end_date);
-        return end ? `${this.compactDuration(end - now)} 后结束` : "";
+        return end ? `${this.compactDuration(end - now)} 后截止` : "";
       }
       return "";
     },
@@ -1010,6 +1010,30 @@ createApp({
       if (grade === "C") return "badge-warning";
       return "badge-neutral";
     },
+    qualityFlags(row) {
+      const label = String(row?.quality_label || "");
+      const twoSided = label.includes("two_sided") || Number(row?.two_sided_signal_count || 0) > 0 || row?.quality_two_sided === true;
+      const disagreement =
+        label.includes("disagreement") ||
+        Number(row?.disagreement_signal_count || 0) > 0 ||
+        row?.quality_disagreement === true ||
+        (!twoSided && row?.contested === true);
+      return { twoSided, disagreement };
+    },
+    qualityBadgeText(row) {
+      const { twoSided, disagreement } = this.qualityFlags(row);
+      if (twoSided && disagreement) return "双边 + 分歧";
+      if (disagreement) return "分歧";
+      if (twoSided) return "双边";
+      return "单向";
+    },
+    qualityBadgeClass(row) {
+      const { twoSided, disagreement } = this.qualityFlags(row);
+      if (twoSided && disagreement) return "badge-error badge-outline";
+      if (disagreement) return "badge-error badge-outline";
+      if (twoSided) return "badge-warning badge-outline";
+      return "badge-success badge-outline";
+    },
     pnlClass(value) {
       const num = Number(value);
       if (!Number.isFinite(num) || Math.abs(num) < 0.000001) return "text-flat";
@@ -1161,16 +1185,21 @@ createApp({
       if (!ts) return "-";
       const deltaSeconds = Math.floor(Date.now() / 1000 - ts);
       const formatDuration = (seconds) => {
+        if (seconds < 5) return "刚刚";
+        if (seconds < 60) return `${seconds}s`;
         const minutes = Math.floor(seconds / 60);
-        if (minutes < 1) return "now";
         if (minutes < 60) return `${minutes}m`;
         const hours = Math.floor(minutes / 60);
         if (hours < 24) return `${hours}h`;
         const days = Math.floor(hours / 24);
         return `${days}d${hours % 24}h`;
       };
-      if (deltaSeconds >= 0) return `${formatDuration(deltaSeconds)} ago`;
-      return `in ${formatDuration(Math.abs(deltaSeconds))}`;
+      if (deltaSeconds >= 0) {
+        const duration = formatDuration(deltaSeconds);
+        return duration === "刚刚" ? duration : `${duration} ago`;
+      }
+      const duration = formatDuration(Math.abs(deltaSeconds));
+      return duration === "刚刚" ? duration : `${duration} 后`;
     },
     normalizeTs(value) {
       if (value == null || value === "") return 0;
@@ -1445,7 +1474,7 @@ createApp({
       const label = String(row?.market_type_label || "").trim();
       if (!label) return false;
       if (/^\d+\s*盘口$/.test(label)) return false;
-      if (["主盘", "moneyline"].includes(label.toLowerCase())) return false;
+      if (label.toLowerCase() === "moneyline") return false;
       const parts = this.matchParts(row);
       const meta = String(parts?.meta || "").trim();
       return !parts || meta !== label;
@@ -1616,6 +1645,20 @@ createApp({
     legSlippageText(leg) {
       const value = this.legSlippageValue(leg);
       return value == null ? "-" : this.signedPctPoints(value);
+    },
+    legFollowDelayText(leg) {
+      const targetTs = this.normalizeTs(leg?.wallet_trade_at || leg?.created_at);
+      const followTs = this.normalizeTs(leg?.leg_at || leg?.created_at);
+      if (!targetTs || !followTs) return "-";
+      const delta = followTs - targetTs;
+      const sign = delta >= 0 ? "+" : "-";
+      const seconds = Math.abs(delta);
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      const secs = seconds % 60;
+      if (hours > 0) return `${sign} ${hours}小时${minutes}分`;
+      if (minutes > 0) return `${sign} ${minutes}分${secs}秒`;
+      return `${sign} ${secs}秒`;
     },
   },
 }).mount("#app");

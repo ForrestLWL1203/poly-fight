@@ -6949,7 +6949,7 @@ class CoreTest(unittest.TestCase):
                 body = response.read().decode()
                 self.assertEqual(response.status, 200)
                 self.assertIn("text/html", response.getheader("Content-Type") or "")
-                self.assertIn("Aegis Alpha", body)
+                self.assertIn("Polymarket Sniper", body)
                 self.assertIn("/app.js", body)
                 self.assertIn("/vendor/vue-3.5.13.global.prod.js", body)
                 self.assertNotIn("cdn.jsdelivr.net", body)
@@ -7711,15 +7711,27 @@ class CoreTest(unittest.TestCase):
                         "signal_id": "m1:0",
                         "wallet": "0xa",
                         "condition_id": "m1",
+                        "outcome_index": 0,
                         "status": "open",
                         "contested": True,
                         "wallet_clv": 0.12,
                         "legs": [{"stake": 1, "would_follow": False}],
                     },
                     {
-                        "signal_id": "m2:0",
+                        "signal_id": "m1:1",
                         "wallet": "0xb",
+                        "condition_id": "m1",
+                        "outcome_index": 1,
+                        "status": "open",
+                        "contested": True,
+                        "wallet_clv": 0.10,
+                        "legs": [{"stake": 1, "would_follow": True}],
+                    },
+                    {
+                        "signal_id": "m2:0",
+                        "wallet": "0xc",
                         "condition_id": "m2",
+                        "outcome_index": 0,
                         "status": "open",
                         "wallet_clv": 0.08,
                         "legs": [{"stake": 1, "would_follow": True}],
@@ -7731,9 +7743,49 @@ class CoreTest(unittest.TestCase):
 
             overview = build_overview(data_dir)
 
-            self.assertEqual(overview["contested_signal_count"], 1)
+            self.assertEqual(overview["contested_signal_count"], 2)
+            self.assertEqual(overview["disagreement_signal_count"], 2)
+            self.assertEqual(overview["disagreement_condition_count"], 1)
+            self.assertEqual(overview["two_sided_signal_count"], 0)
             self.assertEqual(overview["clean_signal_count"], 1)
-            self.assertEqual(overview["avg_wallet_clv"], 0.1)
+            self.assertAlmostEqual(overview["avg_wallet_clv"], 0.1)
+
+    def test_dashboard_quality_splits_two_sided_and_disagreement(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {"signal_id": "m1:a", "wallet": "0xa", "condition_id": "m1", "outcome_index": 0, "status": "open", "contested": True, "legs": []},
+                    {"signal_id": "m1:b", "wallet": "0xa", "condition_id": "m1", "outcome_index": 1, "status": "open", "contested": True, "legs": []},
+                    {"signal_id": "m2:a", "wallet": "0xb", "condition_id": "m2", "outcome_index": 0, "status": "open", "contested": True, "legs": []},
+                    {"signal_id": "m2:b", "wallet": "0xc", "condition_id": "m2", "outcome_index": 1, "status": "open", "contested": True, "legs": []},
+                    {"signal_id": "m3:a", "wallet": "0xd", "condition_id": "m3", "outcome_index": 0, "status": "open", "legs": []},
+                    {"signal_id": "m4:a", "wallet": "0xe", "condition_id": "m4", "outcome_index": 0, "status": "open", "contested": True, "legs": []},
+                    {"signal_id": "m4:b", "wallet": "0xe", "condition_id": "m4", "outcome_index": 1, "status": "open", "contested": True, "legs": []},
+                    {"signal_id": "m4:c", "wallet": "0xf", "condition_id": "m4", "outcome_index": 0, "status": "open", "contested": True, "legs": []},
+                ],
+                result_events=[],
+                performance={},
+            )
+
+            overview = build_overview(data_dir)
+            follows = {row["condition_id"]: row for row in build_follows(data_dir, size=10)["follows"]}
+
+            self.assertEqual(overview["clean_signal_count"], 1)
+            self.assertEqual(overview["two_sided_signal_count"], 5)
+            self.assertEqual(overview["disagreement_signal_count"], 5)
+            self.assertEqual(overview["contested_signal_count"], 5)
+            self.assertEqual(overview["clean_condition_count"], 1)
+            self.assertEqual(overview["two_sided_condition_count"], 2)
+            self.assertEqual(overview["disagreement_condition_count"], 2)
+            self.assertEqual(overview["mixed_quality_condition_count"], 1)
+            self.assertEqual(follows["m1"]["quality_label"], "two_sided")
+            self.assertEqual(follows["m1"]["contested_signal_count"], 0)
+            self.assertEqual(follows["m2"]["quality_label"], "disagreement")
+            self.assertEqual(follows["m3"]["quality_label"], "one_way")
+            self.assertEqual(follows["m4"]["quality_label"], "two_sided_disagreement")
 
     def test_dashboard_overview_exposes_category_breakdown(self):
         with TemporaryDirectory() as tmp:

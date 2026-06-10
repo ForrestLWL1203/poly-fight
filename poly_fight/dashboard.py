@@ -679,7 +679,7 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
     total_stake = sum(_to_float(leg.get("stake")) for leg in legs)
     resolved_stake = sum(_to_float(leg.get("stake")) for leg in result_legs)
     would_follow = [leg for leg in legs if leg.get("would_follow", True)]
-    contested = [signal for signal in all_signals if signal.get("contested")]
+    quality = _signal_quality_summary(all_signals)
     clv_values = [_to_float(signal.get("wallet_clv")) for signal in all_signals if signal.get("wallet_clv") is not None]
     our_pnl = sum(_signal_our_pnl(row) for row in results)
     wallet_basis_pnl = sum(_signal_wallet_pnl(row) for row in results)
@@ -699,8 +699,7 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
         "wallet_basis_realized_roi": (wallet_basis_pnl / resolved_stake) if resolved_stake else None,
         "delay_cost": wallet_basis_pnl - our_pnl,
         "would_follow_capture_rate": (len(would_follow) / len(legs)) if legs else None,
-        "contested_signal_count": len(contested),
-        "clean_signal_count": len(all_signals) - len(contested),
+        **quality,
         "avg_wallet_clv": (sum(clv_values) / len(clv_values)) if clv_values else None,
         "open_exposure": sum(sum(_to_float(leg.get("stake")) for leg in signal.get("legs") or []) for signal in open_signals),
         "behavior_counts": behavior,
@@ -720,6 +719,121 @@ def _signal_category(signal: dict[str, Any]) -> str:
     return normalize_category(str(signal.get("category") or "")) or "esports"
 
 
+def _signal_condition_id(signal: dict[str, Any]) -> str:
+    return str(signal.get("condition_id") or "").lower()
+
+
+def _signal_wallet(signal: dict[str, Any]) -> str:
+    return str(signal.get("wallet") or "").lower()
+
+
+def _signal_has_two_sided_behavior(signal: dict[str, Any]) -> bool:
+    behavior = signal.get("wallet_behavior") if isinstance(signal.get("wallet_behavior"), dict) else {}
+    if behavior.get("hedged"):
+        return True
+    for event in signal.get("behavior_events") or []:
+        if isinstance(event, dict) and str(event.get("kind") or "") == "hedge":
+            return True
+    return False
+
+
+def _signal_quality_flags(signals: list[dict[str, Any]]) -> dict[str, bool]:
+    wallet_outcomes: dict[str, set[str]] = {}
+    comparable: list[tuple[str, str]] = []
+    two_sided = False
+    for signal in signals:
+        if not isinstance(signal, dict):
+            continue
+        wallet = _signal_wallet(signal)
+        side = _signal_side(signal)
+        if _signal_has_two_sided_behavior(signal):
+            two_sided = True
+        if not wallet or not side:
+            continue
+        wallet_outcomes.setdefault(wallet, set()).add(side)
+        comparable.append((wallet, side))
+    if any(len(outcomes) > 1 for outcomes in wallet_outcomes.values()):
+        two_sided = True
+    disagreement = any(
+        wallet_a != wallet_b and side_a != side_b
+        for index, (wallet_a, side_a) in enumerate(comparable)
+        for wallet_b, side_b in comparable[index + 1 :]
+    )
+    return {"two_sided": two_sided, "disagreement": disagreement}
+
+
+def _signal_quality_label(flags: dict[str, bool]) -> str:
+    two_sided = bool(flags.get("two_sided"))
+    disagreement = bool(flags.get("disagreement"))
+    if two_sided and disagreement:
+        return "two_sided_disagreement"
+    if two_sided:
+        return "two_sided"
+    if disagreement:
+        return "disagreement"
+    return "one_way"
+
+
+def _signal_quality_summary(signals: list[dict[str, Any]]) -> dict[str, int]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    ungrouped: list[dict[str, Any]] = []
+    for signal in signals:
+        if not isinstance(signal, dict):
+            continue
+        condition_id = _signal_condition_id(signal)
+        if condition_id:
+            groups.setdefault(condition_id, []).append(signal)
+        else:
+            ungrouped.append(signal)
+
+    summary = {
+        "clean_signal_count": 0,
+        "two_sided_signal_count": 0,
+        "disagreement_signal_count": 0,
+        "contested_signal_count": 0,
+        "clean_condition_count": 0,
+        "two_sided_condition_count": 0,
+        "disagreement_condition_count": 0,
+        "contested_condition_count": 0,
+        "mixed_quality_condition_count": 0,
+        "legacy_contested_signal_count": sum(1 for signal in signals if isinstance(signal, dict) and signal.get("contested")),
+    }
+
+    for group in [*groups.values(), *([signal] for signal in ungrouped)]:
+        flags = _signal_quality_flags(group)
+        signal_count = len(group)
+        if flags["two_sided"]:
+            summary["two_sided_signal_count"] += signal_count
+            summary["two_sided_condition_count"] += 1
+        if flags["disagreement"]:
+            summary["disagreement_signal_count"] += signal_count
+            summary["disagreement_condition_count"] += 1
+        if flags["two_sided"] and flags["disagreement"]:
+            summary["mixed_quality_condition_count"] += 1
+        if not flags["two_sided"] and not flags["disagreement"]:
+            summary["clean_signal_count"] += signal_count
+            summary["clean_condition_count"] += 1
+
+    summary["contested_signal_count"] = summary["disagreement_signal_count"]
+    summary["contested_condition_count"] = summary["disagreement_condition_count"]
+    return summary
+
+
+def _annotate_signal_quality(signals: list[dict[str, Any]]) -> None:
+    by_condition: dict[str, list[dict[str, Any]]] = {}
+    for signal in signals:
+        if not isinstance(signal, dict):
+            continue
+        by_condition.setdefault(_signal_condition_id(signal), []).append(signal)
+    for group in by_condition.values():
+        flags = _signal_quality_flags(group)
+        label = _signal_quality_label(flags)
+        for signal in group:
+            signal["quality_two_sided"] = flags["two_sided"]
+            signal["quality_disagreement"] = flags["disagreement"]
+            signal["quality_label"] = label
+
+
 def _overview_for_signals(open_signals: list[dict[str, Any]], results: list[dict[str, Any]]) -> dict[str, Any]:
     all_signals = [*open_signals, *results]
     settled = [row for row in results if row.get("status") == "settled"]
@@ -730,7 +844,7 @@ def _overview_for_signals(open_signals: list[dict[str, Any]], results: list[dict
     resolved_stake = sum(_to_float(leg.get("stake")) for leg in result_legs)
     our_pnl = sum(_signal_our_pnl(row) for row in results)
     wallet_basis_pnl = sum(_signal_wallet_pnl(row) for row in results)
-    contested = [signal for signal in all_signals if signal.get("contested")]
+    quality = _signal_quality_summary(all_signals)
     return {
         "open_signal_count": len(open_signals),
         "result_count": len(results),
@@ -742,8 +856,7 @@ def _overview_for_signals(open_signals: list[dict[str, Any]], results: list[dict
         "total_stake": sum(_to_float(leg.get("stake")) for leg in legs),
         "resolved_stake": resolved_stake,
         "realized_roi": (our_pnl / resolved_stake) if resolved_stake else None,
-        "contested_signal_count": len(contested),
-        "clean_signal_count": len(all_signals) - len(contested),
+        **quality,
     }
 
 
@@ -1117,6 +1230,7 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
     condition_id = condition_id.lower()
     result = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).load_dashboard_follow_detail(condition_id)
     signals = result.get("signals", [])
+    _annotate_signal_quality(signals)
     market = _active_market_by_condition(data_dir, condition_id, follow_dir=follow_dir)
     logo_cache = _load_team_logo_cache(data_dir)
     leaderboard_ranks = _leaderboard_rank_by_wallet(data_dir, follow_dir=follow_dir)
@@ -1255,6 +1369,7 @@ def build_wallet_follow_detail(
         key=lambda signal: _signal_activity_at(signal),
         reverse=True,
     )
+    _annotate_signal_quality(signals)
     for signal in signals:
         signal["settlement_type"] = _signal_settlement_type(signal)
     total = len(signals)
@@ -2202,6 +2317,10 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                 "last_activity_at": 0,
                 "last_follow_action_at": 0,
                 "contested_signal_count": 0,
+                "two_sided_signal_count": 0,
+                "disagreement_signal_count": 0,
+                "quality_label": "one_way",
+                "quality_signals": [],
                 "clv_sum": 0.0,
                 "clv_count": 0,
             },
@@ -2214,6 +2333,7 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
         wallet = str(signal.get("wallet") or "").lower()
         if wallet:
             bucket["wallets"].add(wallet)
+        bucket["quality_signals"].append(signal)
         legs = signal.get("legs") or []
         bucket["leg_count"] += len(legs)
         bucket["stake"] += sum(_to_float(leg.get("stake")) for leg in legs)
@@ -2240,8 +2360,6 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                     )
         bucket["our_realized_pnl"] += _signal_our_pnl(signal)
         bucket["wallet_basis_realized_pnl"] += _signal_wallet_pnl(signal)
-        if signal.get("contested"):
-            bucket["contested_signal_count"] += 1
         if signal.get("wallet_clv") is not None:
             bucket["clv_sum"] += _to_float(signal.get("wallet_clv"))
             bucket["clv_count"] += 1
@@ -2271,10 +2389,19 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
             bucket["settlement_type"] = ""
         bucket["roi"] = bucket["our_realized_pnl"] / bucket["stake"] if bucket["stake"] else None
         bucket["avg_wallet_clv"] = bucket["clv_sum"] / bucket["clv_count"] if bucket["clv_count"] else None
+        quality_flags = _signal_quality_flags(bucket.get("quality_signals") or [])
+        bucket["quality_two_sided"] = quality_flags["two_sided"]
+        bucket["quality_disagreement"] = quality_flags["disagreement"]
+        bucket["quality_label"] = _signal_quality_label(quality_flags)
+        signal_count = len(bucket.get("quality_signals") or [])
+        bucket["two_sided_signal_count"] = signal_count if quality_flags["two_sided"] else 0
+        bucket["disagreement_signal_count"] = signal_count if quality_flags["disagreement"] else 0
+        bucket["contested_signal_count"] = bucket["disagreement_signal_count"]
         signal_stakes = [value for value in bucket.get("signal_stakes") or [] if value > 0]
         bucket["signal_stake_min"] = min(signal_stakes) if signal_stakes else None
         bucket["signal_stake_max"] = max(signal_stakes) if signal_stakes else None
         bucket.pop("signal_stakes", None)
+        bucket.pop("quality_signals", None)
     return groups
 
 
@@ -2307,9 +2434,7 @@ def _latest_scoring_version(data_dir: Path) -> int | None:
 
 
 def _signals_contested(signals: list[dict[str, Any]]) -> bool:
-    outcomes = {_signal_side(signal) for signal in signals}
-    outcomes.discard("")
-    return len(outcomes) > 1 or any(bool(signal.get("contested")) for signal in signals)
+    return _signal_quality_flags(signals)["disagreement"]
 
 
 def _signal_side_counts(signals: list[dict[str, Any]]) -> dict[str, int]:

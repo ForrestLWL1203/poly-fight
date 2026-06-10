@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
-    <title>Aegis Alpha | Poly Fight</title>
+    <title>Polymarket Sniper</title>
     <link rel="stylesheet" href="/vendor/daisyui-5.0.43.css" />
     <link rel="stylesheet" href="/vendor/daisyui-5.0.43-themes.css" />
     <link rel="stylesheet" href="/styles.css" />
@@ -21,9 +21,6 @@
 
       <main v-else-if="!authenticated" class="login-shell">
         <section class="login-panel">
-          <div>
-            <p class="eyebrow">Poly Fight</p>
-          </div>
           <form class="login-form" @submit.prevent="login">
             <label class="login-field">
               <span class="login-label">用户名</span>
@@ -45,12 +42,7 @@
       <div v-else class="app-shell">
         <header class="topbar">
           <div class="brand-lockup">
-            <p class="eyebrow">Poly Fight · Signal OS</p>
-            <h1 class="topbar-title">
-              <span>Aegis</span>
-              <span>Alpha</span>
-            </h1>
-            <p class="topbar-subtitle">智能跟单中枢</p>
+            <h1 class="topbar-title">Polymarket Sniper</h1>
           </div>
           <div class="topbar-actions">
             <button
@@ -74,9 +66,11 @@
               >
                 <span v-if="loading.runner" class="loading loading-spinner loading-xs"></span>
                 <template v-else>
+                  <span v-if="runner.status === 'running'" class="stop-square-icon" aria-hidden="true"></span>
                   <img
+                    v-else
                     class="button-icon"
-                    :src="runner.status === 'running' ? '/icons/flaticon/stop.png' : '/icons/flaticon/play.png'"
+                    src="/icons/flaticon/play.png"
                     alt=""
                     aria-hidden="true"
                   />
@@ -144,11 +138,10 @@
                 {{ runnerPillText }}
               </div>
               <div class="tick-pill" :title="formatTime(health.last_tick_at)">
-                <img class="status-icon" src="/icons/flaticon/clock.png" alt="" aria-hidden="true" />
-                最后 tick {{ timeAgo(health.last_tick_at) }}
+                最后刷新：{{ timeAgo(health.last_tick_at) }}
               </div>
             </div>
-            <span class="badge badge-error badge-outline" v-if="overview.contested_signal_count">{{ overview.contested_signal_count }} 个分歧盘</span>
+            <span class="badge badge-error badge-outline" v-if="overview.disagreement_condition_count">{{ overview.disagreement_condition_count }} 个分歧盘</span>
           </div>
           <div class="overview-grid">
             <article class="overview-pnl-card">
@@ -158,14 +151,18 @@
                 <div><span>累计投入</span><b>{{ money(overview.total_stake) }}</b></div>
                 <div><span>已结算 ROI</span><b :class="pnlClass(overview.realized_roi)">{{ percent(overview.realized_roi) }}</b></div>
                 <div><span>结算场次</span><b>{{ numberOrDash(overview.settled_count) }}</b></div>
-                <div><span>钱包价盈亏</span><b>{{ money(overview.wallet_basis_realized_pnl) }}</b></div>
+                <div title="按目标钱包成交价计算的理论 PnL，用于对比实际跟单的延迟和滑点影响">
+                  <span>总体 PnL</span>
+                  <b :class="pnlClass(overview.wallet_basis_realized_pnl)">{{ money(overview.wallet_basis_realized_pnl) }}</b>
+                </div>
               </div>
             </article>
             <article class="overview-analysis-card">
               <div><span>监控赛事</span><strong>{{ numberOrDash(healthWatchedByCategory('esports') || health.watched_market_count) }}</strong></div>
               <div><span>进行中跟单</span><strong>{{ numberOrDash(overviewCategory('esports').open_signal_count ?? overview.open_signal_count ?? health.open_signal_count) }}</strong></div>
-              <div><span>干净信号</span><strong>{{ numberOrDash(overview.clean_signal_count) }}</strong><small>未出现对手盘冲突</small></div>
-              <div><span>分歧盘</span><strong>{{ numberOrDash(overview.contested_signal_count) }}</strong><small>同市场出现反向钱包</small></div>
+              <div><span>单向盘</span><strong>{{ numberOrDash(overview.clean_condition_count ?? overview.clean_signal_count) }}</strong><small>无双边/分歧</small></div>
+              <div><span>双边盘</span><strong>{{ numberOrDash(overview.two_sided_condition_count ?? 0) }}</strong><small>同钱包买入两边</small></div>
+              <div><span>分歧盘</span><strong>{{ numberOrDash(overview.disagreement_condition_count ?? overview.contested_signal_count) }}</strong><small>不同钱包买不同方向</small></div>
             </article>
           </div>
         </section>
@@ -173,10 +170,9 @@
         <section class="toolbar-band leaderboard-console" :class="{ 'is-refreshing': walletRefreshBusy }">
           <div class="section-head category-section-head">
             <div>
-              <h2>聪明钱包</h2>
+              <h2 class="leaderboard-title">Leaderboard</h2>
               <p class="toolbar-copy">
                 更新时间 {{ formatTime(wallets.leaderboard_updated_at || health.leaderboard_updated_at) }}
-                <span v-if="wallets.scoring_version || health.scoring_version"> · scoring v{{ wallets.scoring_version || health.scoring_version }}</span>
               </p>
             </div>
             <div class="toolbar-actions">
@@ -248,6 +244,8 @@
                       v-if="walletObservedClosed(wallet) > 0"
                       class="metric-link"
                       type="button"
+                      :title="`查看 ${wallet.short_addr} 的已结算跟单详情`"
+                      :aria-label="`查看 ${wallet.short_addr} 的已结算跟单详情`"
                       @click="openWalletFollowDetail(wallet, 'closed')"
                     >{{ walletObservedClosed(wallet) }}</button>
                     <span v-else>0</span>
@@ -257,6 +255,8 @@
                       v-if="walletObservedOpen(wallet) > 0"
                       class="metric-link"
                       type="button"
+                      :title="`查看 ${wallet.short_addr} 的持仓中跟单详情`"
+                      :aria-label="`查看 ${wallet.short_addr} 的持仓中跟单详情`"
                       @click="openWalletFollowDetail(wallet, 'open')"
                     >{{ walletObservedOpen(wallet) }}</button>
                     <span v-else>0</span>
@@ -327,7 +327,9 @@
                             <span v-else class="team-logo team-logo-fallback">{{ teamInitials(matchParts(follow).teamA) }}</span>
                             <span>{{ matchParts(follow).teamA }}</span>
                           </span>
-                          <span class="vs-pill">VS</span>
+                          <span class="vs-pill" role="img" aria-label="对阵">
+                            <img class="vs-icon" src="/icons/flaticon/swords.png" alt="" aria-hidden="true" loading="lazy">
+                          </span>
                           <span class="team team-b">
                             <img v-if="teamLogo(follow, 'teamB')" class="team-logo" :src="teamLogo(follow, 'teamB')" :alt="matchParts(follow).teamB" loading="lazy">
                             <span v-else class="team-logo team-logo-fallback">{{ teamInitials(matchParts(follow).teamB) }}</span>
@@ -344,7 +346,7 @@
                         <span v-if="showMarketTypeChip(follow) && !matchParts(follow)" class="event-type-chip">{{ follow.market_type_label }}</span>
                         <span class="follow-time-label">开始</span>
                         <span>{{ formatTime(follow.match_start_time) }}</span>
-                        <span class="follow-time-label">结束</span>
+                        <span class="follow-time-label">截止</span>
                         <span>{{ formatTime(follow.end_date) }}</span>
                       </div>
                     </td>
@@ -357,7 +359,7 @@
                       <div>{{ money(followListPnl(follow)) }}</div>
                       <small v-if="follow.display_pnl_kind === 'unrealized'" class="subtle">未实现</small>
                     </td>
-                    <td><span class="badge" :class="follow.contested_signal_count ? 'badge-error badge-outline' : 'badge-success badge-outline'">{{ follow.contested_signal_count ? "双边" : "单边" }}</span></td>
+                    <td><span class="quality-chip" :class="qualityBadgeClass(follow)">{{ qualityBadgeText(follow) }}</span></td>
                   </tr>
                   <tr v-if="!(follows.follows || []).length">
                     <td colspan="8" class="empty-cell">暂无跟单记录</td>
@@ -435,7 +437,9 @@
                               <span v-else class="team-logo team-logo-fallback">{{ teamInitials(matchParts(event).teamA) }}</span>
                               <span>{{ matchParts(event).teamA }}</span>
                             </span>
-                            <span class="vs-pill">VS</span>
+                            <span class="vs-pill" role="img" aria-label="对阵">
+                              <img class="vs-icon" src="/icons/flaticon/swords.png" alt="" aria-hidden="true" loading="lazy">
+                            </span>
                             <span class="team team-b">
                               <img v-if="teamLogo(event, 'teamB')" class="team-logo" :src="teamLogo(event, 'teamB')" :alt="matchParts(event).teamB" loading="lazy">
                               <span v-else class="team-logo team-logo-fallback">{{ teamInitials(matchParts(event).teamB) }}</span>
@@ -452,7 +456,7 @@
                           <span v-if="showMarketTypeChip(event) && !matchParts(event)" class="event-type-chip">{{ event.market_type_label }}</span>
                           <span class="event-time-label">开始</span>
                           <span>{{ formatTime(event.match_start_time) }}</span>
-                          <span class="event-time-label">结束</span>
+                          <span class="event-time-label">截止</span>
                           <span>{{ formatTime(event.end_date) }}</span>
                         </div>
                       </div>
@@ -468,18 +472,11 @@
                         <span v-if="eventView === 'archive'" class="event-pnl" :class="pnlClass(event.our_realized_pnl)">{{ money(event.our_realized_pnl) }}</span>
                         <template v-else>
                           <div class="event-follow-grid">
-                            <div class="event-follow-grid-head">
-                              <span class="event-market-follow-label"></span>
-                              <span v-for="side in eventMarketFollowTable(event).headers" :key="side.label" class="event-follow-head-side" :class="side.tone">
-                                <span class="event-follow-logo-wrap">
-                                  <img v-if="side.logo" class="event-follow-logo" :src="side.logo" :alt="side.label" loading="lazy">
-                                  <span v-else class="event-follow-logo-fallback">{{ side.label.slice(0, 1) }}</span>
-                                </span>
-                              </span>
-                            </div>
                             <div v-for="market in eventMarketFollowTable(event).rows" :key="market.key" class="event-market-follow-row" :class="{ 'has-signal': market.signalCount }">
-                              <span class="event-market-follow-label">{{ market.label }}</span>
-                              <strong v-for="side in market.cells" :key="side.label" class="event-follow-count" :class="side.tone">{{ side.count }}</strong>
+                              <span class="event-market-follow-label">{{ market.label }}：</span>
+                              <strong class="event-follow-count" :class="market.cells[0]?.tone || 'team-a'">{{ market.cells[0]?.count ?? 0 }}</strong>
+                              <span class="event-follow-separator">:</span>
+                              <strong class="event-follow-count" :class="market.cells[1]?.tone || 'team-b'">{{ market.cells[1]?.count ?? 0 }}</strong>
                             </div>
                           </div>
                         </template>
@@ -520,7 +517,9 @@
                     <img v-if="teamLogo(followDetail, 'teamA')" class="team-logo detail-team-logo" :src="teamLogo(followDetail, 'teamA')" :alt="matchParts(followDetail).teamA" loading="lazy">
                     <span>{{ matchParts(followDetail).teamA }}</span>
                   </span>
-                  <span class="vs-pill">VS</span>
+                  <span class="vs-pill" role="img" aria-label="对阵">
+                    <img class="vs-icon" src="/icons/flaticon/swords.png" alt="" aria-hidden="true" loading="lazy">
+                  </span>
                   <span class="team team-b">
                     <img v-if="teamLogo(followDetail, 'teamB')" class="team-logo detail-team-logo" :src="teamLogo(followDetail, 'teamB')" :alt="matchParts(followDetail).teamB" loading="lazy">
                     <span>{{ matchParts(followDetail).teamB }}</span>
@@ -531,7 +530,9 @@
                     <img v-if="teamLogo(followDetail, 'teamA')" class="team-logo detail-team-logo" :src="teamLogo(followDetail, 'teamA')" :alt="matchParts(followDetail).teamA" loading="lazy">
                     <span>{{ matchParts(followDetail).teamA }}</span>
                   </span>
-                  <span class="vs-pill">VS</span>
+                  <span class="vs-pill" role="img" aria-label="对阵">
+                    <img class="vs-icon" src="/icons/flaticon/swords.png" alt="" aria-hidden="true" loading="lazy">
+                  </span>
                   <span class="team team-b">
                     <img v-if="teamLogo(followDetail, 'teamB')" class="team-logo detail-team-logo" :src="teamLogo(followDetail, 'teamB')" :alt="matchParts(followDetail).teamB" loading="lazy">
                     <span>{{ matchParts(followDetail).teamB }}</span>
@@ -554,7 +555,7 @@
                 <strong>{{ formatTime(followDetail.match_start_time) }}</strong>
               </div>
               <div>
-                <span>结束时间</span>
+                <span>市场截止</span>
                 <strong>{{ formatTime(followDetail.end_date) }}</strong>
               </div>
             </div>
@@ -585,9 +586,9 @@
             <section v-for="wallet in followDetail.wallets" :key="wallet.wallet" class="detail-block">
               <div class="section-head">
                 <h4 class="wallet-detail-title">
+                  <em v-if="wallet.leaderboard_rank">#{{ wallet.leaderboard_rank }}</em>
                   <span>跟单地址:</span>
                   <b class="font-mono">{{ wallet.short_addr }}</b>
-                  <em v-if="wallet.leaderboard_rank">#{{ wallet.leaderboard_rank }}</em>
                 </h4>
                 <div class="wallet-summary">
                   <span><b>{{ wallet.leg_count }}</b> 单</span>
@@ -608,7 +609,7 @@
                     >
                     <span>{{ signal.outcome || signal.outcome_index }}</span>
                   </span>
-                  <span class="badge" :class="signal.contested ? 'badge-error badge-outline' : 'badge-success badge-outline'">{{ signal.contested ? "分歧" : "干净" }}</span>
+                  <span class="quality-chip" :class="qualityBadgeClass(signal)">{{ qualityBadgeText(signal) }}</span>
                 </div>
                 <div class="table-wrap leg-table-wrap">
                   <table class="table table-xs dense-table leg-table">
@@ -617,7 +618,7 @@
                         <th>目标成交时间</th>
                         <th>目标成交价格</th>
                         <th>目标购入金额</th>
-                        <th>跟单时间</th>
+                        <th>跟单延迟</th>
                         <th>跟单额</th>
                         <th>跟单价格</th>
                         <th>买入均价</th>
@@ -630,7 +631,7 @@
                         <td>{{ formatTime(leg.wallet_trade_at || leg.created_at) }}</td>
                         <td>{{ price(leg.wallet_fill_price || leg.wallet_avg_price) }}</td>
                         <td>{{ money(legWalletTradeCash(leg)) }}</td>
-                        <td>{{ formatTime(leg.leg_at || leg.created_at) }}</td>
+                        <td>{{ legFollowDelayText(leg) }}</td>
                         <td>{{ money(leg.stake) }}</td>
                         <td>{{ price(leg.our_entry_price) }}</td>
                         <td>{{ price(leg.wallet_fill_price || leg.wallet_avg_price) }}</td>
