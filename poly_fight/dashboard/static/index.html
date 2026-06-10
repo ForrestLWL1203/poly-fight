@@ -341,7 +341,7 @@
                       </div>
                       <div v-else class="market-title">{{ followTitle(follow) }}</div>
                       <div class="subtle follow-time-row">
-                        <span v-if="follow.market_type_label && !matchParts(follow)" class="event-type-chip">{{ follow.market_type_label }}</span>
+                        <span v-if="showMarketTypeChip(follow) && !matchParts(follow)" class="event-type-chip">{{ follow.market_type_label }}</span>
                         <span class="follow-time-label">开始</span>
                         <span>{{ formatTime(follow.match_start_time) }}</span>
                         <span class="follow-time-label">结束</span>
@@ -449,7 +449,7 @@
                         </div>
                         <div v-else class="market-title">{{ event.title || event.question || shortId(event.condition_id) }}</div>
                         <div class="subtle event-time-row">
-                          <span v-if="event.market_type_label && !matchParts(event)" class="event-type-chip">{{ event.market_type_label }}</span>
+                          <span v-if="showMarketTypeChip(event) && !matchParts(event)" class="event-type-chip">{{ event.market_type_label }}</span>
                           <span class="event-time-label">开始</span>
                           <span>{{ formatTime(event.match_start_time) }}</span>
                           <span class="event-time-label">结束</span>

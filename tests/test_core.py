@@ -8698,6 +8698,18 @@ class CoreTest(unittest.TestCase):
                             "outcomes": ["A", "B"],
                         },
                         {
+                            "condition_id": "map2",
+                            "event_id": "event-1",
+                            "event_slug": "cs2-a-b",
+                            "title": "Counter-Strike: A vs B (BO3) - Cup",
+                            "question": "Counter-Strike: A vs B - Map 2 Winner",
+                            "match_start_time": start,
+                            "end_date": end,
+                            "market_type": "map_winner",
+                            "market_type_label": "地图",
+                            "outcomes": ["A", "B"],
+                        },
+                        {
                             "condition_id": "map1",
                             "event_id": "event-1",
                             "event_slug": "cs2-a-b",
@@ -8744,14 +8756,16 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(events["count"], 2)
             grouped = events["events"][0]
             self.assertEqual(grouped["condition_id"], "main")
-            self.assertEqual(grouped["condition_ids"], ["main", "map1"])
-            self.assertEqual(grouped["market_count"], 2)
+            self.assertEqual(grouped["condition_ids"], ["main", "map1", "map2"])
+            self.assertEqual(grouped["market_count"], 3)
             self.assertEqual(grouped["market_types"], ["main_match", "map_winner"])
-            self.assertEqual(grouped["market_type_label"], "2盘口")
+            self.assertEqual(grouped["market_type_label"], "3盘口")
+            self.assertEqual([row["condition_id"] for row in grouped["market_breakdown"]], ["main", "map1", "map2"])
             breakdown = {row["condition_id"]: row for row in grouped["market_breakdown"]}
             self.assertEqual(breakdown["main"]["signal_count"], 0)
             self.assertEqual(breakdown["map1"]["signal_count"], 1)
             self.assertEqual(breakdown["map1"]["side_counts"], {"0": 1})
+            self.assertEqual(breakdown["map2"]["signal_count"], 0)
 
     def test_dashboard_events_include_sports_plus_zero_timezone_starts(self):
         with TemporaryDirectory() as tmp:

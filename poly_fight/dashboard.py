@@ -1341,6 +1341,19 @@ def _dashboard_market_group_rank(market: dict[str, Any]) -> int:
     }.get(market_type, 9)
 
 
+def _dashboard_market_group_sequence(market: dict[str, Any]) -> int:
+    market_type = str(market.get("market_type") or "").strip()
+    if market_type in {"main_match", "moneyline"}:
+        return 0
+    text = " ".join(str(market.get(key) or "") for key in ("question", "title", "market_type_label"))
+    match = re.search(r"\b(?:map|game)\s*(\d+)\b", text, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"(?:地图|第)\s*(\d+)", text)
+    if match:
+        return int(match.group(1))
+    return 10_000
+
+
 def _unique_nonempty(values: Any) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -1405,7 +1418,10 @@ def build_events(
                 (market, condition_id, start_ts, open_signals, results)
             )
     for group_rows in grouped_markets.values():
-        ordered_group = sorted(group_rows, key=lambda row: (_dashboard_market_group_rank(row[0]), row[2] or 0, row[1]))
+        ordered_group = sorted(
+            group_rows,
+            key=lambda row: (_dashboard_market_group_rank(row[0]), _dashboard_market_group_sequence(row[0]), row[2] or 0, row[1]),
+        )
         market, condition_id, _start_ts, _open_signals, _results = ordered_group[0]
         open_signals = [signal for _market, _condition_id, _start, signals, _results in ordered_group for signal in signals]
         results = [result for _market, _condition_id, _start, _signals, group_results in ordered_group for result in group_results]
