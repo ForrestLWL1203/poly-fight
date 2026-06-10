@@ -51,19 +51,19 @@ from poly_fight.cli import (
     acquire_build_lock,
     build_leaderboard_from_profiles,
     build_collection_diagnostics,
-    build_v2_profile_candidate_from_trades,
-    build_v3_leaderboard,
-    command_collect_v2_compare,
-    command_collect_v2_probe,
-    command_collect_v3,
-    aggregate_v2_seed_wallets,
-    build_v2_leaderboard,
-    collect_v2_seed_positions,
+    build_profile_candidate_from_trades,
+    build_collector_profile_refresh_plan,
+    build_collector_snapshot_diagnostics,
+    build_collector_leaderboard,
+    command_collect_wallets,
+    command_analyze_collector_snapshot,
+    aggregate_seed_wallets,
+    build_seeded_leaderboard,
+    collect_seed_positions,
     command_collect,
-    command_collect_v2,
     ESPORTS_CANDIDATE_MARKET_TYPE_THRESHOLDS,
     ESPORTS_CANDIDATE_GAME_FAMILY_THRESHOLDS,
-    filter_v2_profile_wallets,
+    filter_profile_seed_wallets,
     build_profile_budget_summary,
     build_parser,
     build_wallet_overlap_report,
@@ -75,6 +75,7 @@ from poly_fight.cli import (
     command_build_leaderboard,
     _command_build_leaderboard_unlocked,
     command_follow,
+    effective_bankroll_usdc,
     fetch_resolutions_for_open_signals,
     fetch_recent_esports_closed_positions_for_wallet,
     fetch_recent_esports_user_trades_for_wallet,
@@ -88,22 +89,23 @@ from poly_fight.cli import (
     merge_profiles_with_candidates,
     migrate_category_follow_dbs,
     observed_performance_quarantine_events,
-    publish_collector_v3_dashboard_outputs,
+    publish_collector_dashboard_outputs,
     prune_profile_store,
     read_category_leaderboards,
     refresh_team_logo_cache_from_active_markets,
     read_json,
     read_jsonl,
     resolve_data_dir,
-    seed_score_v2_wallet,
+    seed_wallet_score,
     should_refresh_file_cache,
     should_use_cached_profile,
     watched_markets,
     write_json,
     write_jsonl,
     prepare_category_refresh_dir,
-    select_v2_target_markets,
-    resolve_collect_experimental_profile_wallet_limit,
+    select_collector_target_markets,
+    resolve_collector_profile_wallet_limit,
+    merge_collector_cached_profile_with_seed,
 )
 from poly_fight.core import (
     ALLOWED_GAME_FAMILIES,
@@ -218,22 +220,22 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(resolve_data_dir(follow_args), Path("data/esports"))
         self.assertEqual(resolve_data_dir(explicit_args), Path("custom_dir"))
 
-    def test_collect_dispatches_esports_to_latest_collector_and_keeps_sports_v1(self):
+    def test_collect_dispatches_esports_to_wallet_collector_and_keeps_sports_handler(self):
         parser = build_parser()
         esports_args = parser.parse_args(["collect"])
         sports_args = parser.parse_args(["collect", "--category", "sports"])
 
         with (
-            patch("poly_fight.cli.command_collect_v3", return_value=31) as collect_v3,
-            patch("poly_fight.cli.command_build_leaderboard", return_value=17) as build_v1,
+            patch("poly_fight.cli.command_collect_wallets", return_value=31) as collect_wallets,
+            patch("poly_fight.cli.command_build_leaderboard", return_value=17) as sports_handler,
         ):
             self.assertEqual(command_collect(esports_args), 31)
             self.assertEqual(command_collect(sports_args), 17)
 
-        collect_v3.assert_called_once_with(esports_args)
-        build_v1.assert_called_once_with(sports_args)
+        collect_wallets.assert_called_once_with(esports_args)
+        sports_handler.assert_called_once_with(sports_args)
 
-    def test_build_leaderboard_dispatches_esports_to_latest_collector_and_keeps_sports_v1(self):
+    def test_build_leaderboard_dispatches_esports_to_wallet_collector_and_keeps_sports_handler(self):
         parser = build_parser()
         esports_args = parser.parse_args(["build-leaderboard"])
         sports_args = parser.parse_args(["build-leaderboard", "--category", "sports"])
@@ -241,16 +243,16 @@ class CoreTest(unittest.TestCase):
         self.assertIs(esports_args.func, command_collect)
         self.assertIs(sports_args.func, command_collect)
         with (
-            patch("poly_fight.cli.command_collect_v3", return_value=31) as collect_v3,
-            patch("poly_fight.cli.command_build_leaderboard", return_value=17) as build_v1,
+            patch("poly_fight.cli.command_collect_wallets", return_value=31) as collect_wallets,
+            patch("poly_fight.cli.command_build_leaderboard", return_value=17) as sports_handler,
         ):
             self.assertEqual(esports_args.func(esports_args), 31)
             self.assertEqual(sports_args.func(sports_args), 17)
 
-        collect_v3.assert_called_once_with(esports_args)
-        build_v1.assert_called_once_with(sports_args)
+        collect_wallets.assert_called_once_with(esports_args)
+        sports_handler.assert_called_once_with(sports_args)
 
-    def test_collect_accepts_latest_collector_tuning_flags(self):
+    def test_collect_accepts_collector_tuning_flags(self):
         args = build_parser().parse_args(
             [
                 "collect",
@@ -276,11 +278,11 @@ class CoreTest(unittest.TestCase):
         legacy_budget_args = build_parser().parse_args(["collect", "--max-profiles-per-run", "44"])
         self.assertIsNone(legacy_budget_args.max_profile_wallets)
         self.assertEqual(
-            resolve_collect_experimental_profile_wallet_limit(legacy_budget_args, collector_version="v3"),
+            resolve_collector_profile_wallet_limit(legacy_budget_args),
             44,
         )
 
-    def test_build_leaderboard_accepts_latest_collector_tuning_flags(self):
+    def test_build_leaderboard_accepts_collector_tuning_flags(self):
         args = build_parser().parse_args(
             [
                 "build-leaderboard",
@@ -7191,9 +7193,6 @@ class CoreTest(unittest.TestCase):
             fresh_cache = category_dir / "raw_market_trades" / "fresh.json"
             old_cache = category_dir / "raw_user_trades" / "old.json"
             old_nested_cache = category_dir / "clob_market_metadata" / "nested" / "old.json"
-            nested_v3_user_cache = category_dir / "collector_v3" / "esports" / "raw_user_trades" / "two_days_old.json"
-            nested_v3_fresh_user_cache = category_dir / "collector_v3" / "esports" / "raw_user_trades" / "fresh.json"
-            nested_v2_market_cache = category_dir / "collector_v2" / "esports" / "raw_market_trades" / "old.json"
             for path in [
                 output_file,
                 profile_file,
@@ -7201,21 +7200,14 @@ class CoreTest(unittest.TestCase):
                 fresh_cache,
                 old_cache,
                 old_nested_cache,
-                nested_v3_user_cache,
-                nested_v3_fresh_user_cache,
-                nested_v2_market_cache,
             ]:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(path.name, encoding="utf-8")
             now_ts = 2_000_000
             old_mtime = now_ts - 40 * 86400
-            two_days_old_mtime = now_ts - 2 * 86400
-            eight_days_old_mtime = now_ts - 8 * 86400
             fresh_mtime = now_ts - 5 * 86400
             for path in [old_cache, old_nested_cache]:
                 os.utime(path, (old_mtime, old_mtime))
-            os.utime(nested_v3_user_cache, (two_days_old_mtime, two_days_old_mtime))
-            os.utime(nested_v2_market_cache, (eight_days_old_mtime, eight_days_old_mtime))
             os.utime(fresh_cache, (fresh_mtime, fresh_mtime))
 
             prepare_category_refresh_dir(category_dir, max_lookback_days=14, now_ts=now_ts)
@@ -7226,9 +7218,6 @@ class CoreTest(unittest.TestCase):
             self.assertTrue(fresh_cache.exists())
             self.assertFalse(old_cache.exists())
             self.assertFalse(old_nested_cache.exists())
-            self.assertFalse(nested_v3_user_cache.exists())
-            self.assertTrue(nested_v3_fresh_user_cache.exists())
-            self.assertFalse(nested_v2_market_cache.exists())
 
     def test_dashboard_runner_stop_allows_external_process(self):
         with TemporaryDirectory() as tmp:
@@ -8302,33 +8291,33 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(rows, [{"wallet": "0xsqlite", "grade": "A", "category": "esports"}])
             self.assertEqual(mtimes["esports"], 456)
 
-    def test_v3_dashboard_publish_writes_standard_outputs_for_dashboard_and_follow(self):
+    def test_collector_dashboard_publish_writes_standard_outputs_for_dashboard_and_follow(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            collector_dir = root / "collector_v3" / "esports"
+            collector_dir = root / "collector" / "esports"
             data_dir = root / "esports"
             collector_dir.mkdir(parents=True)
             leaderboard = [
                 {
-                    "wallet": "0xV3",
+                    "wallet": "0xcollector",
                     "grade": "A",
-                    "v3_lane": "core",
+                    "lane": "core",
                     "eligible_buckets": ["cs2:main_match"],
                     "eligible_market_types": ["main_match"],
                 }
             ]
             profiles = [
                 {
-                    "wallet": "0xV3",
+                    "wallet": "0xcollector",
                     "grade": "A",
                     "per_game_type": {"cs2:main_match": {"esports_roi": 0.31}},
                 }
             ]
-            summary = {"collector_version": "v3", "leaderboard_wallet_count": 1}
-            write_json(collector_dir / "v3_leaderboard.json", leaderboard)
-            write_json(collector_dir / "v3_wallet_rawdata.json", profiles)
+            summary = {"collector": "wallet_collector", "leaderboard_wallet_count": 1}
+            write_json(collector_dir / "collector_leaderboard.json", leaderboard)
+            write_json(collector_dir / "collector_wallet_profiles.json", profiles)
 
-            publish = publish_collector_v3_dashboard_outputs(
+            publish = publish_collector_dashboard_outputs(
                 collector_dir,
                 data_dir,
                 summary=summary,
@@ -8339,11 +8328,11 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(read_json(data_dir / "smart_wallet_leaderboard.json", []), leaderboard)
             self.assertEqual(read_json(data_dir / "wallet_profiles.json", []), profiles)
             rows, mtimes = read_category_leaderboards(root)
-            self.assertEqual(rows[0]["wallet"], "0xV3")
-            self.assertEqual(rows[0]["v3_lane"], "core")
+            self.assertEqual(rows[0]["wallet"], "0xcollector")
+            self.assertEqual(rows[0]["lane"], "core")
             self.assertEqual(mtimes["esports"], 789)
             dashboard_summary = read_json(data_dir / "build_summary.json", {})
-            self.assertEqual(dashboard_summary["collector_version"], "v3")
+            self.assertEqual(dashboard_summary["collector"], "wallet_collector")
             self.assertEqual(dashboard_summary["dashboard_publish"]["collector_output_dir"], str(collector_dir))
 
     def test_dashboard_wallets_use_observed_follow_trade_time(self):
@@ -9689,7 +9678,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(calls[0][1]["sortBy"], "TOTAL_PNL")
         self.assertEqual(calls[0][1]["sortDirection"], "DESC")
 
-    def test_select_v2_target_markets_uses_six_buckets_without_backfill(self):
+    def test_select_collector_target_markets_uses_six_buckets_without_backfill(self):
         now = datetime(2026, 6, 9, tzinfo=timezone.utc)
 
         def row(condition_id, game_family, market_type, volume, days_ago=5):
@@ -9714,7 +9703,7 @@ class CoreTest(unittest.TestCase):
             row("cs-map", "cs2", "map_winner", 200),
         ]
 
-        selected, meta = select_v2_target_markets(
+        selected, meta = select_collector_target_markets(
             classification,
             now=now,
             lookback_days=30,
@@ -9736,7 +9725,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(meta["bucket_counts"]["lol:main_match"], 2)
         self.assertNotIn("valorant:main_match", meta["bucket_counts"])
 
-    def test_v2_seed_positions_keep_only_profitable_winning_outcome(self):
+    def test_seed_positions_keep_only_profitable_winning_outcome(self):
         market = {
             "condition_id": "m1",
             "category": "esports",
@@ -9781,7 +9770,7 @@ class CoreTest(unittest.TestCase):
             },
         ]
 
-        rows = collect_v2_seed_positions(market, response, positions_per_market=20)
+        rows = collect_seed_positions(market, response, positions_per_market=20)
 
         self.assertEqual([row["wallet"] for row in rows], ["0xaaa"])
         self.assertEqual(rows[0]["seed_cost"], 60)
@@ -9789,7 +9778,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(rows[0]["seed_edge"], 0.4)
         self.assertEqual(rows[0]["seed_rank"], 1)
 
-    def test_v2_seed_wallet_scoring_balances_frequency_profit_entry_and_rank(self):
+    def test_seed_wallet_scoring_balances_frequency_profit_entry_and_rank(self):
         seed_positions = [
             {
                 "wallet": "0xsteady",
@@ -9852,13 +9841,13 @@ class CoreTest(unittest.TestCase):
                 "timestamp": 500,
             },
         ]
-        wallets = aggregate_v2_seed_wallets(seed_positions)
-        selected = filter_v2_profile_wallets(wallets, max_wallets=500)
+        wallets = aggregate_seed_wallets(seed_positions)
+        selected = filter_profile_seed_wallets(wallets, max_wallets=500)
 
         self.assertEqual([row["wallet"] for row in selected], ["0xsteady"])
-        self.assertGreater(seed_score_v2_wallet(wallets["0xsteady"]), seed_score_v2_wallet(wallets["0xoneshot"]))
+        self.assertGreater(seed_wallet_score(wallets["0xsteady"]), seed_wallet_score(wallets["0xoneshot"]))
 
-    def test_v2_seed_wallet_aggregation_dedupes_wallet_market_frequency(self):
+    def test_seed_wallet_aggregation_dedupes_wallet_market_frequency(self):
         seed_positions = [
             {
                 "wallet": "0xDUP",
@@ -9898,7 +9887,7 @@ class CoreTest(unittest.TestCase):
             },
         ]
 
-        wallets = aggregate_v2_seed_wallets(seed_positions)
+        wallets = aggregate_seed_wallets(seed_positions)
         wallet = wallets["0xdup"]
 
         self.assertEqual(wallet["seed_position_row_count"], 3)
@@ -9907,7 +9896,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(wallet["seed_cost_total"], 250)
         self.assertEqual(wallet["seed_bucket_counts"], {"cs2:map_winner": 1, "lol:main_match": 1})
 
-    def test_v2_profile_candidate_uses_deep_trade_behavior_metrics(self):
+    def test_profile_candidate_uses_deep_trade_behavior_metrics(self):
         now = datetime(2026, 6, 9, tzinfo=timezone.utc)
         market_records_by_id = {
             "m1": {
@@ -9952,7 +9941,7 @@ class CoreTest(unittest.TestCase):
             for index in range(20)
         )
 
-        candidate = build_v2_profile_candidate_from_trades(
+        candidate = build_profile_candidate_from_trades(
             {
                 "wallet": "0xAAA",
                 "participated_market_count": 3,
@@ -9960,7 +9949,7 @@ class CoreTest(unittest.TestCase):
                 "two_sided_market_count": 0,
                 "high_churn_market_count": 0,
                 "tail_entry_market_count": 0,
-                "candidate_reasons": ["v2_profitable_winner_seed"],
+                "candidate_reasons": ["profitable_winner_seed"],
             },
             trades,
             market_records_by_id,
@@ -9973,7 +9962,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(candidate["per_game_type_candidate"]["lol:main_match"]["high_churn_market_count"], 1)
         self.assertEqual(candidate["per_game_type_candidate"]["cs2:map_winner"]["tail_entry_market_count"], 1)
 
-    def test_collect_v2_default_output_dir_follows_global_data_dir(self):
+    def test_collector_default_output_dir_follows_global_data_dir(self):
         class FakeClient:
             def list_events_paginated(self, **kwargs):
                 return []
@@ -9984,17 +9973,17 @@ class CoreTest(unittest.TestCase):
                 [
                     "--data-dir",
                     str(root),
-                    "collect-v2",
+                    "collect",
                     "--max-workers",
                     "1",
                 ]
             )
 
             self.assertIsNone(args.output_dir)
-            self.assertEqual(command_collect_v2(args, client=FakeClient()), 0)
-            self.assertTrue((root / "collector_v2" / "esports" / "v2_build_summary.json").exists())
+            self.assertEqual(command_collect_wallets(args, client=FakeClient()), 0)
+            self.assertTrue((root / "collector_build_summary.json").exists())
 
-    def test_collect_v2_command_writes_independent_outputs_and_summary(self):
+    def test_collector_command_writes_outputs_and_summary(self):
         now = datetime(2026, 6, 9, tzinfo=timezone.utc)
 
         class FakeClient:
@@ -10092,10 +10081,10 @@ class CoreTest(unittest.TestCase):
                 return []
 
         with TemporaryDirectory() as tmp:
-            output_dir = Path(tmp) / "v2"
+            output_dir = Path(tmp) / "collector"
             args = build_parser().parse_args(
                 [
-                    "collect-v2",
+                    "collect",
                     "--output-dir",
                     str(output_dir),
                     "--bucket-market-limit",
@@ -10112,20 +10101,25 @@ class CoreTest(unittest.TestCase):
             with patch("poly_fight.cli.datetime") as fake_datetime:
                 fake_datetime.now.return_value = now
                 fake_datetime.fromtimestamp.side_effect = datetime.fromtimestamp
-                self.assertEqual(command_collect_v2(args, client=client), 0)
+                self.assertEqual(command_collect_wallets(args, client=client), 0)
 
             for name in [
-                "v2_classification_set.json",
-                "v2_target_markets.json",
-                "v2_seed_positions.json",
-                "v2_seed_wallets.json",
-                "v2_profile_wallets.json",
-                "v2_wallet_rawdata.json",
-                "v2_leaderboard.json",
-                "v2_build_summary.json",
+                "collector_classification_set.json",
+                "collector_target_markets.json",
+                "collector_seed_positions.json",
+                "collector_seed_wallets.json",
+                "collector_profile_wallets.json",
+                "collector_wallet_profiles.json",
+                "collector_leaderboard.json",
+                "collector_core_leaderboard.json",
+                "collector_momentum_leaderboard.json",
+                "collector_family_leaderboard.json",
+                "collector_watchlist.json",
+                "collector_build_summary.json",
             ]:
                 self.assertTrue((output_dir / name).exists(), name)
-            summary = read_json(output_dir / "v2_build_summary.json", {})
+            summary = read_json(output_dir / "collector_build_summary.json", {})
+            self.assertEqual(summary["collector"], "wallet_collector")
             self.assertEqual(summary["target_market_count"], 2)
             self.assertEqual(summary["seed_position_count"], 2)
             self.assertEqual(summary["seed_wallet_count"], 1)
@@ -10137,108 +10131,348 @@ class CoreTest(unittest.TestCase):
             self.assertIn("leaderboard_reject_reasons", summary)
             self.assertIn("bucket_seed_wallet_counts", summary)
             self.assertIn("bucket_profile_wallet_counts", summary)
+            self.assertIn("lane_counts", summary)
+            self.assertEqual(summary["collector_profile_cache_ttl_hours"], 24.0)
+            self.assertEqual(summary["profile_cache_hits"], 0)
+            self.assertEqual(summary["profile_cache_misses"], 1)
+            self.assertEqual(summary["profile_refresh_plan_count"], 1)
+            self.assertEqual(summary["profile_reused_count"], 0)
+            self.assertEqual(summary["profile_skipped_due_budget"], 0)
+            self.assertEqual(summary["raw_user_trade_api_fetches"], 1)
+            self.assertEqual(summary["raw_user_trade_cache_hits"], 0)
+            self.assertEqual(summary["raw_user_trade_error_count"], 0)
+            self.assertIn("seed_age_buckets", summary)
 
-    def test_collect_v2_compare_writes_v1_v2_overlap_report(self):
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            v1_dir = root / "esports"
-            v2_dir = root / "collector_v2" / "esports"
-            v1_dir.mkdir(parents=True)
-            v2_dir.mkdir(parents=True)
-            write_json(
-                v1_dir / "smart_wallet_leaderboard.json",
-                [{"wallet": "0xAAA", "grade": "A"}, {"wallet": "0xBBB", "grade": "A"}],
-            )
-            write_json(
-                v1_dir / "wallet_profiles.json",
-                [{"wallet": "0xAAA", "grade": "A"}, {"wallet": "0xBBB", "grade": "A"}],
-            )
-            write_json(
-                v2_dir / "v2_leaderboard.json",
-                [{"wallet": "0xbbb", "grade": "A"}, {"wallet": "0xCCC", "grade": "A"}],
-            )
-            write_json(
-                v2_dir / "v2_wallet_rawdata.json",
-                [{"wallet": "0xbbb", "grade": "A"}, {"wallet": "0xCCC", "grade": "B"}],
-            )
-            output_file = root / "v2_compare.json"
-            args = build_parser().parse_args(
-                [
-                    "collect-v2-compare",
-                    "--v1-dir",
-                    str(v1_dir),
-                    "--v2-dir",
-                    str(v2_dir),
-                    "--output-file",
-                    str(output_file),
-                ]
-            )
+    def test_collector_reuses_valid_cached_profile_without_user_trade_api_call(self):
+        now = datetime(2026, 6, 9, tzinfo=timezone.utc)
+        now_ts = int(now.timestamp())
 
-            self.assertEqual(command_collect_v2_compare(args), 0)
-
-            report = read_json(output_file, {})
-            self.assertEqual(report["v1_leaderboard_wallet_count"], 2)
-            self.assertEqual(report["v2_leaderboard_wallet_count"], 2)
-            self.assertEqual(report["leaderboard_overlap_count"], 1)
-            self.assertEqual(report["v1_only_leaderboard_wallets"], ["0xaaa"])
-            self.assertEqual(report["v2_only_leaderboard_wallets"], ["0xccc"])
-            self.assertEqual(report["v2_raw_profile_grade_counts"], {"A": 1, "B": 1})
-
-    def test_collect_v2_probe_records_winner_and_loser_market_position_semantics(self):
         class FakeClient:
             def __init__(self):
-                self.calls = []
+                self.trade_calls = []
+
+            def list_events_paginated(self, **kwargs):
+                markets = []
+                for index in range(2):
+                    markets.append(
+                        {
+                            "id": f"e{index}",
+                            "slug": f"e{index}",
+                            "title": "LoL: A vs B",
+                            "closed": True,
+                            "endDate": (now - timedelta(days=index + 1)).isoformat(),
+                            "tags": [{"slug": "league-of-legends"}],
+                            "markets": [
+                                {
+                                    "conditionId": f"m{index}",
+                                    "question": "LoL: A vs B",
+                                    "outcomes": json.dumps(["A", "B"]),
+                                    "outcomePrices": json.dumps(["1", "0"]),
+                                    "volume": 10_000 + index,
+                                    "endDate": (now - timedelta(days=index + 1)).isoformat(),
+                                }
+                            ],
+                        }
+                    )
+                return markets
 
             def market_positions(self, condition_id, *, limit=20, sort_by="TOTAL_PNL", sort_direction="DESC"):
-                self.calls.append((condition_id, limit, sort_by, sort_direction))
                 return [
                     {
                         "positions": [
-                            {"proxyWallet": "0xWIN", "outcomeIndex": 0, "totalPnl": 25, "realizedPnl": 25},
-                            {"proxyWallet": "0xWINZERO", "outcomeIndex": 0, "totalPnl": 0, "realizedPnl": 0},
+                            {
+                                "proxyWallet": "0xAAA",
+                                "outcomeIndex": 0,
+                                "avgPrice": 0.6,
+                                "totalBought": 300,
+                                "realizedPnl": 40,
+                                "totalPnl": 40,
+                            }
                         ]
-                    },
-                    {
-                        "positions": [
-                            {"proxyWallet": "0xLOSEPOS", "outcomeIndex": 1, "totalPnl": 10, "realizedPnl": 10},
-                            {"proxyWallet": "0xLOSENEG", "outcomeIndex": 1, "totalPnl": -10, "realizedPnl": -10},
-                        ]
-                    },
+                    }
                 ]
 
+            def trades_for_user(self, wallet, *, limit=500, offset=0):
+                self.trade_calls.append((wallet, limit, offset))
+                raise AssertionError("valid cached profile should avoid user trade fetch")
+
         with TemporaryDirectory() as tmp:
-            v2_dir = Path(tmp)
+            output_dir = Path(tmp) / "collector"
+            output_dir.mkdir()
             write_json(
-                v2_dir / "v2_target_markets.json",
+                output_dir / "collector_wallet_profiles.json",
                 [
                     {
-                        "condition_id": "m1",
-                        "outcome_prices": [1.0, 0.0],
-                        "bucket_key": "lol:main_match",
+                        "wallet": "0xAAA",
+                        "category": "esports",
+                        "profile_state": "qualified",
+                        "grade": "C",
+                        "profiled_at": now_ts - 3600,
+                        "scoring_version": SCORING_VERSION,
+                        "esports_condition_ids": ["m0", "m1"],
+                        "last_esports_trade_at": now_ts - 3600,
+                        "candidate": {"wallet": "0xAAA", "source": "old"},
                     }
                 ],
             )
             args = build_parser().parse_args(
                 [
-                    "collect-v2-probe",
-                    "--v2-dir",
-                    str(v2_dir),
-                    "--sample-markets",
+                    "collect",
+                    "--output-dir",
+                    str(output_dir),
+                    "--bucket-market-limit",
+                    "2",
+                    "--max-profile-wallets",
                     "1",
+                    "--max-workers",
+                    "1",
+                    "--no-dashboard-publish",
                 ]
             )
             client = FakeClient()
+            with patch("poly_fight.cli.datetime") as fake_datetime:
+                fake_datetime.now.return_value = now
+                fake_datetime.fromtimestamp.side_effect = datetime.fromtimestamp
+                self.assertEqual(command_collect_wallets(args, client=client), 0)
 
-            self.assertEqual(command_collect_v2_probe(args, client=client), 0)
+            profiles = read_json(output_dir / "collector_wallet_profiles.json", [])
+            summary = read_json(output_dir / "collector_build_summary.json", {})
 
-            report = read_json(v2_dir / "v2_api_probe.json", {})
-            self.assertEqual(report["sampled_market_count"], 1)
-            self.assertEqual(report["totals"]["winning_positive_positions"], 1)
-            self.assertEqual(report["totals"]["losing_positive_positions"], 1)
-            self.assertEqual(report["totals"]["losing_negative_positions"], 1)
-            self.assertEqual(client.calls[0], ("m1", 20, "TOTAL_PNL", "DESC"))
+        self.assertEqual(client.trade_calls, [])
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0]["candidate"]["source"], "collector_market_positions")
+        self.assertEqual(profiles[0]["seed"]["seed_win_count"], 2)
+        self.assertEqual(summary["profile_cache_hits"], 1)
+        self.assertEqual(summary["profile_cache_misses"], 0)
+        self.assertEqual(summary["profile_reused_count"], 1)
+        self.assertEqual(summary["profile_refresh_plan_count"], 0)
+        self.assertEqual(summary["raw_user_trade_api_fetches"], 0)
 
-    def test_v2_leaderboard_uses_clean_eligible_bucket_behavior_not_global_candidate_noise(self):
+    def test_collector_profile_cache_ttl_zero_forces_refresh(self):
+        now = datetime(2026, 6, 9, tzinfo=timezone.utc)
+        now_ts = int(now.timestamp())
+
+        class FakeClient:
+            def __init__(self):
+                self.trade_calls = []
+
+            def list_events_paginated(self, **kwargs):
+                return [
+                    {
+                        "id": f"e{index}",
+                        "slug": f"e{index}",
+                        "title": "LoL: A vs B",
+                        "closed": True,
+                        "endDate": (now - timedelta(days=index + 1)).isoformat(),
+                        "tags": [{"slug": "league-of-legends"}],
+                        "markets": [
+                            {
+                                "conditionId": f"m{index}",
+                                "question": "LoL: A vs B",
+                                "outcomes": json.dumps(["A", "B"]),
+                                "outcomePrices": json.dumps(["1", "0"]),
+                                "volume": 10_000 + index,
+                                "endDate": (now - timedelta(days=index + 1)).isoformat(),
+                            }
+                        ],
+                    }
+                    for index in range(2)
+                ]
+
+            def market_positions(self, condition_id, *, limit=20, sort_by="TOTAL_PNL", sort_direction="DESC"):
+                return [
+                    {
+                        "positions": [
+                            {
+                                "proxyWallet": "0xAAA",
+                                "outcomeIndex": 0,
+                                "avgPrice": 0.6,
+                                "totalBought": 300,
+                                "realizedPnl": 40,
+                                "totalPnl": 40,
+                            }
+                        ]
+                    }
+                ]
+
+            def trades_for_user(self, wallet, *, limit=500, offset=0):
+                self.trade_calls.append((wallet, limit, offset))
+                if offset > 0:
+                    return []
+                return [
+                    {
+                        "proxyWallet": wallet,
+                        "conditionId": "m0",
+                        "outcomeIndex": 0,
+                        "side": "BUY",
+                        "size": 100,
+                        "price": 0.6,
+                        "timestamp": now_ts - 3600,
+                    },
+                    {
+                        "proxyWallet": wallet,
+                        "conditionId": "m1",
+                        "outcomeIndex": 0,
+                        "side": "BUY",
+                        "size": 100,
+                        "price": 0.6,
+                        "timestamp": now_ts - 7200,
+                    },
+                ]
+
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "collector"
+            output_dir.mkdir()
+            write_json(
+                output_dir / "collector_wallet_profiles.json",
+                [
+                    {
+                        "wallet": "0xAAA",
+                        "category": "esports",
+                        "profile_state": "qualified",
+                        "grade": "C",
+                        "profiled_at": now_ts - 3600,
+                        "scoring_version": SCORING_VERSION,
+                        "esports_condition_ids": ["m0", "m1"],
+                    }
+                ],
+            )
+            args = build_parser().parse_args(
+                [
+                    "collect",
+                    "--output-dir",
+                    str(output_dir),
+                    "--bucket-market-limit",
+                    "2",
+                    "--max-profile-wallets",
+                    "1",
+                    "--collector-profile-cache-ttl-hours",
+                    "0",
+                    "--max-workers",
+                    "1",
+                    "--no-dashboard-publish",
+                ]
+            )
+            client = FakeClient()
+            with patch("poly_fight.cli.datetime") as fake_datetime:
+                fake_datetime.now.return_value = now
+                fake_datetime.fromtimestamp.side_effect = datetime.fromtimestamp
+                self.assertEqual(command_collect_wallets(args, client=client), 0)
+
+            summary = read_json(output_dir / "collector_build_summary.json", {})
+
+        self.assertGreater(len(client.trade_calls), 0)
+        self.assertEqual(summary["profile_cache_hits"], 0)
+        self.assertEqual(summary["profile_cache_misses"], 1)
+        self.assertEqual(summary["profile_refresh_plan_count"], 1)
+        self.assertEqual(summary["profile_reused_count"], 0)
+        self.assertEqual(summary["raw_user_trade_api_fetches"], 1)
+
+    def test_collector_refresh_plan_reuses_cache_and_prioritizes_recent_strong_seed(self):
+        now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
+        profile_wallets = [
+            {"wallet": "0xCached", "last_seed_at": now_ts - 60, "seed_score": 10, "seed_win_count": 2, "seed_cost_total": 500},
+            {"wallet": "0xRecent", "last_seed_at": now_ts - 120, "seed_score": 8, "seed_win_count": 2, "seed_cost_total": 500},
+            {"wallet": "0xOldStrong", "last_seed_at": now_ts - 86400, "seed_score": 100, "seed_win_count": 10, "seed_cost_total": 5000},
+        ]
+        existing_profiles = {
+            "0xcached": {
+                "wallet": "0xCached",
+                "profile_state": "qualified",
+                "profiled_at": now_ts - 3600,
+                "esports_condition_ids": ["m1"],
+                "scoring_version": SCORING_VERSION,
+            }
+        }
+
+        plan = build_collector_profile_refresh_plan(
+            profile_wallets,
+            existing_profiles,
+            now_ts=now_ts,
+            ttl_seconds=24 * 3600,
+            max_refresh_profiles=1,
+        )
+
+        self.assertEqual(sorted(plan["reused_profiles_by_wallet"]), ["0xcached"])
+        self.assertEqual([row["wallet"] for row in plan["refresh_plan"]], ["0xrecent"])
+        self.assertEqual([row["wallet"] for row in plan["skipped_due_budget"]], ["0xoldstrong"])
+        self.assertEqual(plan["stats"]["profile_cache_hits"], 1)
+        self.assertEqual(plan["stats"]["profile_cache_misses"], 2)
+
+    def test_collector_refresh_plan_rejects_invalid_cached_profiles(self):
+        now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
+        base_seed = {"wallet": "0xA", "last_seed_at": now_ts, "seed_score": 10, "seed_win_count": 2, "seed_cost_total": 500}
+        invalid_profiles = [
+            {"wallet": "0xA", "profile_state": "qualified", "profiled_at": now_ts - 3600, "esports_condition_ids": ["m1"], "scoring_version": SCORING_VERSION - 1},
+            {"wallet": "0xA", "profile_state": "qualified", "profiled_at": now_ts - 3600, "scoring_version": SCORING_VERSION},
+            {"wallet": "0xA", "profile_state": "failed_retryable", "profiled_at": now_ts - 3600, "esports_condition_ids": ["m1"], "scoring_version": SCORING_VERSION},
+            {"wallet": "0xA", "profile_state": "qualified", "profiled_at": now_ts - 26 * 3600, "esports_condition_ids": ["m1"], "scoring_version": SCORING_VERSION},
+        ]
+
+        for cached in invalid_profiles:
+            with self.subTest(cached=cached):
+                plan = build_collector_profile_refresh_plan(
+                    [base_seed],
+                    {"0xa": cached},
+                    now_ts=now_ts,
+                    ttl_seconds=24 * 3600,
+                    max_refresh_profiles=1,
+                )
+                self.assertEqual(plan["reused_profiles_by_wallet"], {})
+                self.assertEqual([row["wallet"] for row in plan["refresh_plan"]], ["0xa"])
+
+    def test_collector_snapshot_diagnostics_counts_lightweight_vps_snapshot(self):
+        now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
+        with TemporaryDirectory() as tmp:
+            snapshot_dir = Path(tmp) / "esports"
+            raw_dir = snapshot_dir / "raw_user_trades"
+            raw_dir.mkdir(parents=True)
+            write_json(snapshot_dir / "collector_build_summary.json", {"stage_timings": {"wallet_profiles_seconds": 12.5}})
+            write_json(snapshot_dir / "collector_profile_wallets.json", [{"wallet": "0x1"}, {"wallet": "0x2"}])
+            write_json(snapshot_dir / "collector_wallet_profiles.json", [{"wallet": "0x1"}])
+            write_json(snapshot_dir / "collector_seed_wallets.json", [{"wallet": "0x1"}, {"wallet": "0x2"}, {"wallet": "0x3"}])
+            write_json(raw_dir / "0x1.json", {"trades": [1]})
+            write_json(raw_dir / "0x2.json", {"trades": [1, 2]})
+
+            diagnostics = build_collector_snapshot_diagnostics(snapshot_dir, now_ts=now_ts)
+
+        self.assertEqual(diagnostics["summary_file"], "collector_build_summary.json")
+        self.assertEqual(diagnostics["stage_timings"], {"wallet_profiles_seconds": 12.5})
+        self.assertEqual(diagnostics["profile_wallet_count"], 2)
+        self.assertEqual(diagnostics["wallet_profile_count"], 1)
+        self.assertEqual(diagnostics["seed_wallet_count"], 3)
+        self.assertEqual(diagnostics["raw_user_trades"]["file_count"], 2)
+        self.assertGreater(diagnostics["raw_user_trades"]["total_bytes"], 0)
+
+    def test_collector_snapshot_diagnostics_accepts_legacy_snapshot_names(self):
+        now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
+        with TemporaryDirectory() as tmp:
+            snapshot_dir = Path(tmp) / "esports"
+            snapshot_dir.mkdir()
+            write_json(snapshot_dir / "build_summary.json", {"stage_timings": {"raw_user_trades_seconds": 10}})
+            write_json(snapshot_dir / "v3_profile_wallets.json", [{"wallet": "0x1"}])
+            write_json(snapshot_dir / "v3_wallet_rawdata.json", [{"wallet": "0x1"}, {"wallet": "0x2"}])
+            write_json(snapshot_dir / "v3_seed_wallets.json", [{"wallet": "0x1"}, {"wallet": "0x2"}, {"wallet": "0x3"}])
+
+            diagnostics = build_collector_snapshot_diagnostics(snapshot_dir, now_ts=now_ts)
+
+        self.assertEqual(diagnostics["summary_file"], "build_summary.json")
+        self.assertEqual(diagnostics["profile_wallet_count"], 1)
+        self.assertEqual(diagnostics["wallet_profile_count"], 2)
+        self.assertEqual(diagnostics["seed_wallet_count"], 3)
+
+    def test_analyze_collector_snapshot_command_writes_diagnostics(self):
+        with TemporaryDirectory() as tmp:
+            snapshot_dir = Path(tmp) / "esports"
+            snapshot_dir.mkdir()
+            write_json(snapshot_dir / "collector_build_summary.json", {"stage_timings": {}})
+            args = build_parser().parse_args(["analyze-collector-snapshot", "--snapshot-dir", str(snapshot_dir)])
+
+            self.assertEqual(command_analyze_collector_snapshot(args), 0)
+
+            self.assertTrue((snapshot_dir / "collector_snapshot_diagnostics.json").exists())
+
+    def test_seeded_leaderboard_uses_clean_eligible_bucket_behavior_not_global_candidate_noise(self):
         now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
         def profile(wallet, **overrides):
             row = {
@@ -10300,11 +10534,11 @@ class CoreTest(unittest.TestCase):
             row.update(overrides)
             return row
 
-        leaderboard = build_v2_leaderboard({"0xa": profile("0xA")}, now_ts=now_ts)
+        leaderboard = build_seeded_leaderboard({"0xa": profile("0xA")}, now_ts=now_ts)
 
         self.assertEqual([row["wallet"] for row in leaderboard], ["0xA"])
 
-    def test_v2_leaderboard_applies_strict_final_quality_gate(self):
+    def test_seeded_leaderboard_applies_strict_final_quality_gate(self):
         now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
 
         def profile(wallet, **overrides):
@@ -10376,11 +10610,11 @@ class CoreTest(unittest.TestCase):
             "0xlowedge": profile("0xlowedge", capital_weighted_edge=0.02),
         }
 
-        leaderboard = build_v2_leaderboard(profiles, now_ts=now_ts)
+        leaderboard = build_seeded_leaderboard(profiles, now_ts=now_ts)
 
         self.assertEqual([row["wallet"] for row in leaderboard], ["0xkeep"])
 
-    def test_v2_strict_final_gate_can_be_disabled_for_research_views(self):
+    def test_strict_final_gate_can_be_disabled_for_research_views(self):
         now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
         profile = {
             "wallet": "0xlowroi",
@@ -10437,11 +10671,11 @@ class CoreTest(unittest.TestCase):
             },
         }
 
-        leaderboard = build_v2_leaderboard({"0xlowroi": profile}, now_ts=now_ts, require_strict_quality_gate=False)
+        leaderboard = build_seeded_leaderboard({"0xlowroi": profile}, now_ts=now_ts, require_strict_quality_gate=False)
 
         self.assertEqual([row["wallet"] for row in leaderboard], ["0xlowroi"])
 
-    def test_v3_core_lane_excludes_recent_negative_or_inactive_v2_wallets(self):
+    def test_collector_core_lane_excludes_recent_negative_or_inactive_wallets(self):
         now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
 
         def profile(wallet, **overrides):
@@ -10575,17 +10809,17 @@ class CoreTest(unittest.TestCase):
             ),
         }
 
-        result = build_v3_leaderboard(profiles, now_ts=now_ts, max_leaderboard_wallets=30)
+        result = build_collector_leaderboard(profiles, now_ts=now_ts, max_leaderboard_wallets=30)
 
         self.assertEqual([row["wallet"] for row in result["core"]], ["0xgood", "0xstale4d"])
         self.assertEqual([row["wallet"] for row in result["leaderboard"]], ["0xgood", "0xstale4d"])
         self.assertEqual(result["lane_counts"], {"core": 2, "momentum": 0, "family_supplement": 0, "watch": 3})
         self.assertIn(
             "inactive_gt5d",
-            next(row for row in result["watch"] if row["wallet"] == "0xstale6d")["v3_watch_reasons"],
+            next(row for row in result["watch"] if row["wallet"] == "0xstale6d")["watch_reasons"],
         )
 
-    def test_v3_copyable_gate_allows_one_low_rate_two_sided_market(self):
+    def test_collector_copyable_gate_allows_one_low_rate_two_sided_market(self):
         now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
 
         def profile(wallet, two_sided_count):
@@ -10656,7 +10890,7 @@ class CoreTest(unittest.TestCase):
                 },
             }
 
-        result = build_v3_leaderboard(
+        result = build_collector_leaderboard(
             {
                 "0xonetwosided": profile("0xonetwosided", 1),
                 "0xtwotwosided": profile("0xtwotwosided", 2),
@@ -10667,7 +10901,7 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual([row["wallet"] for row in result["core"]], ["0xonetwosided"])
 
-    def test_v3_candidate_behavior_keeps_high_churn_as_observation_not_hard_gate(self):
+    def test_collector_candidate_behavior_keeps_high_churn_as_observation_not_hard_gate(self):
         now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
         profile = {
             "wallet": "0xhighchurn",
@@ -10733,11 +10967,11 @@ class CoreTest(unittest.TestCase):
             },
         }
 
-        result = build_v3_leaderboard({"0xhighchurn": profile}, now_ts=now_ts, max_leaderboard_wallets=30)
+        result = build_collector_leaderboard({"0xhighchurn": profile}, now_ts=now_ts, max_leaderboard_wallets=30)
 
         self.assertEqual([row["wallet"] for row in result["core"]], ["0xhighchurn"])
 
-    def test_v3_momentum_lane_recovers_recent_strong_copyable_wallets(self):
+    def test_collector_momentum_lane_recovers_recent_strong_copyable_wallets(self):
         now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
 
         def profile(wallet, **overrides):
@@ -10817,14 +11051,14 @@ class CoreTest(unittest.TestCase):
             ),
         }
 
-        result = build_v3_leaderboard(profiles, now_ts=now_ts, max_leaderboard_wallets=30)
+        result = build_collector_leaderboard(profiles, now_ts=now_ts, max_leaderboard_wallets=30)
 
         self.assertEqual([row["wallet"] for row in result["core"]], [])
         self.assertEqual([row["wallet"] for row in result["momentum"]], ["0xmomentum"])
         self.assertEqual([row["wallet"] for row in result["leaderboard"]], ["0xmomentum"])
-        self.assertEqual(result["momentum"][0]["v3_lane"], "momentum")
+        self.assertEqual(result["momentum"][0]["lane"], "momentum")
 
-    def test_v3_family_supplement_adds_lol_and_excludes_valorant(self):
+    def test_collector_family_supplement_adds_lol_and_excludes_valorant(self):
         now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
 
         def profile(wallet, bucket, metrics, candidate_metrics=None, **overrides):
@@ -10973,18 +11207,18 @@ class CoreTest(unittest.TestCase):
             ),
         }
 
-        result = build_v3_leaderboard(profiles, now_ts=now_ts, max_leaderboard_wallets=30)
+        result = build_collector_leaderboard(profiles, now_ts=now_ts, max_leaderboard_wallets=30)
 
         self.assertEqual([row["wallet"] for row in result["core"]], [])
         self.assertEqual([row["wallet"] for row in result["momentum"]], [])
         self.assertEqual([row["wallet"] for row in result["family_supplements"]], ["0xlolclean"])
         self.assertEqual([row["wallet"] for row in result["leaderboard"]], ["0xlolclean"])
-        self.assertEqual({row["wallet"]: row["v3_family"] for row in result["family_supplements"]}, {
+        self.assertEqual({row["wallet"]: row["family"] for row in result["family_supplements"]}, {
             "0xlolclean": "lol",
         })
-        self.assertTrue(all(row["v3_lane"] == "family_supplement" for row in result["family_supplements"]))
+        self.assertTrue(all(row["lane"] == "family_supplement" for row in result["family_supplements"]))
 
-    def test_collect_v3_default_output_dir_follows_global_data_dir(self):
+    def test_collector_command_uses_category_data_dir_not_nested_experiment_dir(self):
         class FakeClient:
             def list_events_paginated(self, **kwargs):
                 return []
@@ -10995,19 +11229,19 @@ class CoreTest(unittest.TestCase):
                 [
                     "--data-dir",
                     str(root),
-                    "collect-v3",
+                    "collect",
                     "--max-workers",
                     "1",
                 ]
             )
 
             self.assertIsNone(args.output_dir)
-            self.assertEqual(command_collect_v3(args, client=FakeClient()), 0)
-            self.assertTrue((root / "v3_build_summary.json").exists())
-            self.assertFalse((root / "collector_v3" / "esports").exists())
+            self.assertEqual(command_collect_wallets(args, client=FakeClient()), 0)
+            self.assertTrue((root / "collector_build_summary.json").exists())
+            self.assertFalse((root / "collector" / "esports").exists())
 
-    def test_collect_v3_uses_v1_style_user_history_depth_by_default(self):
-        args = build_parser().parse_args(["collect-v3"])
+    def test_collector_uses_scoped_user_history_depth_by_default(self):
+        args = build_parser().parse_args(["collect"])
 
         self.assertEqual(args.user_history_trades_max_pages, 3)
 
@@ -11054,6 +11288,8 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.execution_mode, "paper")
         self.assertEqual(args.stake_usdc, 25)
         self.assertEqual(args.stake_ratio_percent, 10)
+        self.assertEqual(args.bankroll_usdc, 0.0)
+        self.assertEqual(effective_bankroll_usdc(args.bankroll_usdc), float("inf"))
         self.assertEqual(args.follow_recency_days, 30)
         self.assertEqual(args.observe_window_hours, 24)
         self.assertEqual(args.max_slippage_over_entry, 0.05)
@@ -11085,6 +11321,8 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.command, "run")
         self.assertEqual(args.stake_usdc, 1)
         self.assertEqual(args.stake_ratio_percent, 10)
+        self.assertEqual(args.bankroll_usdc, 0.0)
+        self.assertEqual(effective_bankroll_usdc(args.bankroll_usdc), float("inf"))
         self.assertTrue(args.skip_initial_build)
         self.assertEqual(args.max_run_ticks, 1)
         self.assertEqual(args.pool_refresh_hours, 24)
@@ -11108,6 +11346,12 @@ class CoreTest(unittest.TestCase):
 
         pre_match_args = parser.parse_args(["run", "--stake-usdc", "1", "--require-pre-match"])
         self.assertTrue(pre_match_args.require_pre_match)
+
+    def test_zero_bankroll_disables_follow_exposure_cap(self):
+        self.assertEqual(effective_bankroll_usdc(0), float("inf"))
+        self.assertEqual(effective_bankroll_usdc(-1), float("inf"))
+        self.assertEqual(effective_bankroll_usdc("bad"), float("inf"))
+        self.assertEqual(effective_bankroll_usdc(250), 250)
 
     def test_follow_commands_reject_removed_dead_options(self):
         parser = build_parser()
