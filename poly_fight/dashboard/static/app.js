@@ -846,34 +846,39 @@ createApp({
     eventGame(event) {
       return this.matchParts(event)?.game || "";
     },
+    eventFollowHeadline(event) {
+      const total = this.eventFollowParts(event).total;
+      if (total) return `${total}笔跟单`;
+      const marketCount = Math.max(1, Number(event?.market_count || (event?.market_breakdown || []).length || 1));
+      return `监控 ${marketCount}盘口`;
+    },
+    eventMarketCountLabel(event) {
+      const marketCount = Math.max(0, Number(event?.market_count || (event?.market_breakdown || []).length || 0));
+      return marketCount > 1 ? `${marketCount}盘口聚合` : "";
+    },
     eventFollowText(event) {
-      const parts = this.eventFollowParts(event);
-      const sideText = parts.sides.map((side) => `${side.label}: ${side.count}单`).join(" ");
-      return sideText ? `${parts.total}笔跟单中 · ${sideText}` : `${parts.total}笔跟单中`;
+      const rows = this.eventMarketFollowRows(event);
+      const rowText = rows
+        .map((row) => {
+          const sideText = row.sides.map((side) => `${side.label}: ${side.count}单`).join(" ");
+          return sideText ? `${row.label} ${sideText}` : row.label;
+        })
+        .join(" · ");
+      return rowText ? `${this.eventFollowHeadline(event)} · ${rowText}` : this.eventFollowHeadline(event);
     },
     eventFollowParts(event) {
       const signals = [...(event?.open_signals || []), ...(event?.results || [])];
       const total = signals.length;
       const parts = this.matchParts(event);
       const counts = event?.side_counts || {};
-      const countFor = (label, index) => {
-        const keys = [label, String(index), String(label || "").trim().toLowerCase()];
-        for (const key of keys) {
-          if (Object.prototype.hasOwnProperty.call(counts, key)) return Number(counts[key]) || 0;
-        }
-        for (const [key, value] of Object.entries(counts)) {
-          if (String(key).trim().toLowerCase() === String(label || "").trim().toLowerCase()) return Number(value) || 0;
-        }
-        return 0;
-      };
       if (parts) {
         const teamA = parts.teamA || "A";
         const teamB = parts.teamB || "B";
         return {
           total,
           sides: [
-            { label: teamA, count: countFor(teamA, 0), logo: this.teamLogo(event, "teamA"), tone: "team-a" },
-            { label: teamB, count: countFor(teamB, 1), logo: this.teamLogo(event, "teamB"), tone: "team-b" },
+            { label: teamA, count: this.sideCountValue(counts, teamA, 0), logo: this.teamLogo(event, "teamA"), tone: "team-a" },
+            { label: teamB, count: this.sideCountValue(counts, teamB, 1), logo: this.teamLogo(event, "teamB"), tone: "team-b" },
           ],
         };
       }
@@ -881,6 +886,90 @@ createApp({
         total,
         sides: Object.entries(counts).map(([side, count]) => ({ label: side, count: Number(count) || 0, tone: "" })),
       };
+    },
+    eventMarketFollowRows(event) {
+      const breakdown = Array.isArray(event?.market_breakdown) && event.market_breakdown.length
+        ? event.market_breakdown
+        : [
+            {
+              condition_id: event?.condition_id,
+              question: event?.question,
+              title: event?.title,
+              market_type: event?.market_type,
+              market_type_label: event?.market_type_label,
+              outcomes: event?.outcomes,
+              signal_count: this.eventFollowParts(event).total,
+              side_counts: event?.side_counts || {},
+            },
+          ];
+      const parts = this.matchParts(event);
+      return breakdown.map((market, index) => {
+        const counts = market?.side_counts || {};
+        const countTotal = Object.values(counts).reduce((sum, value) => sum + (Number(value) || 0), 0);
+        const signalCount = Number(market?.signal_count ?? countTotal) || countTotal;
+        let sides = [];
+        if (parts) {
+          const teamA = parts.teamA || "A";
+          const teamB = parts.teamB || "B";
+          sides = [
+            { label: teamA, count: this.sideCountValue(counts, teamA, 0), logo: this.teamLogo(event, "teamA"), tone: "team-a" },
+            { label: teamB, count: this.sideCountValue(counts, teamB, 1), logo: this.teamLogo(event, "teamB"), tone: "team-b" },
+          ];
+        } else {
+          const outcomes = this.marketOutcomes(market);
+          if (outcomes.length) {
+            sides = outcomes.slice(0, 2).map((label, outcomeIndex) => ({
+              label,
+              count: this.sideCountValue(counts, label, outcomeIndex),
+              logo: "",
+              tone: outcomeIndex === 0 ? "team-a" : outcomeIndex === 1 ? "team-b" : "",
+            }));
+          } else {
+            sides = Object.entries(counts).map(([label, count]) => ({ label, count: Number(count) || 0, logo: "", tone: "" }));
+          }
+        }
+        return {
+          key: market?.condition_id || `${event?.condition_id || "event"}:${index}`,
+          label: this.eventMarketDisplayLabel(market, index),
+          signalCount,
+          sides,
+        };
+      });
+    },
+    eventMarketDisplayLabel(market, index) {
+      const type = String(market?.market_type || "").trim();
+      const rawLabel = String(market?.market_type_label || "").trim();
+      const text = String(market?.question || market?.title || "").trim();
+      const mapMatch = text.match(/\bmap\s*(\d+)\b/i) || text.match(/地图\s*(\d+)/i);
+      const gameMatch = text.match(/\bgame\s*(\d+)\b/i) || text.match(/第\s*(\d+)\s*局/i);
+      if (type === "main_match" || rawLabel === "主盘") return "主盘";
+      if (type === "map_winner") return mapMatch ? `地图${mapMatch[1]}` : rawLabel || `地图${index + 1}`;
+      if (type === "game_winner") return gameMatch ? `第${gameMatch[1]}局` : rawLabel || `第${index + 1}局`;
+      return rawLabel || type || `盘口${index + 1}`;
+    },
+    marketOutcomes(market) {
+      const outcomes = market?.outcomes;
+      if (Array.isArray(outcomes)) return outcomes.map((value) => String(value || "").trim()).filter(Boolean);
+      if (typeof outcomes === "string") {
+        try {
+          const parsed = JSON.parse(outcomes);
+          if (Array.isArray(parsed)) return parsed.map((value) => String(value || "").trim()).filter(Boolean);
+        } catch (_err) {
+          return outcomes.split(",").map((value) => value.trim()).filter(Boolean);
+        }
+      }
+      return [];
+    },
+    sideCountValue(counts, label, index) {
+      const normalized = String(label || "").trim().toLowerCase();
+      const keys = [label, String(index), normalized];
+      for (const key of keys) {
+        if (Object.prototype.hasOwnProperty.call(counts, key)) return Number(counts[key]) || 0;
+      }
+      for (const [key, value] of Object.entries(counts || {})) {
+        if (String(key).trim().toLowerCase() === normalized) return Number(value) || 0;
+      }
+      return 0;
     },
     reasonText(reason) {
       const map = {

@@ -1412,6 +1412,23 @@ def build_events(
         condition_ids = [row_condition_id for _market, row_condition_id, _start, _signals, _results in ordered_group if row_condition_id]
         market_types = _unique_nonempty(str(row_market.get("market_type") or "") for row_market, *_rest in ordered_group)
         market_type_labels = _unique_nonempty(str(row_market.get("market_type_label") or "") for row_market, *_rest in ordered_group)
+        market_breakdown = []
+        for row_market, row_condition_id, _row_start, row_signals, row_results in ordered_group:
+            row_follow_items = [*row_signals, *row_results]
+            market_breakdown.append(
+                {
+                    "condition_id": row_condition_id,
+                    "title": row_market.get("title"),
+                    "question": row_market.get("question"),
+                    "market_type": row_market.get("market_type"),
+                    "market_type_label": row_market.get("market_type_label"),
+                    "outcomes": row_market.get("outcomes"),
+                    "open_signal_count": len(row_signals),
+                    "result_count": len(row_results),
+                    "signal_count": len(row_follow_items),
+                    "side_counts": _signal_side_counts(row_follow_items),
+                }
+            )
         match_parts = _match_parts_for_row(market)
         category = normalize_category(str(market.get("category") or "")) or "esports"
         league = normalize_league(market.get("league"))
@@ -1438,6 +1455,7 @@ def build_events(
                 "market_count": len(ordered_group),
                 "market_types": market_types,
                 "market_type_labels": market_type_labels,
+                "market_breakdown": market_breakdown,
                 "open_signals": open_signals,
                 "results": results,
                 "settled_count": sum(1 for result in results if result.get("status") == "settled"),

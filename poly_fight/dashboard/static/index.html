@@ -464,18 +464,28 @@
                       </div>
                     </td>
                     <td>
-                      <div class="event-meta">
+                      <div class="event-meta event-follow-cell" :title="eventFollowText(event)">
                         <span v-if="eventView === 'archive'" class="event-pnl" :class="pnlClass(event.our_realized_pnl)">{{ money(event.our_realized_pnl) }}</span>
-                        <div v-if="eventFollowParts(event).total" class="event-follow-summary" :title="eventFollowText(event)">
-                          <span v-for="side in eventFollowParts(event).sides" :key="side.label" class="event-follow-side" :class="side.tone">
-                            <span class="event-follow-logo-wrap">
-                              <img v-if="side.logo" class="event-follow-logo" :src="side.logo" :alt="side.label" loading="lazy">
-                              <span v-else class="event-follow-logo-fallback">{{ side.label.slice(0, 1) }}</span>
-                            </span>
-                            <strong>{{ side.count }}</strong>
-                          </span>
-                        </div>
-                        <span v-if="!eventFollowParts(event).total && eventView !== 'archive'" class="subtle">-</span>
+                        <template v-else>
+                          <div class="event-follow-head">
+                            <strong>{{ eventFollowHeadline(event) }}</strong>
+                            <span v-if="eventMarketCountLabel(event)">{{ eventMarketCountLabel(event) }}</span>
+                          </div>
+                          <div class="event-market-follow-list">
+                            <div v-for="market in eventMarketFollowRows(event)" :key="market.key" class="event-market-follow-row" :class="{ 'has-signal': market.signalCount }">
+                              <span class="event-market-follow-label">{{ market.label }}</span>
+                              <span class="event-follow-side-strip">
+                                <span v-for="side in market.sides" :key="side.label" class="event-follow-side" :class="side.tone">
+                                  <span class="event-follow-logo-wrap">
+                                    <img v-if="side.logo" class="event-follow-logo" :src="side.logo" :alt="side.label" loading="lazy">
+                                    <span v-else class="event-follow-logo-fallback">{{ side.label.slice(0, 1) }}</span>
+                                  </span>
+                                  <strong>{{ side.count }}</strong>
+                                </span>
+                              </span>
+                            </div>
+                          </div>
+                        </template>
                       </div>
                     </td>
                   </tr>

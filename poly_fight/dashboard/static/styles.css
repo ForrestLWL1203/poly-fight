@@ -1760,6 +1760,9 @@ body {
 .event-table th:nth-child(3),
 .event-table td:nth-child(3) {
   width: 24%;
+  min-width: 12rem;
+  text-align: left;
+  vertical-align: middle;
 }
 
 .event-subtabs {
@@ -2037,6 +2040,72 @@ body {
   font-size: 0.82rem;
   font-weight: 900;
   text-align: right;
+}
+
+.event-table .event-follow-cell {
+  flex-direction: column;
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 0.34rem;
+}
+
+.event-follow-head {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.38rem;
+  min-width: 0;
+  color: #dfe9ed;
+  font-size: 0.78rem;
+  line-height: 1.15;
+}
+
+.event-follow-head strong {
+  font-size: 0.84rem;
+  font-weight: 900;
+}
+
+.event-follow-head span {
+  color: #8fa4ad;
+  font-size: 0.7rem;
+  font-weight: 750;
+}
+
+.event-market-follow-list {
+  display: grid;
+  gap: 0.22rem;
+  width: 100%;
+  min-width: 0;
+}
+
+.event-market-follow-row {
+  display: grid;
+  grid-template-columns: minmax(3.1rem, max-content) minmax(0, 1fr);
+  align-items: center;
+  column-gap: 0.38rem;
+  min-height: 1.65rem;
+  min-width: 0;
+}
+
+.event-market-follow-label {
+  color: #91a7b0;
+  font-size: 0.7rem;
+  font-weight: 850;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.event-market-follow-row.has-signal .event-market-follow-label {
+  color: #dfe9ed;
+}
+
+.event-follow-side-strip {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.26rem;
+  min-width: 0;
 }
 
 .event-follow-summary {

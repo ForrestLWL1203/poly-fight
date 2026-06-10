@@ -8695,6 +8695,7 @@ class CoreTest(unittest.TestCase):
                             "end_date": end,
                             "market_type": "main_match",
                             "market_type_label": "主盘",
+                            "outcomes": ["A", "B"],
                         },
                         {
                             "condition_id": "map1",
@@ -8706,6 +8707,7 @@ class CoreTest(unittest.TestCase):
                             "end_date": end,
                             "market_type": "map_winner",
                             "market_type_label": "地图",
+                            "outcomes": ["A", "B"],
                         },
                         {
                             "condition_id": "other",
@@ -8720,6 +8722,22 @@ class CoreTest(unittest.TestCase):
                     ],
                 },
             )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "s-map",
+                        "wallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "condition_id": "map1",
+                        "outcome_index": 0,
+                        "status": "open",
+                        "legs": [],
+                    }
+                ],
+                result_events=[],
+                performance={},
+            )
 
             events = build_events(data_dir)
 
@@ -8730,6 +8748,10 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(grouped["market_count"], 2)
             self.assertEqual(grouped["market_types"], ["main_match", "map_winner"])
             self.assertEqual(grouped["market_type_label"], "2盘口")
+            breakdown = {row["condition_id"]: row for row in grouped["market_breakdown"]}
+            self.assertEqual(breakdown["main"]["signal_count"], 0)
+            self.assertEqual(breakdown["map1"]["signal_count"], 1)
+            self.assertEqual(breakdown["map1"]["side_counts"], {"0": 1})
 
     def test_dashboard_events_include_sports_plus_zero_timezone_starts(self):
         with TemporaryDirectory() as tmp:
