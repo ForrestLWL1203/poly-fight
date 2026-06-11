@@ -1012,7 +1012,6 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
                 "best_bucket_label": row.get("best_bucket_label"),
                 "best_game_family": row.get("best_game_family"),
                 "best_bucket_score": row.get("best_bucket_score"),
-                "bucket_scores": row.get("bucket_scores") or {},
                 "overall_esports_roi": row.get("overall_esports_roi", row.get("esports_roi")),
                 "overall_wilson_win_rate_lower_bound": row.get(
                     "overall_wilson_win_rate_lower_bound",
@@ -1040,7 +1039,6 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
                 "recent_14d_market_count": metrics.get("recent_14d_market_count"),
                 "recent_14d_roi": metrics.get("recent_14d_roi"),
                 "recent_14d_positive_rate": metrics.get("recent_14d_positive_rate"),
-                "reasons": metrics.get("reasons") or row.get("reasons") or [],
                 "scoring_version": row.get("scoring_version"),
                 "esports_win_count": metrics.get("esports_win_count"),
                 "esports_loss_count": metrics.get("esports_loss_count"),
@@ -1058,16 +1056,12 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
                 "observed_market_type_labels": row.get("observed_market_type_labels") or _market_type_labels(observed_market_types),
                 "observed_buckets": observed_buckets,
                 "observed_bucket_labels": row.get("observed_bucket_labels") or [bucket_label(value) for value in observed_buckets],
-                "per_type_grades": row.get("per_type_grades") or {},
-                "per_game_type_grades": row.get("per_game_type_grades") or {},
                 "participation_rate": row.get("participation_rate"),
                 "participated_events": row.get("participated_events"),
                 "eligible_event_count": row.get("eligible_event_count"),
                 "quarantined": quarantine_key in quarantine or wallet in quarantine,
                 "quarantine": quarantine.get(quarantine_key) or quarantine.get(wallet),
-                "performance": performance.get(wallet, {}),
                 "observed": observed,
-                "open_signals": open_by_wallet.get(wallet, []),
             }
         )
     for category in CATEGORIES:
@@ -1587,8 +1581,9 @@ def build_events(
                 "market_types": market_types,
                 "market_type_labels": market_type_labels,
                 "market_breakdown": market_breakdown,
-                "open_signals": open_signals,
-                "results": results,
+                "open_signal_count": len(open_signals),
+                "result_count": len(results),
+                "signal_count": len(open_signals) + len(results),
                 "settled_count": sum(1 for result in results if result.get("status") == "settled"),
                 "exited_count": sum(1 for result in results if result.get("status") == "exited"),
                 "contested": _signals_contested([*open_signals, *results]),
@@ -1597,7 +1592,7 @@ def build_events(
         )
     events.sort(
         key=lambda row: (
-            0 if row.get("open_signals") else 1 if row.get("results") else 2,
+            0 if row.get("open_signal_count") else 1 if row.get("result_count") else 2,
             _parse_timestamp(row.get("match_start_time")) or 0,
         )
     )
@@ -1656,8 +1651,9 @@ def build_events(
                 "outcome_prices": market.get("outcome_prices") or market.get("outcomePrices"),
                 "market_type": market.get("market_type") or next((result.get("market_type") for result in results if isinstance(result, dict)), None),
                 "market_type_label": market_type_label,
-                "open_signals": [],
-                "results": results,
+                "open_signal_count": 0,
+                "result_count": len(results),
+                "signal_count": len(results),
                 "settled_count": sum(1 for result in results if result.get("status") == "settled"),
                 "exited_count": sum(1 for result in results if result.get("status") == "exited"),
                 "contested": _signals_contested(results),

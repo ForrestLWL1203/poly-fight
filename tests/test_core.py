@@ -8009,6 +8009,77 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(settled_page["status"], "settled")
             self.assertEqual(settled_page["follows"][0]["condition_id"], "m1")
 
+    def test_dashboard_wallet_rows_omit_heavy_internal_payloads(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [
+                    {
+                        "wallet": wallet,
+                        "grade": "A",
+                        "best_bucket_score": 92,
+                        "positive_market_rate": 0.95,
+                        "wilson_win_rate_lower_bound": 0.84,
+                        "entry_edge": 0.22,
+                        "esports_roi": 0.41,
+                        "eligible_market_types": ["main_match"],
+                        "eligible_market_type_labels": ["主盘"],
+                        "bucket_scores": {"main_match": {"debug_blob": "x" * 1000}},
+                        "per_type_grades": {
+                            "main_match": {
+                                "esports_win_count": 10,
+                                "esports_loss_count": 1,
+                                "positive_market_rate": 0.91,
+                                "wilson_win_rate_lower_bound": 0.75,
+                                "entry_edge": 0.18,
+                                "esports_roi": 0.36,
+                                "avg_market_cash": 2000,
+                                "debug_blob": "y" * 1000,
+                            }
+                        },
+                        "per_game_type_grades": {"cs2:main_match": {"debug_blob": "z" * 1000}},
+                    }
+                ],
+            )
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "sig-open",
+                        "wallet": wallet,
+                        "condition_id": "m1",
+                        "status": "open",
+                        "created_at": 100,
+                        "debug_blob": "raw-signal" * 200,
+                        "legs": [
+                            {
+                                "stake": 1,
+                                "our_entry_price": 0.5,
+                                "wallet_trade_at": 100,
+                                "debug_blob": "raw-leg" * 200,
+                            }
+                        ],
+                    }
+                ],
+                result_events=[],
+                performance={"wallets": {wallet: {"signals": 3, "wins": 2, "our_pnl": 1.25}}, "total": {}},
+            )
+
+            row = build_wallets(data_dir)["wallets"][0]
+
+            self.assertEqual(row["wallet"], wallet)
+            self.assertEqual(row["rank"], 1)
+            self.assertEqual(row["esports_win_count"], 10)
+            self.assertEqual(row["observed"]["open"], 1)
+            self.assertEqual(row["observed"]["signals"], 3)
+            self.assertNotIn("bucket_scores", row)
+            self.assertNotIn("per_type_grades", row)
+            self.assertNotIn("per_game_type_grades", row)
+            self.assertNotIn("open_signals", row)
+            self.assertNotIn("performance", row)
+
     def test_dashboard_follows_filter_by_category(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -9198,6 +9269,67 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(events["events"][0]["league"], "ufc")
             self.assertEqual(events["events"][0]["league_label"], "UFC")
             self.assertEqual(events["events"][0]["match_parts"]["game"], "UFC")
+
+    def test_dashboard_events_return_counts_not_raw_follow_payloads(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now_ts = int(time.time())
+            write_json(
+                data_dir / "follow" / "active_market_cache.json",
+                {
+                    "updated_at": now_ts,
+                    "markets": [
+                        {
+                            "condition_id": "m1",
+                            "title": "Counter-Strike: A vs B (BO3) - Cup",
+                            "question": "Counter-Strike: A vs B (BO3) - Cup",
+                            "match_start_time": datetime.fromtimestamp(now_ts + 3600, timezone.utc).isoformat(),
+                            "end_date": datetime.fromtimestamp(now_ts + 7200, timezone.utc).isoformat(),
+                            "outcomes": ["A", "B"],
+                            "market_type": "main_match",
+                            "market_type_label": "主盘",
+                        }
+                    ],
+                },
+            )
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "s-open",
+                        "wallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "condition_id": "m1",
+                        "outcome": "A",
+                        "status": "open",
+                        "created_at": now_ts,
+                        "debug_blob": "open" * 500,
+                        "legs": [{"stake": 1, "debug_blob": "leg" * 500}],
+                    }
+                ],
+                result_events=[
+                    {
+                        "signal_id": "s-settled",
+                        "wallet": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "condition_id": "m1",
+                        "outcome": "B",
+                        "status": "settled",
+                        "outcome_won": False,
+                        "settled_at": now_ts + 10,
+                        "debug_blob": "result" * 500,
+                        "legs": [{"stake": 1, "debug_blob": "leg" * 500}],
+                    }
+                ],
+                performance={},
+            )
+
+            event = build_events(data_dir)["events"][0]
+
+            self.assertEqual(event["open_signal_count"], 1)
+            self.assertEqual(event["result_count"], 1)
+            self.assertEqual(event["signal_count"], 2)
+            self.assertEqual(event["side_counts"], {"A": 1, "B": 1})
+            self.assertNotIn("open_signals", event)
+            self.assertNotIn("results", event)
 
     def test_dashboard_events_sort_followed_markets_first(self):
         with TemporaryDirectory() as tmp:

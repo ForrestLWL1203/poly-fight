@@ -446,8 +446,8 @@ createApp({
       try {
         const result = await this.request("/api/events");
         result.events = (result.events || []).slice().sort((a, b) => {
-          const aFollowed = (a.open_signals || []).length > 0 ? 0 : (a.results || []).length > 0 ? 1 : 2;
-          const bFollowed = (b.open_signals || []).length > 0 ? 0 : (b.results || []).length > 0 ? 1 : 2;
+          const aFollowed = Number(a.open_signal_count || 0) > 0 ? 0 : Number(a.result_count || 0) > 0 ? 1 : 2;
+          const bFollowed = Number(b.open_signal_count || 0) > 0 ? 0 : Number(b.result_count || 0) > 0 ? 1 : 2;
           if (aFollowed !== bFollowed) return aFollowed - bFollowed;
           return this.normalizeTs(a.match_start_time) - this.normalizeTs(b.match_start_time);
         });
@@ -856,8 +856,7 @@ createApp({
         .join(" · ");
     },
     eventFollowParts(event) {
-      const signals = [...(event?.open_signals || []), ...(event?.results || [])];
-      const total = signals.length;
+      const total = Number(event?.signal_count ?? (Number(event?.open_signal_count || 0) + Number(event?.result_count || 0))) || 0;
       const parts = this.matchParts(event);
       const counts = event?.side_counts || {};
       if (parts) {
