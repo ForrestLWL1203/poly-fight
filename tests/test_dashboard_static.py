@@ -73,6 +73,21 @@ class DashboardStaticTests(unittest.TestCase):
 
         self.assertEqual([], failures)
 
+    def test_decimal_input_patterns_accept_integer_values(self):
+        template_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "index.html"
+        parser = _TemplateParser()
+        parser.feed(template_path.read_text())
+
+        failures = []
+        for node in _walk(parser.root):
+            pattern = node.attrs.get("pattern")
+            if pattern and "0-9" in pattern:
+                if "\\\\." in pattern:
+                    failures.append(f"line {node.line}: pattern has a double-escaped decimal point")
+                self.assertRegex("2000", rf"^(?:{pattern})$")
+
+        self.assertEqual([], failures)
+
 
 if __name__ == "__main__":
     unittest.main()

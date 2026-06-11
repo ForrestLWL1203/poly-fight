@@ -125,7 +125,7 @@
                   v-model="runnerStakeRatioInput"
                   type="text"
                   inputmode="decimal"
-                  pattern="[0-9]*\\.?[0-9]*"
+                  pattern="[0-9]*\.?[0-9]*"
                   placeholder="10"
                   :disabled="runner.status === 'running' || loading.runner"
                   required
@@ -138,7 +138,7 @@
                   v-model="runnerMaxStakeInput"
                   type="text"
                   inputmode="decimal"
-                  pattern="[0-9]*\\.?[0-9]*"
+                  pattern="[0-9]*\.?[0-9]*"
                   :disabled="runner.status === 'running' || loading.runner"
                 />
               </label>
@@ -148,7 +148,7 @@
                   v-model="runnerSignalStakePercentInput"
                   type="text"
                   inputmode="decimal"
-                  pattern="[0-9]*\\.?[0-9]*"
+                  pattern="[0-9]*\.?[0-9]*"
                   placeholder="0"
                   :disabled="runner.status === 'running' || loading.runner"
                 />
@@ -206,7 +206,7 @@
                         v-model="accountBalanceInput"
                         type="text"
                         inputmode="decimal"
-                        pattern="[0-9]*\\.?[0-9]*"
+                        pattern="[0-9]*\.?[0-9]*"
                         placeholder="金额上限"
                         :disabled="accountBalanceLocked"
                         @input="accountBalanceDirty = true"
