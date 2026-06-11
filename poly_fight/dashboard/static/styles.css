@@ -1478,32 +1478,37 @@ body {
   justify-content: center;
   width: 1.9rem;
   height: 1.9rem;
-  border: 1px solid rgba(238, 111, 141, 0.3);
+  border: 0;
   border-radius: 50%;
-  background: rgba(238, 111, 141, 0.07);
-  color: #f05e78;
+  background: transparent;
   cursor: pointer;
   font: inherit;
   line-height: 1;
   padding: 0;
-  transition: border-color 140ms ease, background 140ms ease, color 140ms ease, transform 140ms ease;
+  transition: background 140ms ease, transform 140ms ease;
 }
 
-.wallet-quarantine-symbol {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 1rem;
-  line-height: 1;
+.wallet-quarantine-bar {
+  display: block;
+  width: 1.12rem;
+  height: 0.24rem;
+  border-radius: 999px;
+  background: #ff4f68;
+  box-shadow: 0 0 0.45rem rgba(255, 79, 104, 0.28);
+  transition: background 140ms ease, box-shadow 140ms ease, transform 140ms ease;
 }
 
 .wallet-quarantine-btn:hover,
 .wallet-quarantine-btn:focus-visible {
-  border-color: rgba(238, 111, 141, 0.72);
-  background: rgba(238, 111, 141, 0.16);
-  color: #ff9aad;
+  background: rgba(255, 79, 104, 0.12);
   outline: none;
   transform: translateY(-1px);
+}
+
+.wallet-quarantine-btn:hover .wallet-quarantine-bar,
+.wallet-quarantine-btn:focus-visible .wallet-quarantine-bar {
+  background: #ff6a7f;
+  box-shadow: 0 0 0.65rem rgba(255, 79, 104, 0.42);
 }
 
 .wallet-unquarantine-btn {

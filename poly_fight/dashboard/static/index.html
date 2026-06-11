@@ -126,7 +126,6 @@
                   type="text"
                   inputmode="decimal"
                   pattern="[0-9]*\.?[0-9]*"
-                  placeholder="10"
                   :disabled="runner.status === 'running' || loading.runner"
                   required
                 />
@@ -394,7 +393,7 @@
                       @click.stop="quarantineWallet(wallet)"
                     >
                       <span v-if="quarantineBusy[walletFavoriteKey(wallet)]" class="loading loading-spinner loading-xs"></span>
-                      <span v-else class="wallet-quarantine-symbol" aria-hidden="true">⛔</span>
+                      <span v-else class="wallet-quarantine-bar" aria-hidden="true"></span>
                     </button>
                     <button
                       v-else
@@ -791,12 +790,12 @@
                     <tbody>
                       <tr v-for="leg in signalVisibleLegs(signal)" :key="leg.trade_id || leg.created_at || leg.leg_at">
                         <td>{{ formatTime(leg.wallet_trade_at || leg.created_at) }}</td>
-                        <td>{{ price(signalAverageEntry(signal)) }}</td>
+                        <td>{{ price(legWalletEntryPrice(leg)) }}</td>
                         <td>{{ money(legWalletTradeCash(leg)) }}</td>
                         <td>{{ legFollowDelayText(leg) }}</td>
                         <td>{{ money(leg.stake) }}</td>
                         <td>{{ price(leg.our_entry_price) }}</td>
-                        <td>{{ price(leg.wallet_fill_price || leg.wallet_avg_price) }}</td>
+                        <td>{{ price(signalAverageEntry(signal)) }}</td>
                         <td :class="pnlClass(-(legSlippageValue(leg) || 0))">{{ legSlippageText(leg) }}</td>
                         <td>
                           <span class="badge badge-xs badge-outline">{{ legStatusText(leg, signal) }}</span>

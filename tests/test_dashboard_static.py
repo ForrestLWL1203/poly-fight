@@ -80,11 +80,13 @@ class DashboardStaticTests(unittest.TestCase):
     def test_wallet_quarantine_action_lives_at_row_end(self):
         template_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "index.html"
         parser = _TemplateParser()
-        parser.feed(template_path.read_text())
+        template_text = template_path.read_text()
+        parser.feed(template_text)
 
         favorite_cells = [node for node in _walk(parser.root) if "favorite-cell" in _classes(node)]
         end_action_cells = [node for node in _walk(parser.root) if "wallet-end-action-cell" in _classes(node)]
 
+        self.assertNotIn("⛔", template_text)
         self.assertTrue(favorite_cells)
         self.assertTrue(end_action_cells)
         for cell in favorite_cells:
@@ -99,7 +101,38 @@ class DashboardStaticTests(unittest.TestCase):
             for child in _walk(cell):
                 end_action_classes.update(_classes(child))
         self.assertIn("wallet-quarantine-btn", end_action_classes)
+        self.assertIn("wallet-quarantine-bar", end_action_classes)
         self.assertIn("wallet-unquarantine-btn", end_action_classes)
+
+    def test_runner_stake_ratio_input_has_no_placeholder(self):
+        template_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "index.html"
+        parser = _TemplateParser()
+        parser.feed(template_path.read_text())
+
+        ratio_inputs = [
+            node
+            for node in _walk(parser.root)
+            if node.tag == "input" and node.attrs.get("v-model") == "runnerStakeRatioInput"
+        ]
+
+        self.assertEqual(1, len(ratio_inputs))
+        self.assertNotIn("placeholder", ratio_inputs[0].attrs)
+
+    def test_follow_detail_slippage_uses_our_price_minus_wallet_price(self):
+        root = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static"
+        template = (root / "index.html").read_text()
+        app = (root / "app.js").read_text()
+
+        self.assertIn("<td>{{ price(legWalletEntryPrice(leg)) }}</td>", template)
+        self.assertIn("<td>{{ price(signalAverageEntry(signal)) }}</td>", template)
+        self.assertNotIn("<td>{{ price(leg.wallet_fill_price || leg.wallet_avg_price) }}</td>", template)
+
+        start = app.index("legSlippageValue(leg)")
+        end = app.index("legSlippageText(leg)", start)
+        body = app[start:end]
+        self.assertIn("const walletEntry = this.legWalletEntryPrice(leg);", body)
+        self.assertIn("const ourEntry = Number(leg.our_entry_price);", body)
+        self.assertIn("return ourEntry - walletEntry;", body)
 
     def test_decimal_input_patterns_accept_integer_values(self):
         template_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "index.html"

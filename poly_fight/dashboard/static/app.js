@@ -2040,7 +2040,14 @@ createApp({
       const price = Number(leg.wallet_fill_price ?? leg.wallet_avg_price);
       return Number.isFinite(size) && Number.isFinite(price) ? size * price : null;
     },
+    legWalletEntryPrice(leg) {
+      const value = Number(leg.wallet_fill_price ?? leg.wallet_avg_price);
+      return Number.isFinite(value) ? value : null;
+    },
     legSlippageValue(leg) {
+      const walletEntry = this.legWalletEntryPrice(leg);
+      const ourEntry = Number(leg.our_entry_price);
+      if (Number.isFinite(walletEntry) && Number.isFinite(ourEntry)) return ourEntry - walletEntry;
       const value = leg.slippage_over_wallet_entry ?? leg.slippage;
       const num = Number(value);
       return Number.isFinite(num) ? num : null;
