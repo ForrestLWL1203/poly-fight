@@ -45,17 +45,17 @@
             <h1 class="topbar-title">Polymarket Sniper</h1>
           </div>
           <div class="topbar-actions">
-            <button
-              class="danger-reset-btn"
-              type="button"
-              title="清除本地历史数据并回到空状态"
-              @click="openResetModal"
-              :disabled="loading.runner || resetModal.loading"
-            >
-              <span class="reset-cross-icon" aria-hidden="true"></span>
-              <span>重置数据</span>
-            </button>
-            <div class="runner-control-group">
+            <div class="runner-action-row">
+              <button
+                class="danger-reset-btn"
+                type="button"
+                title="清除本地历史数据并回到空状态"
+                @click="openResetModal"
+                :disabled="loading.runner || resetModal.loading"
+              >
+                <span class="reset-cross-icon" aria-hidden="true"></span>
+                <span>重置数据</span>
+              </button>
               <button
                 class="runner-control-btn"
                 :class="runner.status === 'running' ? 'runner-control-stop' : 'runner-control-start'"
@@ -77,18 +77,6 @@
                   <span>{{ runnerControlLabel }}</span>
                 </template>
               </button>
-              <label class="runner-stake-field" title="按目标钱包买入金额的固定比例跟单，最低 1 USDC">
-                <input
-                  v-model="runnerStakeRatioInput"
-                  type="text"
-                  inputmode="decimal"
-                  pattern="[0-9]*\\.?[0-9]*"
-                  placeholder="比例"
-                  :disabled="runner.status === 'running' || loading.runner"
-                  required
-                />
-                <span>%</span>
-              </label>
               <button
                 v-if="runner.status !== 'running' && !hasFollowWallets"
                 class="runner-start-warning"
@@ -109,6 +97,63 @@
                 !
                 <span v-if="runnerWarningMessage" class="runner-warning-popover">{{ runnerWarningMessage }}</span>
               </button>
+              <button
+                v-else-if="runner.status !== 'running' && !runnerMaxStakeValid"
+                class="runner-start-warning"
+                type="button"
+                aria-label="单笔跟单限额格式不正确"
+                @click="showRunnerWarning('单笔跟单限额格式不正确')"
+              >
+                !
+                <span v-if="runnerWarningMessage" class="runner-warning-popover">{{ runnerWarningMessage }}</span>
+              </button>
+              <button
+                v-else-if="runner.status !== 'running' && !runnerSignalStakePercentValid"
+                class="runner-start-warning"
+                type="button"
+                aria-label="单场余额比例格式不正确"
+                @click="showRunnerWarning('单场余额比例格式不正确')"
+              >
+                !
+                <span v-if="runnerWarningMessage" class="runner-warning-popover">{{ runnerWarningMessage }}</span>
+              </button>
+            </div>
+            <div class="runner-control-group">
+              <label class="runner-stake-field runner-ratio-field" title="按目标钱包买入金额的固定比例跟单，最低 1 USDC">
+                <span class="runner-stake-label">目标金额比例</span>
+                <input
+                  v-model="runnerStakeRatioInput"
+                  type="text"
+                  inputmode="decimal"
+                  pattern="[0-9]*\\.?[0-9]*"
+                  placeholder="10"
+                  :disabled="runner.status === 'running' || loading.runner"
+                  required
+                />
+                <span>%</span>
+              </label>
+              <label class="runner-stake-field runner-limit-field" title="单笔跟单限额，留空表示不限额">
+                <span class="runner-stake-label">单笔限额</span>
+                <input
+                  v-model="runnerMaxStakeInput"
+                  type="text"
+                  inputmode="decimal"
+                  pattern="[0-9]*\\.?[0-9]*"
+                  :disabled="runner.status === 'running' || loading.runner"
+                />
+              </label>
+              <label class="runner-stake-field runner-signal-limit-field" title="同一钱包、同一场比赛、同一方向的累计跟单金额，不超过当前余额总额的该比例；留空表示不限额">
+                <span class="runner-stake-label">单场余额上限</span>
+                <input
+                  v-model="runnerSignalStakePercentInput"
+                  type="text"
+                  inputmode="decimal"
+                  pattern="[0-9]*\\.?[0-9]*"
+                  placeholder="0"
+                  :disabled="runner.status === 'running' || loading.runner"
+                />
+                <span>%</span>
+              </label>
             </div>
           </div>
         </header>
@@ -146,8 +191,47 @@
           </div>
           <div class="overview-grid">
             <article class="overview-pnl-card">
-              <span>已结算盈亏</span>
-              <strong :class="pnlClass(overview.our_realized_pnl)">{{ signedMoney(overview.our_realized_pnl) }}</strong>
+              <div class="overview-money-row">
+                <div class="overview-money-block">
+                  <span>已结算盈亏</span>
+                  <strong :class="pnlClass(overview.our_realized_pnl)">{{ signedMoney(overview.our_realized_pnl) }}</strong>
+                </div>
+                <form class="overview-money-block overview-balance-block" @submit.prevent="saveAccountBalance">
+                  <span>钱包余额</span>
+                  <strong :title="accountBalanceTitle">{{ accountBalanceText }}</strong>
+                  <span class="account-usable-label">可动用</span>
+                  <div class="account-balance-controls">
+                    <label class="account-balance-input" title="手动设置本轮跟单可动用金额上限">
+                      <input
+                        v-model="accountBalanceInput"
+                        type="text"
+                        inputmode="decimal"
+                        pattern="[0-9]*\\.?[0-9]*"
+                        placeholder="金额上限"
+                        :disabled="accountBalanceLocked"
+                        @input="accountBalanceDirty = true"
+                      />
+                      <span>USDC</span>
+                    </label>
+                    <button
+                      class="account-balance-max"
+                      type="button"
+                      :disabled="accountBalanceMaxDisabled"
+                      :title="accountBalanceMaxDisabled ? '暂无可用钱包余额' : '填满当前钱包余额'"
+                      @click="fillAccountBalanceMax"
+                    >Max</button>
+                    <button
+                      class="account-balance-save"
+                      type="submit"
+                      :disabled="accountBalanceSaveBlocked"
+                      :title="accountBalanceLocked ? '跟单运行中不可修改' : '保存可动用金额上限'"
+                    >
+                      <span v-if="accountBalanceSaving" class="loading loading-spinner loading-xs"></span>
+                      <span v-else>保存</span>
+                    </button>
+                  </div>
+                </form>
+              </div>
               <div class="pnl-metrics">
                 <div><span>累计投入</span><b>{{ money(overview.total_stake) }}</b></div>
                 <div><span>已结算 ROI</span><b :class="pnlClass(overview.realized_roi)">{{ percent(overview.realized_roi) }}</b></div>
@@ -177,7 +261,17 @@
               </p>
             </div>
             <div class="toolbar-actions">
-              <div v-if="wallets.quarantined_count" class="badge badge-error badge-outline">{{ wallets.quarantined_count }} 个隔离钱包</div>
+              <div class="category-tabs leaderboard-view-tabs" role="tablist" aria-label="Leaderboard wallet state">
+                <button
+                  v-for="option in walletViewOptions"
+                  :key="option.value"
+                  type="button"
+                  :class="{ active: walletView === option.value }"
+                  @click="setWalletView(option.value)"
+                >
+                  {{ option.label }} <span>{{ option.count }}</span>
+                </button>
+              </div>
               <button class="sample-refresh-btn" @click="startWalletRefresh" :disabled="walletRefreshBusy">
                 <span v-if="walletRefreshBusy" class="loading loading-spinner loading-sm"></span>
                 <img v-else class="button-icon" src="/icons/flaticon/refresh.png" alt="" aria-hidden="true" />
@@ -189,8 +283,10 @@
             <table class="table table-sm dense-table">
               <thead>
                 <tr>
+                  <th class="favorite-head">操作</th>
                   <th>Rank</th>
                   <th>钱包</th>
+                  <th v-if="walletView === 'quarantined'">隔离原因</th>
                   <th>评分</th>
                   <th>专精 ROI</th>
                   <th>专精胜率</th>
@@ -206,6 +302,43 @@
               </thead>
               <tbody>
                 <tr v-for="wallet in walletPageRows" :key="wallet.wallet">
+                  <td class="favorite-cell">
+                    <div class="wallet-action-stack">
+                      <button
+                        v-if="walletView !== 'quarantined'"
+                        class="favorite-star-btn"
+                        :class="{ active: wallet.favorite }"
+                        type="button"
+                        :title="favoriteButtonTitle(wallet)"
+                        :aria-label="favoriteButtonTitle(wallet)"
+                        :disabled="favoriteBusy[walletFavoriteKey(wallet)] || quarantineBusy[walletFavoriteKey(wallet)]"
+                        @click.stop="toggleWalletFavorite(wallet)"
+                      >{{ wallet.favorite ? '★' : '☆' }}</button>
+                      <button
+                        class="wallet-quarantine-btn"
+                        type="button"
+                        :title="quarantineButtonTitle(wallet)"
+                        :aria-label="quarantineButtonTitle(wallet)"
+                        :disabled="quarantineBusy[walletFavoriteKey(wallet)]"
+                        @click.stop="quarantineWallet(wallet)"
+                      >
+                        <span v-if="quarantineBusy[walletFavoriteKey(wallet)]" class="loading loading-spinner loading-xs"></span>
+                        <span v-else>隔离</span>
+                      </button>
+                      <button
+                        v-else
+                        class="wallet-unquarantine-btn"
+                        type="button"
+                        :title="unquarantineButtonTitle(wallet)"
+                        :aria-label="unquarantineButtonTitle(wallet)"
+                        :disabled="quarantineBusy[walletFavoriteKey(wallet)]"
+                        @click.stop="unquarantineWallet(wallet)"
+                      >
+                        <span v-if="quarantineBusy[walletFavoriteKey(wallet)]" class="loading loading-spinner loading-xs"></span>
+                        <span v-else>解除</span>
+                      </button>
+                    </div>
+                  </td>
                   <td class="rank-cell">
                     <img v-if="rankIcon(wallet)" class="rank-medal" :src="rankIcon(wallet)" :alt="rankTitle(wallet)" :title="rankTitle(wallet)" loading="lazy">
                     <span v-else class="rank-number">{{ wallet.rank || "-" }}</span>
@@ -214,6 +347,10 @@
                     <a class="wallet-link font-mono" :href="profileUrl(wallet.wallet)" target="_blank" rel="noreferrer">
                       {{ wallet.short_addr }}
                     </a>
+                  </td>
+                  <td v-if="walletView === 'quarantined'" class="quarantine-reason-cell">
+                    <div class="metric-strong">{{ quarantineReasonText(wallet) }}</div>
+                    <small class="subtle">{{ quarantineTimeText(wallet) }}</small>
                   </td>
                   <td class="metric-strong">{{ bucketScoreText(wallet) }}</td>
                   <td>
@@ -269,13 +406,14 @@
                   </td>
                 </tr>
                 <tr v-if="!walletPageRows.length">
-                  <td colspan="14" class="empty-cell">暂无候选钱包</td>
+                  <td :colspan="walletEmptyColspan" class="empty-cell">
+                    {{ walletEmptyText }}
+                  </td>
                 </tr>
               </tbody>
             </table>
           </div>
           <div class="pagination-actions leaderboard-pagination">
-            <span>{{ categoryLabel(activeCategory) }} 共 {{ walletRowsByCategory.length || 0 }} 个钱包</span>
             <button class="btn btn-xs" :disabled="walletPage <= 1" @click="setWalletPage(walletPage - 1)">上一页</button>
             <span>第 {{ walletPage }} / {{ walletPageCount }} 页</span>
             <button class="btn btn-xs" :disabled="walletPage >= walletPageCount" @click="setWalletPage(walletPage + 1)">下一页</button>
@@ -357,7 +495,7 @@
                     <td>{{ follow.leg_count }}</td>
                     <td>{{ money(follow.stake) }}</td>
                     <td :class="pnlClass(followListPnl(follow))">
-                      <div>{{ money(followListPnl(follow)) }}</div>
+                      <div>{{ signedMoney(followListPnl(follow)) }}</div>
                       <small v-if="follow.display_pnl_kind === 'unrealized'" class="subtle">未实现</small>
                     </td>
                     <td><span class="quality-chip" :class="qualityBadgeClass(follow)">{{ qualityBadgeText(follow) }}</span></td>
@@ -420,7 +558,7 @@
                   <tr>
                     <th>赛事</th>
                     <th>状态</th>
-                    <th>跟单情况</th>
+                    <th>{{ eventView === 'archive' ? '结算PNL' : '跟单情况' }}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -481,8 +619,14 @@
                       </div>
                     </td>
                     <td>
-                      <div class="event-meta event-follow-cell" :title="eventFollowText(event)">
-                        <span v-if="eventView === 'archive'" class="event-pnl" :class="pnlClass(event.our_realized_pnl)">{{ money(event.our_realized_pnl) }}</span>
+                      <div
+                        class="event-meta event-follow-cell"
+                        :class="{ 'archive-pnl-cell': eventView === 'archive' }"
+                        :title="eventView === 'archive' ? `结算PNL ${signedMoney(event.our_realized_pnl)}` : eventFollowText(event)"
+                      >
+                        <span v-if="eventView === 'archive'" class="event-pnl" :class="pnlClass(event.our_realized_pnl)">
+                          <b>{{ signedMoney(event.our_realized_pnl) }}</b>
+                        </span>
                         <template v-else>
                           <div class="event-follow-grid">
                             <div v-for="market in eventMarketFollowTable(event).rows" :key="market.key" class="event-market-follow-row" :class="{ 'has-signal': market.signalCount }">
@@ -606,8 +750,8 @@
                 <div class="wallet-summary">
                   <span><b>{{ wallet.leg_count }}</b> 单</span>
                   <span>总金额 <b>{{ money(walletTotalStake(wallet)) }}</b></span>
-                  <span>均价 <b>{{ price(walletAverageEntry(wallet)) }}</b></span>
-                  <span v-if="walletHasRealizedPnl(wallet)">已实现 PnL <b :class="pnlClass(walletRealizedPnl(wallet))">{{ money(walletRealizedPnl(wallet)) }}</b></span>
+                  <span>跟单均价 <b>{{ walletAverageEntryText(wallet) }}</b></span>
+                  <span v-if="walletHasRealizedPnl(wallet)">已实现 PnL <b :class="pnlClass(walletRealizedPnl(wallet))">{{ signedMoney(walletRealizedPnl(wallet)) }}</b></span>
                 </div>
               </div>
               <div v-for="signal in wallet.signals" :key="signal.signal_id || signal.condition_id + signal.outcome" class="signal-block">
@@ -634,7 +778,7 @@
                         <th>跟单延迟</th>
                         <th>跟单额</th>
                         <th>跟单价格</th>
-                        <th>买入均价</th>
+                        <th>跟单均价</th>
                         <th>滑点</th>
                         <th>状态</th>
                       </tr>
@@ -642,7 +786,7 @@
                     <tbody>
                       <tr v-for="leg in signalVisibleLegs(signal)" :key="leg.trade_id || leg.created_at || leg.leg_at">
                         <td>{{ formatTime(leg.wallet_trade_at || leg.created_at) }}</td>
-                        <td>{{ price(leg.wallet_fill_price || leg.wallet_avg_price) }}</td>
+                        <td>{{ price(signalAverageEntry(signal)) }}</td>
                         <td>{{ money(legWalletTradeCash(leg)) }}</td>
                         <td>{{ legFollowDelayText(leg) }}</td>
                         <td>{{ money(leg.stake) }}</td>
@@ -650,7 +794,7 @@
                         <td>{{ price(leg.wallet_fill_price || leg.wallet_avg_price) }}</td>
                         <td :class="pnlClass(-(legSlippageValue(leg) || 0))">{{ legSlippageText(leg) }}</td>
                         <td>
-                          <span class="badge badge-xs badge-outline">{{ signalStatusText(signal) }}</span>
+                          <span class="badge badge-xs badge-outline">{{ legStatusText(leg, signal) }}</span>
                         </td>
                       </tr>
                       <tr v-if="!(signal.legs || []).length">

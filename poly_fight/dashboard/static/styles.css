@@ -185,6 +185,11 @@ body {
   gap: 0.5rem;
 }
 
+.topbar-actions {
+  align-items: flex-end;
+  flex-direction: column;
+}
+
 .category-tabs {
   display: inline-flex;
   align-items: center;
@@ -223,6 +228,17 @@ body {
   color: var(--pf-cyan);
   font-size: 0.76rem;
   margin-left: 0.25rem;
+}
+
+.leaderboard-view-tabs {
+  min-height: 2.15rem;
+}
+
+.leaderboard-view-tabs button {
+  width: 6.3rem;
+  min-width: 6.3rem;
+  min-height: 2.15rem;
+  font-size: 0.78rem;
 }
 
 .category-section-head {
@@ -295,7 +311,7 @@ body {
 
 .overview-pnl-card {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   align-content: stretch;
   gap: 0.85rem;
   min-height: 9.7rem;
@@ -316,6 +332,107 @@ body {
   overflow-wrap: anywhere;
   font-size: 2rem;
   line-height: 1.16;
+}
+
+.overview-money-row {
+  display: grid;
+  gap: 0.72rem;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: start;
+}
+
+.overview-money-block {
+  display: grid;
+  gap: 0.28rem;
+  min-width: 0;
+}
+
+.overview-balance-block strong {
+  color: var(--pf-cyan);
+}
+
+.account-balance-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.42rem;
+  min-width: 0;
+}
+
+.account-usable-label {
+  margin-top: 0.08rem;
+  color: #9db2bb;
+  font-size: 0.74rem;
+  font-weight: 800;
+}
+
+.account-balance-input {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+  min-width: min(100%, 12rem);
+  flex: 1 0 100%;
+  min-height: 1.95rem;
+  border: 1px solid rgba(141, 160, 169, 0.2);
+  border-radius: 999px;
+  background: rgba(7, 12, 15, 0.52);
+  padding: 0 0.58rem;
+  color: var(--pf-muted);
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.account-balance-input input {
+  width: 8.5rem;
+  min-width: 0;
+  flex: 1 1 7rem;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--pf-text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.account-balance-input input::placeholder {
+  color: rgba(184, 199, 205, 0.52);
+}
+
+.account-balance-input:has(input:disabled) {
+  opacity: 0.62;
+}
+
+.account-balance-max,
+.account-balance-save {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 3rem;
+  min-height: 1.95rem;
+  border: 1px solid rgba(86, 214, 201, 0.34);
+  border-radius: 999px;
+  background: rgba(86, 214, 201, 0.1);
+  color: var(--pf-cyan);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 850;
+  line-height: 1;
+  padding: 0 0.62rem;
+}
+
+.account-balance-max {
+  min-width: 3.2rem;
+  border-color: rgba(243, 185, 95, 0.34);
+  background: rgba(243, 185, 95, 0.1);
+  color: var(--pf-amber);
+}
+
+.account-balance-max:disabled,
+.account-balance-save:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
 }
 
 .pnl-metrics {
@@ -522,9 +639,18 @@ body {
 }
 
 .runner-control-group {
+  display: flex;
+  align-items: stretch;
+  flex-direction: column;
+  gap: 0.45rem;
+  width: min(22rem, 100%);
+}
+
+.runner-action-row {
   display: inline-flex;
   align-items: center;
-  gap: 0.4rem;
+  justify-content: flex-end;
+  gap: 0.5rem;
 }
 
 .runner-stake-field {
@@ -532,6 +658,7 @@ body {
   align-items: center;
   gap: 0.35rem;
   flex: 0 0 auto;
+  justify-content: space-between;
   min-height: 2.55rem;
   border: 1px solid rgba(141, 160, 169, 0.24);
   border-radius: 999px;
@@ -540,6 +667,11 @@ body {
   padding: 0 0.68rem;
   font-size: 0.82rem;
   font-weight: 850;
+}
+
+.runner-stake-label {
+  color: #9db2bb;
+  white-space: nowrap;
 }
 
 .runner-stake-field input {
@@ -551,6 +683,15 @@ body {
   color: var(--pf-text);
   font: inherit;
   font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.runner-limit-field input {
+  width: 5.6rem;
+}
+
+.runner-signal-limit-field input {
+  width: 4.4rem;
 }
 
 .runner-stake-field input::-webkit-inner-spin-button,
@@ -1261,6 +1402,113 @@ body {
   text-decoration: none;
 }
 
+.quarantine-reason-cell {
+  min-width: 9.8rem;
+}
+
+.quarantine-reason-cell .metric-strong {
+  color: #f3b95f;
+}
+
+.favorite-head,
+.favorite-cell {
+  width: 4.1rem;
+  min-width: 4.1rem;
+  text-align: center;
+}
+
+.wallet-action-stack {
+  display: inline-flex;
+  align-items: center;
+  flex-direction: column;
+  gap: 0.22rem;
+}
+
+.favorite-star-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #94a8b0;
+  font-size: 1.36rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 160ms ease, text-shadow 160ms ease, transform 160ms ease;
+}
+
+.favorite-star-btn:hover {
+  color: #f3b95f;
+}
+
+.favorite-star-btn:focus-visible {
+  outline: 2px solid rgba(243, 185, 95, 0.72);
+  outline-offset: 2px;
+  color: #f3b95f;
+}
+
+.favorite-star-btn.active {
+  color: #f3b95f;
+  text-shadow: 0 0 0.65rem rgba(243, 185, 95, 0.46);
+}
+
+.favorite-star-btn:disabled {
+  cursor: wait;
+  opacity: 0.62;
+  transform: none;
+}
+
+.wallet-quarantine-btn,
+.wallet-unquarantine-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2.75rem;
+  min-height: 1.42rem;
+  border: 1px solid rgba(238, 111, 141, 0.36);
+  border-radius: 999px;
+  background: rgba(238, 111, 141, 0.08);
+  color: #f2a3b0;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.68rem;
+  font-weight: 850;
+  line-height: 1;
+  padding: 0 0.42rem;
+  transition: border-color 140ms ease, background 140ms ease, color 140ms ease;
+}
+
+.wallet-quarantine-btn:hover,
+.wallet-quarantine-btn:focus-visible {
+  border-color: rgba(238, 111, 141, 0.72);
+  background: rgba(238, 111, 141, 0.16);
+  color: #ffc2cc;
+  outline: none;
+}
+
+.wallet-unquarantine-btn {
+  border-color: rgba(86, 214, 201, 0.34);
+  background: rgba(86, 214, 201, 0.08);
+  color: var(--pf-cyan);
+}
+
+.wallet-unquarantine-btn:hover,
+.wallet-unquarantine-btn:focus-visible {
+  border-color: rgba(86, 214, 201, 0.68);
+  background: rgba(86, 214, 201, 0.16);
+  color: #8ff0e7;
+  outline: none;
+}
+
+.wallet-quarantine-btn:disabled,
+.wallet-unquarantine-btn:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
 .rank-cell {
   width: 3.2rem;
   min-width: 3.2rem;
@@ -1539,7 +1787,7 @@ body {
 }
 
 .dense-table {
-  min-width: 860px;
+  min-width: 900px;
 }
 
 .dense-table th {
@@ -1725,6 +1973,12 @@ body {
   border-color: rgba(243, 185, 95, 0.42);
   background: rgba(243, 185, 95, 0.1);
   color: #f1c77d;
+}
+
+.follow-status-pill.is-insufficient_balance {
+  border-color: rgba(238, 111, 141, 0.44);
+  background: rgba(238, 111, 141, 0.12);
+  color: #ff9bac;
 }
 
 .team {
@@ -2161,11 +2415,36 @@ body {
 }
 
 .event-pnl {
-  min-width: 4.9rem;
+  display: inline-flex;
+  align-items: flex-start;
+  min-width: 7rem;
   color: #dfe9ed;
-  font-size: 0.82rem;
   font-weight: 900;
-  text-align: right;
+  text-align: left;
+  line-height: 1.25;
+}
+
+.event-pnl b {
+  color: inherit;
+  font-size: 1rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.25;
+}
+
+.event-pnl.text-good {
+  color: var(--pf-green);
+}
+
+.event-pnl.text-bad {
+  color: var(--pf-rose);
+}
+
+.event-pnl.text-flat {
+  color: var(--pf-muted);
+}
+
+.event-table .archive-pnl-cell {
+  align-items: flex-start;
 }
 
 .event-table .event-follow-cell {
@@ -2678,6 +2957,10 @@ body {
     min-height: 8rem;
   }
 
+  .overview-money-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .pnl-metrics {
     grid-template-columns: repeat(2, minmax(8rem, 1fr));
   }
@@ -2711,6 +2994,7 @@ body {
 
   .topbar-actions,
   .runner-control-group {
+    align-items: flex-start;
     justify-content: flex-start;
   }
 }
@@ -2726,6 +3010,7 @@ body {
   }
 
   .panel-grid,
+  .overview-money-row,
   .pnl-metrics,
   .quality-row,
   .overview-analysis-card {
@@ -2758,8 +3043,18 @@ body {
 
   .topbar-actions,
   .runner-control-group,
-  .runner-control-btn {
+  .runner-action-row {
     width: 100%;
+  }
+
+  .runner-action-row {
+    justify-content: flex-start;
+  }
+
+  .runner-action-row .danger-reset-btn,
+  .runner-action-row .runner-control-btn {
+    flex: 1 1 0;
+    min-width: 0;
   }
 
   .runner-control-group {
@@ -2767,12 +3062,36 @@ body {
   }
 
   .runner-stake-field {
-    flex: 0 0 5.2rem;
-    justify-content: center;
+    flex: 0 0 auto;
+    justify-content: space-between;
+    width: 100%;
   }
 
   .runner-stake-field input {
-    width: 2.9rem;
+    width: 4.4rem;
+    text-align: right;
+  }
+
+  .runner-limit-field input {
+    width: 5.6rem;
+  }
+
+  .runner-signal-limit-field input {
+    width: 4.4rem;
+  }
+
+  .account-balance-controls {
+    flex-wrap: wrap;
+  }
+
+  .account-balance-input {
+    flex: 1 0 100%;
+    justify-content: space-between;
+  }
+
+  .account-balance-input input {
+    width: 8.5rem;
+    flex-basis: 7rem;
   }
 
   .event-filters select {

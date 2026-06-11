@@ -7,6 +7,7 @@ createApp({
       authChecking: true,
       activeTab: "follows",
       activeCategory: "esports",
+      walletView: "active",
       tabs: [
         { id: "follows", label: "跟单" },
         { id: "events", label: "赛事" },
@@ -19,6 +20,11 @@ createApp({
       loading: {},
       runnerActionText: "",
       runnerStakeRatioInput: "",
+      runnerMaxStakeInput: "",
+      runnerSignalStakePercentInput: "",
+      accountBalanceInput: "",
+      accountBalanceDirty: false,
+      accountBalanceSaving: false,
       health: {},
       overview: {},
       wallets: { wallets: [] },
@@ -29,6 +35,8 @@ createApp({
       runnerWarningMessage: "",
       runnerWarningTimer: null,
       pauseFollow: null,
+      favoriteBusy: {},
+      quarantineBusy: {},
       walletPage: 1,
       walletSize: 10,
       walletFollowPage: 1,
@@ -39,6 +47,7 @@ createApp({
       followStatusOptions: [
         { value: "", label: "全部状态" },
         { value: "open", label: "跟单中" },
+        { value: "insufficient_balance", label: "余额不足" },
         { value: "settled", label: "已结算" },
       ],
       eventPage: 1,
@@ -101,7 +110,12 @@ createApp({
       return Number(this.wallets?.count || (this.wallets?.wallets || []).length || 0) > 0;
     },
     runnerStartBlocked() {
-      return this.runner.status !== "running" && (!this.hasFollowWallets || !this.runnerStakeRatioValid);
+      return this.runner.status !== "running" && (
+        !this.hasFollowWallets
+        || !this.runnerStakeRatioValid
+        || !this.runnerMaxStakeValid
+        || !this.runnerSignalStakePercentValid
+      );
     },
     runnerStakeRatioValue() {
       const value = Number(this.runnerStakeRatioInput);
@@ -110,10 +124,57 @@ createApp({
     runnerStakeRatioValid() {
       return this.runnerStakeRatioValue > 0;
     },
+    runnerMaxStakeValue() {
+      const raw = String(this.runnerMaxStakeInput || "").trim();
+      if (!raw) return 0;
+      const value = Number(raw);
+      return Number.isFinite(value) ? value : -1;
+    },
+    runnerMaxStakeValid() {
+      return this.runnerMaxStakeValue >= 0;
+    },
+    runnerSignalStakePercentValue() {
+      const raw = String(this.runnerSignalStakePercentInput || "").trim();
+      if (!raw) return 0;
+      const value = Number(raw);
+      return Number.isFinite(value) ? value : -1;
+    },
+    runnerSignalStakePercentValid() {
+      return this.runnerSignalStakePercentValue >= 0;
+    },
     runnerControlTitle() {
       if (this.runner.status !== "running" && !this.hasFollowWallets) return "需先采集目标跟单钱包";
       if (this.runner.status !== "running" && !this.runnerStakeRatioValid) return "需填写跟单比例";
+      if (this.runner.status !== "running" && !this.runnerMaxStakeValid) return "单笔跟单限额格式不正确";
+      if (this.runner.status !== "running" && !this.runnerSignalStakePercentValid) return "单场余额比例格式不正确";
       return this.runner.status === "running" ? "停止跟单脚本" : "启动跟单脚本";
+    },
+    accountBalanceState() {
+      return this.overview?.account_balance || {};
+    },
+    accountBalanceConfigured() {
+      return Boolean(this.accountBalanceState.configured);
+    },
+    accountBalanceText() {
+      return this.accountBalanceConfigured ? this.money(this.accountBalanceState.balance_usdc) : "无限 Paper";
+    },
+    accountBalanceTitle() {
+      return this.accountBalanceConfigured ? "当前钱包余额；v1 由可动用金额上限初始化" : "未设置可动用金额上限时沿用无限 paper 资金";
+    },
+    accountBalanceLocked() {
+      return this.runner.status === "running" || this.runner.status === "stopping";
+    },
+    accountBalanceInputValue() {
+      return this.parseUsdcInput(this.accountBalanceInput);
+    },
+    accountBalanceMaxDisabled() {
+      const value = Number(this.accountBalanceState.balance_usdc);
+      return this.accountBalanceLocked || !this.accountBalanceConfigured || !Number.isFinite(value) || value < 0;
+    },
+    accountBalanceSaveBlocked() {
+      const raw = String(this.accountBalanceInput || "").trim();
+      const value = this.accountBalanceInputValue;
+      return !raw || !Number.isFinite(value) || value < 0 || this.accountBalanceSaving || this.accountBalanceLocked;
     },
     healthPillText() {
       if (this.runner.status !== "running") return "tick 停止";
@@ -131,7 +192,32 @@ createApp({
       return Math.max(1, Math.ceil(count / this.walletSize));
     },
     walletRowsByCategory() {
-      return (this.wallets.wallets || []).filter((wallet) => (wallet.category || "esports") === this.activeCategory);
+      return (this.wallets.wallets || []).filter((wallet) => {
+        if ((wallet.category || "esports") !== this.activeCategory) return false;
+        if (this.walletView === "favorite") return Boolean(wallet.favorite);
+        if (this.walletView === "quarantined") return Boolean(wallet.quarantined) && !wallet.favorite;
+        return !wallet.favorite && !wallet.quarantined;
+      });
+    },
+    walletViewOptions() {
+      const category = this.activeCategory;
+      const summary = (this.wallets.by_category || {})[category] || {};
+      const activeCount = Number(summary.active_count ?? (this.wallets.active_count || 0));
+      const favoriteCount = Number(summary.favorite_count ?? (this.wallets.favorite_count || 0));
+      const quarantinedCount = Number(summary.quarantined_count ?? (this.wallets.quarantined_count || 0));
+      return [
+        { value: "active", label: "生效中", count: activeCount },
+        { value: "favorite", label: "收藏", count: favoriteCount },
+        { value: "quarantined", label: "隔离", count: quarantinedCount },
+      ];
+    },
+    walletEmptyText() {
+      if (this.walletView === "favorite") return "暂无收藏钱包";
+      if (this.walletView === "quarantined") return "暂无隔离钱包";
+      return "暂无生效钱包";
+    },
+    walletEmptyColspan() {
+      return 14;
     },
     walletPageRows() {
       const rows = this.walletRowsByCategory;
@@ -367,8 +453,14 @@ createApp({
       this.pollingFallback = false;
       this.stopPolling();
       if (payload.health) this.health = payload.health;
-      if (payload.overview) this.overview = payload.overview;
-      if (payload.runner) this.runner = payload.runner;
+      if (payload.overview) {
+        this.overview = payload.overview;
+        this.syncAccountBalanceInput(payload.overview);
+      }
+      if (payload.runner) {
+        this.runner = payload.runner;
+        this.syncRunnerInputs();
+      }
       if (payload.refresh) this.refreshStatus = payload.refresh;
       if (this.refreshStatus?.status !== "running") this.walletRefreshStartedLocal = 0;
       if (Object.prototype.hasOwnProperty.call(payload, "pause_follow")) this.pauseFollow = payload.pause_follow;
@@ -419,6 +511,7 @@ createApp({
     },
     async loadOverview() {
       this.overview = await this.request("/api/overview");
+      this.syncAccountBalanceInput(this.overview);
     },
     async loadWallets() {
       this.wallets = await this.request("/api/wallets");
@@ -464,9 +557,7 @@ createApp({
     },
     async loadRunner() {
       this.runner = await this.request("/api/runner");
-      if (this.runner.status === "running" && this.runner.stake_ratio_percent) {
-        this.runnerStakeRatioInput = String(this.runner.stake_ratio_percent);
-      }
+      this.syncRunnerInputs();
     },
     async refreshAfterRunnerChange() {
       await Promise.allSettled([
@@ -480,7 +571,14 @@ createApp({
     },
     async startRunner() {
       if (this.runnerStartBlocked) {
-        this.showRunnerWarning(this.hasFollowWallets ? "需填写跟单比例" : "需先采集目标跟单钱包");
+        const message = !this.hasFollowWallets
+          ? "需先采集目标跟单钱包"
+          : !this.runnerStakeRatioValid
+            ? "需填写跟单比例"
+            : !this.runnerMaxStakeValid
+              ? "单笔跟单限额格式不正确"
+              : "单场余额比例格式不正确";
+        this.showRunnerWarning(message);
         return;
       }
       await this.loadRunner();
@@ -492,13 +590,26 @@ createApp({
         this.showRunnerWarning("需填写跟单比例");
         return;
       }
+      if (!this.runnerMaxStakeValid) {
+        this.showRunnerWarning("单笔跟单限额格式不正确");
+        return;
+      }
+      if (!this.runnerSignalStakePercentValid) {
+        this.showRunnerWarning("单场余额比例格式不正确");
+        return;
+      }
       this.loading.runner = true;
       this.runnerActionText = "正在启动跟单脚本并刷新数据";
       try {
+        const body = { stake_ratio_percent: this.runnerStakeRatioValue };
+        if (this.runnerMaxStakeValue > 0) body.max_stake_usdc = this.runnerMaxStakeValue;
+        if (this.runnerSignalStakePercentValue > 0) {
+          body.max_signal_stake_balance_percent = this.runnerSignalStakePercentValue;
+        }
         this.runner = await this.request("/api/runner/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ stake_ratio_percent: this.runnerStakeRatioValue }),
+          body: JSON.stringify(body),
         });
         this.showToast("跟单脚本已启动");
         await this.refreshAfterRunnerChange();
@@ -513,6 +624,65 @@ createApp({
       } finally {
         this.loading.runner = false;
         this.runnerActionText = "";
+      }
+    },
+    syncRunnerInputs() {
+      if (this.runner.status === "running" && this.runner.stake_ratio_percent) {
+        this.runnerStakeRatioInput = String(this.runner.stake_ratio_percent);
+      }
+      const maxStake = Number(this.runner.max_stake_usdc);
+      if (this.runner.status === "running" && Number.isFinite(maxStake) && maxStake > 0) {
+        this.runnerMaxStakeInput = String(maxStake);
+      }
+      const signalStakePercent = Number(this.runner.max_signal_stake_balance_percent);
+      if (this.runner.status === "running" && Number.isFinite(signalStakePercent) && signalStakePercent > 0) {
+        this.runnerSignalStakePercentInput = String(signalStakePercent);
+      }
+    },
+    syncAccountBalanceInput(overview) {
+      if (this.accountBalanceDirty) return;
+      const state = overview?.account_balance || {};
+      const value = Number(state.balance_usdc);
+      this.accountBalanceInput = state.configured && Number.isFinite(value) ? this.formatInputAmount(value) : "";
+    },
+    parseUsdcInput(value) {
+      const raw = String(value || "").replace(/,/g, "").trim();
+      if (!raw) return NaN;
+      if (/^\d+(?:\.\d+)?$/.test(raw)) return Number(raw);
+      const match = raw.match(/\d+(?:\.\d+)?/);
+      return match ? Number(match[0]) : NaN;
+    },
+    formatInputAmount(value) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return "";
+      return String(Math.round(num * 100000000) / 100000000);
+    },
+    fillAccountBalanceMax() {
+      if (this.accountBalanceMaxDisabled) return;
+      this.accountBalanceInput = this.formatInputAmount(this.accountBalanceState.balance_usdc);
+      this.accountBalanceDirty = true;
+    },
+    async saveAccountBalance() {
+      if (this.accountBalanceSaveBlocked) {
+        this.showToast(this.accountBalanceLocked ? "跟单运行中不可修改可动用金额上限" : "请输入有效的可动用金额上限", "error");
+        return;
+      }
+      const nextBalance = this.accountBalanceInputValue;
+      this.accountBalanceSaving = true;
+      try {
+        await this.request("/api/account-balance", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ balance_usdc: nextBalance }),
+        });
+        this.accountBalanceInput = this.formatInputAmount(nextBalance);
+        this.accountBalanceDirty = false;
+        await this.loadOverview();
+        this.showToast("可动用金额上限已更新");
+      } catch (error) {
+        this.showToast(`上限保存失败: ${error.message}`, "error");
+      } finally {
+        this.accountBalanceSaving = false;
       }
     },
     async stopRunner() {
@@ -606,12 +776,134 @@ createApp({
     setWalletPage(page) {
       this.walletPage = Math.min(Math.max(1, page), this.walletPageCount);
     },
+    setWalletView(view) {
+      this.walletView = ["active", "favorite", "quarantined"].includes(view) ? view : "active";
+      this.walletPage = 1;
+    },
     async setCategory(category) {
       this.activeCategory = "esports";
+      this.walletView = "active";
       this.walletPage = 1;
       this.followPage = 1;
       this.eventPage = 1;
       await Promise.allSettled([this.loadFollows(), this.loadEvents()]);
+    },
+    walletFavoriteKey(wallet) {
+      return `${wallet?.category || "esports"}:${wallet?.wallet || ""}`;
+    },
+    favoriteButtonTitle(wallet) {
+      return wallet.favorite ? "取消收藏" : "收藏钱包";
+    },
+    async toggleWalletFavorite(wallet) {
+      if (!wallet?.wallet) return;
+      const key = this.walletFavoriteKey(wallet);
+      if (this.favoriteBusy[key]) return;
+      const nextFavorite = !wallet.favorite;
+      this.favoriteBusy = { ...this.favoriteBusy, [key]: true };
+      try {
+        await this.request("/api/wallet-favorites", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            wallet: wallet.wallet,
+            category: wallet.category || this.activeCategory,
+            favorite: nextFavorite,
+          }),
+        });
+        await this.loadWallets();
+        if (nextFavorite) {
+          this.setWalletView("favorite");
+          this.showToast("已收藏钱包");
+        } else {
+          const remaining = (this.wallets.wallets || []).find((row) => (
+            row.wallet === wallet.wallet && (row.category || "esports") === (wallet.category || this.activeCategory)
+          ));
+          if (remaining?.favorite) {
+            this.setWalletView("favorite");
+          } else if (remaining?.quarantined) {
+            this.setWalletView("quarantined");
+          } else if (remaining) {
+            this.setWalletView("active");
+          } else {
+            this.walletPage = 1;
+          }
+          this.showToast(remaining ? "已取消收藏" : "已取消收藏，等待下次评分回榜");
+        }
+      } catch (error) {
+        this.showToast(`收藏操作失败: ${error.message}`, "error");
+      } finally {
+        const nextBusy = { ...this.favoriteBusy };
+        delete nextBusy[key];
+        this.favoriteBusy = nextBusy;
+      }
+    },
+    quarantineButtonTitle(wallet) {
+      return `隔离 ${wallet?.short_addr || wallet?.wallet || "钱包"}`;
+    },
+    unquarantineButtonTitle(wallet) {
+      return `解除隔离 ${wallet?.short_addr || wallet?.wallet || "钱包"}`;
+    },
+    async quarantineWallet(wallet) {
+      if (!wallet?.wallet) return;
+      const key = this.walletFavoriteKey(wallet);
+      if (this.quarantineBusy[key]) return;
+      this.quarantineBusy = { ...this.quarantineBusy, [key]: true };
+      try {
+        await this.request("/api/wallet-quarantine", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            wallet: wallet.wallet,
+            category: wallet.category || this.activeCategory,
+          }),
+        });
+        await this.loadWallets();
+        this.setWalletView("quarantined");
+        this.showToast("已隔离钱包，runner 下一轮不会继续开新跟单");
+      } catch (error) {
+        this.showToast(`隔离失败: ${error.message}`, "error");
+      } finally {
+        const nextBusy = { ...this.quarantineBusy };
+        delete nextBusy[key];
+        this.quarantineBusy = nextBusy;
+      }
+    },
+    async unquarantineWallet(wallet) {
+      if (!wallet?.wallet) return;
+      const key = this.walletFavoriteKey(wallet);
+      if (this.quarantineBusy[key]) return;
+      this.quarantineBusy = { ...this.quarantineBusy, [key]: true };
+      try {
+        await this.request("/api/wallet-quarantine", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            wallet: wallet.wallet,
+            category: wallet.category || this.activeCategory,
+            quarantined: false,
+          }),
+        });
+        await this.loadWallets();
+        const stillVisible = (this.wallets.wallets || []).find((row) => (
+          row.wallet === wallet.wallet && (row.category || "esports") === (wallet.category || this.activeCategory)
+        ));
+        if (stillVisible?.favorite) {
+          this.setWalletView("favorite");
+        } else if (stillVisible?.quarantined) {
+          this.setWalletView("quarantined");
+        } else if (stillVisible) {
+          this.setWalletView("active");
+        } else {
+          this.walletPage = 1;
+        }
+        this.showToast(stillVisible ? "已解除隔离" : "已解除隔离，等待下次采样评分回榜");
+      } catch (error) {
+        this.showToast(`解除隔离失败: ${error.message}`, "error");
+      } finally {
+        const nextBusy = { ...this.quarantineBusy };
+        delete nextBusy[key];
+        this.quarantineBusy = nextBusy;
+      }
     },
     setEventPage(page) {
       this.eventPage = Math.min(Math.max(1, page), this.eventPageCount);
@@ -801,6 +1093,7 @@ createApp({
         error: "异常",
         waiting_for_runner: "等待脚本",
         open: "跟单中",
+        insufficient_balance: "余额不足",
         settled: "已结算",
         exited: "已结算",
         idle: "空闲",
@@ -1020,11 +1313,22 @@ createApp({
         stale: "不活跃",
         sold_before_resolution: "提前卖出",
         two_sided_trading: "双边交易",
+        material_sell: "旧规则提前卖出",
+        two_sided_switch: "旧规则双边切换",
+        observed_paper_underperformance: "近期表现差",
+        recent_chop_loss: "反复双边",
+        manual_dashboard_quarantine: "手动隔离",
         low_historical_roi: "ROI偏低",
         negative_roi: "负收益",
         bot_like: "疑似机器人",
       };
       return map[reason] || reason || "-";
+    },
+    quarantineReasonText(wallet) {
+      return this.reasonText((wallet?.quarantine || {}).reason);
+    },
+    quarantineTimeText(wallet) {
+      return this.formatTime((wallet?.quarantine || {}).quarantined_at);
     },
     gradeClass(grade) {
       if (grade === "A") return "badge-success";
@@ -1460,8 +1764,24 @@ createApp({
       const status = String(signal.status || "");
       if (status === "settled") return "已结算";
       if (status === "exited") return "已结算";
+      if (status === "insufficient_balance") return "余额不足";
+      if (status === "open" && this.signalFundingStatus(signal) === "insufficient_balance") return "余额不足";
       if (status === "open") return "持仓中";
       return this.statusText(status);
+    },
+    signalFundingStatus(signal) {
+      const legs = signal?.legs || [];
+      if (!legs.length) return "";
+      const hasFunded = legs.some((leg) => this.legFundedStake(leg) > 0);
+      const hasInsufficient = legs.some((leg) => String(leg?.funding_status || "") === "insufficient_balance");
+      if (!hasFunded && hasInsufficient) return "insufficient_balance";
+      return "";
+    },
+    legStatusText(leg, signal) {
+      const funding = String(leg?.funding_status || "");
+      if (funding === "insufficient_balance") return "余额不足";
+      if (funding === "blocked") return "未跟";
+      return this.signalStatusText(signal);
     },
     followSettlementTypeText(follow) {
       const type = String(follow?.settlement_type || "");
@@ -1594,8 +1914,7 @@ createApp({
       const currentPrice = this.detailMarketPriceByOutcomeIndex(signal?.outcome_index);
       if (!Number.isFinite(currentPrice)) return 0;
       return (signal.legs || []).reduce((total, leg) => {
-        if (leg.would_follow === false) return total;
-        const stake = Number(leg.stake);
+        const stake = this.legFundedStake(leg);
         const entry = Number(leg.our_entry_price);
         if (!Number.isFinite(stake) || !Number.isFinite(entry) || entry <= 0) return total;
         return total + (stake * (currentPrice - entry)) / entry;
@@ -1624,19 +1943,33 @@ createApp({
       return (wallet.signals || []).flatMap((signal) => signal.legs || []);
     },
     walletFollowedLegs(wallet) {
-      return this.walletLegs(wallet).filter((leg) => leg.would_follow !== false);
+      return this.walletLegs(wallet).filter((leg) => this.legFundedStake(leg) > 0);
+    },
+    legFundedStake(leg) {
+      if (leg && Object.prototype.hasOwnProperty.call(leg, "funded_stake")) {
+        const funded = Number(leg.funded_stake);
+        return Number.isFinite(funded) ? Math.max(0, funded) : 0;
+      }
+      if (leg?.would_follow === false) return 0;
+      const stake = Number(leg?.stake);
+      return Number.isFinite(stake) ? Math.max(0, stake) : 0;
     },
     walletTotalStake(wallet) {
+      const direct = Number(wallet?.follow_total_stake);
+      if (Number.isFinite(direct)) return direct;
       return this.walletFollowedLegs(wallet).reduce((total, leg) => {
-        const stake = Number(leg.stake);
+        const stake = this.legFundedStake(leg);
         return Number.isFinite(stake) ? total + stake : total;
       }, 0);
     },
     walletAverageEntry(wallet) {
+      if (wallet?.follow_mixed_outcomes) return null;
+      const direct = Number(wallet?.follow_avg_entry_price);
+      if (Number.isFinite(direct)) return direct;
       let weighted = 0;
       let totalStake = 0;
       for (const leg of this.walletFollowedLegs(wallet)) {
-        const stake = Number(leg.stake);
+        const stake = this.legFundedStake(leg);
         const entry = Number(leg.our_entry_price);
         if (!Number.isFinite(stake) || !Number.isFinite(entry) || stake <= 0) continue;
         weighted += stake * entry;
@@ -1644,11 +1977,34 @@ createApp({
       }
       return totalStake > 0 ? weighted / totalStake : null;
     },
+    walletAverageEntryText(wallet) {
+      if (wallet?.follow_mixed_outcomes) return "多方向";
+      return this.price(this.walletAverageEntry(wallet));
+    },
+    signalRealizedPnl(signal) {
+      const direct = Number(signal?.follow_realized_pnl);
+      if (Number.isFinite(direct)) return direct;
+      const status = String(signal?.status || "");
+      const realized = Number(signal?.our_realized_pnl);
+      const paper = Number(signal?.our_paper_pnl);
+      if (status === "exited") {
+        if (Number.isFinite(realized)) return realized;
+        return Number.isFinite(paper) ? paper : null;
+      }
+      if (status === "settled") {
+        if (Number.isFinite(paper)) return paper;
+        return Number.isFinite(realized) ? realized : null;
+      }
+      if (Number.isFinite(realized)) return realized;
+      return Number.isFinite(paper) ? paper : null;
+    },
     walletRealizedPnl(wallet) {
+      const direct = Number(wallet?.follow_realized_pnl);
+      if (Number.isFinite(direct)) return direct;
       return (wallet.signals || []).reduce((total, signal) => {
         const status = String(signal.status || "");
         if (status !== "settled" && status !== "exited") return total;
-        const pnl = Number(signal.our_paper_pnl ?? signal.our_realized_pnl);
+        const pnl = this.signalRealizedPnl(signal);
         return Number.isFinite(pnl) ? total + pnl : total;
       }, 0);
     },

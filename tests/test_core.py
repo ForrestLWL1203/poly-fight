@@ -12,6 +12,7 @@ from tempfile import TemporaryDirectory
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import unittest
 from unittest.mock import patch
@@ -91,6 +92,7 @@ from poly_fight.cli import (
     merge_profiles_with_candidates,
     migrate_category_follow_dbs,
     observed_performance_quarantine_events,
+    recent_chop_loss_quarantine_events,
     publish_collector_dashboard_outputs,
     prune_profile_store,
     read_category_leaderboards,
@@ -140,6 +142,7 @@ from poly_fight.follow import (
     compute_clv,
     contested_markets,
     desired_tick_interval,
+    detect_position_shadow_events,
     detect_new_positions,
     eligible_follow_wallets,
     esports_match_imminent,
@@ -149,6 +152,7 @@ from poly_fight.follow import (
     paper_pnl,
     process_follow_trades,
     follow_stake_for_signal,
+    match_position_trade_latency,
     qualify_follow,
     quarantine_reason,
     select_new_trades,
@@ -4447,6 +4451,43 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual([row["wallet"] for row in plan], ["0xa"])
 
+    def test_profile_fetch_plan_forces_favorite_wallets_outside_budget(self):
+        candidates = [
+            {"wallet": "0xA"},
+            {"wallet": "0xFav", "favorite": True},
+        ]
+        existing = {
+            "0xa": {
+                "wallet": "0xA",
+                "grade": "A",
+                "profile_state": "qualified",
+                "profiled_at": 200,
+                "esports_condition_ids": ["m1"],
+                "scoring_version": SCORING_VERSION,
+            },
+            "0xfav": {
+                "wallet": "0xFav",
+                "grade": "A",
+                "profile_state": "qualified",
+                "profiled_at": 200,
+                "esports_condition_ids": ["m2"],
+                "scoring_version": SCORING_VERSION,
+                "positive_market_rate": 1.0,
+                "entry_edge": 0.2,
+            },
+        }
+
+        plan = build_profile_fetch_plan(
+            candidates,
+            existing,
+            now_ts=300,
+            ttl_seconds=7 * 86400,
+            max_profiles=0,
+            force_refresh_wallets={"0xfav"},
+        )
+
+        self.assertEqual([row["wallet"] for row in plan], ["0xfav"])
+
     def test_leaderboard_is_rebuilt_from_all_profiles_not_only_current_candidates(self):
         now = 100 + 10 * 86400
         profiles_by_wallet = {
@@ -5069,6 +5110,36 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual([row["wallet"] for row in eligible], ["0xb"])
 
+    def test_follow_eligible_wallets_keep_favorites_despite_stale_score_but_not_quarantine(self):
+        rows = [
+            {
+                "wallet": "0xA",
+                "category": "esports",
+                "grade": "C",
+                "eligible_market_types": ["main_match"],
+                "last_esports_trade_at": 1000 - 90 * 86400,
+            }
+        ]
+
+        stale_favorite = eligible_follow_wallets(
+            rows,
+            now_ts=1000,
+            recency_days=30,
+            favorite_wallets={"esports:0xa"},
+            allowed_categories={"esports"},
+        )
+        eligible = eligible_follow_wallets(
+            rows,
+            now_ts=1000,
+            recency_days=30,
+            quarantined_wallets={"esports:0xa"},
+            favorite_wallets={"esports:0xa"},
+            allowed_categories={"esports"},
+        )
+
+        self.assertEqual([row["wallet"] for row in stale_favorite], ["0xa"])
+        self.assertEqual(eligible, [])
+
     def test_follow_eligible_wallets_use_eligible_types_not_overall_positive_rate(self):
         rows = [
             {"wallet": "0xA", "grade": "A", "eligible_market_types": ["game_winner"], "positive_market_rate": 0.60, "last_esports_trade_at": 1000},
@@ -5099,6 +5170,98 @@ class CoreTest(unittest.TestCase):
             self.assertIn("0xa", quarantined)
             self.assertEqual(quarantined["0xa"]["reason"], "material_sell")
 
+    def test_follow_store_records_wallet_favorites_with_snapshot(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+
+            store.upsert_wallet_favorite(
+                "0xA",
+                category="esports",
+                favorite=True,
+                ts=100,
+                snapshot={"wallet": "0xA", "grade": "A", "eligible_market_types": ["main_match"]},
+            )
+            favorites = store.load_wallet_favorites()
+
+            self.assertIn("esports:0xa", favorites)
+            self.assertEqual(favorites["esports:0xa"]["wallet"], "0xa")
+            self.assertEqual(favorites["esports:0xa"]["category"], "esports")
+            self.assertEqual(favorites["esports:0xa"]["favorited_at"], 100)
+            self.assertEqual(favorites["esports:0xa"]["snapshot"]["eligible_market_types"], ["main_match"])
+
+            category_favorites = store.load_wallet_favorites(category="esports")
+            self.assertEqual(list(category_favorites), ["0xa"])
+
+            store.upsert_wallet_favorite("0xA", category="esports", favorite=False, ts=200)
+            self.assertEqual(store.load_wallet_favorites(), {})
+
+    def test_follow_store_favorite_does_not_clear_existing_quarantine(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            store.upsert_wallet_quarantine("0xA", reason="manual_dashboard_quarantine", ts=100, category="esports")
+
+            store.upsert_wallet_favorite(
+                "0xA",
+                category="esports",
+                favorite=True,
+                ts=200,
+                snapshot={"wallet": "0xA", "grade": "A", "eligible_market_types": ["main_match"]},
+            )
+
+            self.assertIn("0xa", store.load_wallet_favorites(category="esports"))
+            quarantine = store.load_wallet_quarantine(category="esports")
+            self.assertIn("0xa", quarantine)
+            self.assertEqual(quarantine["0xa"]["reason"], "manual_dashboard_quarantine")
+
+    def test_follow_store_account_balance_ledger_is_idempotent(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+
+            store.set_account_balance(100, ts=1000, source="manual")
+            state = store.load_account_balance()
+            self.assertTrue(state["configured"])
+            self.assertEqual(state["balance_usdc"], 100)
+
+            debit = {
+                "ledger_id": "buy:sig1:t1",
+                "kind": "buy",
+                "amount_usdc": -25,
+                "created_at": 1001,
+                "signal_id": "sig1",
+                "trade_id": "t1",
+            }
+            applied = store.apply_account_ledger([debit])
+            self.assertEqual(applied["applied_count"], 1)
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 75)
+
+            applied_again = store.apply_account_ledger([debit])
+            self.assertEqual(applied_again["applied_count"], 0)
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 75)
+
+            credit = {
+                "ledger_id": "settle:sig1",
+                "kind": "settle",
+                "amount_usdc": 40,
+                "created_at": 1100,
+                "signal_id": "sig1",
+            }
+            store.apply_account_ledger([credit])
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 115)
+
+    def test_follow_store_clears_legacy_quarantine_reasons(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            store.upsert_wallet_quarantine("0xA", reason="material_sell", ts=100)
+            store.upsert_wallet_quarantine("0xB", reason="two_sided_switch", ts=100)
+            store.upsert_wallet_quarantine("0xC", reason="observed_paper_underperformance", ts=100)
+
+            store.clear_wallet_quarantine_reasons({"material_sell", "two_sided_switch"})
+            quarantined = store.load_wallet_quarantine()
+
+            self.assertNotIn("0xa", quarantined)
+            self.assertNotIn("0xb", quarantined)
+            self.assertIn("0xc", quarantined)
+
     def test_observed_performance_quarantine_events_require_enough_bad_samples(self):
         performance = {
             "wallets": {
@@ -5112,17 +5275,83 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(events, [{"wallet": "0xbad", "reason": "observed_paper_underperformance", "timestamp": 500}])
 
+    def test_recent_chop_loss_quarantine_events_detect_repeated_alternating_losses(self):
+        now = 10 * 86400
+
+        def exited(outcome_index, exit_at):
+            return {
+                "signal_id": f"m1-{outcome_index}-{exit_at}",
+                "wallet": "0xA",
+                "category": "esports",
+                "condition_id": "m1",
+                "outcome_index": outcome_index,
+                "status": "exited",
+                "exit_at": exit_at,
+                "exit_price": 0.4,
+                "legs": [{"wallet_fill_price": 0.55, "wallet_trade_size": 10, "stake": 1}],
+            }
+
+        events = recent_chop_loss_quarantine_events(
+            [
+                exited(0, now - 4 * 86400),
+                exited(1, now - 3 * 86400),
+                exited(0, now - 2 * 86400),
+                exited(1, now - 1 * 86400),
+            ],
+            now_ts=now,
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["wallet"], "0xa")
+        self.assertEqual(events[0]["category"], "esports")
+        self.assertEqual(events[0]["reason"], "recent_chop_loss")
+        self.assertEqual(events[0]["timestamp"], now - 1 * 86400)
+        self.assertEqual(events[0]["details"]["window_days"], 7)
+        self.assertEqual(events[0]["details"]["cut_loss_count"], 4)
+        self.assertEqual(events[0]["details"]["condition_ids"], ["m1"])
+
+    def test_recent_chop_loss_quarantine_ignores_single_stop_and_old_losses(self):
+        now = 10 * 86400
+
+        def exited(outcome_index, exit_at, *, exit_price=0.4):
+            return {
+                "signal_id": f"m1-{outcome_index}-{exit_at}",
+                "wallet": "0xA",
+                "category": "esports",
+                "condition_id": "m1",
+                "outcome_index": outcome_index,
+                "status": "exited",
+                "exit_at": exit_at,
+                "exit_price": exit_price,
+                "legs": [{"wallet_fill_price": 0.55, "wallet_trade_size": 10, "stake": 1}],
+            }
+
+        events = recent_chop_loss_quarantine_events(
+            [
+                exited(0, now - 8 * 86400),
+                exited(1, now - 3 * 86400),
+                exited(0, now - 2 * 86400),
+                exited(1, now - 1 * 86400),
+                exited(1, now - 100, exit_price=0.7),
+            ],
+            now_ts=now,
+        )
+
+        self.assertEqual(events, [])
+
     def test_follow_store_clears_only_revalidated_quarantine(self):
         with TemporaryDirectory() as tmp:
             store = FollowStore(Path(tmp) / "follow.db")
             store.upsert_wallet_quarantine("0xA", reason="material_sell", ts=100)
             store.upsert_wallet_quarantine("0xB", reason="material_sell", ts=300)
+            store.upsert_wallet_quarantine("0xC", reason="manual_dashboard_quarantine", ts=100)
 
-            store.clear_revalidated_quarantine({"0xa", "0xb"}, validated_at=200)
+            store.clear_revalidated_quarantine({"0xa", "0xb", "0xc"}, validated_at=200)
             quarantined = store.load_wallet_quarantine()
 
             self.assertNotIn("0xa", quarantined)
             self.assertIn("0xb", quarantined)
+            self.assertIn("0xc", quarantined)
 
     def test_follow_event_gate_detects_imminent_esports_start(self):
         now = 1000
@@ -5150,6 +5379,133 @@ class CoreTest(unittest.TestCase):
         self.assertFalse(cold_start)
         self.assertEqual([row["conditionId"] for row in new_positions], ["m2"])
         self.assertEqual(snapshot, ["m1:0", "m2:1"])
+
+    def test_position_shadow_observer_cold_start_only_builds_baseline(self):
+        positions = [{"conditionId": "m1", "outcomeIndex": 0, "size": 10, "avgPrice": 0.5, "initialValue": 5}]
+
+        events, cursor, cold_start = detect_position_shadow_events(
+            None,
+            positions,
+            tracked_condition_ids={"m1"},
+            wallet="0xA",
+            category="esports",
+            seen_at=100,
+        )
+
+        self.assertTrue(cold_start)
+        self.assertEqual(events, [])
+        self.assertIn("m1:0", cursor)
+        self.assertEqual(cursor["m1:0"]["size"], 10)
+        self.assertEqual(cursor["m1:0"]["avgPrice"], 0.5)
+        self.assertEqual(cursor["m1:0"]["initialValue"], 5)
+        self.assertEqual(cursor["m1:0"]["first_seen_at"], 100)
+        self.assertEqual(cursor["m1:0"]["last_seen_at"], 100)
+
+    def test_position_shadow_observer_records_new_and_add_events(self):
+        events, cursor, cold_start = detect_position_shadow_events(
+            {},
+            [{"conditionId": "m1", "outcomeIndex": 0, "size": 10, "avgPrice": 0.5, "curPrice": 0.55, "initialValue": 5}],
+            tracked_condition_ids={"m1"},
+            wallet="0xA",
+            category="esports",
+            seen_at=100,
+        )
+
+        self.assertFalse(cold_start)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "position_new")
+        self.assertEqual(events[0]["wallet"], "0xa")
+        self.assertEqual(events[0]["condition_id"], "m1")
+        self.assertEqual(events[0]["outcome_index"], 0)
+        self.assertEqual(events[0]["position_size"], 10)
+        self.assertEqual(events[0]["delta_size"], 10)
+        self.assertEqual(events[0]["estimated_delta_cash"], 5)
+        self.assertEqual(events[0]["avg_price"], 0.5)
+        self.assertEqual(events[0]["cur_price"], 0.55)
+
+        events, cursor, cold_start = detect_position_shadow_events(
+            cursor,
+            [{"conditionId": "m1", "outcomeIndex": 0, "size": 14, "avgPrice": 0.5, "initialValue": 7}],
+            tracked_condition_ids={"m1"},
+            wallet="0xA",
+            category="esports",
+            seen_at=160,
+        )
+
+        self.assertFalse(cold_start)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "position_add")
+        self.assertEqual(events[0]["previous_size"], 10)
+        self.assertEqual(events[0]["delta_size"], 4)
+        self.assertEqual(events[0]["estimated_delta_cash"], 2)
+        self.assertEqual(events[0]["add_ratio_to_first"], 0.4)
+        self.assertEqual(cursor["m1:0"]["first_seen_at"], 100)
+        self.assertEqual(cursor["m1:0"]["last_seen_at"], 160)
+
+    def test_position_shadow_observer_filters_unwatched_conditions(self):
+        events, cursor, cold_start = detect_position_shadow_events(
+            {},
+            [{"conditionId": "m2", "outcomeIndex": 0, "size": 10, "avgPrice": 0.5, "initialValue": 5}],
+            tracked_condition_ids={"m1"},
+            wallet="0xA",
+            category="esports",
+            seen_at=100,
+        )
+
+        self.assertFalse(cold_start)
+        self.assertEqual(events, [])
+        self.assertEqual(cursor, {})
+
+    def test_position_trade_latency_matches_both_directions(self):
+        position_events = [
+            {
+                "event_type": "position_new",
+                "position_seen_at": 100,
+                "condition_id": "m1",
+                "outcome_index": 0,
+                "wallet": "0xa",
+                "category": "esports",
+            }
+        ]
+
+        annotated, matches, lead_values, position_seen, trade_seen = match_position_trade_latency(
+            position_events,
+            [{"id": "t1", "market": "m1", "outcomeIndex": 0, "side": "BUY"}],
+            wallet="0xA",
+            category="esports",
+            trade_seen_at=140,
+            position_seen_by_key={},
+            trade_seen_by_key={},
+        )
+
+        self.assertEqual(annotated[0]["position_seen_at"], 100)
+        self.assertEqual(matches[0]["position_before_trade_seconds"], 40)
+        self.assertEqual(lead_values, [40])
+        self.assertIn("esports:0xa:m1:0", position_seen)
+        self.assertIn("esports:0xa:m1:0", trade_seen)
+
+        annotated, matches, lead_values, _position_seen, _trade_seen = match_position_trade_latency(
+            [
+                {
+                    "event_type": "position_add",
+                    "position_seen_at": 200,
+                    "condition_id": "m1",
+                    "outcome_index": 0,
+                    "wallet": "0xa",
+                    "category": "esports",
+                }
+            ],
+            [],
+            wallet="0xA",
+            category="esports",
+            trade_seen_at=200,
+            position_seen_by_key={},
+            trade_seen_by_key={"esports:0xa:m1:0": 170},
+        )
+
+        self.assertEqual(annotated[0]["trade_before_position_seconds"], 30)
+        self.assertEqual(matches[0]["trade_before_position_seconds"], 30)
+        self.assertEqual(lead_values, [-30])
 
     def test_follow_qualifies_only_before_match_start(self):
         now = 1000
@@ -5338,6 +5694,143 @@ class CoreTest(unittest.TestCase):
         )
         self.assertEqual((stake, tier), (0.0, "skipped"))
 
+    def test_follow_stake_applies_single_leg_limit_before_balance(self):
+        stake, tier, ratio = follow_stake_for_signal(
+            wallet_trade_cash=3000,
+            stake_ratio_percent=10,
+            min_stake_usdc=1,
+            max_stake_usdc=100,
+            available_balance=1000,
+        )
+        self.assertEqual((stake, tier), (100, "limited"))
+        self.assertEqual(ratio, 0.1)
+
+        stake, tier, _ = follow_stake_for_signal(
+            wallet_trade_cash=3000,
+            stake_ratio_percent=10,
+            min_stake_usdc=1,
+            max_stake_usdc=100,
+            available_balance=50,
+        )
+        self.assertEqual((stake, tier), (50, "capped"))
+
+    def test_process_follow_trades_records_unfunded_intent_when_balance_is_too_low(self):
+        now = 1000
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.5, 0.5],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "Match",
+            "market_type": "main_match",
+        }
+        trades = [{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 20, "timestamp": now}]
+
+        signals, stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=trades,
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            stake_usdc=1,
+            stake_ratio_percent=10,
+            max_follow_legs=10,
+            max_slippage=0.05,
+            bankroll_usdc=0.5,
+        )
+
+        self.assertEqual(stats["insufficient_balance_count"], 1)
+        self.assertEqual(len(signals), 1)
+        leg = signals[0]["legs"][0]
+        self.assertEqual(leg["stake"], 1)
+        self.assertEqual(leg["funded_stake"], 0)
+        self.assertEqual(leg["funding_status"], "insufficient_balance")
+        self.assertFalse(leg["would_follow"])
+        self.assertTrue(leg["would_follow_if_funded"])
+        self.assertEqual(leg["follow_block_reason"], "insufficient_balance")
+
+    def test_settlement_keeps_unfunded_intent_out_of_actual_pnl(self):
+        now = 1000
+        signals = [
+            {
+                "signal_id": "sig-unfunded",
+                "wallet": "0xa",
+                "condition_id": "m1",
+                "outcome_index": 0,
+                "status": "open",
+                "legs": [
+                    {
+                        "stake": 10,
+                        "funded_stake": 0,
+                        "funding_status": "insufficient_balance",
+                        "our_entry_price": 0.5,
+                        "wallet_fill_price": 0.5,
+                    }
+                ],
+            }
+        ]
+
+        remaining, settled = settle_open_signals(signals, {"m1": 0}, now_ts=now)
+
+        self.assertEqual(remaining, [])
+        self.assertEqual(settled[0]["our_paper_pnl"], 0)
+        self.assertEqual(settled[0]["hypothetical_pnl"], 10)
+
+    def test_dashboard_overview_excludes_unfunded_intents_from_actual_totals(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.set_account_balance(100, ts=100, source="manual")
+            store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "open-unfunded",
+                        "wallet": "0xabc",
+                        "condition_id": "m2",
+                        "status": "open",
+                        "legs": [{"stake": 10, "funded_stake": 0, "funding_status": "insufficient_balance", "would_follow": False}],
+                    }
+                ],
+                result_events=[
+                    {
+                        "signal_id": "settled-funded",
+                        "wallet": "0xabc",
+                        "condition_id": "m1",
+                        "status": "settled",
+                        "outcome_won": True,
+                        "our_paper_pnl": 0.8,
+                        "hypothetical_pnl": 0.8,
+                        "wallet_paper_pnl_by_wallet": {"0xabc": 1.0},
+                        "legs": [{"stake": 1, "funded_stake": 1, "would_follow": True}],
+                        "settled_at": 100,
+                    },
+                    {
+                        "signal_id": "settled-unfunded",
+                        "wallet": "0xabc",
+                        "condition_id": "m3",
+                        "status": "settled",
+                        "outcome_won": True,
+                        "our_paper_pnl": 0,
+                        "hypothetical_pnl": 8,
+                        "wallet_paper_pnl_by_wallet": {"0xabc": 0.0},
+                        "legs": [{"stake": 10, "funded_stake": 0, "funding_status": "insufficient_balance", "would_follow": False}],
+                        "settled_at": 101,
+                    },
+                ],
+                performance={"wallets": {}, "total": {}},
+            )
+
+            overview = build_overview(data_dir)
+
+            self.assertEqual(overview["account_balance"]["configured"], True)
+            self.assertEqual(overview["account_balance"]["balance_usdc"], 100)
+            self.assertEqual(overview["total_stake"], 1)
+            self.assertEqual(overview["resolved_stake"], 1)
+            self.assertEqual(overview["open_exposure"], 0)
+            self.assertEqual(overview["our_realized_pnl"], 0.8)
+            self.assertEqual(overview["hypothetical_pnl"], 8.8)
+
     def test_process_follow_trades_applies_wallet_cash_ratio_to_signal(self):
         now = 1000
         market = {
@@ -5432,6 +5925,73 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(leg["follow_block_reasons"], ["low_entry_price"])
         self.assertEqual(leg["min_wallet_entry_price"], 0.4)
 
+    def test_process_follow_trades_allows_ten_point_slippage(self):
+        now = 1000
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.615, 0.385],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "Match",
+            "market_type": "main_match",
+        }
+        trades = [{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.56, "size": 100, "timestamp": now}]
+
+        signals, stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=trades,
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.10,
+            min_wallet_entry_price=0.4,
+            max_entry_price=0.85,
+        )
+
+        self.assertEqual(stats["ignored_trade_count"], 0)
+        self.assertEqual(stats["high_entry_price_blocked_count"], 0)
+        leg = signals[0]["legs"][0]
+        self.assertTrue(leg["would_follow"])
+        self.assertEqual(leg["slippage_over_wallet_entry"], 0.055)
+        self.assertEqual(leg["max_entry_price"], 0.85)
+
+    def test_process_follow_trades_blocks_high_our_entry_price(self):
+        now = 1000
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.86, 0.14],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "Match",
+            "market_type": "main_match",
+        }
+        trades = [{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.80, "size": 100, "timestamp": now}]
+
+        signals, stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=trades,
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.10,
+            min_wallet_entry_price=0.4,
+            max_entry_price=0.85,
+        )
+
+        self.assertEqual(stats["high_entry_price_blocked_count"], 1)
+        self.assertEqual(stats["ignored_trade_count"], 0)
+        leg = signals[0]["legs"][0]
+        self.assertFalse(leg["would_follow"])
+        self.assertEqual(leg["funding_status"], "blocked")
+        self.assertEqual(leg["funded_stake"], 0)
+        self.assertEqual(leg["follow_block_reason"], "high_entry_price")
+        self.assertEqual(leg["follow_block_reasons"], ["high_entry_price"])
+        self.assertEqual(leg["max_entry_price"], 0.85)
+
     def test_process_follow_trades_recalculates_ratio_for_each_add(self):
         now = 1000
         market = {
@@ -5452,6 +6012,61 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual([leg["stake"] for leg in signals[0]["legs"]], [300, 30])
         self.assertEqual(stats["insufficient_balance_count"], 0)
+
+    def test_process_follow_trades_blocks_add_under_ten_percent_of_first_buy(self):
+        now = 1000
+        market = {
+            "condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [0.5, 0.5],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "Match", "market_type": "main_match",
+        }
+        trades = [
+            {"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 1000, "timestamp": now},
+            {"id": "b2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 90, "timestamp": now + 1},
+        ]
+
+        signals, stats = process_follow_trades(
+            [], wallet="0xA", trades=trades, markets_by_condition={"m1": market}, now_ts=now,
+            stake_usdc=1, stake_ratio_percent=10, max_follow_legs=10, max_slippage=0.05,
+            bankroll_usdc=1000,
+        )
+
+        self.assertEqual(len(signals[0]["legs"]), 2)
+        self.assertTrue(signals[0]["legs"][0]["would_follow"])
+        self.assertFalse(signals[0]["legs"][1]["would_follow"])
+        self.assertEqual(signals[0]["legs"][1]["funded_stake"], 0)
+        self.assertEqual(signals[0]["legs"][1]["add_ratio_to_first"], 0.09)
+        self.assertEqual(signals[0]["legs"][1]["follow_block_reason"], "small_add")
+        self.assertEqual(stats["small_add_blocked_count"], 1)
+
+    def test_process_follow_trades_caps_total_stake_per_signal(self):
+        now = 1000
+        market = {
+            "condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [0.5, 0.5],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "Match", "market_type": "main_match",
+        }
+        trades = [
+            {"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 1000, "timestamp": now},
+            {"id": "b2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 1000, "timestamp": now + 1},
+            {"id": "b3", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 1000, "timestamp": now + 2},
+        ]
+
+        signals, stats = process_follow_trades(
+            [], wallet="0xA", trades=trades, markets_by_condition={"m1": market}, now_ts=now,
+            stake_usdc=1, stake_ratio_percent=10, max_follow_legs=10, max_slippage=0.05,
+            bankroll_usdc=1000, max_stake_usdc=50, max_signal_stake_usdc=75,
+        )
+
+        legs = signals[0]["legs"]
+        self.assertEqual([leg["funded_stake"] for leg in legs], [50, 25, 0])
+        self.assertEqual([leg["funding_status"] for leg in legs], ["funded", "signal_cap", "blocked"])
+        self.assertEqual(legs[1]["stake_mode"], "signal_cap")
+        self.assertFalse(legs[2]["would_follow"])
+        self.assertEqual(legs[2]["follow_block_reason"], "signal_cap_reached")
+        self.assertEqual(stats["signal_cap_limited_count"], 1)
+        self.assertEqual(stats["signal_cap_blocked_count"], 1)
+        self.assertEqual(stats["funded_stake_usdc"], 75)
 
     def test_follow_v2_buy_legs_sell_mirror_exits_by_default(self):
         now = 1000
@@ -5802,7 +6417,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(signals[0]["status"], "exited")
         self.assertEqual(signals[0]["wallet_sell_size"], 5)
 
-    def test_follow_v4_cumulative_sells_can_trigger_quarantine(self):
+    def test_follow_v4_cumulative_sells_exit_without_quarantine(self):
         now = 1000
         market = {
             "condition_id": "m1",
@@ -5836,8 +6451,46 @@ class CoreTest(unittest.TestCase):
             quarantine_sell_frac=0.2,
         )
 
-        self.assertEqual(stats["quarantine_events"][0]["reason"], "material_sell")
+        self.assertEqual(stats["quarantine_events"], [])
+        self.assertEqual(stats["exited_signal_count"], 1)
         self.assertEqual(signals[0]["wallet_sell_size"], 25)
+
+    def test_follow_v4_high_profit_sell_exits_without_quarantine(self):
+        now = 1000
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.45, 0.55],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+        }
+        signals, _stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=[{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 100, "timestamp": now}],
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.05,
+        )
+        market["outcome_prices"] = [0.999, 0.001]
+
+        signals, stats = process_follow_trades(
+            signals,
+            wallet="0xA",
+            trades=[{"id": "s1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.999, "size": 90, "timestamp": now + 1}],
+            markets_by_condition={"m1": market},
+            now_ts=now + 1,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.05,
+            quarantine_sell_frac=0.2,
+        )
+
+        self.assertEqual(stats["quarantine_events"], [])
+        self.assertEqual(stats["exited_signal_count"], 1)
+        self.assertEqual(signals[0]["status"], "exited")
+        self.assertGreater(signals[0]["our_realized_pnl"], 0)
 
     def test_follow_v2_bootstraps_existing_position_when_price_still_acceptable(self):
         now = 1000
@@ -5937,6 +6590,7 @@ class CoreTest(unittest.TestCase):
         )
 
         self.assertEqual(stats["opposite_blocked_count"], 1)
+        self.assertEqual(stats["quarantine_events"], [])
         self.assertEqual(stats["exited_signal_count"], 0)
         self.assertEqual(stats["new_leg_count"], 1)
         self.assertEqual(len(signals), 2)
@@ -5950,6 +6604,42 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(contested_stats["contested_signal_count"], 2)
         self.assertTrue(all(signal["contested"] for signal in signals))
         self.assertTrue(all(leg["would_follow"] for signal in signals for leg in signal.get("legs") or []))
+
+    def test_follow_v2_low_price_opposite_buy_is_insurance_not_quarantine(self):
+        now = 1000
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.95, 0.05],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+        }
+        signals, _stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=[{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 10, "timestamp": now}],
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.5,
+        )
+
+        signals, stats = process_follow_trades(
+            signals,
+            wallet="0xA",
+            trades=[{"id": "b2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 1, "side": "BUY", "price": 0.05, "size": 1, "timestamp": now + 1}],
+            markets_by_condition={"m1": market},
+            now_ts=now + 1,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.5,
+        )
+
+        self.assertEqual(stats["quarantine_events"], [])
+        self.assertEqual(stats["hedge_event_count"], 1)
+        self.assertEqual(stats["low_entry_price_blocked_count"], 1)
+        self.assertEqual(len(signals), 2)
+        self.assertFalse(signals[1]["legs"][0]["would_follow"])
 
     def test_follow_v2_opposite_wallet_buy_opens_other_side_by_default(self):
         now = 1000
@@ -6071,7 +6761,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(clv["wallet_clv"], 0.14)
         self.assertEqual(clv["our_clv"], 0.09)
 
-    def test_v4_material_sell_and_quarantine_reason(self):
+    def test_v4_trade_level_quarantine_reason_is_disabled(self):
         signal = {"outcome_index": 0, "legs": [{"wallet_trade_size": 100}, {"wallet_trade_size": 50}]}
         dust_sell = {"side": "SELL", "size": 10}
         big_sell = {"side": "SELL", "size": 40}
@@ -6079,8 +6769,8 @@ class CoreTest(unittest.TestCase):
 
         self.assertFalse(material_sell(signal, dust_sell, sell_frac=0.2))
         self.assertTrue(material_sell(signal, big_sell, sell_frac=0.2))
-        self.assertEqual(quarantine_reason(signal, big_sell, sell_frac=0.2), "material_sell")
-        self.assertEqual(quarantine_reason(signal, opposite_buy, sell_frac=0.2), "two_sided_switch")
+        self.assertIsNone(quarantine_reason(signal, big_sell, sell_frac=0.2))
+        self.assertIsNone(quarantine_reason(signal, opposite_buy, sell_frac=0.2))
 
     def test_v4_closing_line_snapshot_marks_started_signals_once(self):
         now = 2000
@@ -6435,6 +7125,124 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(summary["watched_market_count"], 1)
             self.assertEqual(requested_wallets, ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
 
+    def test_follow_tick_quarantine_takes_precedence_over_favorite(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now = datetime.now(timezone.utc)
+            start = now + timedelta(hours=2)
+            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [
+                    {
+                        "wallet": wallet,
+                        "category": "esports",
+                        "grade": "A",
+                        "last_esports_trade_at": int((now - timedelta(days=90)).timestamp()),
+                        "eligible_market_types": ["main_match"],
+                    }
+                ],
+            )
+            write_json(
+                data_dir / "follow" / "active_market_cache.json",
+                {
+                    "updated_at": int(now.timestamp()),
+                    "categories": ["esports"],
+                    "markets": [
+                        {
+                            "condition_id": "m1",
+                            "category": "esports",
+                            "market_type": "main_match",
+                            "match_start_time": start.isoformat(),
+                            "outcomes": ["A", "B"],
+                            "outcome_prices": [0.5, 0.5],
+                        }
+                    ],
+                },
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.upsert_wallet_quarantine(wallet, reason="manual_dashboard_quarantine", ts=100, category="esports")
+            store.upsert_wallet_favorite(wallet, category="esports", favorite=True, ts=200, snapshot={"wallet": wallet})
+            requested_wallets = []
+
+            class FakeClient:
+                def trades_for_user(self, wallet_arg, *_args, **_kwargs):
+                    requested_wallets.append(wallet_arg)
+                    return []
+
+                def positions(self, *_args, **_kwargs):
+                    return []
+
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "--data-dir",
+                    str(data_dir),
+                    "follow",
+                    "--stake-usdc",
+                    "1",
+                    "--user-trades-max-pages",
+                    "1",
+                    "--max-workers",
+                    "1",
+                ]
+            )
+
+            summary = command_follow(args, client=FakeClient(), emit=False)
+
+            self.assertEqual(summary["eligible_follow_wallet_count"], 0)
+            self.assertEqual(requested_wallets, [])
+            self.assertIn(wallet, store.load_wallet_quarantine(category="esports"))
+
+    def test_follow_tick_does_not_quarantine_favorite_for_bad_observed_performance(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [
+                    {
+                        "wallet": wallet,
+                        "category": "esports",
+                        "grade": "A",
+                        "last_esports_trade_at": int(time.time()),
+                        "eligible_market_types": ["main_match"],
+                    }
+                ],
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.upsert_wallet_favorite(wallet, category="esports", favorite=True, ts=200, snapshot={"wallet": wallet})
+            store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[],
+                result_events=[],
+                performance={"wallets": {wallet: {"signals": 10, "wins": 4, "our_pnl": -1.5}}, "total": {}},
+            )
+
+            class FakeClient:
+                def list_events_paginated(self, **_kwargs):
+                    return []
+
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "--data-dir",
+                    str(data_dir),
+                    "follow",
+                    "--stake-usdc",
+                    "1",
+                    "--gamma-pages",
+                    "1",
+                    "--max-workers",
+                    "1",
+                ]
+            )
+
+            summary = command_follow(args, client=FakeClient(), emit=False)
+
+            self.assertEqual(summary["quarantine_event_count"], 0)
+            self.assertEqual(store.load_wallet_quarantine(category="esports"), {})
+
     def test_dashboard_events_parse_sports_matchups_and_team_logos(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -6552,7 +7360,7 @@ class CoreTest(unittest.TestCase):
                 [{"wallet": "0xabc", "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
             )
             store = FollowStore(data_dir / "follow" / "follow.db")
-            store.upsert_wallet_quarantine("0xabc", reason="material_sell", ts=int(now.timestamp()))
+            store.upsert_wallet_quarantine("0xabc", reason="observed_paper_underperformance", ts=int(now.timestamp()))
             calls = []
 
             class FakeClient:
@@ -6863,6 +7671,169 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(summary["new_signal_count"], 0, summary)
             self.assertEqual(snapshot["open_signals"], [])
 
+    def test_follow_tick_shadow_positions_observes_without_opening_signal(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now = datetime.now(timezone.utc)
+            start = now + timedelta(hours=2)
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [{"wallet": "0xa", "category": "esports", "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.save_follow_snapshot(
+                wallet_trade_state={
+                    "esports:0xa": {
+                        "last_trade_cursor": {"timestamp": 10, "id": "old"},
+                        "last_seen_at": 10,
+                        "position_cursor_by_key": {},
+                    },
+                },
+                open_signals=[],
+                result_events=[],
+                performance={},
+            )
+
+            class FakeClient:
+                def __init__(self):
+                    self.position_calls = []
+
+                def list_events_paginated(self, **_kwargs):
+                    return [
+                        {
+                            "id": "event1",
+                            "slug": "event1",
+                            "title": "Dota 2: Team A vs Team B (BO3)",
+                            "tags": [{"slug": "dota-2"}],
+                            "startTime": start.isoformat(),
+                            "markets": [
+                                {
+                                    "conditionId": "m1",
+                                    "question": "Dota 2: Team A vs Team B (BO3)",
+                                    "outcomes": ["Team A", "Team B"],
+                                    "outcomePrices": ["0.50", "0.50"],
+                                    "active": True,
+                                    "closed": False,
+                                    "volume": 100000,
+                                    "startTime": start.isoformat(),
+                                }
+                            ],
+                        }
+                    ]
+
+                def trades_for_user(self, _wallet, **_kwargs):
+                    return []
+
+                def positions(self, wallet, *, limit=100):
+                    self.position_calls.append((wallet, limit))
+                    return [{"conditionId": "m1", "outcomeIndex": 0, "size": 10, "avgPrice": 0.5, "curPrice": 0.5, "initialValue": 5}]
+
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "--data-dir",
+                    str(data_dir),
+                    "follow",
+                    "--stake-usdc",
+                    "1",
+                    "--gamma-pages",
+                    "1",
+                    "--user-trades-max-pages",
+                    "1",
+                    "--max-workers",
+                    "1",
+                    "--position-observe-limit",
+                    "25",
+                ]
+            )
+            client = FakeClient()
+
+            summary = command_follow(args, client=client, emit=False)
+            snapshot = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_snapshot()
+            state = snapshot["wallet_trade_state"]["esports:0xa"]
+
+            self.assertEqual(client.position_calls, [("0xa", 25)])
+            self.assertEqual(summary["position_request_count"], 1)
+            self.assertEqual(summary["position_observed_count"], 1)
+            self.assertEqual(summary["position_new_count"], 1)
+            self.assertEqual(summary["new_signal_count"], 0)
+            self.assertEqual(snapshot["open_signals"], [])
+            self.assertIn("m1:0", state["position_cursor_by_key"])
+
+    def test_follow_tick_position_failure_does_not_block_trade_follow(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now = datetime.now(timezone.utc)
+            start = now + timedelta(hours=2)
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [{"wallet": "0xa", "category": "esports", "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.save_follow_snapshot(
+                wallet_trade_state={
+                    "esports:0xa": {"last_trade_cursor": {"timestamp": 10, "id": "old"}, "last_seen_at": 10},
+                },
+                open_signals=[],
+                result_events=[],
+                performance={},
+            )
+
+            class FakeClient:
+                def list_events_paginated(self, **_kwargs):
+                    return [
+                        {
+                            "id": "event1",
+                            "slug": "event1",
+                            "title": "Dota 2: Team A vs Team B (BO3)",
+                            "tags": [{"slug": "dota-2"}],
+                            "startTime": start.isoformat(),
+                            "markets": [
+                                {
+                                    "conditionId": "m1",
+                                    "question": "Dota 2: Team A vs Team B (BO3)",
+                                    "outcomes": ["Team A", "Team B"],
+                                    "outcomePrices": ["0.50", "0.50"],
+                                    "active": True,
+                                    "closed": False,
+                                    "volume": 100000,
+                                    "startTime": start.isoformat(),
+                                }
+                            ],
+                        }
+                    ]
+
+                def trades_for_user(self, _wallet, **_kwargs):
+                    return [{"id": "b1", "timestamp": 20, "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 10}]
+
+                def positions(self, _wallet, *, limit=100):
+                    raise RuntimeError("positions down")
+
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "--data-dir",
+                    str(data_dir),
+                    "follow",
+                    "--stake-usdc",
+                    "1",
+                    "--gamma-pages",
+                    "1",
+                    "--user-trades-max-pages",
+                    "1",
+                    "--max-workers",
+                    "1",
+                ]
+            )
+
+            summary = command_follow(args, client=FakeClient(), emit=False)
+            snapshot = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_snapshot()
+
+            self.assertEqual(summary["position_request_count"], 1)
+            self.assertEqual(summary["position_fetch_error_count"], 1)
+            self.assertEqual(summary["new_signal_count"], 1)
+            self.assertEqual(len(snapshot["open_signals"]), 1)
+
     def test_follow_tick_dual_follows_opposite_wallet_buys(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -7010,11 +7981,319 @@ class CoreTest(unittest.TestCase):
             )
 
             summary = command_follow(args, client=FakeClient(), emit=False)
+            snapshot = store.load_dashboard_snapshot()
             run_log = read_jsonl(follow_run_log_path(data_dir))
 
-            self.assertEqual(summary["new_signal_count"], 0)
+            self.assertEqual(summary["new_signal_count"], 1)
             self.assertEqual(summary["insufficient_balance_count"], 1)
             self.assertEqual(run_log[-1]["insufficient_balance_count"], 1)
+            self.assertEqual(len(snapshot["open_signals"]), 1)
+            leg = snapshot["open_signals"][0]["legs"][0]
+            self.assertEqual(leg["funding_status"], "insufficient_balance")
+            self.assertEqual(leg["funded_stake"], 0)
+
+    def test_follow_tick_debits_configured_account_balance_for_funded_buy_once(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now = datetime.now(timezone.utc)
+            start = now + timedelta(hours=2)
+            wallet = "0xa"
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [{"wallet": wallet, "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.set_account_balance(1.5, ts=10, source="manual")
+            store.save_follow_snapshot(
+                wallet_trade_state={
+                    f"esports:{wallet}": {"last_trade_cursor": {"timestamp": 10, "id": "old"}, "last_seen_at": 10},
+                },
+                open_signals=[],
+                result_events=[],
+                performance={},
+            )
+
+            class FakeClient:
+                def list_events_paginated(self, **_kwargs):
+                    return [
+                        {
+                            "id": "event1",
+                            "slug": "event1",
+                            "title": "Dota 2: Team A vs Team B (BO3)",
+                            "tags": [{"slug": "dota-2"}],
+                            "startTime": start.isoformat(),
+                            "markets": [
+                                {
+                                    "conditionId": "m1",
+                                    "question": "Dota 2: Team A vs Team B (BO3)",
+                                    "outcomes": ["Team A", "Team B"],
+                                    "outcomePrices": ["0.50", "0.50"],
+                                    "active": True,
+                                    "closed": False,
+                                    "volume": 100000,
+                                    "startTime": start.isoformat(),
+                                }
+                            ],
+                        }
+                    ]
+
+                def trades_for_user(self, _wallet, **_kwargs):
+                    return [{"id": "b1", "timestamp": 20, "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 20}]
+
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "--data-dir",
+                    str(data_dir),
+                    "follow",
+                    "--stake-usdc",
+                    "1",
+                    "--gamma-pages",
+                    "1",
+                    "--user-trades-max-pages",
+                    "1",
+                    "--max-workers",
+                    "1",
+                ]
+            )
+
+            command_follow(args, client=FakeClient(), emit=False)
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 0.5)
+
+            command_follow(args, client=FakeClient(), emit=False)
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 0.5)
+
+    def test_follow_tick_credits_account_balance_when_signal_settles_once(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now = datetime.now(timezone.utc)
+            start = now - timedelta(hours=2)
+            wallet = "0xa"
+            signal_id = f"{wallet}:m1:0"
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.set_account_balance(1.5, ts=10, source="manual")
+            store.apply_account_ledger(
+                [
+                    {
+                        "ledger_id": f"buy:{signal_id}:buy1",
+                        "kind": "buy",
+                        "amount_usdc": -1,
+                        "created_at": 20,
+                        "signal_id": signal_id,
+                        "trade_id": "buy1",
+                    }
+                ]
+            )
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 0.5)
+            store.save_follow_snapshot(
+                wallet_trade_state={
+                    f"esports:{wallet}": {"last_trade_cursor": {"timestamp": 20, "id": "buy1"}, "last_seen_at": 20},
+                },
+                open_signals=[
+                    {
+                        "signal_id": signal_id,
+                        "wallet": wallet,
+                        "category": "esports",
+                        "condition_id": "m1",
+                        "outcome_index": 0,
+                        "outcome": "Team A",
+                        "status": "open",
+                        "created_at": 20,
+                        "updated_at": 20,
+                        "match_start_time": start.isoformat(),
+                        "legs": [
+                            {
+                                "stake": 1,
+                                "funded_stake": 1,
+                                "funding_status": "funded",
+                                "would_follow": True,
+                                "our_entry_price": 0.5,
+                                "wallet_fill_price": 0.5,
+                                "trade_id": "buy1",
+                                "leg_at": 20,
+                            }
+                        ],
+                        "behavior_events": [],
+                    }
+                ],
+                result_events=[],
+                performance={},
+            )
+
+            class FakeClient:
+                def list_events_paginated(self, **kwargs):
+                    if kwargs.get("closed") is True:
+                        return [
+                            {
+                                "id": "event1",
+                                "slug": "",
+                                "title": "Dota 2: Team A vs Team B (BO3)",
+                                "tags": [{"slug": "dota-2"}],
+                                "startTime": start.isoformat(),
+                                "markets": [
+                                    {
+                                        "conditionId": "m1",
+                                        "question": "Dota 2: Team A vs Team B (BO3)",
+                                        "outcomes": ["Team A", "Team B"],
+                                        "outcomePrices": ["1", "0"],
+                                        "active": False,
+                                        "closed": True,
+                                        "volume": 100000,
+                                        "startTime": start.isoformat(),
+                                    }
+                                ],
+                            }
+                        ]
+                    return []
+
+                def trades_for_user(self, _wallet, **_kwargs):
+                    return []
+
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "--data-dir",
+                    str(data_dir),
+                    "follow",
+                    "--stake-usdc",
+                    "1",
+                    "--gamma-pages",
+                    "1",
+                    "--resolution-gamma-pages",
+                    "1",
+                    "--user-trades-max-pages",
+                    "1",
+                    "--max-workers",
+                    "1",
+                ]
+            )
+
+            summary = command_follow(args, client=FakeClient(), emit=False)
+            self.assertEqual(summary["settled_signal_count"], 1)
+            self.assertEqual(summary["balance_ledger_applied_amount_usdc"], 2)
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 2.5)
+
+            summary_again = command_follow(args, client=FakeClient(), emit=False)
+            self.assertEqual(summary_again["balance_ledger_applied_count"], 0)
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 2.5)
+
+    def test_follow_tick_credits_account_balance_when_signal_exits_once(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now = datetime.now(timezone.utc)
+            start = now + timedelta(hours=2)
+            wallet = "0xa"
+            signal_id = f"{wallet}:m1:0"
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [{"wallet": wallet, "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.set_account_balance(1.5, ts=10, source="manual")
+            store.apply_account_ledger(
+                [
+                    {
+                        "ledger_id": f"buy:{signal_id}:buy1",
+                        "kind": "buy",
+                        "amount_usdc": -1,
+                        "created_at": 20,
+                        "signal_id": signal_id,
+                        "trade_id": "buy1",
+                    }
+                ]
+            )
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 0.5)
+            store.save_follow_snapshot(
+                wallet_trade_state={
+                    f"esports:{wallet}": {"last_trade_cursor": {"timestamp": 20, "id": "buy1"}, "last_seen_at": 20},
+                },
+                open_signals=[
+                    {
+                        "signal_id": signal_id,
+                        "wallet": wallet,
+                        "category": "esports",
+                        "condition_id": "m1",
+                        "outcome_index": 0,
+                        "outcome": "Team A",
+                        "status": "open",
+                        "created_at": 20,
+                        "updated_at": 20,
+                        "match_start_time": start.isoformat(),
+                        "legs": [
+                            {
+                                "stake": 1,
+                                "funded_stake": 1,
+                                "funding_status": "funded",
+                                "would_follow": True,
+                                "our_entry_price": 0.5,
+                                "wallet_fill_price": 0.5,
+                                "trade_id": "buy1",
+                                "leg_at": 20,
+                            }
+                        ],
+                        "behavior_events": [],
+                    }
+                ],
+                result_events=[],
+                performance={},
+            )
+
+            class FakeClient:
+                def list_events_paginated(self, **kwargs):
+                    if kwargs.get("closed") is True:
+                        return []
+                    return [
+                        {
+                            "id": "event1",
+                            "slug": "",
+                            "title": "Dota 2: Team A vs Team B (BO3)",
+                            "tags": [{"slug": "dota-2"}],
+                            "startTime": start.isoformat(),
+                            "markets": [
+                                {
+                                    "conditionId": "m1",
+                                    "question": "Dota 2: Team A vs Team B (BO3)",
+                                    "outcomes": ["Team A", "Team B"],
+                                    "outcomePrices": ["0.75", "0.25"],
+                                    "active": True,
+                                    "closed": False,
+                                    "volume": 100000,
+                                    "startTime": start.isoformat(),
+                                }
+                            ],
+                        }
+                    ]
+
+                def trades_for_user(self, _wallet, **_kwargs):
+                    return [{"id": "sell1", "timestamp": 30, "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.75, "size": 10}]
+
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "--data-dir",
+                    str(data_dir),
+                    "follow",
+                    "--stake-usdc",
+                    "1",
+                    "--gamma-pages",
+                    "1",
+                    "--resolution-gamma-pages",
+                    "1",
+                    "--user-trades-max-pages",
+                    "1",
+                    "--max-workers",
+                    "1",
+                ]
+            )
+
+            summary = command_follow(args, client=FakeClient(), emit=False)
+            self.assertEqual(summary["exited_signal_count"], 1)
+            self.assertEqual(summary["balance_ledger_applied_amount_usdc"], 1.5)
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 2.0)
+
+            summary_again = command_follow(args, client=FakeClient(), emit=False)
+            self.assertEqual(summary_again["balance_ledger_applied_count"], 0)
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 2.0)
 
     def test_dashboard_short_addr_and_session_token(self):
         self.assertEqual(short_addr("0x1234567890abcdef1234567890abcdef12345678"), "0x123...678")
@@ -7133,6 +8412,287 @@ class CoreTest(unittest.TestCase):
                 self.assertFalse(payload["ok"])
                 self.assertEqual(payload["error"], "unauthorized")
                 conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_wallet_favorites_post_requires_auth(self):
+        with TemporaryDirectory() as tmp:
+            server = create_server(
+                DashboardConfig(
+                    data_dir=Path(tmp),
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/wallet-favorites",
+                    body=json.dumps({"wallet": "0xabc", "category": "esports", "favorite": True}),
+                    headers={"Content-Type": "application/json"},
+                )
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                self.assertEqual(response.status, 401)
+                self.assertFalse(payload["ok"])
+                self.assertEqual(payload["error"], "unauthorized")
+                conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_wallet_quarantine_post_requires_auth(self):
+        with TemporaryDirectory() as tmp:
+            server = create_server(
+                DashboardConfig(
+                    data_dir=Path(tmp),
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/wallet-quarantine",
+                    body=json.dumps({"wallet": "0xabc", "category": "esports"}),
+                    headers={"Content-Type": "application/json"},
+                )
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                self.assertEqual(response.status, 401)
+                self.assertFalse(payload["ok"])
+                self.assertEqual(payload["error"], "unauthorized")
+                conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_wallet_favorites_post_rejects_quarantined_wallet(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [{"wallet": wallet, "category": "esports", "grade": "A", "positive_market_rate": 1.0}],
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.upsert_wallet_quarantine(wallet, reason="recent_chop_loss", ts=100, category="esports")
+            server = create_server(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                token = make_session_token("admin", "secret", now=int(datetime.now(timezone.utc).timestamp()))
+                cookie = f"poly_fight_session={token}"
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/wallet-favorites",
+                    body=json.dumps({"wallet": wallet, "category": "esports", "favorite": True}),
+                    headers={"Content-Type": "application/json", "Cookie": cookie},
+                )
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+
+                self.assertEqual(response.status, 409)
+                self.assertFalse(payload["ok"])
+                self.assertEqual(payload["error"], "wallet_quarantined")
+                self.assertEqual(store.load_wallet_favorites(category="esports"), {})
+                self.assertIn(wallet, store.load_wallet_quarantine(category="esports"))
+
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/api/wallets", headers={"Cookie": cookie})
+                response = conn.getresponse()
+                wallets = json.loads(response.read().decode())["data"]
+                conn.close()
+                row = wallets["wallets"][0]
+                self.assertFalse(row["favorite"])
+                self.assertTrue(row["quarantined"])
+                self.assertEqual(wallets["favorite_count"], 0)
+                self.assertEqual(wallets["active_count"], 0)
+                self.assertEqual(wallets["quarantined_count"], 1)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_wallet_favorites_form_false_removes_favorite(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [{"wallet": wallet, "category": "esports", "grade": "A", "positive_market_rate": 1.0}],
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.upsert_wallet_favorite(wallet, category="esports", favorite=True, ts=100, snapshot={"wallet": wallet})
+            server = create_server(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                token = make_session_token("admin", "secret", now=int(datetime.now(timezone.utc).timestamp()))
+                cookie = f"poly_fight_session={token}"
+                body = urllib.parse.urlencode({"wallet": wallet, "category": "esports", "favorite": "false"})
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/wallet-favorites",
+                    body=body,
+                    headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie},
+                )
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+
+                self.assertEqual(response.status, 200)
+                self.assertTrue(payload["ok"])
+                self.assertFalse(payload["data"]["favorite"])
+                self.assertEqual(store.load_wallet_favorites(category="esports"), {})
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_wallet_quarantine_post_quarantines_and_clears_favorite(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [{"wallet": wallet, "category": "esports", "grade": "A", "positive_market_rate": 1.0}],
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.upsert_wallet_favorite(wallet, category="esports", favorite=True, ts=100, snapshot={"wallet": wallet})
+            server = create_server(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                token = make_session_token("admin", "secret", now=int(datetime.now(timezone.utc).timestamp()))
+                cookie = f"poly_fight_session={token}"
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/wallet-quarantine",
+                    body=json.dumps({"wallet": wallet, "category": "esports"}),
+                    headers={"Content-Type": "application/json", "Cookie": cookie},
+                )
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+
+                self.assertEqual(response.status, 200)
+                self.assertTrue(payload["ok"])
+                self.assertTrue(payload["data"]["quarantined"])
+                self.assertEqual(payload["data"]["reason"], "manual_dashboard_quarantine")
+                self.assertEqual(store.load_wallet_favorites(category="esports"), {})
+                quarantine = store.load_wallet_quarantine(category="esports")
+                self.assertIn(wallet, quarantine)
+                self.assertEqual(quarantine[wallet]["reason"], "manual_dashboard_quarantine")
+
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/api/wallets", headers={"Cookie": cookie})
+                response = conn.getresponse()
+                wallets = json.loads(response.read().decode())["data"]
+                conn.close()
+                row = wallets["wallets"][0]
+                self.assertFalse(row["favorite"])
+                self.assertTrue(row["quarantined"])
+                self.assertEqual(wallets["active_count"], 0)
+                self.assertEqual(wallets["favorite_count"], 0)
+                self.assertEqual(wallets["quarantined_count"], 1)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_wallet_quarantine_post_unquarantines_without_restoring_missing_wallet(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.upsert_wallet_quarantine(wallet, reason="manual_dashboard_quarantine", ts=100, category="esports")
+            server = create_server(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                token = make_session_token("admin", "secret", now=int(datetime.now(timezone.utc).timestamp()))
+                cookie = f"poly_fight_session={token}"
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/wallet-quarantine",
+                    body=json.dumps({"wallet": wallet, "category": "esports", "quarantined": False}),
+                    headers={"Content-Type": "application/json", "Cookie": cookie},
+                )
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+
+                self.assertEqual(response.status, 200)
+                self.assertTrue(payload["ok"])
+                self.assertFalse(payload["data"]["quarantined"])
+                self.assertEqual(store.load_wallet_quarantine(category="esports"), {})
+
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/api/wallets", headers={"Cookie": cookie})
+                response = conn.getresponse()
+                wallets = json.loads(response.read().decode())["data"]
+                conn.close()
+                self.assertEqual(wallets["wallets"], [])
+                self.assertEqual(wallets["active_count"], 0)
+                self.assertEqual(wallets["quarantined_count"], 0)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -7464,6 +9024,72 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(status["stake_ratio_percent"], 5.0)
             self.assertEqual(read_follow_control(follow_dir)["runner"]["stake_ratio_percent"], 5.0)
 
+    def test_dashboard_runner_start_accepts_max_stake_usdc(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            follow_dir = data_dir / "follow"
+            calls = []
+
+            class FakeProcess:
+                pid = 4321
+                pgid = 4321
+
+            def fake_starter(command, log_path):
+                calls.append((command, log_path))
+                return FakeProcess()
+
+            status = start_runner(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    follow_dir=follow_dir,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                    runner_process_lister=lambda: [],
+                    runner_process_starter=fake_starter,
+                ),
+                stake_ratio_percent=5,
+                max_stake_usdc=25,
+            )
+
+            max_index = calls[0][0].index("--max-stake-usdc") + 1
+            self.assertEqual(calls[0][0][max_index], "25.0")
+            self.assertEqual(status["max_stake_usdc"], 25.0)
+            self.assertEqual(read_follow_control(follow_dir)["runner"]["max_stake_usdc"], 25.0)
+
+    def test_dashboard_runner_start_accepts_signal_balance_percent(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            follow_dir = data_dir / "follow"
+            calls = []
+
+            class FakeProcess:
+                pid = 4321
+                pgid = 4321
+
+            def fake_starter(command, log_path):
+                calls.append((command, log_path))
+                return FakeProcess()
+
+            status = start_runner(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    follow_dir=follow_dir,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                    runner_process_lister=lambda: [],
+                    runner_process_starter=fake_starter,
+                ),
+                stake_ratio_percent=5,
+                max_signal_stake_balance_percent=2.5,
+            )
+
+            signal_cap_index = calls[0][0].index("--max-signal-stake-balance-percent") + 1
+            self.assertEqual(calls[0][0][signal_cap_index], "2.5")
+            self.assertEqual(status["max_signal_stake_balance_percent"], 2.5)
+            self.assertEqual(read_follow_control(follow_dir)["runner"]["max_signal_stake_balance_percent"], 2.5)
+
     def test_dashboard_wallet_refresh_is_category_scoped(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp) / "data"
@@ -7749,6 +9375,104 @@ class CoreTest(unittest.TestCase):
                 self.assertIn("--stake-usdc", calls[0][0])
                 self.assertIn("--stake-ratio-percent", calls[0][0])
                 self.assertEqual(calls[0][0][calls[0][0].index("--stake-ratio-percent") + 1], "5.0")
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_account_balance_api_requires_auth_and_updates_overview(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            server = create_server(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/account-balance",
+                    body=json.dumps({"balance_usdc": 123.45}),
+                    headers={"Content-Type": "application/json"},
+                )
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+                self.assertEqual(response.status, 401)
+                self.assertEqual(payload["error"], "unauthorized")
+
+                token = make_session_token("admin", "secret", now=int(datetime.now(timezone.utc).timestamp()))
+                cookie = f"poly_fight_session={token}"
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/account-balance",
+                    body=json.dumps({"balance_usdc": 123.45}),
+                    headers={"Cookie": cookie, "Content-Type": "application/json"},
+                )
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["data"]["balance_usdc"], 123.45)
+
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/api/overview", headers={"Cookie": cookie})
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["data"]["account_balance"]["balance_usdc"], 123.45)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_account_balance_api_locks_while_runner_running(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            server = create_server(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                    runner_process_lister=lambda: [
+                        {
+                            "pid": 9234,
+                            "ppid": 1,
+                            "pgid": 9234,
+                            "command": f"{sys.executable} -m poly_fight.cli --data-dir {data_dir} run --stake-usdc 1",
+                        }
+                    ],
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                token = make_session_token("admin", "secret", now=int(datetime.now(timezone.utc).timestamp()))
+                host, port = server.server_address[:2]
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/account-balance",
+                    body=json.dumps({"balance_usdc": 123.45}),
+                    headers={"Cookie": f"poly_fight_session={token}", "Content-Type": "application/json"},
+                )
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+                self.assertEqual(response.status, 409)
+                self.assertEqual(payload["error"], "account_balance_locked")
             finally:
                 server.shutdown()
                 server.server_close()
@@ -8254,8 +9978,8 @@ class CoreTest(unittest.TestCase):
 
             row = page["follows"][0]
             self.assertEqual(row["stake_mode_counts"], {"proportional": 1})
-            self.assertEqual(row["signal_stake_min"], 5.0)
-            self.assertEqual(row["signal_stake_max"], 5.0)
+            self.assertEqual(row["signal_stake_min"], 6.0)
+            self.assertEqual(row["signal_stake_max"], 6.0)
             self.assertEqual(detail["wallets"][0]["signals"][0]["stake_mode"], "proportional")
             self.assertEqual(detail["wallets"][0]["signals"][0]["signal_stake"], 5)
 
@@ -8307,6 +10031,49 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(row["unrealized_pnl"], 4.5)
             self.assertEqual(row["display_pnl"], 4.5)
             self.assertEqual(row["display_pnl_kind"], "unrealized")
+
+    def test_dashboard_follows_excludes_blocked_legs_from_unrealized_pnl(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_json(
+                data_dir / "follow" / "active_market_cache.json",
+                {
+                    "updated_at": 200,
+                    "markets": [
+                        {
+                            "condition_id": "m1",
+                            "outcomes": ["A", "B"],
+                            "outcome_prices": [0.1, 0.9],
+                        }
+                    ],
+                },
+            )
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "sig-open",
+                        "wallet": "0xabc",
+                        "condition_id": "m1",
+                        "outcome_index": 1,
+                        "status": "open",
+                        "created_at": 100,
+                        "legs": [
+                            {"stake": 100, "our_entry_price": 0.5, "would_follow": True},
+                            {"stake": 50, "our_entry_price": 0.75, "would_follow": False},
+                        ],
+                    },
+                ],
+                result_events=[],
+                performance={},
+            )
+
+            row = build_follows(data_dir, page=1, size=10)["follows"][0]
+
+            self.assertEqual(row["stake"], 100)
+            self.assertEqual(row["signal_stake_min"], 100)
+            self.assertEqual(row["signal_stake_max"], 100)
+            self.assertEqual(row["unrealized_pnl"], 80)
 
     def test_dashboard_rows_include_cached_team_logos(self):
         with TemporaryDirectory() as tmp:
@@ -8699,6 +10466,160 @@ class CoreTest(unittest.TestCase):
             self.assertEqual([row["rank"] for row in wallets], [1, 2, 3])
             self.assertEqual(detail["wallets"][0]["leaderboard_rank"], 2)
 
+    def test_dashboard_follow_detail_does_not_mix_wallet_avg_across_outcomes(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "sig-a",
+                        "wallet": wallet,
+                        "condition_id": "m1",
+                        "outcome": "A",
+                        "outcome_index": 0,
+                        "status": "open",
+                        "created_at": 100,
+                        "legs": [{"stake": 100, "our_entry_price": 0.7, "would_follow": True}],
+                    },
+                    {
+                        "signal_id": "sig-b",
+                        "wallet": wallet,
+                        "condition_id": "m1",
+                        "outcome": "B",
+                        "outcome_index": 1,
+                        "status": "open",
+                        "created_at": 101,
+                        "legs": [{"stake": 100, "our_entry_price": 0.1, "would_follow": True}],
+                    },
+                ],
+                result_events=[],
+                performance={"wallets": {}, "total": {}},
+            )
+
+            detail = build_follow_detail(data_dir, "m1")
+
+            wallet_row = detail["wallets"][0]
+            self.assertEqual(wallet_row["follow_total_stake"], 200)
+            self.assertTrue(wallet_row["follow_mixed_outcomes"])
+            self.assertEqual(wallet_row["followed_outcome_count"], 2)
+            self.assertIsNone(wallet_row["follow_avg_entry_price"])
+            signal_avgs = {signal["signal_id"]: signal["follow_avg_entry_price"] for signal in wallet_row["signals"]}
+            self.assertEqual(signal_avgs, {"sig-a": 0.7, "sig-b": 0.1})
+
+    def test_dashboard_follow_detail_realized_pnl_uses_status_specific_field(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[],
+                result_events=[
+                    {
+                        "signal_id": "sig-exited-loss",
+                        "wallet": wallet,
+                        "condition_id": "m1",
+                        "status": "exited",
+                        "created_at": 100,
+                        "exit_at": 200,
+                        "our_paper_pnl": 0,
+                        "our_realized_pnl": -12.5,
+                        "legs": [{"stake": 50, "our_entry_price": 0.8}],
+                    },
+                    {
+                        "signal_id": "sig-settled-loss",
+                        "wallet": wallet,
+                        "condition_id": "m1",
+                        "status": "settled",
+                        "created_at": 101,
+                        "settled_at": 201,
+                        "outcome_won": False,
+                        "our_paper_pnl": -7.5,
+                        "our_realized_pnl": 0,
+                        "legs": [{"stake": 7.5, "our_entry_price": 0.5}],
+                    },
+                ],
+                performance={"wallets": {}, "total": {}},
+            )
+
+            detail = build_follow_detail(data_dir, "m1")
+
+            wallet_row = detail["wallets"][0]
+            pnl_by_signal = {signal["signal_id"]: signal["follow_realized_pnl"] for signal in wallet_row["signals"]}
+            self.assertEqual(pnl_by_signal["sig-exited-loss"], -12.5)
+            self.assertEqual(pnl_by_signal["sig-settled-loss"], -7.5)
+            self.assertEqual(wallet_row["follow_realized_pnl"], -20.0)
+
+    def test_dashboard_follow_detail_exited_total_stake_uses_original_follow_stake(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[],
+                result_events=[
+                    {
+                        "signal_id": "sig-exited",
+                        "wallet": wallet,
+                        "condition_id": "m1",
+                        "outcome_index": 0,
+                        "status": "exited",
+                        "created_at": 100,
+                        "exit_at": 200,
+                        "our_realized_pnl": -589,
+                        "legs": [
+                            {"stake": 1000, "funded_stake": 9.71, "our_entry_price": 0.5, "would_follow": True},
+                            {"stake": 250, "funded_stake": 0, "our_entry_price": 0.45, "would_follow": False},
+                        ],
+                    }
+                ],
+                performance={"wallets": {}, "total": {}},
+            )
+
+            detail = build_follow_detail(data_dir, "m1")
+            row = build_follows(data_dir, page=1, size=10)["follows"][0]
+
+            signal = detail["wallets"][0]["signals"][0]
+            self.assertEqual(signal["follow_total_stake"], 1000)
+            self.assertEqual(detail["wallets"][0]["follow_total_stake"], 1000)
+            self.assertEqual(row["stake"], 1000)
+            self.assertEqual(row["signal_stake_min"], 1000)
+            self.assertEqual(row["signal_stake_max"], 1000)
+
+    def test_dashboard_follow_detail_open_total_stake_uses_original_follow_stake(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "sig-open",
+                        "wallet": wallet,
+                        "condition_id": "m1",
+                        "outcome_index": 0,
+                        "status": "open",
+                        "created_at": 100,
+                        "legs": [
+                            {"stake": 1729.71, "funded_stake": 9.71, "our_entry_price": 0.5, "would_follow": True},
+                        ],
+                    }
+                ],
+                result_events=[],
+                performance={"wallets": {}, "total": {}},
+            )
+
+            detail = build_follow_detail(data_dir, "m1")
+            row = build_follows(data_dir, page=1, size=10)["follows"][0]
+
+            signal = detail["wallets"][0]["signals"][0]
+            self.assertEqual(signal["follow_total_stake"], 1729.71)
+            self.assertEqual(detail["wallets"][0]["follow_total_stake"], 1729.71)
+            self.assertEqual(row["stake"], 1729.71)
+            self.assertEqual(row["signal_stake_min"], 1729.71)
+            self.assertEqual(row["signal_stake_max"], 1729.71)
+
     def test_dashboard_wallet_follow_detail_merges_closed_statuses_and_paginates(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -8751,15 +10672,92 @@ class CoreTest(unittest.TestCase):
     def test_dashboard_wallets_expose_quarantine_state(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_json(data_dir / "smart_wallet_leaderboard.json", [{"wallet": "0xabc", "grade": "A"}])
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [
+                    {"wallet": "0xabc", "grade": "A"},
+                    {"wallet": "0xdef", "grade": "A"},
+                ],
+            )
             store = FollowStore(data_dir / "follow" / "follow.db")
-            store.upsert_wallet_quarantine("0xabc", reason="material_sell", ts=100)
+            store.upsert_wallet_quarantine("0xabc", reason="recent_chop_loss", ts=100)
 
             wallets = build_wallets(data_dir)
 
             self.assertEqual(wallets["quarantined_count"], 1)
-            self.assertTrue(wallets["wallets"][0]["quarantined"])
-            self.assertEqual(wallets["wallets"][0]["quarantine"]["reason"], "material_sell")
+            self.assertEqual(wallets["active_count"], 1)
+            self.assertEqual(wallets["by_category"]["esports"]["quarantined_count"], 1)
+            self.assertEqual(wallets["by_category"]["esports"]["active_count"], 1)
+            quarantined = [row for row in wallets["wallets"] if row["quarantined"]]
+            active = [row for row in wallets["wallets"] if not row["quarantined"]]
+            self.assertEqual([row["wallet"] for row in active], ["0xdef"])
+            self.assertEqual([row["wallet"] for row in quarantined], ["0xabc"])
+            self.assertEqual(quarantined[0]["quarantine"]["reason"], "recent_chop_loss")
+
+    def test_dashboard_wallets_separate_active_favorite_and_quarantine_counts(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [
+                    {"wallet": "0xaaa", "category": "esports", "grade": "A", "positive_market_rate": 1.0},
+                    {"wallet": "0xbbb", "category": "esports", "grade": "A", "positive_market_rate": 1.0},
+                    {"wallet": "0xccc", "category": "esports", "grade": "A", "positive_market_rate": 1.0},
+                ],
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.upsert_wallet_favorite(
+                "0xbbb",
+                category="esports",
+                favorite=True,
+                ts=200,
+                snapshot={"wallet": "0xbbb", "grade": "A", "eligible_market_types": ["main_match"]},
+            )
+            store.upsert_wallet_quarantine("0xbbb", reason="recent_chop_loss", ts=100, category="esports")
+            store.upsert_wallet_quarantine("0xccc", reason="recent_chop_loss", ts=100, category="esports")
+
+            wallets = build_wallets(data_dir)
+
+            self.assertEqual(wallets["active_count"], 1)
+            self.assertEqual(wallets["favorite_count"], 0)
+            self.assertEqual(wallets["quarantined_count"], 2)
+            self.assertEqual(wallets["by_category"]["esports"]["active_count"], 1)
+            self.assertEqual(wallets["by_category"]["esports"]["favorite_count"], 0)
+            self.assertEqual(wallets["by_category"]["esports"]["quarantined_count"], 2)
+            by_wallet = {row["wallet"]: row for row in wallets["wallets"]}
+            self.assertFalse(by_wallet["0xaaa"]["favorite"])
+            self.assertFalse(by_wallet["0xaaa"]["quarantined"])
+            self.assertFalse(by_wallet["0xbbb"]["favorite"])
+            self.assertTrue(by_wallet["0xbbb"]["quarantined"])
+            self.assertTrue(by_wallet["0xccc"]["quarantined"])
+
+    def test_dashboard_wallets_append_snapshot_only_favorites(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.upsert_wallet_favorite(
+                "0xbbb",
+                category="esports",
+                favorite=True,
+                ts=200,
+                snapshot={
+                    "wallet": "0xbbb",
+                    "category": "esports",
+                    "grade": "A",
+                    "positive_market_rate": 1.0,
+                    "avg_market_cash": 1234,
+                    "eligible_market_types": ["game_winner"],
+                },
+            )
+
+            wallets = build_wallets(data_dir)
+
+            self.assertEqual(wallets["favorite_count"], 1)
+            self.assertEqual(wallets["active_count"], 0)
+            self.assertEqual(wallets["wallets"][0]["wallet"], "0xbbb")
+            self.assertTrue(wallets["wallets"][0]["favorite"])
+            self.assertTrue(wallets["wallets"][0]["favorite_snapshot_only"])
+            self.assertEqual(wallets["wallets"][0]["avg_market_cash"], 1234)
 
     def test_dashboard_wallets_prefer_sqlite_leaderboard_over_legacy_json(self):
         with TemporaryDirectory() as tmp:
@@ -9057,6 +11055,52 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(loser["observed"]["losses"], 1)
             self.assertEqual(loser["observed"]["our_pnl"], -1.0)
             self.assertTrue(loser["observed"]["has_loss"])
+
+    def test_dashboard_wallets_count_exited_realized_loss_as_observed_loss(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [
+                    {
+                        "wallet": wallet,
+                        "grade": "A",
+                        "esports_win_count": 8,
+                        "esports_loss_count": 0,
+                        "positive_market_rate": 1.0,
+                        "wilson_win_rate_lower_bound": 0.83,
+                        "entry_edge": 0.3,
+                        "esports_roi": 0.75,
+                    }
+                ],
+            )
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[],
+                result_events=[
+                    {
+                        "signal_id": "sig-exited-loss",
+                        "wallet": wallet,
+                        "condition_id": "m1",
+                        "status": "exited",
+                        "created_at": 100,
+                        "exit_at": 200,
+                        "our_realized_pnl": -589,
+                        "legs": [{"stake": 1000, "our_entry_price": 0.5, "would_follow": True}],
+                    }
+                ],
+                performance={"wallets": {}, "total": {}},
+            )
+
+            row = build_wallets(data_dir)["wallets"][0]
+
+            self.assertEqual(row["observed"]["signals"], 1)
+            self.assertEqual(row["observed"]["wins"], 0)
+            self.assertEqual(row["observed"]["losses"], 1)
+            self.assertEqual(row["observed"]["exits"], 1)
+            self.assertEqual(row["observed"]["our_pnl"], -589)
+            self.assertEqual(row["observed"]["win_rate"], 0)
 
     def test_dashboard_wallet_ranks_are_category_scoped(self):
         with TemporaryDirectory() as tmp:
@@ -12129,6 +14173,102 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual([row["wallet"] for row in result["core"]], ["0xonetwosided", "0xtwotwosided"])
 
+    def test_collector_copyable_gate_ignores_roi_gate_when_two_sided_rate_under_five_percent(self):
+        now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
+
+        def profile(wallet, *, participated, two_sided_count):
+            wins = 25
+            roi = 0.3318
+            return {
+                "wallet": wallet,
+                "category": "esports",
+                "grade": "A",
+                "scoring_version": SCORING_VERSION,
+                "eligible_buckets": ["cs2:main_match"],
+                "eligible_market_types": ["main_match"],
+                "last_esports_trade_at": now_ts - 3600,
+                "esports_closed_count": participated,
+                "esports_win_count": wins,
+                "positive_market_rate": 0.76,
+                "wilson_win_rate_lower_bound": 0.65,
+                "first_direction_market_count": participated,
+                "first_direction_win_count": wins,
+                "first_direction_win_rate": wins / participated,
+                "esports_roi": roi,
+                "capital_weighted_edge": 0.23,
+                "median_entry_price": 0.60,
+                "actual_minus_hold_pnl_rate": 0.0,
+                "historical_trade_behavior_market_count": participated,
+                "two_sided_trade_market_count": two_sided_count,
+                "two_sided_trade_market_rate": two_sided_count / participated,
+                "per_game_type": {
+                    "cs2:main_match": {
+                        "esports_closed_count": participated,
+                        "esports_win_count": wins,
+                        "positive_market_rate": 0.76,
+                        "wilson_win_rate_lower_bound": 0.65,
+                        "first_direction_market_count": participated,
+                        "first_direction_win_count": wins,
+                        "first_direction_win_rate": wins / participated,
+                        "capital_weighted_edge": 0.23,
+                        "esports_roi": roi,
+                        "median_entry_price": 0.60,
+                        "last_esports_trade_at": now_ts - 3600,
+                        "recent_bucket_market_count": 27,
+                        "recent_bucket_roi": 0.35,
+                        "recent_bucket_positive_rate": 0.77,
+                        "recent_7d_market_count": 27,
+                        "recent_7d_roi": 0.35,
+                        "recent_7d_positive_rate": 0.77,
+                        "recent_14d_market_count": participated,
+                        "recent_14d_roi": roi,
+                        "recent_14d_positive_rate": 0.76,
+                    }
+                },
+                "per_game_type_grades": {
+                    "cs2:main_match": {
+                        "grade": "A",
+                        "esports_closed_count": participated,
+                        "positive_market_rate": 0.76,
+                        "wilson_win_rate_lower_bound": 0.65,
+                        "first_direction_market_count": participated,
+                        "first_direction_win_count": wins,
+                        "first_direction_win_rate": wins / participated,
+                        "capital_weighted_edge": 0.23,
+                        "esports_roi": roi,
+                        "median_entry_price": 0.60,
+                    }
+                },
+                "candidate": {
+                    "participated_market_count": participated,
+                    "avg_market_cash": 5_000,
+                    "two_sided_market_count": two_sided_count,
+                    "tail_entry_market_count": 0,
+                    "high_churn_market_count": 0,
+                    "per_game_type_candidate": {
+                        "cs2:main_match": {
+                            "participated_market_count": participated,
+                            "avg_market_cash": 5_000,
+                            "two_sided_market_count": two_sided_count,
+                            "tail_entry_market_count": 0,
+                            "high_churn_market_count": 0,
+                        }
+                    },
+                },
+            }
+
+        result = build_collector_leaderboard(
+            {
+                "0xlowrate": profile("0xlowrate", participated=33, two_sided_count=1),
+                "0xhighrate": profile("0xhighrate", participated=33, two_sided_count=2),
+            },
+            now_ts=now_ts,
+            max_leaderboard_wallets=30,
+        )
+
+        self.assertEqual([row["wallet"] for row in result["core"]], ["0xlowrate"])
+        self.assertIn("copyability_gate", next(row for row in result["watch"] if row["wallet"] == "0xhighrate")["watch_reasons"])
+
     def test_collector_copyable_gate_allows_high_roi_first_direction_two_sided_wallets(self):
         now_ts = int(datetime(2026, 6, 9, tzinfo=timezone.utc).timestamp())
 
@@ -12941,11 +15081,15 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.command, "follow")
         self.assertEqual(args.stake_usdc, 25)
         self.assertEqual(args.stake_ratio_percent, 10)
+        self.assertEqual(args.max_stake_usdc, 0.0)
+        self.assertEqual(args.max_signal_stake_usdc, 0.0)
+        self.assertEqual(args.max_signal_stake_balance_percent, 0.0)
         self.assertEqual(args.bankroll_usdc, 0.0)
         self.assertEqual(effective_bankroll_usdc(args.bankroll_usdc), float("inf"))
         self.assertEqual(args.follow_recency_days, 30)
         self.assertEqual(args.observe_window_hours, 24)
-        self.assertEqual(args.max_slippage_over_entry, 0.05)
+        self.assertEqual(args.max_slippage_over_entry, 0.10)
+        self.assertEqual(args.max_entry_price, 0.85)
         self.assertEqual(args.min_wallet_entry_price, 0.4)
         self.assertFalse(args.require_pre_match)
         self.assertEqual(args.run_log_retention_days, 7)
@@ -12958,6 +15102,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.max_follow_legs, 10)
         self.assertEqual(args.min_tick_seconds, 180)
         self.assertEqual(args.max_tick_seconds, 900)
+        self.assertEqual(args.tick_seconds, 60)
+        self.assertEqual(args.position_observe_mode, "shadow")
+        self.assertEqual(args.position_observe_limit, 0)
         self.assertEqual(args.max_workers, 8)
         self.assertFalse(hasattr(args, "consensus_block_opposite"))
         self.assertFalse(hasattr(args, "conflict_policy"))
@@ -12974,6 +15121,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.command, "run")
         self.assertEqual(args.stake_usdc, 1)
         self.assertEqual(args.stake_ratio_percent, 10)
+        self.assertEqual(args.max_stake_usdc, 0.0)
+        self.assertEqual(args.max_signal_stake_usdc, 0.0)
+        self.assertEqual(args.max_signal_stake_balance_percent, 0.0)
         self.assertEqual(args.bankroll_usdc, 0.0)
         self.assertEqual(effective_bankroll_usdc(args.bankroll_usdc), float("inf"))
         self.assertTrue(args.skip_initial_build)
@@ -12986,10 +15136,15 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.max_follow_legs, 10)
         self.assertEqual(args.error_retry_seconds, 180)
         self.assertEqual(args.max_consecutive_error_seconds, 600)
+        self.assertEqual(args.max_slippage_over_entry, 0.10)
+        self.assertEqual(args.max_entry_price, 0.85)
         self.assertEqual(args.min_wallet_entry_price, 0.4)
         self.assertEqual(args.event_cache_ttl_minutes, 10)
         self.assertEqual(args.resolution_cache_ttl_seconds, 60)
         self.assertEqual(args.resolution_gamma_pages, 2)
+        self.assertEqual(args.tick_seconds, 60)
+        self.assertEqual(args.position_observe_mode, "shadow")
+        self.assertEqual(args.position_observe_limit, 0)
         self.assertEqual(args.market_batch_size, 50)
         self.assertEqual(args.market_batch_count, 2)
         self.assertFalse(hasattr(args, "consensus_block_opposite"))

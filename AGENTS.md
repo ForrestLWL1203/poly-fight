@@ -250,8 +250,10 @@ if sports follow is later enabled.
 NBA wallets follow NBA only. UFC wallets follow UFC only. Wallets no longer
 eligible can only affect already-open signal markets.
 
-`--max-slippage-over-entry` sets `would_follow`; paper signals are still
-recorded for learning. Contested signals are recorded but not live-followable.
+`--max-slippage-over-entry` defaults to 0.10 and sets `would_follow`; paper
+signals are still recorded for learning. `--max-entry-price` defaults to 0.85
+and blocks funded follow when our observed buy price is already higher.
+Contested signals are recorded but not live-followable.
 
 Failure policy:
 
@@ -298,17 +300,20 @@ Allowed dashboard mutations only:
 
 ```text
 POST /api/wallet-refresh
+POST /api/wallet-favorites
+POST /api/account-balance
 POST /api/runner/start
 POST /api/runner/stop
 POST /api/reset-data
 ```
 
 `wallet-refresh` and runner controls write process/control state only, not
-follow signal state. `reset-data` is an explicit personal-use destructive
-operation for clearing generated category/follow/log state; it must stay behind
-authenticated dashboard access and must not be called implicitly. The only live
-external Data API request from dashboard is `/api/wallets/{addr}/trades`;
-validate wallet addresses first.
+follow signal state. `account-balance` writes the manual paper usable-funds cap
+in `follow.db`; it must be locked while the runner is running. `reset-data` is an
+explicit personal-use destructive operation for clearing generated
+category/follow/log state; it must stay behind authenticated dashboard access
+and must not be called implicitly. The only live external Data API request from
+dashboard is `/api/wallets/{addr}/trades`; validate wallet addresses first.
 
 `GET /api/stream` is same-origin, cookie-authenticated SSE. It sends an
 immediate frame, heartbeats, caps clients, and releases the count in `finally`.

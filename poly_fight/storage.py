@@ -239,6 +239,30 @@ class FollowStore:
                     quarantined_at INTEGER NOT NULL,
                     raw_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS wallet_favorites (
+                    wallet_key TEXT PRIMARY KEY,
+                    wallet TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    favorited_at INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS account_balance (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    balance_usdc REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS account_balance_ledger (
+                    ledger_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    amount_usdc REAL NOT NULL,
+                    balance_after_usdc REAL NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    signal_id TEXT,
+                    trade_id TEXT,
+                    raw_json TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_follow_signals_status ON follow_signals(status);
                 CREATE INDEX IF NOT EXISTS idx_follow_signals_wallet ON follow_signals(wallet);
                 CREATE INDEX IF NOT EXISTS idx_follow_signals_condition_id ON follow_signals(condition_id);
@@ -248,6 +272,8 @@ class FollowStore:
                 CREATE INDEX IF NOT EXISTS idx_follow_results_status_resolved_at ON follow_results(status, resolved_at);
                 CREATE INDEX IF NOT EXISTS idx_market_cache_kind ON market_cache(cache_kind);
                 CREATE INDEX IF NOT EXISTS idx_wallet_quarantine_ts ON wallet_quarantine(quarantined_at);
+                CREATE INDEX IF NOT EXISTS idx_wallet_favorites_category_ts ON wallet_favorites(category, favorited_at);
+                CREATE INDEX IF NOT EXISTS idx_account_balance_ledger_created_at ON account_balance_ledger(created_at);
                 """
             )
             conn.execute(
@@ -280,7 +306,134 @@ class FollowStore:
             rows = conn.execute("SELECT raw_json FROM follow_results ORDER BY resolved_at, signal_id").fetchall()
         return [_loads(row["raw_json"], {}) for row in rows]
 
-    def upsert_wallet_quarantine(self, wallet: str, *, reason: str, ts: int, category: str | None = None) -> None:
+    def set_account_balance(self, balance_usdc: float, *, ts: int | None = None, source: str = "manual") -> dict[str, Any]:
+        self.init_db()
+        balance = round(float(balance_usdc), 8)
+        updated_at = int(ts or time.time())
+        row = {
+            "configured": True,
+            "balance_usdc": balance,
+            "source": str(source or "manual"),
+            "updated_at": updated_at,
+        }
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO account_balance(id, balance_usdc, source, updated_at, raw_json)
+                VALUES (1, ?, ?, ?, ?)
+                """,
+                (balance, row["source"], updated_at, _dumps(row)),
+            )
+        return row
+
+    def load_account_balance(self, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+        def read_from(active: sqlite3.Connection) -> dict[str, Any]:
+            try:
+                tables = {
+                    str(row["name"])
+                    for row in active.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                }
+                if "account_balance" not in tables:
+                    return {"configured": False, "balance_usdc": None}
+                row = active.execute("SELECT raw_json FROM account_balance WHERE id = 1").fetchone()
+            except sqlite3.Error:
+                return {"configured": False, "balance_usdc": None}
+            if not row:
+                return {"configured": False, "balance_usdc": None}
+            payload = _loads(row["raw_json"], {})
+            if not isinstance(payload, dict):
+                return {"configured": False, "balance_usdc": None}
+            payload["configured"] = True
+            return payload
+
+        if conn is not None:
+            return read_from(conn)
+        self.init_db()
+        with self.connect() as active:
+            return read_from(active)
+
+    def load_account_balance_readonly(self) -> dict[str, Any]:
+        readonly = self.connect_readonly()
+        if readonly is None:
+            return {"configured": False, "balance_usdc": None}
+        try:
+            return self.load_account_balance(readonly)
+        finally:
+            readonly.close()
+
+    def apply_account_ledger(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        self.init_db()
+        applied_count = 0
+        applied_amount = 0.0
+        with self.connect() as conn:
+            state = self.load_account_balance(conn)
+            if not state.get("configured"):
+                return {"configured": False, "applied_count": 0, "applied_amount_usdc": 0.0}
+            balance = float(state.get("balance_usdc") or 0.0)
+            for entry in entries:
+                ledger_id = str(entry.get("ledger_id") or "").strip()
+                if not ledger_id:
+                    continue
+                exists = conn.execute(
+                    "SELECT 1 FROM account_balance_ledger WHERE ledger_id = ?",
+                    (ledger_id,),
+                ).fetchone()
+                if exists:
+                    continue
+                amount = round(float(entry.get("amount_usdc") or 0.0), 8)
+                balance = round(balance + amount, 8)
+                payload = dict(entry)
+                payload["amount_usdc"] = amount
+                payload["balance_after_usdc"] = balance
+                conn.execute(
+                    """
+                    INSERT INTO account_balance_ledger
+                    (ledger_id, kind, amount_usdc, balance_after_usdc, created_at, signal_id, trade_id, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ledger_id,
+                        str(entry.get("kind") or ""),
+                        amount,
+                        balance,
+                        int(entry.get("created_at") or time.time()),
+                        str(entry.get("signal_id") or ""),
+                        str(entry.get("trade_id") or ""),
+                        _dumps(payload),
+                    ),
+                )
+                applied_count += 1
+                applied_amount = round(applied_amount + amount, 8)
+            if applied_count:
+                updated_at = int(time.time())
+                updated = {
+                    **state,
+                    "configured": True,
+                    "balance_usdc": balance,
+                    "updated_at": updated_at,
+                }
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO account_balance(id, balance_usdc, source, updated_at, raw_json)
+                    VALUES (1, ?, ?, ?, ?)
+                    """,
+                    (balance, str(updated.get("source") or "manual"), updated_at, _dumps(updated)),
+                )
+        return {
+            "configured": True,
+            "applied_count": applied_count,
+            "applied_amount_usdc": round(applied_amount, 8),
+        }
+
+    def upsert_wallet_quarantine(
+        self,
+        wallet: str,
+        *,
+        reason: str,
+        ts: int,
+        category: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         self.init_db()
         wallet = str(wallet or "").lower()
         if not wallet:
@@ -290,6 +443,8 @@ class FollowStore:
         row = {"wallet": wallet, "reason": reason, "quarantined_at": int(ts)}
         if category:
             row["category"] = category
+        if details:
+            row["details"] = details
         with self.connect() as conn:
             conn.execute(
                 """
@@ -317,6 +472,15 @@ class FollowStore:
             result[result_key] = value
         return result
 
+    def clear_wallet_quarantine_reasons(self, reasons: set[str]) -> None:
+        self.init_db()
+        clean = {str(reason).strip() for reason in reasons if str(reason).strip()}
+        if not clean:
+            return
+        placeholders = ",".join("?" for _ in clean)
+        with self.connect() as conn:
+            conn.execute(f"DELETE FROM wallet_quarantine WHERE reason IN ({placeholders})", tuple(sorted(clean)))
+
     def clear_wallet_quarantine_except(self, wallets: set[str]) -> None:
         self.init_db()
         wallets = {str(wallet).lower() for wallet in wallets if wallet}
@@ -326,6 +490,21 @@ class FollowStore:
                 return
             placeholders = ",".join("?" for _ in wallets)
             conn.execute(f"DELETE FROM wallet_quarantine WHERE wallet NOT IN ({placeholders})", tuple(sorted(wallets)))
+
+    def clear_wallet_quarantine_wallets(self, wallets: set[str]) -> None:
+        self.init_db()
+        clean = {str(wallet).lower() for wallet in wallets if str(wallet).strip()}
+        if not clean:
+            return
+        expanded = set(clean)
+        for value in list(clean):
+            if ":" in value:
+                expanded.add(value.split(":", 1)[1])
+            else:
+                expanded.add(f"esports:{value}")
+        placeholders = ",".join("?" for _ in expanded)
+        with self.connect() as conn:
+            conn.execute(f"DELETE FROM wallet_quarantine WHERE wallet IN ({placeholders})", tuple(sorted(expanded)))
 
     def clear_revalidated_quarantine(self, wallets: set[str], *, validated_at: int) -> None:
         self.init_db()
@@ -341,9 +520,77 @@ class FollowStore:
                 DELETE FROM wallet_quarantine
                 WHERE wallet IN ({placeholders})
                   AND quarantined_at < ?
+                  AND reason != ?
                 """,
-                (*tuple(sorted(expanded_wallets)), int(validated_at)),
+                    (*tuple(sorted(expanded_wallets)), int(validated_at), "manual_dashboard_quarantine"),
             )
+
+    def upsert_wallet_favorite(
+        self,
+        wallet: str,
+        *,
+        category: str = "esports",
+        favorite: bool = True,
+        ts: int | None = None,
+        snapshot: dict[str, Any] | None = None,
+    ) -> None:
+        self.init_db()
+        wallet = str(wallet or "").lower()
+        category = str(category or "esports").lower()
+        if not wallet or not category:
+            return
+        key = f"{category}:{wallet}"
+        with self.connect() as conn:
+            if not favorite:
+                conn.execute("DELETE FROM wallet_favorites WHERE wallet_key = ?", (key,))
+                return
+            favorited_at = int(ts or time.time())
+            compact_snapshot = dict(snapshot or {})
+            if compact_snapshot:
+                compact_snapshot["wallet"] = str(compact_snapshot.get("wallet") or wallet).lower()
+                compact_snapshot.setdefault("category", category)
+            row = {
+                "wallet": wallet,
+                "category": category,
+                "favorited_at": favorited_at,
+                "snapshot": compact_snapshot,
+            }
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO wallet_favorites(wallet_key, wallet, category, favorited_at, raw_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (key, wallet, category, favorited_at, _dumps(row)),
+            )
+
+    def load_wallet_favorites(self, *, category: str | None = None) -> dict[str, dict[str, Any]]:
+        self.init_db()
+        category = str(category or "").lower()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT wallet_key, wallet, category, raw_json FROM wallet_favorites ORDER BY favorited_at DESC"
+            ).fetchall()
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            row_category = str(row["category"] or "").lower()
+            wallet = str(row["wallet"] or "").lower()
+            if category and row_category != category:
+                continue
+            value = _loads(row["raw_json"], {})
+            if not isinstance(value, dict):
+                value = {}
+            value.setdefault("wallet", wallet)
+            value.setdefault("category", row_category)
+            result_key = wallet if category else str(row["wallet_key"]).lower()
+            result[result_key] = value
+        return result
+
+    def is_wallet_favorite(self, wallet: str, *, category: str = "esports") -> bool:
+        wallet = str(wallet or "").lower()
+        category = str(category or "esports").lower()
+        if not wallet or not category:
+            return False
+        return f"{category}:{wallet}" in self.load_wallet_favorites()
 
     def save_market_cache(self, markets: dict[str, dict[str, Any]], *, cache_kind: str, updated_at: int) -> None:
         self.init_db()
@@ -549,6 +796,28 @@ class FollowStore:
         return {
             "db_ready": True,
             "wallet_quarantine": {str(row["wallet"]).lower(): _loads(row["raw_json"], {}) for row in rows},
+        }
+
+    def load_dashboard_wallet_favorites(self) -> dict[str, Any]:
+        empty = {"db_ready": False, "wallet_favorites": {}}
+        conn = self.connect_readonly()
+        if conn is None:
+            return empty
+        try:
+            tables = {
+                str(row["name"])
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            if "wallet_favorites" not in tables:
+                return empty
+            rows = conn.execute("SELECT wallet_key, raw_json FROM wallet_favorites ORDER BY favorited_at DESC").fetchall()
+        except sqlite3.Error:
+            return empty
+        finally:
+            conn.close()
+        return {
+            "db_ready": True,
+            "wallet_favorites": {str(row["wallet_key"]).lower(): _loads(row["raw_json"], {}) for row in rows},
         }
 
     def load_dashboard_follow_rows(

@@ -29,6 +29,7 @@ from .core import (
     MAX_HIGH_CHURN_MARKET_RATE,
     MIN_A_POSITIVE_MARKET_RATE,
     SCORING_VERSION,
+    SECONDS_PER_DAY,
     SWING_DEPENDENT_RATE,
     TRADE_BEHAVIOR_EXCLUDE_RATE,
     TRADE_BEHAVIOR_MIN_MARKETS,
@@ -66,11 +67,16 @@ from .follow import (
     bootstrap_position_trades,
     contested_markets,
     desired_tick_interval,
+    detect_position_shadow_events,
     detect_new_positions,
     eligible_follow_wallets,
     esports_match_imminent,
     evaluate_slippage,
+    leg_actual_stake,
     market_current_price,
+    match_position_trade_latency,
+    paper_exit_pnl,
+    paper_pnl,
     process_follow_trades,
     qualify_follow,
     select_new_trades,
@@ -126,6 +132,9 @@ DEFAULT_REFRESH_CACHE_RETENTION_DAYS = {
     "raw_user_trades": 1,
     "clob_market_metadata": 30,
 }
+LEGACY_TRADE_QUARANTINE_REASONS = {"material_sell", "two_sided_switch"}
+RECENT_CHOP_LOSS_QUARANTINE_REASON = "recent_chop_loss"
+
 @contextmanager
 def acquire_build_lock(data_dir: Path, *, blocking: bool = True):
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -1341,6 +1350,109 @@ def observed_performance_quarantine_events(
     return events
 
 
+def _signal_result_at(signal: dict[str, Any]) -> int:
+    return to_int(signal.get("exit_at") or signal.get("settled_at") or signal.get("updated_at") or signal.get("created_at"))
+
+
+def _weighted_wallet_entry_price(signal: dict[str, Any]) -> float:
+    legs = [leg for leg in signal.get("legs") or [] if isinstance(leg, dict)]
+    size_weighted = [
+        (to_float(leg.get("wallet_fill_price")), to_float(leg.get("wallet_trade_size")))
+        for leg in legs
+        if to_float(leg.get("wallet_fill_price")) > 0 and to_float(leg.get("wallet_trade_size")) > 0
+    ]
+    total_size = sum(size for _price, size in size_weighted)
+    if total_size > 0:
+        return sum(price * size for price, size in size_weighted) / total_size
+    stake_weighted = [
+        (to_float(leg.get("wallet_fill_price")), to_float(leg.get("stake")))
+        for leg in legs
+        if to_float(leg.get("wallet_fill_price")) > 0 and to_float(leg.get("stake")) > 0
+    ]
+    total_stake = sum(stake for _price, stake in stake_weighted)
+    if total_stake > 0:
+        return sum(price * stake for price, stake in stake_weighted) / total_stake
+    return to_float(signal.get("wallet_avg_price") or signal.get("wallet_entry_price"))
+
+
+def recent_chop_loss_quarantine_events(
+    result_events: list[dict[str, Any]],
+    *,
+    now_ts: int,
+    window_days: int = 7,
+    loss_epsilon: float = 0.005,
+    min_cut_loss_count: int = 4,
+) -> list[dict[str, Any]]:
+    cutoff = now_ts - max(1, int(window_days)) * SECONDS_PER_DAY
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for signal in result_events:
+        if not isinstance(signal, dict) or str(signal.get("status") or "").lower() != "exited":
+            continue
+        event_at = _signal_result_at(signal)
+        if event_at < cutoff or event_at > now_ts:
+            continue
+        wallet = normalize_wallet(signal.get("wallet"))
+        category = str(signal.get("category") or "esports").lower()
+        condition_id = str(signal.get("condition_id") or "").lower()
+        outcome_index = to_int(signal.get("outcome_index"), -1)
+        exit_price = to_float(signal.get("exit_price"))
+        entry_price = _weighted_wallet_entry_price(signal)
+        if not wallet or not condition_id or outcome_index < 0 or exit_price <= 0 or entry_price <= 0:
+            continue
+        if exit_price + loss_epsilon >= entry_price:
+            continue
+        grouped.setdefault((wallet, category, condition_id), []).append(
+            {
+                "wallet": wallet,
+                "category": category,
+                "condition_id": condition_id,
+                "outcome_index": outcome_index,
+                "timestamp": event_at,
+                "entry_price": round(entry_price, 8),
+                "exit_price": round(exit_price, 8),
+                "signal_id": str(signal.get("signal_id") or ""),
+            }
+        )
+
+    triggered_by_wallet: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for (wallet, category, condition_id), rows in grouped.items():
+        alternating: list[dict[str, Any]] = []
+        for row in sorted(rows, key=lambda item: (item["timestamp"], item["signal_id"])):
+            if alternating and row["outcome_index"] == alternating[-1]["outcome_index"]:
+                alternating[-1] = row
+            else:
+                alternating.append(row)
+        if len(alternating) < min_cut_loss_count:
+            continue
+        triggered_by_wallet.setdefault((wallet, category), []).append(
+            {
+                "condition_id": condition_id,
+                "cut_loss_count": len(alternating),
+                "last_event_at": max(row["timestamp"] for row in alternating),
+            }
+        )
+
+    events = []
+    for (wallet, category), triggers in sorted(triggered_by_wallet.items()):
+        last_event_at = max(to_int(row.get("last_event_at")) for row in triggers)
+        condition_ids = sorted({str(row.get("condition_id") or "") for row in triggers if row.get("condition_id")})
+        events.append(
+            {
+                "wallet": wallet,
+                "category": category,
+                "reason": RECENT_CHOP_LOSS_QUARANTINE_REASON,
+                "timestamp": last_event_at,
+                "details": {
+                    "window_days": max(1, int(window_days)),
+                    "cut_loss_count": sum(to_int(row.get("cut_loss_count")) for row in triggers),
+                    "condition_ids": condition_ids,
+                    "last_event_at": last_event_at,
+                },
+            }
+        )
+    return events
+
+
 def market_records_from_events(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     records = {}
     for event in events:
@@ -1860,6 +1972,86 @@ def effective_bankroll_usdc(value: Any) -> float:
     return bankroll
 
 
+def funded_open_exposure(signals: list[dict[str, Any]]) -> float:
+    return round(
+        sum(
+            leg_actual_stake(leg)
+            for signal in signals
+            if (signal.get("status") or "open") == "open"
+            for leg in signal.get("legs") or []
+        ),
+        8,
+    )
+
+
+def account_buy_ledger_entries(signals: list[dict[str, Any]], *, created_at: int) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for signal in signals:
+        signal_id = str(signal.get("signal_id") or "")
+        if not signal_id:
+            continue
+        wallet = normalize_wallet(signal.get("wallet"))
+        condition_id = str(signal.get("condition_id") or "").lower()
+        for leg in signal.get("legs") or []:
+            if not isinstance(leg, dict) or leg.get("funded_stake") is None:
+                continue
+            funded_stake = to_float(leg.get("funded_stake"))
+            if funded_stake <= 0:
+                continue
+            trade_id = str(leg.get("trade_id") or leg.get("leg_at") or "")
+            ledger_id = f"buy:{signal_id}:{trade_id}"
+            entries.append(
+                {
+                    "ledger_id": ledger_id,
+                    "kind": "buy",
+                    "amount_usdc": -round(funded_stake, 8),
+                    "created_at": int(leg.get("leg_at") or created_at),
+                    "signal_id": signal_id,
+                    "trade_id": trade_id,
+                    "wallet": wallet,
+                    "condition_id": condition_id,
+                }
+            )
+    return entries
+
+
+def account_result_ledger_entries(results: list[dict[str, Any]], *, created_at: int) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for result in results:
+        signal_id = str(result.get("signal_id") or "")
+        if not signal_id:
+            continue
+        payout = 0.0
+        status = str(result.get("status") or "")
+        for leg in result.get("legs") or []:
+            if not isinstance(leg, dict) or leg.get("funded_stake") is None:
+                continue
+            funded_stake = to_float(leg.get("funded_stake"))
+            if funded_stake <= 0:
+                continue
+            entry_price = to_float(leg.get("our_entry_price"))
+            if status == "exited":
+                exit_price = to_float(result.get("exit_price"))
+                payout += funded_stake + paper_exit_pnl(entry_price, exit_price, funded_stake)
+            elif status == "settled":
+                payout += funded_stake + paper_pnl(entry_price, bool(result.get("outcome_won")), funded_stake)
+        if payout <= 0:
+            continue
+        ledger_kind = "exit" if status == "exited" else "settle"
+        entries.append(
+            {
+                "ledger_id": f"{ledger_kind}:{signal_id}",
+                "kind": ledger_kind,
+                "amount_usdc": round(payout, 8),
+                "created_at": int(result.get("settled_at") or result.get("exit_at") or created_at),
+                "signal_id": signal_id,
+                "wallet": normalize_wallet(result.get("wallet")),
+                "condition_id": str(result.get("condition_id") or "").lower(),
+            }
+        )
+    return entries
+
+
 def should_use_cached_profile(cached: dict[str, Any] | None, *, now_ts: int, ttl_seconds: int) -> bool:
     if not cached:
         return False
@@ -1916,7 +2108,10 @@ def copyable_two_sided_reject_reasons(
         reasons.append("two_sided_rate_gte_max")
     if int(quality_metrics.get("esports_closed_count") or 0) < COPYABLE_TWO_SIDED_MIN_CLOSED_COUNT:
         reasons.append("two_sided_closed_count_lt_min")
-    if to_float(quality_metrics.get("esports_roi")) < COPYABLE_TWO_SIDED_MIN_BUCKET_ROI:
+    if (
+        two_sided_rate >= MAX_COPYABLE_TWO_SIDED_RATE
+        and to_float(quality_metrics.get("esports_roi")) < COPYABLE_TWO_SIDED_MIN_BUCKET_ROI
+    ):
         reasons.append("two_sided_bucket_roi_lt_min")
     first_direction_rate = quality_metrics.get("first_direction_win_rate")
     if first_direction_rate is None:
@@ -3018,10 +3213,11 @@ def build_profile_fetch_plan(
     now_ts: int,
     ttl_seconds: int,
     max_profiles: int,
+    force_refresh_wallets: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    if max_profiles <= 0:
-        return []
-
+    force_refresh_wallets = {normalize_wallet(wallet) for wallet in (force_refresh_wallets or set()) if normalize_wallet(wallet)}
+    forced_items: list[dict[str, Any]] = []
+    seen_forced: set[str] = set()
     candidate_items: list[dict[str, Any]] = []
     seen_candidates: set[str] = set()
     ordered_profile_candidates = list(profile_candidates)
@@ -3039,11 +3235,24 @@ def build_profile_fetch_plan(
         seen_candidates.add(wallet)
         normalized = {**candidate, "wallet": wallet}
         cached = existing_profiles.get(wallet)
+        if wallet in force_refresh_wallets:
+            forced_items.append(normalized)
+            seen_forced.add(wallet)
+            continue
         if (
             not should_use_cached_profile(cached, now_ts=now_ts, ttl_seconds=ttl_seconds)
             or profile_needs_schema_migration(cached)
         ):
             candidate_items.append(normalized)
+
+    for wallet in sorted(force_refresh_wallets - seen_forced):
+        profile = existing_profiles.get(wallet)
+        if not profile:
+            continue
+        candidate = dict(profile.get("candidate") or {})
+        candidate["wallet"] = wallet
+        forced_items.append(candidate)
+        seen_candidates.add(wallet)
 
     migration_items: list[dict[str, Any]] = []
     seen_migration: set[str] = set()
@@ -3057,6 +3266,9 @@ def build_profile_fetch_plan(
         candidate = dict(profile.get("candidate") or {})
         candidate["wallet"] = wallet
         migration_items.append(candidate)
+
+    if max_profiles <= 0:
+        return forced_items
 
     candidate_budget = min(len(candidate_items), math.ceil(max_profiles * 0.7))
     selected_candidates = candidate_items[:candidate_budget]
@@ -3073,7 +3285,143 @@ def build_profile_fetch_plan(
         )
         selected_candidates = selected_candidates[: candidate_budget + remaining]
 
-    return [*selected_candidates, *selected_migrations]
+    normal_items = [*selected_candidates, *selected_migrations]
+    forced_wallets = {row["wallet"] for row in forced_items}
+    return [*forced_items, *(row for row in normal_items if row["wallet"] not in forced_wallets)]
+
+
+def dashboard_follow_db_for_category_data_dir(data_dir: Path, category: str) -> Path:
+    category = str(category or "").lower()
+    root = Path(data_dir)
+    if category and root.name.lower() == category:
+        root = root.parent
+    return root / "follow" / "follow.db"
+
+
+def load_favorite_wallet_rows_for_category(data_dir: Path, category: str) -> dict[str, dict[str, Any]]:
+    snapshot = FollowStore(dashboard_follow_db_for_category_data_dir(data_dir, category)).load_dashboard_wallet_favorites()
+    rows = snapshot.get("wallet_favorites") if isinstance(snapshot, dict) else {}
+    result: dict[str, dict[str, Any]] = {}
+    category = str(category or "esports").lower()
+    for key, row in (rows or {}).items():
+        if not isinstance(row, dict):
+            continue
+        wallet = normalize_wallet(row.get("wallet") or str(key).split(":", 1)[-1])
+        row_category = str(row.get("category") or str(key).split(":", 1)[0] or "esports").lower()
+        if not wallet or row_category != category:
+            continue
+        result[wallet] = row
+    return result
+
+
+def favorite_profile_candidates(favorites: dict[str, dict[str, Any]], *, category: str) -> list[dict[str, Any]]:
+    rows = []
+    category = str(category or "esports").lower()
+    for wallet, favorite in sorted(favorites.items()):
+        if not isinstance(favorite, dict):
+            continue
+        snapshot = favorite.get("snapshot") if isinstance(favorite.get("snapshot"), dict) else {}
+        candidate = dict(snapshot.get("candidate") or {})
+        candidate.update(
+            {
+                "wallet": wallet,
+                "category": category,
+                "favorite": True,
+                "favorite_protected": True,
+                "favorited_at": favorite.get("favorited_at"),
+            }
+        )
+        for field in (
+            "qualified_market_types",
+            "eligible_market_types",
+            "eligible_buckets",
+            "eligible_game_families",
+            "league",
+        ):
+            if field in snapshot and not candidate.get(field):
+                candidate[field] = snapshot.get(field)
+        if not candidate.get("qualified_market_types") and candidate.get("eligible_market_types"):
+            candidate["qualified_market_types"] = list(candidate.get("eligible_market_types") or [])
+        if category == "esports" and not candidate.get("qualified_market_types"):
+            candidate["qualified_market_types"] = ["main_match"]
+        rows.append(candidate)
+    return rows
+
+
+def apply_favorite_profile_defaults(
+    profiles_by_wallet: dict[str, dict[str, Any]],
+    favorites: dict[str, dict[str, Any]],
+    *,
+    category: str,
+) -> dict[str, dict[str, Any]]:
+    if not favorites:
+        return profiles_by_wallet
+    result = dict(profiles_by_wallet)
+    category = str(category or "esports").lower()
+    scope_fields = (
+        "eligible_market_types",
+        "eligible_market_type_labels",
+        "eligible_buckets",
+        "eligible_bucket_labels",
+        "eligible_game_families",
+        "eligible_game_family_labels",
+        "best_market_type",
+        "best_market_type_label",
+        "best_bucket",
+        "best_bucket_label",
+        "best_game_family",
+        "league",
+        "league_label",
+    )
+    for wallet, favorite in favorites.items():
+        if not isinstance(favorite, dict):
+            continue
+        snapshot = favorite.get("snapshot") if isinstance(favorite.get("snapshot"), dict) else {}
+        profile = dict(result.get(wallet) or snapshot or {})
+        if not profile:
+            profile = {"wallet": wallet, "category": category}
+        profile["wallet"] = wallet
+        profile["category"] = category
+        profile["favorite"] = True
+        profile["favorite_protected"] = True
+        profile["favorited_at"] = favorite.get("favorited_at")
+        for field in scope_fields:
+            if not profile.get(field) and snapshot.get(field):
+                profile[field] = snapshot.get(field)
+        if not profile.get("eligible_market_types") and category == "esports":
+            profile["eligible_market_types"] = ["main_match"]
+        result[wallet] = profile
+    return result
+
+
+def merge_favorites_into_leaderboard(
+    leaderboard: list[dict[str, Any]],
+    profiles_by_wallet: dict[str, dict[str, Any]],
+    favorites: dict[str, dict[str, Any]],
+    *,
+    category: str,
+) -> list[dict[str, Any]]:
+    if not favorites:
+        return leaderboard
+    rows = [dict(row) for row in leaderboard]
+    by_wallet = {normalize_wallet(row.get("wallet")) for row in rows if normalize_wallet(row.get("wallet"))}
+    for wallet in sorted(favorites):
+        if wallet in by_wallet:
+            continue
+        profile = profiles_by_wallet.get(wallet)
+        if not profile:
+            favorite = favorites.get(wallet) or {}
+            profile = favorite.get("snapshot") if isinstance(favorite.get("snapshot"), dict) else {}
+        if not isinstance(profile, dict) or not profile:
+            continue
+        row = dict(profile)
+        row["wallet"] = wallet
+        row["category"] = category
+        row["favorite"] = True
+        row["favorite_protected"] = True
+        rows.append(row)
+        by_wallet.add(wallet)
+    return rows
 
 
 def build_profile_budget_summary(
@@ -5397,6 +5745,15 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         market_type_thresholds=ESPORTS_CANDIDATE_MARKET_TYPE_THRESHOLDS if category == "esports" else None,
         game_family_thresholds=ESPORTS_CANDIDATE_GAME_FAMILY_THRESHOLDS if category == "esports" else None,
     )
+    favorite_rows = load_favorite_wallet_rows_for_category(data_dir, category)
+    favorite_wallets = set(favorite_rows)
+    if favorite_rows:
+        seen_profile_candidates = {normalize_wallet(row.get("wallet")) for row in profile_candidates}
+        profile_candidates.extend(
+            row
+            for row in favorite_profile_candidates(favorite_rows, category=category)
+            if normalize_wallet(row.get("wallet")) not in seen_profile_candidates
+        )
     write_json(data_dir / "candidate_wallets.json", candidates)
     write_json(data_dir / "profile_candidate_wallets.json", profile_candidates)
     mark_stage("candidate_filtering")
@@ -5427,6 +5784,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         now_ts=now_ts,
         ttl_seconds=args.profile_refresh_ttl_days * 86400,
         max_profiles=max_profiles_per_run_effective,
+        force_refresh_wallets=favorite_wallets,
     )
 
     def fetch_raw_user_trades_for_candidate(candidate: dict[str, Any]) -> tuple[str, list[dict]]:
@@ -5439,7 +5797,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
             data_dir=data_dir,
             now_ts=now_ts,
             cache_ttl_days=args.market_trades_cache_ttl_days,
-            force_refresh=args.refresh_market_trades,
+            force_refresh=args.refresh_market_trades or wallet in favorite_wallets,
             use_cache=not args.no_market_trades_cache,
         )
         return wallet, trades
@@ -5559,6 +5917,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
             for wallet, profile in profiles_by_wallet.items()
         }
     profiles_by_wallet = merge_profiles_with_candidates(profiles_by_wallet, profile_candidates)
+    profiles_by_wallet = apply_favorite_profile_defaults(profiles_by_wallet, favorite_rows, category=category)
     if category == "esports":
         refreshed_profiles: dict[str, dict[str, Any]] = {}
         for wallet, profile in profiles_by_wallet.items():
@@ -5573,6 +5932,7 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
                 now_ts=now_ts,
             )
         profiles_by_wallet = refreshed_profiles
+        profiles_by_wallet = apply_favorite_profile_defaults(profiles_by_wallet, favorite_rows, category=category)
     leaderboard = build_leaderboard_from_profiles(
         profiles_by_wallet,
         now_ts=now_ts,
@@ -5583,6 +5943,12 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         max_leaderboard_wallets=args.max_leaderboard_wallets,
         min_pre_match_entry_rate=0.0,
         league_event_counts=league_event_counts if category == "sports" else None,
+    )
+    leaderboard = merge_favorites_into_leaderboard(
+        leaderboard,
+        profiles_by_wallet,
+        favorite_rows,
+        category=category,
     )
     overlap_report = build_wallet_overlap_report(leaderboard)
     diagnostics = build_collection_diagnostics(
@@ -5751,6 +6117,9 @@ def command_follow(
     }
     leaderboard_validated_at = max(leaderboard_mtimes.values() or [0])
     store.clear_revalidated_quarantine(leaderboard_wallets, validated_at=leaderboard_validated_at)
+    store.clear_wallet_quarantine_reasons(LEGACY_TRADE_QUARANTINE_REASONS)
+    favorite_rows = store.load_wallet_favorites()
+    favorite_wallets = set(favorite_rows)
     quarantine_rows = store.load_wallet_quarantine()
     quarantined_wallets = set(quarantine_rows)
     eligible_wallet_rows = eligible_follow_wallets(
@@ -5758,6 +6127,7 @@ def command_follow(
         now_ts=now_ts,
         recency_days=args.follow_recency_days,
         quarantined_wallets=quarantined_wallets,
+        favorite_wallets=favorite_wallets,
         allowed_categories=set(FOLLOW_SIGNAL_CATEGORIES),
     )
 
@@ -5779,6 +6149,8 @@ def command_follow(
     wallet_trade_state = store.load_wallet_trade_state()
     open_signals = store.load_open_signals()
     performance = store.load_performance()
+    account_balance = store.load_account_balance()
+    account_balance_configured = bool(account_balance.get("configured"))
     control = read_follow_control(follow_dir)
     pause_new_signals = control.get("pause_new_signals") if isinstance(control.get("pause_new_signals"), dict) else {}
     paused_new_signal_categories = {
@@ -5886,11 +6258,35 @@ def command_follow(
     trade_request_count = 0
     insufficient_balance_count = 0
     low_entry_price_blocked_count = 0
+    high_entry_price_blocked_count = 0
+    small_add_blocked_count = 0
+    signal_cap_limited_count = 0
+    signal_cap_blocked_count = 0
     wallet_fetch_error_count = 0
     wallet_fetch_seconds: list[float] = []
     observed_delay_values: list[int] = []
     index_lag_lower_bound_values: list[int] = []
+    position_observe_mode = str(getattr(args, "position_observe_mode", "shadow") or "off").lower()
+    position_observe_enabled = position_observe_mode == "shadow"
+    position_observe_limit = to_int(getattr(args, "position_observe_limit", 0))
+    if position_observe_limit <= 0:
+        position_observe_limit = to_int(getattr(args, "positions_limit", 100), 100)
+    position_request_count = 0
+    position_fetch_error_count = 0
+    position_fetch_seconds: list[float] = []
+    position_observed_count = 0
+    position_new_count = 0
+    position_add_count = 0
+    position_small_add_blocked_count = 0
+    position_shadow_events: list[dict[str, Any]] = []
+    position_vs_trade_lead_values: list[float] = []
     bankroll_usdc = effective_bankroll_usdc(args.bankroll_usdc)
+    if account_balance_configured:
+        bankroll_usdc = to_float(account_balance.get("balance_usdc")) + funded_open_exposure(open_signals)
+    max_signal_stake_usdc = to_float(getattr(args, "max_signal_stake_usdc", 0.0))
+    max_signal_stake_balance_percent = to_float(getattr(args, "max_signal_stake_balance_percent", 0.0))
+    if max_signal_stake_usdc <= 0 and max_signal_stake_balance_percent > 0 and math.isfinite(bankroll_usdc):
+        max_signal_stake_usdc = round(bankroll_usdc * max_signal_stake_balance_percent / 100.0, 8)
 
     tracked_condition_ids = {str(condition_id).lower() for condition_id in watched}
     tracked_condition_ids.update(str(signal.get("condition_id") or "").lower() for signal in open_signals)
@@ -5912,6 +6308,8 @@ def command_follow(
                 "fetch_started_at": fetch_started_at,
                 "previous_poll_at": to_int(previous_state.get("last_seen_at")),
             }
+            trades: list[dict] = []
+            positions: list[dict] = []
             try:
                 trades = fetch_user_trades_until_cursor(
                     client,
@@ -5920,17 +6318,28 @@ def command_follow(
                     limit=args.user_trades_limit,
                     max_pages=args.user_trades_max_pages,
                 )
-                positions = []
-                if scope_key in eligible_wallet_set and previous_cursor is None:
-                    positions = client.positions(wallet, limit=args.positions_limit)
-                meta["fetch_completed_at"] = int(datetime.now(timezone.utc).timestamp())
-                meta["fetch_seconds"] = round(time.monotonic() - fetch_started_mono, 3)
-                return scope_key, trades, positions, meta
             except Exception as exc:
                 meta["fetch_completed_at"] = int(datetime.now(timezone.utc).timestamp())
                 meta["fetch_seconds"] = round(time.monotonic() - fetch_started_mono, 3)
                 meta["error"] = exc.__class__.__name__
                 return scope_key, [], [], meta
+            should_fetch_positions = scope_key in eligible_wallet_set and (
+                position_observe_enabled or previous_cursor is None
+            )
+            if should_fetch_positions:
+                position_fetch_started_mono = time.monotonic()
+                meta["position_requested"] = True
+                try:
+                    position_limit = position_observe_limit if position_observe_enabled else args.positions_limit
+                    positions = client.positions(wallet, limit=position_limit)
+                except Exception as exc:
+                    meta["position_error"] = exc.__class__.__name__
+                    positions = []
+                finally:
+                    meta["position_fetch_seconds"] = round(time.monotonic() - position_fetch_started_mono, 3)
+            meta["fetch_completed_at"] = int(datetime.now(timezone.utc).timestamp())
+            meta["fetch_seconds"] = round(time.monotonic() - fetch_started_mono, 3)
+            return scope_key, trades, positions, meta
 
         wallet_fetch_started_mono = time.monotonic()
         trade_results = run_ordered_io_tasks(
@@ -5960,13 +6369,48 @@ def command_follow(
                 wallet_fetch_seconds.append(fetch_seconds_value)
             if isinstance(fetch_meta, dict) and fetch_meta.get("error"):
                 wallet_fetch_error_count += 1
+            if isinstance(fetch_meta, dict) and fetch_meta.get("position_requested"):
+                position_request_count += 1
+                position_seconds_value = to_float(fetch_meta.get("position_fetch_seconds"))
+                if position_seconds_value >= 0:
+                    position_fetch_seconds.append(position_seconds_value)
+                if fetch_meta.get("position_error"):
+                    position_fetch_error_count += 1
             category, wallet = scope_key.split(":", 1)
             wallet_can_open_new = scope_key in eligible_wallet_set and category not in paused_new_signal_categories
-            previous_cursor = (wallet_trade_state.get(scope_key) or wallet_trade_state.get(wallet) or {}).get("last_trade_cursor")
+            previous_wallet_state = wallet_trade_state.get(scope_key) or wallet_trade_state.get(wallet) or {}
+            next_wallet_state = dict(previous_wallet_state)
+            previous_cursor = previous_wallet_state.get("last_trade_cursor")
             observed_at = to_int(fetch_meta.get("fetch_completed_at")) if isinstance(fetch_meta, dict) else now_ts
             if observed_at <= 0:
                 observed_at = now_ts
             previous_poll_at = to_int(fetch_meta.get("previous_poll_at")) if isinstance(fetch_meta, dict) else 0
+            current_tracked_condition_ids = {str(condition_id).lower() for condition_id in watched}
+            current_tracked_condition_ids.update(str(signal.get("condition_id") or "").lower() for signal in open_signals)
+            current_markets_for_follow = {
+                condition_id: market
+                for condition_id, market in active_markets_for_follow.items()
+                if condition_id in current_tracked_condition_ids or condition_id in watched
+            }
+            if wallet_can_open_new:
+                wallet_tracked_condition_ids = current_tracked_condition_ids
+            else:
+                wallet_tracked_condition_ids = open_condition_ids_by_wallet.get(scope_key, set())
+            position_events: list[dict[str, Any]] = []
+            if position_observe_enabled and isinstance(fetch_meta, dict) and fetch_meta.get("position_requested"):
+                position_events, next_position_cursor, _position_cold_start = detect_position_shadow_events(
+                    previous_wallet_state.get("position_cursor_by_key"),
+                    positions,
+                    tracked_condition_ids={str(condition_id).lower() for condition_id in wallet_tracked_condition_ids},
+                    wallet=wallet,
+                    category=category,
+                    seen_at=observed_at,
+                )
+                next_wallet_state["position_cursor_by_key"] = next_position_cursor
+                position_observed_count += len(next_position_cursor)
+                position_new_count += sum(1 for event in position_events if event.get("event_type") == "position_new")
+                position_add_count += sum(1 for event in position_events if event.get("event_type") == "position_add")
+                position_small_add_blocked_count += sum(1 for event in position_events if event.get("follow_block_reason") == "small_add")
             new_trades, next_cursor, cold_start = select_new_trades(trades, previous_cursor)
             if cold_start:
                 cold_start_wallet_count += 1
@@ -5980,6 +6424,7 @@ def command_follow(
                         now_ts=now_ts,
                         max_slippage=args.max_slippage_over_entry,
                         min_wallet_entry_price=args.min_wallet_entry_price,
+                        max_entry_price=args.max_entry_price,
                         eligible_market_types=eligible_market_types_by_wallet.get(scope_key),
                         eligible_buckets=eligible_buckets_by_wallet.get(scope_key),
                         eligible_category=category,
@@ -5991,7 +6436,7 @@ def command_follow(
                         open_signals,
                         wallet=wallet,
                         trades=bootstrap_trades,
-                        markets_by_condition=markets_for_follow or watched,
+                        markets_by_condition=current_markets_for_follow or watched,
                         now_ts=now_ts,
                         observed_at=observed_at,
                         previous_poll_at=previous_poll_at,
@@ -5999,6 +6444,7 @@ def command_follow(
                         max_follow_legs=args.max_follow_legs,
                         max_slippage=args.max_slippage_over_entry,
                         min_wallet_entry_price=args.min_wallet_entry_price,
+                        max_entry_price=args.max_entry_price,
                         stake_ratio_percent=args.stake_ratio_percent,
                         require_pre_match=args.require_pre_match,
                         post_start_grace_seconds=args.post_start_trade_grace_seconds,
@@ -6009,46 +6455,76 @@ def command_follow(
                         eligible_leagues=eligible_leagues_by_wallet.get(scope_key),
                         conflict_policy="dual_follow",
                         bankroll_usdc=bankroll_usdc,
+                        max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
+                        max_signal_stake_usdc=max_signal_stake_usdc,
                     )
                     after_ids = {signal.get("signal_id") for signal in open_signals}
                     new_signal_count += len(after_ids - before_ids)
                     bootstrap_position_count += len(bootstrap_trades)
                     for event in stats.get("quarantine_events") or []:
+                        event_category = str(event.get("category") or category).lower()
+                        event_wallet = normalize_wallet(event.get("wallet"))
+                        if f"{event_category}:{event_wallet}" in favorite_wallets or event_wallet in favorite_wallets:
+                            continue
                         store.upsert_wallet_quarantine(event.get("wallet"), reason=str(event.get("reason") or ""), ts=int(event.get("timestamp") or now_ts), category=str(event.get("category") or category))
                         quarantine_event_count += 1
                     market_type_not_eligible_count += stats.get("market_type_not_eligible_count", 0)
                     ignored_trade_count += stats.get("ignored_trade_count", 0)
                     insufficient_balance_count += stats.get("insufficient_balance_count", 0)
                     low_entry_price_blocked_count += stats.get("low_entry_price_blocked_count", 0)
+                    high_entry_price_blocked_count += stats.get("high_entry_price_blocked_count", 0)
+                    small_add_blocked_count += stats.get("small_add_blocked_count", 0)
+                    signal_cap_limited_count += stats.get("signal_cap_limited_count", 0)
+                    signal_cap_blocked_count += stats.get("signal_cap_blocked_count", 0)
                     exited_signal_count += stats.get("exited_signal_count", 0)
                     hedge_event_count += stats.get("hedge_event_count", 0)
                     opposite_blocked_count += stats.get("opposite_blocked_count", 0)
-                wallet_trade_state[scope_key] = {
+                if position_observe_enabled and position_events:
+                    annotated_position_events, latency_events, lead_values, position_seen_by_key, trade_seen_by_key = match_position_trade_latency(
+                        position_events,
+                        [],
+                        wallet=wallet,
+                        category=category,
+                        trade_seen_at=observed_at,
+                        position_seen_by_key=previous_wallet_state.get("position_seen_by_key") or {},
+                        trade_seen_by_key=previous_wallet_state.get("trade_seen_by_position_key") or {},
+                    )
+                    position_shadow_events.extend(annotated_position_events)
+                    position_shadow_events.extend(latency_events)
+                    position_vs_trade_lead_values.extend(lead_values)
+                    next_wallet_state["position_seen_by_key"] = position_seen_by_key
+                    next_wallet_state["trade_seen_by_position_key"] = trade_seen_by_key
+                next_wallet_state.update({
                     "last_trade_cursor": next_cursor,
                     "last_seen_at": now_ts,
                     "wallet": wallet,
                     "category": category,
-                }
+                })
+                wallet_trade_state[scope_key] = next_wallet_state
                 continue
-            tracked_condition_ids = {str(condition_id).lower() for condition_id in watched}
-            tracked_condition_ids.update(str(signal.get("condition_id") or "").lower() for signal in open_signals)
-            markets_for_follow = {
-                condition_id: market
-                for condition_id, market in active_markets_for_follow.items()
-                if condition_id in tracked_condition_ids or condition_id in watched
-            }
-            if wallet_can_open_new:
-                wallet_tracked_condition_ids = tracked_condition_ids
-            else:
-                wallet_tracked_condition_ids = open_condition_ids_by_wallet.get(scope_key, set())
             watched_trades = [trade for trade in new_trades if trade_condition_id(trade) in wallet_tracked_condition_ids]
+            if position_observe_enabled and (position_events or watched_trades):
+                annotated_position_events, latency_events, lead_values, position_seen_by_key, trade_seen_by_key = match_position_trade_latency(
+                    position_events,
+                    watched_trades,
+                    wallet=wallet,
+                    category=category,
+                    trade_seen_at=observed_at,
+                    position_seen_by_key=previous_wallet_state.get("position_seen_by_key") or {},
+                    trade_seen_by_key=previous_wallet_state.get("trade_seen_by_position_key") or {},
+                )
+                position_shadow_events.extend(annotated_position_events)
+                position_shadow_events.extend(latency_events)
+                position_vs_trade_lead_values.extend(lead_values)
+                next_wallet_state["position_seen_by_key"] = position_seen_by_key
+                next_wallet_state["trade_seen_by_position_key"] = trade_seen_by_key
             record_observed_delay(watched_trades, observed_at=observed_at, previous_poll_at=previous_poll_at)
             before_ids = {signal.get("signal_id") for signal in open_signals}
             open_signals, stats = process_follow_trades(
                 open_signals,
                 wallet=wallet,
                 trades=watched_trades,
-                markets_by_condition=markets_for_follow or watched,
+                markets_by_condition=current_markets_for_follow or watched,
                 now_ts=now_ts,
                 observed_at=observed_at,
                 previous_poll_at=previous_poll_at,
@@ -6056,6 +6532,7 @@ def command_follow(
                 max_follow_legs=args.max_follow_legs,
                 max_slippage=args.max_slippage_over_entry,
                 min_wallet_entry_price=args.min_wallet_entry_price,
+                max_entry_price=args.max_entry_price,
                 stake_ratio_percent=args.stake_ratio_percent,
                 require_pre_match=args.require_pre_match,
                 post_start_grace_seconds=args.post_start_trade_grace_seconds,
@@ -6066,6 +6543,8 @@ def command_follow(
                 eligible_leagues=eligible_leagues_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 conflict_policy="dual_follow",
                 bankroll_usdc=bankroll_usdc,
+                max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
+                max_signal_stake_usdc=max_signal_stake_usdc,
             )
             after_ids = {signal.get("signal_id") for signal in open_signals}
             new_signal_count += len(after_ids - before_ids)
@@ -6075,18 +6554,27 @@ def command_follow(
             insufficient_balance_count += stats.get("insufficient_balance_count", 0)
             market_type_not_eligible_count += stats.get("market_type_not_eligible_count", 0)
             low_entry_price_blocked_count += stats.get("low_entry_price_blocked_count", 0)
+            high_entry_price_blocked_count += stats.get("high_entry_price_blocked_count", 0)
+            small_add_blocked_count += stats.get("small_add_blocked_count", 0)
+            signal_cap_limited_count += stats.get("signal_cap_limited_count", 0)
+            signal_cap_blocked_count += stats.get("signal_cap_blocked_count", 0)
             exited_signal_count += stats.get("exited_signal_count", 0)
             hedge_event_count += stats.get("hedge_event_count", 0)
             opposite_blocked_count += stats.get("opposite_blocked_count", 0)
             for event in stats.get("quarantine_events") or []:
+                event_category = str(event.get("category") or category).lower()
+                event_wallet = normalize_wallet(event.get("wallet"))
+                if f"{event_category}:{event_wallet}" in favorite_wallets or event_wallet in favorite_wallets:
+                    continue
                 store.upsert_wallet_quarantine(event.get("wallet"), reason=str(event.get("reason") or ""), ts=int(event.get("timestamp") or now_ts), category=str(event.get("category") or category))
                 quarantine_event_count += 1
-            wallet_trade_state[scope_key] = {
+            next_wallet_state.update({
                 "last_trade_cursor": next_cursor,
                 "last_seen_at": now_ts,
                 "wallet": wallet,
                 "category": category,
-            }
+            })
+            wallet_trade_state[scope_key] = next_wallet_state
         stage_seconds["wallet_trade_process"] = round(time.monotonic() - wallet_process_started_mono, 3)
     else:
         stage_seconds["wallet_trade_fetch"] = 0.0
@@ -6123,15 +6611,54 @@ def command_follow(
     for event in observed_performance_quarantine_events(performance, now_ts=now_ts):
         category = str(event.get("category") or "esports").lower()
         key = f"{category}:{event['wallet']}"
+        if key in favorite_wallets or event["wallet"] in favorite_wallets:
+            continue
         if key in existing_quarantine:
             continue
         store.upsert_wallet_quarantine(event["wallet"], reason=event["reason"], ts=int(event["timestamp"]), category=category)
         existing_quarantine.add(key)
         quarantine_event_count += 1
+    historical_results = store.load_results()
+    for event in recent_chop_loss_quarantine_events([*historical_results, *result_events], now_ts=now_ts):
+        category = str(event.get("category") or "esports").lower()
+        wallet = normalize_wallet(event.get("wallet"))
+        key = f"{category}:{wallet}"
+        if key in favorite_wallets or wallet in favorite_wallets:
+            continue
+        if key in existing_quarantine:
+            continue
+        store.upsert_wallet_quarantine(
+            wallet,
+            reason=str(event.get("reason") or ""),
+            ts=int(event.get("timestamp") or now_ts),
+            category=category,
+            details=event.get("details") if isinstance(event.get("details"), dict) else None,
+        )
+        existing_quarantine.add(key)
+        quarantine_event_count += 1
     stage_seconds["settlement_and_quarantine"] = round(time.monotonic() - settlement_started_mono, 3)
+    balance_ledger_result = {"configured": account_balance_configured, "applied_count": 0, "applied_amount_usdc": 0.0}
+    if account_balance_configured:
+        balance_ledger_entries = [
+            *account_buy_ledger_entries([*open_signals, *result_events], created_at=now_ts),
+            *account_result_ledger_entries(result_events, created_at=now_ts),
+        ]
+        balance_ledger_result = store.apply_account_ledger(balance_ledger_entries)
+        account_balance = store.load_account_balance()
 
     def summarize_seconds(values: list[int] | list[float]) -> dict[str, Any]:
         clean = sorted(float(value) for value in values if value is not None and float(value) >= 0)
+        if not clean:
+            return {"count": 0}
+        return {
+            "count": len(clean),
+            "p50": round(clean[int((len(clean) - 1) * 0.50)], 3),
+            "p90": round(clean[int((len(clean) - 1) * 0.90)], 3),
+            "max": round(clean[-1], 3),
+        }
+
+    def summarize_signed_seconds(values: list[int] | list[float]) -> dict[str, Any]:
+        clean = sorted(float(value) for value in values if value is not None)
         if not clean:
             return {"count": 0}
         return {
@@ -6154,6 +6681,16 @@ def command_follow(
         "wallet_trade_fetch_seconds": summarize_seconds(wallet_fetch_seconds),
         "observed_trade_delay_seconds": summarize_seconds(observed_delay_values),
         "index_lag_lower_bound_seconds": summarize_seconds(index_lag_lower_bound_values),
+        "position_observe_mode": position_observe_mode,
+        "position_request_count": position_request_count,
+        "position_fetch_error_count": position_fetch_error_count,
+        "position_fetch_seconds": summarize_seconds(position_fetch_seconds),
+        "position_observed_count": position_observed_count,
+        "position_new_count": position_new_count,
+        "position_add_count": position_add_count,
+        "position_small_add_blocked_count": position_small_add_blocked_count,
+        "position_vs_trade_lead_seconds": summarize_signed_seconds(position_vs_trade_lead_values),
+        "position_shadow_events": position_shadow_events[-100:],
         "bootstrap_position_request_count": bootstrap_position_request_count,
         "cold_start_wallet_count": cold_start_wallet_count,
         "bootstrap_position_count": bootstrap_position_count,
@@ -6164,6 +6701,12 @@ def command_follow(
         "insufficient_balance_count": insufficient_balance_count,
         "market_type_not_eligible_count": market_type_not_eligible_count,
         "low_entry_price_blocked_count": low_entry_price_blocked_count,
+        "high_entry_price_blocked_count": high_entry_price_blocked_count,
+        "small_add_blocked_count": small_add_blocked_count,
+        "signal_cap_limited_count": signal_cap_limited_count,
+        "signal_cap_blocked_count": signal_cap_blocked_count,
+        "max_signal_stake_usdc": max_signal_stake_usdc,
+        "max_signal_stake_balance_percent": max_signal_stake_balance_percent,
         "opposite_blocked_count": opposite_blocked_count,
         "new_signal_count": new_signal_count,
         "exited_signal_count": exited_signal_count,
@@ -6171,6 +6714,10 @@ def command_follow(
         "quarantine_event_count": quarantine_event_count,
         "contested_signal_count": contested_signal_count,
         "closing_line_snapshot_count": closing_line_snapshot_count,
+        "account_balance_configured": account_balance_configured,
+        "account_balance_usdc": account_balance.get("balance_usdc") if account_balance_configured else None,
+        "balance_ledger_applied_count": balance_ledger_result.get("applied_count", 0),
+        "balance_ledger_applied_amount_usdc": balance_ledger_result.get("applied_amount_usdc", 0.0),
         "open_signal_count": len(open_signals),
         "settled_signal_count": len(settled),
         "desired_next_interval_seconds": next_interval,
@@ -6461,13 +7008,17 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--follow-dir")
         subparser.add_argument("--stake-usdc", type=float, required=True, help="minimum paper stake per followed BUY leg")
         subparser.add_argument("--stake-ratio-percent", type=float, default=10.0, help="target-wallet cash replication ratio per BUY leg")
+        subparser.add_argument("--max-stake-usdc", type=float, default=0.0, help="optional maximum paper stake per followed BUY leg; 0 disables the cap")
+        subparser.add_argument("--max-signal-stake-usdc", type=float, default=0.0, help="optional maximum funded stake per wallet/market/outcome signal; 0 disables the cap")
+        subparser.add_argument("--max-signal-stake-balance-percent", type=float, default=0.0, help="optional maximum funded stake per signal as a percent of current paper balance; 0 disables the cap")
         subparser.add_argument("--bankroll-usdc", type=float, default=0.0, help="optional paper bankroll cap for total open exposure; 0 disables the cap")
         subparser.add_argument("--follow-recency-days", type=int, default=30)
         subparser.add_argument("--observe-window-hours", type=float, default=24)
         subparser.add_argument("--event-cache-ttl-minutes", type=int, default=10)
         subparser.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
         subparser.add_argument("--resolution-gamma-pages", type=int, default=2)
-        subparser.add_argument("--max-slippage-over-entry", type=float, default=0.05)
+        subparser.add_argument("--max-slippage-over-entry", type=float, default=0.10)
+        subparser.add_argument("--max-entry-price", type=float, default=0.85)
         subparser.add_argument("--min-wallet-entry-price", type=float, default=0.4)
         subparser.add_argument("--post-start-trade-grace-seconds", type=int, default=900)
         subparser.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=False)
@@ -6475,6 +7026,8 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--run-log-retention-days", type=int, default=7)
         subparser.add_argument("--gamma-pages", type=int, default=3)
         subparser.add_argument("--positions-limit", type=int, default=100)
+        subparser.add_argument("--position-observe-mode", choices=["off", "shadow"], default="shadow")
+        subparser.add_argument("--position-observe-limit", type=int, default=0)
         subparser.add_argument("--user-trades-limit", type=int, default=50)
         subparser.add_argument("--user-trades-max-pages", type=int, default=1)
         subparser.add_argument("--max-follow-legs", type=int, default=10)
@@ -6482,7 +7035,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--max-tick-seconds", type=int, default=900)
         # Fixed polling cadence (seconds). >0 overrides the adaptive min/max curve so every
         # wallet is checked on one steady interval; 0 restores the start-time-aware backoff.
-        subparser.add_argument("--tick-seconds", type=int, default=120)
+        subparser.add_argument("--tick-seconds", type=int, default=60)
         subparser.add_argument("--quarantine-sell-frac", type=float, default=0.2)
         subparser.add_argument("--max-workers", type=int, default=8)
         subparser.add_argument("--max-requests-per-second", type=float, default=10)
@@ -6549,26 +7102,32 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--follow-dir")
     run.add_argument("--stake-usdc", type=float, required=True, help="minimum paper stake per followed BUY leg")
     run.add_argument("--stake-ratio-percent", type=float, default=10.0, help="target-wallet cash replication ratio per BUY leg")
+    run.add_argument("--max-stake-usdc", type=float, default=0.0, help="optional maximum paper stake per followed BUY leg; 0 disables the cap")
+    run.add_argument("--max-signal-stake-usdc", type=float, default=0.0, help="optional maximum funded stake per wallet/market/outcome signal; 0 disables the cap")
+    run.add_argument("--max-signal-stake-balance-percent", type=float, default=0.0, help="optional maximum funded stake per signal as a percent of current paper balance; 0 disables the cap")
     run.add_argument("--bankroll-usdc", type=float, default=0.0, help="optional paper bankroll cap for total open exposure; 0 disables the cap")
     run.add_argument("--follow-recency-days", type=int, default=30)
     run.add_argument("--observe-window-hours", type=float, default=24)
     run.add_argument("--event-cache-ttl-minutes", type=int, default=10)
     run.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
     run.add_argument("--resolution-gamma-pages", type=int, default=2)
-    run.add_argument("--max-slippage-over-entry", type=float, default=0.05)
+    run.add_argument("--max-slippage-over-entry", type=float, default=0.10)
+    run.add_argument("--max-entry-price", type=float, default=0.85)
     run.add_argument("--min-wallet-entry-price", type=float, default=0.4)
     run.add_argument("--post-start-trade-grace-seconds", type=int, default=900)
     run.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=False)
     run.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
     run.add_argument("--run-log-retention-days", type=int, default=7)
     run.add_argument("--positions-limit", type=int, default=100)
+    run.add_argument("--position-observe-mode", choices=["off", "shadow"], default="shadow")
+    run.add_argument("--position-observe-limit", type=int, default=0)
     run.add_argument("--user-trades-limit", type=int, default=50)
     run.add_argument("--user-trades-max-pages", type=int, default=1)
     run.add_argument("--max-follow-legs", type=int, default=10)
     run.add_argument("--min-tick-seconds", type=int, default=180)
     run.add_argument("--max-tick-seconds", type=int, default=900)
     # Fixed polling cadence (seconds). >0 overrides the adaptive min/max curve; 0 = adaptive.
-    run.add_argument("--tick-seconds", type=int, default=120)
+    run.add_argument("--tick-seconds", type=int, default=60)
     run.add_argument("--quarantine-sell-frac", type=float, default=0.2)
     run.add_argument("--error-retry-seconds", type=int, default=180)
     run.add_argument("--max-consecutive-error-seconds", type=int, default=600)

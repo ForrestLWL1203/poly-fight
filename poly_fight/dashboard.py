@@ -58,6 +58,8 @@ class DashboardConfig:
     wallet_refresh_timeout_seconds: int = 7200
     runner_stake_usdc: float = 1.0
     runner_stake_ratio_percent: float = 10.0
+    runner_max_stake_usdc: float = 0.0
+    runner_max_signal_stake_balance_percent: float = 0.0
     stream_poll_seconds: float = 2.0
     stream_heartbeat_seconds: float = 15.0
     max_stream_clients: int = 8
@@ -71,6 +73,19 @@ def short_addr(addr: str | None) -> str:
     if len(text) <= 11:
         return text
     return f"{text[:5]}...{text[-3:]}"
+
+
+def _request_bool(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return default
 
 
 def _b64(data: bytes) -> str:
@@ -132,6 +147,8 @@ def create_server(config: DashboardConfig) -> ThreadingHTTPServer:
         wallet_refresh_timeout_seconds=config.wallet_refresh_timeout_seconds,
         runner_stake_usdc=config.runner_stake_usdc,
         runner_stake_ratio_percent=config.runner_stake_ratio_percent,
+        runner_max_stake_usdc=config.runner_max_stake_usdc,
+        runner_max_signal_stake_balance_percent=config.runner_max_signal_stake_balance_percent,
         stream_poll_seconds=config.stream_poll_seconds,
         stream_heartbeat_seconds=config.stream_heartbeat_seconds,
         max_stream_clients=config.max_stream_clients,
@@ -189,6 +206,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/wallet-refresh":
                 self._wallet_refresh()
+                return
+            if parsed.path == "/api/wallet-favorites":
+                self._wallet_favorite()
+                return
+            if parsed.path == "/api/wallet-quarantine":
+                self._wallet_quarantine()
+                return
+            if parsed.path == "/api/account-balance":
+                self._account_balance()
                 return
             if parsed.path == "/api/runner/start":
                 self._runner_start()
@@ -326,6 +352,92 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         self._json({"ok": True, "data": status, "generated_at": int(time.time())}, status=HTTPStatus.ACCEPTED)
 
+    def _wallet_favorite(self) -> None:
+        form = self._read_request_form()
+        wallet = str(form.get("wallet") or "").lower()
+        category = normalize_category(str(form.get("category") or "esports"))
+        favorite = _request_bool(form.get("favorite"), default=False)
+        if not ADDRESS_RE.match(wallet):
+            self._error("invalid_wallet", status=HTTPStatus.BAD_REQUEST)
+            return
+        if not category:
+            self._error("invalid_category", status=HTTPStatus.BAD_REQUEST)
+            return
+        follow_dir = _follow_dir(self.dashboard_config)
+        store = FollowStore(_follow_db_path(self.dashboard_config))
+        snapshot = None
+        if favorite:
+            quarantine = store.load_wallet_quarantine(category=category)
+            if wallet in quarantine or f"{category}:{wallet}" in quarantine:
+                self._error("wallet_quarantined", status=HTTPStatus.CONFLICT)
+                return
+            wallet_payload = build_wallets(self.dashboard_config.data_dir, follow_dir=follow_dir)
+            snapshot = next(
+                (
+                    compact_wallet_favorite_snapshot(row)
+                    for row in wallet_payload.get("wallets", [])
+                    if str(row.get("wallet") or "").lower() == wallet
+                    and normalize_category(str(row.get("category") or "esports")) == category
+                ),
+                None,
+            )
+            if snapshot is None:
+                self._error("wallet_not_found", status=HTTPStatus.NOT_FOUND)
+                return
+        ts = int(time.time())
+        store.upsert_wallet_favorite(wallet, category=category, favorite=favorite, ts=ts, snapshot=snapshot)
+        self._ok(
+            {
+                "wallet": wallet,
+                "category": category,
+                "favorite": favorite,
+                "favorited_at": ts if favorite else None,
+            }
+        )
+
+    def _wallet_quarantine(self) -> None:
+        form = self._read_request_form()
+        wallet = str(form.get("wallet") or "").lower()
+        category = normalize_category(str(form.get("category") or "esports"))
+        quarantined = _request_bool(form.get("quarantined"), default=True)
+        if not ADDRESS_RE.match(wallet):
+            self._error("invalid_wallet", status=HTTPStatus.BAD_REQUEST)
+            return
+        if not category:
+            self._error("invalid_category", status=HTTPStatus.BAD_REQUEST)
+            return
+        ts = int(time.time())
+        store = FollowStore(_follow_db_path(self.dashboard_config))
+        if quarantined is False:
+            store.clear_wallet_quarantine_wallets({f"{category}:{wallet}"})
+            self._ok(
+                {
+                    "wallet": wallet,
+                    "category": category,
+                    "quarantined": False,
+                    "unquarantined_at": ts,
+                }
+            )
+            return
+        reason = "manual_dashboard_quarantine"
+        store.upsert_wallet_quarantine(
+            wallet,
+            reason=reason,
+            ts=ts,
+            category=category,
+            details={"source": "dashboard"},
+        )
+        store.upsert_wallet_favorite(wallet, category=category, favorite=False, ts=ts)
+        self._ok(
+            {
+                "wallet": wallet,
+                "category": category,
+                "quarantined": True,
+                "reason": reason,
+                "quarantined_at": ts,
+            }
+        )
+
     def _runner_start(self) -> None:
         current = build_runner_status(self.dashboard_config)
         if current.get("status") == "running":
@@ -336,12 +448,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not math.isfinite(stake_ratio_percent) or stake_ratio_percent <= 0:
             self._error("invalid_stake_ratio_percent", status=HTTPStatus.BAD_REQUEST)
             return
+        max_stake_usdc = to_float(form.get("max_stake_usdc") or form.get("max_stake") or 0)
+        if not math.isfinite(max_stake_usdc) or max_stake_usdc < 0:
+            self._error("invalid_max_stake_usdc", status=HTTPStatus.BAD_REQUEST)
+            return
+        max_signal_stake_balance_percent = to_float(
+            form.get("max_signal_stake_balance_percent") or form.get("max_signal_stake_percent") or 0
+        )
+        if not math.isfinite(max_signal_stake_balance_percent) or max_signal_stake_balance_percent < 0:
+            self._error("invalid_max_signal_stake_balance_percent", status=HTTPStatus.BAD_REQUEST)
+            return
         try:
-            status = start_runner(self.dashboard_config, stake_ratio_percent=stake_ratio_percent)
+            status = start_runner(
+                self.dashboard_config,
+                stake_ratio_percent=stake_ratio_percent,
+                max_stake_usdc=max_stake_usdc,
+                max_signal_stake_balance_percent=max_signal_stake_balance_percent,
+            )
         except RunnerAlreadyRunning as exc:
             self._json({"ok": False, "error": "runner_already_running", "data": exc.status}, status=HTTPStatus.CONFLICT)
             return
         self._json({"ok": True, "data": status, "generated_at": int(time.time())}, status=HTTPStatus.ACCEPTED)
+
+    def _account_balance(self) -> None:
+        current = build_runner_status(self.dashboard_config)
+        if current.get("status") in {"running", "stopping"}:
+            self._json({"ok": False, "error": "account_balance_locked", "data": current}, status=HTTPStatus.CONFLICT)
+            return
+        form = self._read_request_form()
+        balance = to_float(form.get("balance_usdc") or form.get("balance"))
+        if not math.isfinite(balance) or balance < 0:
+            self._error("invalid_balance_usdc", status=HTTPStatus.BAD_REQUEST)
+            return
+        store = FollowStore(_follow_db_path(self.dashboard_config))
+        state = store.set_account_balance(balance, ts=int(time.time()), source="manual")
+        self._ok(state)
 
     def _runner_stop(self) -> None:
         status = stop_runner(self.dashboard_config)
@@ -667,7 +808,9 @@ def build_stream_header(config: DashboardConfig, *, started_at: float) -> dict[s
 
 
 def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str, Any]:
-    snapshot = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).load_dashboard_snapshot()
+    store = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir))
+    snapshot = store.load_dashboard_snapshot()
+    account_balance = store.load_account_balance_readonly()
     open_signals = snapshot.get("open_signals", [])
     results = snapshot.get("results", [])
     all_signals = [*open_signals, *results]
@@ -676,12 +819,13 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
     wins = [row for row in settled if _result_win(row)]
     legs = [leg for signal in all_signals for leg in signal.get("legs") or []]
     result_legs = [leg for signal in results for leg in signal.get("legs") or []]
-    total_stake = sum(_to_float(leg.get("stake")) for leg in legs)
-    resolved_stake = sum(_to_float(leg.get("stake")) for leg in result_legs)
+    total_stake = sum(_leg_actual_stake(leg) for leg in legs)
+    resolved_stake = sum(_leg_actual_stake(leg) for leg in result_legs)
     would_follow = [leg for leg in legs if leg.get("would_follow", True)]
     quality = _signal_quality_summary(all_signals)
     clv_values = [_to_float(signal.get("wallet_clv")) for signal in all_signals if signal.get("wallet_clv") is not None]
     our_pnl = sum(_signal_our_pnl(row) for row in results)
+    hypothetical_pnl = sum(_signal_hypothetical_pnl(row) for row in results)
     wallet_basis_pnl = sum(_signal_wallet_pnl(row) for row in results)
     behavior = _behavior_counts(all_signals)
     tracking_started_at = _tracking_started_at(all_signals)
@@ -694,6 +838,7 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
         "exited_count": len(exited),
         "win_rate": (len(wins) / len(settled)) if settled else None,
         "our_realized_pnl": our_pnl,
+        "hypothetical_pnl": hypothetical_pnl,
         "wallet_basis_realized_pnl": wallet_basis_pnl,
         "total_stake": total_stake,
         "resolved_stake": resolved_stake,
@@ -703,7 +848,8 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
         "would_follow_capture_rate": (len(would_follow) / len(legs)) if legs else None,
         **quality,
         "avg_wallet_clv": (sum(clv_values) / len(clv_values)) if clv_values else None,
-        "open_exposure": sum(sum(_to_float(leg.get("stake")) for leg in signal.get("legs") or []) for signal in open_signals),
+        "open_exposure": sum(sum(_leg_actual_stake(leg) for leg in signal.get("legs") or []) for signal in open_signals),
+        "account_balance": account_balance,
         "behavior_counts": behavior,
         "performance": snapshot.get("performance") or {},
         "tracking_started_at": tracking_started_at or None,
@@ -960,6 +1106,70 @@ def _signal_wallet_trade_at(signal: dict[str, Any]) -> int:
     return max([value for value in [direct, *values] if value] or [0])
 
 
+FAVORITE_SNAPSHOT_FIELDS = (
+    "wallet",
+    "category",
+    "league",
+    "league_label",
+    "grade",
+    "last_esports_trade_at",
+    "best_market_type",
+    "best_market_type_label",
+    "best_bucket",
+    "best_bucket_label",
+    "best_game_family",
+    "best_bucket_score",
+    "overall_esports_roi",
+    "overall_wilson_win_rate_lower_bound",
+    "overall_positive_market_rate",
+    "wilson_win_rate_lower_bound",
+    "entry_edge",
+    "capital_weighted_edge",
+    "esports_roi",
+    "median_market_roi",
+    "median_entry_price",
+    "avg_market_cash",
+    "participated_market_count",
+    "total_cash_volume",
+    "recent_bucket_market_count",
+    "recent_bucket_window_days",
+    "recent_bucket_roi",
+    "recent_bucket_positive_rate",
+    "recent_bucket_pnl",
+    "recent_7d_market_count",
+    "recent_7d_roi",
+    "recent_7d_positive_rate",
+    "recent_14d_market_count",
+    "recent_14d_roi",
+    "recent_14d_positive_rate",
+    "scoring_version",
+    "esports_win_count",
+    "esports_loss_count",
+    "esports_closed_count",
+    "positive_market_rate",
+    "eligible_market_types",
+    "eligible_market_type_labels",
+    "eligible_buckets",
+    "eligible_bucket_labels",
+    "eligible_game_families",
+    "eligible_game_family_labels",
+    "observed_market_types",
+    "observed_market_type_labels",
+    "observed_buckets",
+    "observed_bucket_labels",
+    "participation_rate",
+    "participated_events",
+    "eligible_event_count",
+)
+
+
+def compact_wallet_favorite_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    snapshot = {field: row.get(field) for field in FAVORITE_SNAPSHOT_FIELDS if field in row}
+    snapshot["wallet"] = str(row.get("wallet") or "").lower()
+    snapshot["category"] = normalize_category(str(row.get("category") or "esports")) or "esports"
+    return snapshot
+
+
 def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str, Any]:
     leaderboard_sources = _category_leaderboards(data_dir)
     leaderboard = [row for _category, _dir, rows, _mtime in leaderboard_sources for row in rows]
@@ -967,12 +1177,38 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
     perf_snapshot = store.load_dashboard_performance()
     follow_snapshot = store.load_dashboard_snapshot()
     quarantine_snapshot = store.load_dashboard_wallet_quarantine()
+    favorite_snapshot = store.load_dashboard_wallet_favorites()
     performance = (perf_snapshot.get("performance") or {}).get("wallets") or {}
     quarantine = quarantine_snapshot.get("wallet_quarantine") or {}
+    favorites = favorite_snapshot.get("wallet_favorites") or {}
+    leaderboard_keys = {
+        f"{normalize_category(str(row.get('category') or 'esports')) or 'esports'}:{str(row.get('wallet') or '').lower()}"
+        for row in leaderboard
+        if isinstance(row, dict) and row.get("wallet")
+    }
+    for key, favorite in (favorites or {}).items():
+        if not isinstance(favorite, dict):
+            continue
+        wallet = str(favorite.get("wallet") or str(key).split(":", 1)[-1]).lower()
+        category = normalize_category(str(favorite.get("category") or str(key).split(":", 1)[0] or "esports")) or "esports"
+        favorite_key = f"{category}:{wallet}"
+        if not wallet or favorite_key in leaderboard_keys:
+            continue
+        snapshot = favorite.get("snapshot") if isinstance(favorite.get("snapshot"), dict) else {}
+        if not snapshot:
+            continue
+        row = dict(snapshot)
+        row["wallet"] = wallet
+        row["category"] = category
+        row["favorite_snapshot_only"] = True
+        leaderboard.append(row)
+        leaderboard_keys.add(favorite_key)
     open_by_wallet: dict[str, list[dict[str, Any]]] = {}
     observed_trade_at_by_wallet: dict[str, int] = {}
     open_signals = follow_snapshot.get("open_signals", [])
-    all_follow_signals = [*open_signals, *follow_snapshot.get("results", [])]
+    result_signals = follow_snapshot.get("results", [])
+    all_follow_signals = [*open_signals, *result_signals]
+    result_observed_by_wallet = observed_performance_from_results(result_signals)
     for signal in open_signals:
         wallet = str(signal.get("wallet") or "").lower()
         open_by_wallet.setdefault(wallet, []).append(signal)
@@ -988,14 +1224,23 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
         # (e.g. game_winner) while its blended overall record looks weak. Display the
         # eligible bucket's own stats so the shown numbers match the grade + type label.
         metrics = _eligible_display_metrics(row)
-        if "positive_market_rate" in metrics and to_float(metrics.get("positive_market_rate")) < MIN_A_POSITIVE_MARKET_RATE:
-            continue
         wallet = str(row.get("wallet") or "").lower()
         category = normalize_category(str(row.get("category") or "")) or "esports"
+        favorite_key = f"{category}:{wallet}"
+        favorite_row = favorites.get(favorite_key) or favorites.get(wallet)
+        quarantine_key = f"{category}:{wallet}"
+        is_quarantined = quarantine_key in quarantine or wallet in quarantine
+        is_favorite = bool(favorite_row) and not is_quarantined
+        if (
+            "positive_market_rate" in metrics
+            and to_float(metrics.get("positive_market_rate")) < MIN_A_POSITIVE_MARKET_RATE
+            and not is_favorite
+        ):
+            continue
         league = normalize_league(row.get("league"))
         row_league_label = str(row.get("league_label") or league_label(league)).strip()
-        quarantine_key = f"{category}:{wallet}"
-        observed = wallet_observed_performance(performance.get(wallet, {}), open_count=len(open_by_wallet.get(wallet, [])))
+        observed_source = result_observed_by_wallet.get(wallet) or performance.get(wallet, {})
+        observed = wallet_observed_performance(observed_source, open_count=len(open_by_wallet.get(wallet, [])))
         observed_market_types = _observed_market_types(row)
         observed_buckets = _observed_buckets(row)
         last_trade_at = max(_parse_timestamp(row.get("last_esports_trade_at")), observed_trade_at_by_wallet.get(wallet, 0))
@@ -1063,7 +1308,10 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
                 "participation_rate": row.get("participation_rate"),
                 "participated_events": row.get("participated_events"),
                 "eligible_event_count": row.get("eligible_event_count"),
-                "quarantined": quarantine_key in quarantine or wallet in quarantine,
+                "favorite": is_favorite,
+                "favorited_at": (favorite_row or {}).get("favorited_at") if isinstance(favorite_row, dict) else None,
+                "favorite_snapshot_only": bool(row.get("favorite_snapshot_only")),
+                "quarantined": is_quarantined,
                 "quarantine": quarantine.get(quarantine_key) or quarantine.get(wallet),
                 "observed": observed,
             }
@@ -1078,28 +1326,35 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
         category: [row for row in rows if row.get("category") == category]
         for category in CATEGORIES
     }
+    source_mtimes = {category: mtime for category, _source_dir, _rows, mtime in leaderboard_sources if category in CATEGORIES}
     return {
         "wallets": rows,
         "count": len(rows),
-        "quarantined_count": sum(1 for row in rows if row.get("quarantined")),
+        "active_count": sum(1 for row in rows if not row.get("favorite") and not row.get("quarantined")),
+        "favorite_count": sum(1 for row in rows if row.get("favorite")),
+        "quarantined_count": sum(1 for row in rows if not row.get("favorite") and row.get("quarantined")),
         "leaderboard_updated_at": max([mtime for *_rest, mtime in leaderboard_sources] or [0]),
         "by_category": {
             category: {
                 "count": len(rows_by_category.get(category, [])),
-                "leaderboard_updated_at": mtime,
+                "active_count": sum(1 for row in rows_by_category.get(category, []) if not row.get("favorite") and not row.get("quarantined")),
+                "favorite_count": sum(1 for row in rows_by_category.get(category, []) if row.get("favorite")),
+                "leaderboard_updated_at": source_mtimes.get(category, 0),
                 "scoring_version": max([int(row.get("scoring_version") or 0) for row in rows_by_category.get(category, [])] or [0]) or None,
                 "quarantined_count": sum(
                     1
                     for row in rows_by_category.get(category, [])
-                    if f"{category}:{str(row.get('wallet') or '').lower()}" in quarantine
+                    if not row.get("favorite")
+                    and (
+                        f"{category}:{str(row.get('wallet') or '').lower()}" in quarantine
                     or str(row.get("wallet") or "").lower() in quarantine
+                    )
                 ),
             }
-            for category, _source_dir, rows, mtime in leaderboard_sources
-            if category in CATEGORIES
+            for category in CATEGORIES
         },
         "scoring_version": max([int(row.get("scoring_version") or 0) for row in rows] or [0]) or None,
-        "db_ready": bool(perf_snapshot.get("db_ready") or follow_snapshot.get("db_ready") or quarantine_snapshot.get("db_ready")),
+        "db_ready": bool(perf_snapshot.get("db_ready") or follow_snapshot.get("db_ready") or quarantine_snapshot.get("db_ready") or favorite_snapshot.get("db_ready")),
     }
 
 
@@ -1122,6 +1377,28 @@ def wallet_observed_performance(performance: dict[str, Any], *, open_count: int 
         "win_rate": win_rate,
         "has_loss": losses > 0 or our_pnl < -0.000001,
     }
+
+
+def observed_performance_from_results(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    observed: dict[str, dict[str, Any]] = {}
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        wallet = str(result.get("wallet") or "").lower()
+        if not wallet:
+            continue
+        pnl = _signal_our_pnl(result)
+        row = observed.setdefault(wallet, {"signals": 0, "wins": 0, "exits": 0, "wallet_pnl": 0.0, "our_pnl": 0.0})
+        row["signals"] += 1
+        row["wins"] += 1 if _result_win(result) else 0
+        if str(result.get("status") or "") == "exited":
+            row["exits"] += 1
+        row["our_pnl"] = round(to_float(row.get("our_pnl")) + pnl, 8)
+        row["wallet_pnl"] = round(to_float(row.get("wallet_pnl")) + _signal_wallet_pnl(result), 8)
+    for row in observed.values():
+        signals = int(row.get("signals") or 0)
+        row["win_rate"] = round(to_float(row.get("wins")) / signals, 8) if signals else None
+    return observed
 
 
 def wallet_leaderboard_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
@@ -1153,7 +1430,7 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
     store = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir))
     result = store.load_dashboard_follow_rows(page=1, size=10_000)
     logo_cache = _load_team_logo_cache(data_dir)
-    allowed_statuses = {"open", "settled"}
+    allowed_statuses = {"open", "settled", "insufficient_balance"}
     status_filter = status if status in allowed_statuses else ""
     category_filter = normalize_category(category)
     groups = _follow_groups_from_signals(result.get("signals", []))
@@ -1166,7 +1443,9 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
         ),
         reverse=True,
     )
-    if status_filter:
+    if status_filter == "open":
+        rows = [row for row in rows if str(row.get("status") or "") in {"open", "insufficient_balance"}]
+    elif status_filter:
         rows = [row for row in rows if str(row.get("status") or "") == status_filter]
     if category_filter:
         rows = [row for row in rows if _signal_category(row) == category_filter]
@@ -1202,11 +1481,13 @@ def _attach_follow_unrealized_pnl(row: dict[str, Any], market: dict[str, Any]) -
     for leg in open_legs:
         if not isinstance(leg, dict):
             continue
+        if leg.get("would_follow") is False:
+            continue
         outcome_index = int(leg.get("outcome_index") or 0)
         if outcome_index < 0 or outcome_index >= len(prices):
             continue
         current_price = prices[outcome_index]
-        stake = _to_float(leg.get("stake"))
+        stake = _leg_actual_stake(leg)
         entry = _to_float(leg.get("our_entry_price"))
         if stake <= 0 or entry <= 0:
             continue
@@ -1222,6 +1503,37 @@ def _attach_follow_unrealized_pnl(row: dict[str, Any], market: dict[str, Any]) -
     row["display_pnl"] = row["unrealized_pnl"] if row.get("status") == "open" and row["unrealized_pnl"] is not None else row.get("our_realized_pnl")
     row["display_pnl_kind"] = "unrealized" if row.get("status") == "open" and row["unrealized_pnl"] is not None else "realized"
     row.pop("open_pnl_legs", None)
+
+
+def _signal_follow_entry_summary(signal: dict[str, Any]) -> dict[str, Any]:
+    total_stake = 0.0
+    priced_stake = 0.0
+    weighted_entry = 0.0
+    for leg in signal.get("legs") or []:
+        if not isinstance(leg, dict) or leg.get("would_follow") is False:
+            continue
+        stake = _leg_hypothetical_stake(leg)
+        if stake <= 0:
+            continue
+        total_stake += stake
+        entry = to_float(leg.get("our_entry_price"))
+        if entry > 0:
+            priced_stake += stake
+            weighted_entry += stake * entry
+    return {
+        "follow_total_stake": round(total_stake, 8),
+        "follow_avg_entry_price": round(weighted_entry / priced_stake, 8) if priced_stake > 0 else None,
+        "_priced_stake": priced_stake,
+        "_weighted_entry": weighted_entry,
+    }
+
+
+def _signal_follow_outcome_key(signal: dict[str, Any]) -> str:
+    condition_id = str(signal.get("condition_id") or "").lower()
+    outcome_index = signal.get("outcome_index")
+    if outcome_index is not None and str(outcome_index) != "":
+        return f"{condition_id}:idx:{outcome_index}"
+    return f"{condition_id}:outcome:{str(signal.get('outcome') or '').strip().lower()}"
 
 
 def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path | None = None) -> dict[str, Any]:
@@ -1260,10 +1572,45 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
                 "leaderboard_rank": leaderboard_ranks.get(f"{signal_category}:{wallet}") or leaderboard_ranks.get(wallet),
                 "signals": [],
                 "leg_count": 0,
+                "_follow_total_stake": 0.0,
+                "_follow_priced_stake": 0.0,
+                "_follow_weighted_entry": 0.0,
+                "_follow_outcome_keys": set(),
+                "_follow_realized_pnl": 0.0,
+                "_follow_realized_count": 0,
             },
         )
+        entry_summary = _signal_follow_entry_summary(signal)
+        signal["follow_total_stake"] = entry_summary["follow_total_stake"]
+        signal["follow_avg_entry_price"] = entry_summary["follow_avg_entry_price"]
+        if str(signal.get("status") or "") in {"settled", "exited"}:
+            realized_pnl = _signal_our_pnl(signal)
+            signal["follow_realized_pnl"] = round(realized_pnl, 8)
+            bucket["_follow_realized_pnl"] += realized_pnl
+            bucket["_follow_realized_count"] += 1
         bucket["signals"].append(signal)
         bucket["leg_count"] += len(signal.get("legs") or [])
+        bucket["_follow_total_stake"] += entry_summary["follow_total_stake"] or 0.0
+        bucket["_follow_priced_stake"] += entry_summary["_priced_stake"] or 0.0
+        bucket["_follow_weighted_entry"] += entry_summary["_weighted_entry"] or 0.0
+        if entry_summary["follow_total_stake"] > 0:
+            bucket["_follow_outcome_keys"].add(_signal_follow_outcome_key(signal))
+    for bucket in by_wallet.values():
+        total_stake = to_float(bucket.pop("_follow_total_stake", 0.0))
+        priced_stake = to_float(bucket.pop("_follow_priced_stake", 0.0))
+        weighted_entry = to_float(bucket.pop("_follow_weighted_entry", 0.0))
+        outcome_keys = bucket.pop("_follow_outcome_keys", set())
+        realized_pnl = to_float(bucket.pop("_follow_realized_pnl", 0.0))
+        realized_count = int(bucket.pop("_follow_realized_count", 0) or 0)
+        outcome_count = len(outcome_keys) if isinstance(outcome_keys, set) else 0
+        mixed_outcomes = outcome_count > 1
+        bucket["follow_total_stake"] = round(total_stake, 8)
+        bucket["followed_outcome_count"] = outcome_count
+        bucket["follow_mixed_outcomes"] = mixed_outcomes
+        bucket["follow_avg_entry_price"] = (
+            round(weighted_entry / priced_stake, 8) if priced_stake > 0 and not mixed_outcomes else None
+        )
+        bucket["follow_realized_pnl"] = round(realized_pnl, 8) if realized_count else None
     title = title or str(market.get("title") or "")
     question = question or str(market.get("question") or "")
     match_start_time = match_start_time or market.get("match_start_time") or market.get("market_start_time")
@@ -1968,6 +2315,8 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
             "started_at": recorded.get("started_at") if source == "dashboard" else None,
             "stake_usdc": recorded.get("stake_usdc"),
             "stake_ratio_percent": recorded.get("stake_ratio_percent"),
+            "max_stake_usdc": recorded.get("max_stake_usdc"),
+            "max_signal_stake_balance_percent": recorded.get("max_signal_stake_balance_percent"),
             "log_path": recorded.get("log_path") if source == "dashboard" else None,
             "data_dir": str(config.data_dir),
             "follow_dir": str(follow_dir),
@@ -1983,7 +2332,13 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
     return {"status": "stopped", "data_dir": str(config.data_dir), "follow_dir": str(follow_dir)}
 
 
-def start_runner(config: DashboardConfig, *, stake_ratio_percent: float | None = None) -> dict[str, Any]:
+def start_runner(
+    config: DashboardConfig,
+    *,
+    stake_ratio_percent: float | None = None,
+    max_stake_usdc: float | None = None,
+    max_signal_stake_balance_percent: float | None = None,
+) -> dict[str, Any]:
     current = build_runner_status(config)
     if current.get("status") == "running":
         raise RunnerAlreadyRunning(current)
@@ -1993,6 +2348,16 @@ def start_runner(config: DashboardConfig, *, stake_ratio_percent: float | None =
     stake_ratio = to_float(config.runner_stake_ratio_percent if stake_ratio_percent is None else stake_ratio_percent)
     if not math.isfinite(stake_ratio) or stake_ratio <= 0:
         raise ValueError("invalid_stake_ratio_percent")
+    max_stake = to_float(config.runner_max_stake_usdc if max_stake_usdc is None else max_stake_usdc)
+    if not math.isfinite(max_stake) or max_stake < 0:
+        raise ValueError("invalid_max_stake_usdc")
+    max_signal_stake_percent = to_float(
+        config.runner_max_signal_stake_balance_percent
+        if max_signal_stake_balance_percent is None
+        else max_signal_stake_balance_percent
+    )
+    if not math.isfinite(max_signal_stake_percent) or max_signal_stake_percent < 0:
+        raise ValueError("invalid_max_signal_stake_balance_percent")
     now_ts = int(time.time())
     follow_dir = _follow_dir(config)
     follow_dir.mkdir(parents=True, exist_ok=True)
@@ -2017,6 +2382,10 @@ def start_runner(config: DashboardConfig, *, stake_ratio_percent: float | None =
         str(stake_ratio),
         "--skip-initial-build",
     ]
+    if max_stake > 0:
+        command.extend(["--max-stake-usdc", str(max_stake)])
+    if max_signal_stake_percent > 0:
+        command.extend(["--max-signal-stake-balance-percent", str(max_signal_stake_percent)])
     if config.runner_process_starter is not None:
         process = config.runner_process_starter(command, log_path)
         pid = int(getattr(process, "pid", process if isinstance(process, int) else 0) or 0)
@@ -2041,6 +2410,8 @@ def start_runner(config: DashboardConfig, *, stake_ratio_percent: float | None =
         "command": command,
         "stake_usdc": min_stake,
         "stake_ratio_percent": stake_ratio,
+        "max_stake_usdc": max_stake,
+        "max_signal_stake_balance_percent": max_signal_stake_percent,
         "log_path": str(log_path),
         "data_dir": str(config.data_dir),
         "follow_dir": str(follow_dir),
@@ -2360,6 +2731,8 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                 "signal_stakes": [],
                 "stake_mode_counts": {},
                 "status_counts": {},
+                "funded_open_leg_count": 0,
+                "insufficient_balance_leg_count": 0,
                 "settlement_type_counts": {},
                 "open_pnl_legs": [],
                 "our_realized_pnl": 0.0,
@@ -2386,8 +2759,9 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
         bucket["quality_signals"].append(signal)
         legs = signal.get("legs") or []
         bucket["leg_count"] += len(legs)
-        bucket["stake"] += sum(_to_float(leg.get("stake")) for leg in legs)
-        signal_stake = _to_float(signal.get("signal_stake"))
+        entry_summary = _signal_follow_entry_summary(signal)
+        bucket["stake"] += entry_summary["follow_total_stake"]
+        signal_stake = entry_summary["follow_total_stake"]
         if signal_stake > 0:
             bucket["signal_stakes"].append(signal_stake)
         mode = str(signal.get("stake_mode") or signal.get("conviction_tier") or "fixed")
@@ -2401,11 +2775,16 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
             outcome_index = int(signal.get("outcome_index") or 0)
             for leg in legs:
                 if isinstance(leg, dict):
+                    if _leg_actual_stake(leg) > 0:
+                        bucket["funded_open_leg_count"] += 1
+                    elif str(leg.get("funding_status") or "") == "insufficient_balance":
+                        bucket["insufficient_balance_leg_count"] += 1
                     bucket["open_pnl_legs"].append(
                         {
                             "outcome_index": outcome_index,
-                            "stake": _to_float(leg.get("stake")),
+                            "stake": _leg_actual_stake(leg),
                             "our_entry_price": _to_float(leg.get("our_entry_price")),
+                            "would_follow": leg.get("would_follow", True),
                         }
                     )
         bucket["our_realized_pnl"] += _signal_our_pnl(signal)
@@ -2425,7 +2804,11 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
         bucket["wallet_count"] = len(bucket["wallets"])
         bucket["wallets"] = sorted(bucket["wallets"])
         if bucket["status_counts"].get("open"):
-            bucket["status"] = "open"
+            bucket["status"] = (
+                "insufficient_balance"
+                if bucket.get("funded_open_leg_count", 0) <= 0 and bucket.get("insufficient_balance_leg_count", 0) > 0
+                else "open"
+            )
         else:
             bucket["status"] = "settled"
         settlement_types = set(bucket.get("settlement_type_counts") or {})
@@ -2452,6 +2835,8 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
         bucket["signal_stake_max"] = max(signal_stakes) if signal_stakes else None
         bucket.pop("signal_stakes", None)
         bucket.pop("quality_signals", None)
+        bucket.pop("funded_open_leg_count", None)
+        bucket.pop("insufficient_balance_leg_count", None)
     return groups
 
 
@@ -2573,6 +2958,22 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
+def _leg_actual_stake(leg: dict[str, Any]) -> float:
+    if not isinstance(leg, dict):
+        return 0.0
+    if leg.get("funded_stake") is not None:
+        return max(0.0, _to_float(leg.get("funded_stake")))
+    if leg.get("would_follow") is False:
+        return 0.0
+    return max(0.0, _to_float(leg.get("stake")))
+
+
+def _leg_hypothetical_stake(leg: dict[str, Any]) -> float:
+    if not isinstance(leg, dict):
+        return 0.0
+    return max(0.0, _to_float(leg.get("stake")))
+
+
 def _parse_timestamp(value: Any) -> int:
     if value is None:
         return 0
@@ -2601,9 +3002,24 @@ def _result_win(row: dict[str, Any]) -> bool:
 
 
 def _signal_our_pnl(row: dict[str, Any]) -> float:
+    status = str(row.get("status") or "")
+    if status == "settled":
+        if row.get("our_paper_pnl") is not None:
+            return _to_float(row.get("our_paper_pnl"))
+        return _to_float(row.get("our_realized_pnl"))
+    if status == "exited":
+        if row.get("our_realized_pnl") is not None:
+            return _to_float(row.get("our_realized_pnl"))
+        return _to_float(row.get("our_paper_pnl"))
     if row.get("our_realized_pnl") is not None:
         return _to_float(row.get("our_realized_pnl"))
     return _to_float(row.get("our_paper_pnl"))
+
+
+def _signal_hypothetical_pnl(row: dict[str, Any]) -> float:
+    if row.get("hypothetical_pnl") is not None:
+        return _to_float(row.get("hypothetical_pnl"))
+    return _signal_our_pnl(row)
 
 
 def _signal_wallet_pnl(row: dict[str, Any]) -> float:
