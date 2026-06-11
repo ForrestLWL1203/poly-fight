@@ -315,6 +315,7 @@
                         @click.stop="toggleWalletFavorite(wallet)"
                       >{{ wallet.favorite ? '★' : '☆' }}</button>
                       <button
+                        v-if="walletView !== 'quarantined'"
                         class="wallet-quarantine-btn"
                         type="button"
                         :title="quarantineButtonTitle(wallet)"
