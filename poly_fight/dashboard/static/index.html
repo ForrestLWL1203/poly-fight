@@ -135,7 +135,8 @@
               <h2>总览</h2>
               <div class="status-pill" :class="runnerStatusClass">
                 <span class="status-dot" aria-hidden="true"></span>
-                {{ runnerPillText }}
+                <span>{{ runnerPillText }}</span>
+                <span class="status-duration" v-if="trackingDurationText()" :title="trackingDurationTitle()">{{ trackingDurationText() }}</span>
               </div>
               <div class="tick-pill" :title="formatTime(health.last_tick_at)">
                 最后刷新：{{ timeAgo(health.last_tick_at) }}
@@ -146,7 +147,7 @@
           <div class="overview-grid">
             <article class="overview-pnl-card">
               <span>已结算盈亏</span>
-              <strong :class="pnlClass(overview.our_realized_pnl)">{{ money(overview.our_realized_pnl) }}</strong>
+              <strong :class="pnlClass(overview.our_realized_pnl)">{{ signedMoney(overview.our_realized_pnl) }}</strong>
               <div class="pnl-metrics">
                 <div><span>累计投入</span><b>{{ money(overview.total_stake) }}</b></div>
                 <div><span>已结算 ROI</span><b :class="pnlClass(overview.realized_roi)">{{ percent(overview.realized_roi) }}</b></div>
@@ -423,7 +424,19 @@
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="event in eventPageRows" :key="event.condition_id" class="event-table-row">
+                  <tr
+                    v-for="event in eventPageRows"
+                    :key="event.condition_id"
+                    class="event-table-row"
+                    :class="{ 'click-row': eventUrl(event) }"
+                    :tabindex="eventUrl(event) ? 0 : null"
+                    :role="eventUrl(event) ? 'link' : null"
+                    :aria-label="eventRowAriaLabel(event)"
+                    :title="eventUrl(event) ? '打开 Polymarket 赛事主页' : null"
+                    @click="openEventPage(event, $event)"
+                    @keydown.enter="openEventPage(event, $event)"
+                    @keydown.space.prevent="openEventPage(event, $event)"
+                  >
                     <td>
                       <div class="event-main">
                         <div class="event-match-title" v-if="matchParts(event)">

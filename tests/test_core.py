@@ -7851,6 +7851,53 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(overview["wallet_basis_realized_roi"], 1.0)
             self.assertAlmostEqual(overview["delay_cost"], 0.2)
 
+    def test_dashboard_overview_exposes_total_tracking_duration(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            tracking_started_at = 100_000
+            now_ts = tracking_started_at + (3 * 86400) + (7 * 3600)
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "sig-open",
+                        "wallet": "0xabc",
+                        "condition_id": "m2",
+                        "status": "open",
+                        "created_at": tracking_started_at + 60,
+                        "updated_at": tracking_started_at + 120,
+                        "legs": [
+                            {
+                                "stake": 3,
+                                "would_follow": True,
+                                "wallet_trade_at": tracking_started_at,
+                                "leg_at": tracking_started_at + 30,
+                            }
+                        ],
+                    }
+                ],
+                result_events=[
+                    {
+                        "signal_id": "sig1",
+                        "wallet": "0xabc",
+                        "condition_id": "m1",
+                        "status": "settled",
+                        "outcome_won": True,
+                        "created_at": tracking_started_at + 3600,
+                        "settled_at": now_ts - 60,
+                        "legs": [{"stake": 1, "wallet_trade_at": tracking_started_at + 3600}],
+                    }
+                ],
+                performance={},
+            )
+
+            with patch("poly_fight.dashboard.time.time", return_value=now_ts):
+                overview = build_overview(data_dir)
+
+            self.assertEqual(overview["tracking_started_at"], tracking_started_at)
+            self.assertEqual(overview["tracking_duration_seconds"], now_ts - tracking_started_at)
+
     def test_dashboard_overview_exposes_contested_and_clv(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -9330,6 +9377,55 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(event["side_counts"], {"A": 1, "B": 1})
             self.assertNotIn("open_signals", event)
             self.assertNotIn("results", event)
+
+    def test_dashboard_events_expose_polymarket_event_urls(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now_ts = int(time.time())
+            write_json(
+                data_dir / "follow" / "active_market_cache.json",
+                {
+                    "updated_at": now_ts,
+                    "markets": [
+                        {
+                            "condition_id": "active",
+                            "event_slug": "counter-strike-a-vs-b",
+                            "title": "Counter-Strike: A vs B",
+                            "match_start_time": datetime.fromtimestamp(now_ts + 3600, timezone.utc).isoformat(),
+                            "end_date": datetime.fromtimestamp(now_ts + 7200, timezone.utc).isoformat(),
+                        },
+                        {
+                            "condition_id": "settled",
+                            "event_slug": "lol-c-vs-d",
+                            "title": "LoL: C vs D",
+                            "match_start_time": datetime.fromtimestamp(now_ts - 7200, timezone.utc).isoformat(),
+                            "end_date": datetime.fromtimestamp(now_ts - 3600, timezone.utc).isoformat(),
+                        },
+                    ],
+                },
+            )
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[],
+                result_events=[
+                    {
+                        "signal_id": "s-settled",
+                        "wallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "condition_id": "settled",
+                        "event_slug": "lol-c-vs-d",
+                        "status": "settled",
+                        "created_at": now_ts - 7000,
+                        "settled_at": now_ts - 3000,
+                        "legs": [],
+                    }
+                ],
+                performance={},
+            )
+
+            events = build_events(data_dir)
+
+            self.assertEqual(events["events"][0]["event_url"], "https://polymarket.com/event/counter-strike-a-vs-b")
+            self.assertEqual(events["archived_events"][0]["event_url"], "https://polymarket.com/event/lol-c-vs-d")
 
     def test_dashboard_events_sort_followed_markets_first(self):
         with TemporaryDirectory() as tmp:

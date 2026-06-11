@@ -764,6 +764,29 @@ createApp({
     profileUrl(wallet) {
       return `https://polymarket.com/@${wallet}?tab=activity`;
     },
+    eventUrl(event) {
+      const explicit = String(event?.event_url || "").trim();
+      if (explicit) return explicit;
+      const slug = String(event?.event_slug || "").trim();
+      return slug ? `https://polymarket.com/event/${encodeURIComponent(slug)}` : "";
+    },
+    eventRowAriaLabel(event) {
+      if (!this.eventUrl(event)) return null;
+      const title = event?.title || event?.question || event?.condition_id || "赛事";
+      return `打开 Polymarket 赛事主页：${title}`;
+    },
+    openEventPage(event, domEvent) {
+      const url = this.eventUrl(event);
+      if (!url) return;
+      const target = domEvent?.target;
+      if (target?.closest?.("a,button,input,select,textarea,label")) return;
+      const opened = window.open(url, "_blank");
+      if (opened) {
+        opened.opener = null;
+      } else {
+        window.location.assign(url);
+      }
+    },
     statusClass(status) {
       return `status-${status || "error"}`;
     },
@@ -1047,6 +1070,13 @@ createApp({
       if (!Number.isFinite(num)) return "-";
       return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(num);
     },
+    signedMoney(value) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return "-";
+      const formatted = this.money(Math.abs(num));
+      if (Math.abs(num) < 0.000001) return formatted;
+      return `${num > 0 ? "+" : "-"}${formatted}`;
+    },
     compactMoney(value) {
       const num = Number(value);
       if (!Number.isFinite(num)) return "-";
@@ -1158,6 +1188,24 @@ createApp({
       if (hours > 0) return `${hours}h ${minutes}m`;
       if (minutes > 0) return `${minutes}m ${secs}s`;
       return `${secs}s`;
+    },
+    trackingDurationText() {
+      const startedAt = this.normalizeTs(this.overview?.tracking_started_at);
+      const rawDuration = Number(this.overview?.tracking_duration_seconds);
+      const duration = Number.isFinite(rawDuration) && rawDuration >= 0
+        ? rawDuration
+        : (startedAt ? this.clockNow - startedAt : 0);
+      if (!startedAt && duration <= 0) return "";
+      const seconds = Math.max(0, Math.floor(duration));
+      if (seconds < 3600) return "已跟踪 <1小时";
+      const days = Math.floor(seconds / 86400);
+      const hours = Math.floor((seconds % 86400) / 3600);
+      if (days > 0) return `已跟踪 ${days}天${hours}小时`;
+      return `已跟踪 ${hours}小时`;
+    },
+    trackingDurationTitle() {
+      const startedAt = this.normalizeTs(this.overview?.tracking_started_at);
+      return startedAt ? `开始跟踪：${this.formatTime(startedAt)}` : "";
     },
     formatTime(value) {
       const ts = this.normalizeTs(value);

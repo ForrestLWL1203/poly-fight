@@ -684,6 +684,8 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
     our_pnl = sum(_signal_our_pnl(row) for row in results)
     wallet_basis_pnl = sum(_signal_wallet_pnl(row) for row in results)
     behavior = _behavior_counts(all_signals)
+    tracking_started_at = _tracking_started_at(all_signals)
+    now_ts = int(time.time())
     overview = {
         "db_ready": bool(snapshot.get("db_ready")),
         "open_signal_count": len(open_signals),
@@ -704,6 +706,8 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
         "open_exposure": sum(sum(_to_float(leg.get("stake")) for leg in signal.get("legs") or []) for signal in open_signals),
         "behavior_counts": behavior,
         "performance": snapshot.get("performance") or {},
+        "tracking_started_at": tracking_started_at or None,
+        "tracking_duration_seconds": max(0, now_ts - tracking_started_at) if tracking_started_at else None,
     }
     overview["by_category"] = {
         category: _overview_for_signals(
@@ -1242,7 +1246,7 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
         question = question or str(signal.get("market_question") or signal.get("question") or "")
         match_start_time = match_start_time or signal.get("match_start_time") or signal.get("market_start_time")
         end_date = end_date or signal.get("end_date")
-        event_slug = event_slug or str(signal.get("event_slug") or "")
+        event_slug = event_slug or _event_slug(signal)
         market_type = market_type or str(signal.get("market_type") or "")
         market_type_label = market_type_label or str(signal.get("market_type_label") or "")
         signal_category = normalize_category(str(signal.get("category") or ""))
@@ -1264,7 +1268,7 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
     question = question or str(market.get("question") or "")
     match_start_time = match_start_time or market.get("match_start_time") or market.get("market_start_time")
     end_date = end_date or market.get("end_date")
-    event_slug = event_slug or str(market.get("event_slug") or "")
+    event_slug = event_slug or _event_slug(market)
     market_type = market_type or str(market.get("market_type") or "")
     market_type_label = market_type_label or str(market.get("market_type_label") or "")
     category = category or normalize_category(str(market.get("category") or "")) or "esports"
@@ -1284,7 +1288,7 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
         "match_start_time": match_start_time,
         "end_date": end_date,
         "event_slug": event_slug,
-        "event_url": f"https://polymarket.com/event/{event_slug}" if event_slug else "",
+        "event_url": _polymarket_event_url(event_slug),
         "market_type": market_type,
         "market_type_label": market_type_label,
         "match_parts": match_parts,
@@ -1411,6 +1415,27 @@ def _signal_activity_at(signal: dict[str, Any]) -> int:
     return max([value for value in leg_times if value] or [0])
 
 
+def _tracking_started_at(signals: list[dict[str, Any]]) -> int:
+    timestamps = [_signal_tracking_started_at(signal) for signal in signals if isinstance(signal, dict)]
+    return min([value for value in timestamps if value] or [0])
+
+
+def _signal_tracking_started_at(signal: dict[str, Any]) -> int:
+    timestamps: list[int] = []
+    for leg in signal.get("legs") or []:
+        if not isinstance(leg, dict):
+            continue
+        for key in ("wallet_trade_at", "trade_at", "leg_at", "created_at", "observed_at"):
+            ts = _parse_timestamp(leg.get(key))
+            if ts:
+                timestamps.append(ts)
+    for key in ("wallet_trade_at", "last_trade_at", "created_at", "updated_at", "settled_at", "exit_at"):
+        ts = _parse_timestamp(signal.get(key))
+        if ts:
+            timestamps.append(ts)
+    return min(timestamps or [0])
+
+
 def _signal_follow_action_at(signal: dict[str, Any]) -> int:
     direct = _parse_timestamp(signal.get("wallet_trade_at") or signal.get("last_trade_at"))
     leg_times = [
@@ -1425,6 +1450,29 @@ def _signal_follow_action_at(signal: dict[str, Any]) -> int:
     ]
     fallback = _parse_timestamp(signal.get("created_at"))
     return max([value for value in [direct, fallback, *leg_times] if value] or [0])
+
+
+def _event_slug(row: dict[str, Any]) -> str:
+    if not isinstance(row, dict):
+        return ""
+    return str(row.get("event_slug") or row.get("eventSlug") or row.get("slug") or "").strip()
+
+
+def _first_event_slug(rows: list[dict[str, Any]]) -> str:
+    for row in rows:
+        slug = _event_slug(row)
+        if slug:
+            return slug
+    return ""
+
+
+def _polymarket_event_url(event_slug: Any) -> str:
+    slug = str(event_slug or "").strip().strip("/")
+    if not slug:
+        return ""
+    if slug.startswith(("https://", "http://")):
+        return slug
+    return f"https://polymarket.com/event/{urllib.parse.quote(slug, safe='')}"
 
 
 def _dashboard_event_group_key(market: dict[str, Any], *, start_ts: int) -> tuple[Any, ...]:
@@ -1558,10 +1606,13 @@ def build_events(
         category = normalize_category(str(market.get("category") or "")) or "esports"
         league = normalize_league(market.get("league"))
         row_league_label = str(market.get("league_label") or league_label(league)).strip()
+        event_slug = _first_event_slug([row_market for row_market, *_rest in ordered_group])
         events.append(
             {
                 "condition_id": condition_id,
                 "condition_ids": condition_ids,
+                "event_slug": event_slug,
+                "event_url": _polymarket_event_url(event_slug),
                 "category": category,
                 "league": league,
                 "league_label": row_league_label,
@@ -1623,6 +1674,7 @@ def build_events(
         league = normalize_league(market.get("league") or next((result.get("league") for result in results if isinstance(result, dict)), ""))
         row_league_label = str(market.get("league_label") or next((result.get("league_label") for result in results if isinstance(result, dict)), "") or league_label(league)).strip()
         market_type_label = market.get("market_type_label") or next((result.get("market_type_label") for result in results if isinstance(result, dict)), None)
+        event_slug = _event_slug(market) or _first_event_slug([result for result in results if isinstance(result, dict)])
         match_parts = _match_parts_for_row(
             {
                 "title": title,
@@ -1636,6 +1688,8 @@ def build_events(
         archived_events.append(
             {
                 "condition_id": condition_id,
+                "event_slug": event_slug,
+                "event_url": _polymarket_event_url(event_slug),
                 "category": category,
                 "league": league,
                 "league_label": row_league_label,

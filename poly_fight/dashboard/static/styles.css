@@ -433,6 +433,7 @@ body {
 .overview-title-row {
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 0.75rem;
 }
 
@@ -448,6 +449,13 @@ body {
   background: rgba(21, 31, 37, 0.78);
   font-size: 0.78rem;
   font-weight: 850;
+}
+
+.status-duration {
+  border-left: 1px solid rgba(141, 160, 169, 0.22);
+  color: var(--pf-text);
+  padding-left: 0.5rem;
+  white-space: nowrap;
 }
 
 .tick-pill {
