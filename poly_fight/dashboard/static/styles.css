@@ -130,12 +130,17 @@ body {
   text-overflow: ellipsis;
   text-transform: none;
   white-space: nowrap;
-  background: linear-gradient(92deg, #f7fbff 0%, #56d6c9 36%, #72d98d 62%, #f3b95f 100%);
-  -webkit-background-clip: text;
-  background-clip: text;
+  color: transparent;
   -webkit-text-fill-color: transparent;
-  filter: drop-shadow(0 0 18px rgba(86, 214, 201, 0.24));
-  text-shadow: 0 0.75rem 2.2rem rgba(0, 0, 0, 0.42);
+  -webkit-text-stroke: 1.45px rgba(247, 251, 255, 0.94);
+  paint-order: stroke fill;
+  text-shadow:
+    1px 0 rgba(86, 214, 201, 0.34),
+    -1px 0 rgba(86, 214, 201, 0.34),
+    0 1px rgba(86, 214, 201, 0.34),
+    0 -1px rgba(86, 214, 201, 0.34),
+    0 0.75rem 2.2rem rgba(0, 0, 0, 0.42),
+    0 0 20px rgba(86, 214, 201, 0.18);
 }
 
 .toolbar-copy,
@@ -252,11 +257,16 @@ body {
   letter-spacing: 0.08em;
   line-height: 0.9;
   text-transform: uppercase;
-  background: linear-gradient(90deg, #f6fbff 0%, #56d6c9 48%, #f3b95f 100%);
-  -webkit-background-clip: text;
-  background-clip: text;
+  color: transparent;
   -webkit-text-fill-color: transparent;
-  text-shadow: 0 0 22px rgba(86, 214, 201, 0.28);
+  -webkit-text-stroke: 1.25px rgba(86, 214, 201, 0.9);
+  paint-order: stroke fill;
+  text-shadow:
+    1px 0 rgba(246, 251, 255, 0.22),
+    -1px 0 rgba(246, 251, 255, 0.22),
+    0 1px rgba(246, 251, 255, 0.22),
+    0 -1px rgba(246, 251, 255, 0.22),
+    0 0 22px rgba(86, 214, 201, 0.22);
 }
 
 .center-category-tabs {

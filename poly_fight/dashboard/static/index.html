@@ -152,9 +152,9 @@
                 <div><span>累计投入</span><b>{{ money(overview.total_stake) }}</b></div>
                 <div><span>已结算 ROI</span><b :class="pnlClass(overview.realized_roi)">{{ percent(overview.realized_roi) }}</b></div>
                 <div><span>结算场次</span><b>{{ numberOrDash(overview.settled_count) }}</b></div>
-                <div title="按目标钱包成交价计算的理论 PnL，用于对比实际跟单的延迟和滑点影响">
-                  <span>总体 PnL</span>
-                  <b :class="pnlClass(overview.wallet_basis_realized_pnl)">{{ money(overview.wallet_basis_realized_pnl) }}</b>
+                <div title="当前未结算跟单的纸面持仓金额，按已投入 stake 统计">
+                  <span>当前持仓金额</span>
+                  <b>{{ money(overview.open_exposure) }}</b>
                 </div>
               </div>
             </article>
