@@ -120,27 +120,22 @@ body {
   margin: 0;
   width: 100%;
   max-width: 100%;
-  color: #f7fbff;
-  font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  font-family: Impact, Haettenschweiler, "Arial Black", "Avenir Next Condensed", sans-serif;
   font-size: clamp(1.95rem, 3.1vw, 3rem);
-  font-weight: 850;
-  letter-spacing: 0;
+  font-weight: 900;
+  letter-spacing: 0.035em;
   line-height: 0.96;
   overflow: hidden;
   text-overflow: ellipsis;
-  text-transform: none;
+  text-transform: uppercase;
   white-space: nowrap;
   color: transparent;
   -webkit-text-fill-color: transparent;
-  -webkit-text-stroke: 1.45px rgba(247, 251, 255, 0.94);
+  -webkit-text-stroke: 1.7px rgba(243, 185, 95, 0.96);
   paint-order: stroke fill;
   text-shadow:
-    1px 0 rgba(86, 214, 201, 0.34),
-    -1px 0 rgba(86, 214, 201, 0.34),
-    0 1px rgba(86, 214, 201, 0.34),
-    0 -1px rgba(86, 214, 201, 0.34),
     0 0.75rem 2.2rem rgba(0, 0, 0, 0.42),
-    0 0 20px rgba(86, 214, 201, 0.18);
+    0 0 18px rgba(243, 185, 95, 0.18);
 }
 
 .toolbar-copy,
@@ -250,23 +245,17 @@ body {
   margin: 0;
   width: max-content;
   max-width: 100%;
-  color: var(--pf-text);
-  font-family: Copperplate, "DIN Condensed", "Avenir Next Condensed", Impact, sans-serif;
+  font-family: Impact, Haettenschweiler, "Arial Black", "Avenir Next Condensed", sans-serif;
   font-size: clamp(1.95rem, 3.4vw, 3.15rem);
-  font-weight: 800;
-  letter-spacing: 0.08em;
+  font-weight: 900;
+  letter-spacing: 0.1em;
   line-height: 0.9;
   text-transform: uppercase;
   color: transparent;
   -webkit-text-fill-color: transparent;
-  -webkit-text-stroke: 1.25px rgba(86, 214, 201, 0.9);
+  -webkit-text-stroke: 1.55px rgba(243, 185, 95, 0.96);
   paint-order: stroke fill;
-  text-shadow:
-    1px 0 rgba(246, 251, 255, 0.22),
-    -1px 0 rgba(246, 251, 255, 0.22),
-    0 1px rgba(246, 251, 255, 0.22),
-    0 -1px rgba(246, 251, 255, 0.22),
-    0 0 22px rgba(86, 214, 201, 0.22);
+  text-shadow: 0 0 18px rgba(243, 185, 95, 0.18);
 }
 
 .center-category-tabs {
