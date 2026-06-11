@@ -56,6 +56,10 @@ def _walk(node):
         yield from _walk(child)
 
 
+def _classes(node):
+    return set((node.attrs.get("class") or "").split())
+
+
 class DashboardStaticTests(unittest.TestCase):
     def test_vue_else_branches_have_adjacent_conditionals(self):
         template_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "index.html"
@@ -72,6 +76,30 @@ class DashboardStaticTests(unittest.TestCase):
                 previous = child
 
         self.assertEqual([], failures)
+
+    def test_wallet_quarantine_action_lives_at_row_end(self):
+        template_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "index.html"
+        parser = _TemplateParser()
+        parser.feed(template_path.read_text())
+
+        favorite_cells = [node for node in _walk(parser.root) if "favorite-cell" in _classes(node)]
+        end_action_cells = [node for node in _walk(parser.root) if "wallet-end-action-cell" in _classes(node)]
+
+        self.assertTrue(favorite_cells)
+        self.assertTrue(end_action_cells)
+        for cell in favorite_cells:
+            nested_classes = set()
+            for child in _walk(cell):
+                nested_classes.update(_classes(child))
+            self.assertNotIn("wallet-quarantine-btn", nested_classes)
+            self.assertNotIn("wallet-unquarantine-btn", nested_classes)
+
+        end_action_classes = set()
+        for cell in end_action_cells:
+            for child in _walk(cell):
+                end_action_classes.update(_classes(child))
+        self.assertIn("wallet-quarantine-btn", end_action_classes)
+        self.assertIn("wallet-unquarantine-btn", end_action_classes)
 
     def test_decimal_input_patterns_accept_integer_values(self):
         template_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "index.html"

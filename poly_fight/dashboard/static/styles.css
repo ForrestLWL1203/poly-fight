@@ -1412,16 +1412,22 @@ body {
 
 .favorite-head,
 .favorite-cell {
-  width: 4.1rem;
-  min-width: 4.1rem;
+  width: 3.25rem;
+  min-width: 3.25rem;
+  text-align: center;
+}
+
+.wallet-end-action-head,
+.wallet-end-action-cell {
+  width: 3.25rem;
+  min-width: 3.25rem;
   text-align: center;
 }
 
 .wallet-action-stack {
   display: inline-flex;
   align-items: center;
-  flex-direction: column;
-  gap: 0.22rem;
+  justify-content: center;
 }
 
 .favorite-star-btn {
@@ -1461,17 +1467,55 @@ body {
   transform: none;
 }
 
-.wallet-quarantine-btn,
+.favorite-placeholder {
+  color: #536871;
+  font-weight: 800;
+}
+
+.wallet-quarantine-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.9rem;
+  height: 1.9rem;
+  border: 1px solid rgba(238, 111, 141, 0.3);
+  border-radius: 50%;
+  background: rgba(238, 111, 141, 0.07);
+  color: #f05e78;
+  cursor: pointer;
+  font: inherit;
+  line-height: 1;
+  padding: 0;
+  transition: border-color 140ms ease, background 140ms ease, color 140ms ease, transform 140ms ease;
+}
+
+.wallet-quarantine-symbol {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.wallet-quarantine-btn:hover,
+.wallet-quarantine-btn:focus-visible {
+  border-color: rgba(238, 111, 141, 0.72);
+  background: rgba(238, 111, 141, 0.16);
+  color: #ff9aad;
+  outline: none;
+  transform: translateY(-1px);
+}
+
 .wallet-unquarantine-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   min-width: 2.75rem;
   min-height: 1.42rem;
-  border: 1px solid rgba(238, 111, 141, 0.36);
+  border: 1px solid rgba(86, 214, 201, 0.34);
   border-radius: 999px;
-  background: rgba(238, 111, 141, 0.08);
-  color: #f2a3b0;
+  background: rgba(86, 214, 201, 0.08);
+  color: var(--pf-cyan);
   cursor: pointer;
   font: inherit;
   font-size: 0.68rem;
@@ -1481,19 +1525,6 @@ body {
   transition: border-color 140ms ease, background 140ms ease, color 140ms ease;
 }
 
-.wallet-quarantine-btn:hover,
-.wallet-quarantine-btn:focus-visible {
-  border-color: rgba(238, 111, 141, 0.72);
-  background: rgba(238, 111, 141, 0.16);
-  color: #ffc2cc;
-  outline: none;
-}
-
-.wallet-unquarantine-btn {
-  border-color: rgba(86, 214, 201, 0.34);
-  background: rgba(86, 214, 201, 0.08);
-  color: var(--pf-cyan);
-}
 
 .wallet-unquarantine-btn:hover,
 .wallet-unquarantine-btn:focus-visible {

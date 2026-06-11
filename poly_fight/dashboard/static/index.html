@@ -283,7 +283,7 @@
             <table class="table table-sm dense-table">
               <thead>
                 <tr>
-                  <th class="favorite-head">操作</th>
+                  <th class="favorite-head">收藏</th>
                   <th>Rank</th>
                   <th>钱包</th>
                   <th v-if="walletView === 'quarantined'">隔离原因</th>
@@ -298,6 +298,7 @@
                   <th>跟单胜负</th>
                   <th>跟单 PnL</th>
                   <th>最后交易时间</th>
+                  <th class="wallet-end-action-head">隔离</th>
                 </tr>
               </thead>
               <tbody>
@@ -314,30 +315,7 @@
                         :disabled="favoriteBusy[walletFavoriteKey(wallet)] || quarantineBusy[walletFavoriteKey(wallet)]"
                         @click.stop="toggleWalletFavorite(wallet)"
                       >{{ wallet.favorite ? '★' : '☆' }}</button>
-                      <button
-                        v-if="walletView !== 'quarantined'"
-                        class="wallet-quarantine-btn"
-                        type="button"
-                        :title="quarantineButtonTitle(wallet)"
-                        :aria-label="quarantineButtonTitle(wallet)"
-                        :disabled="quarantineBusy[walletFavoriteKey(wallet)]"
-                        @click.stop="quarantineWallet(wallet)"
-                      >
-                        <span v-if="quarantineBusy[walletFavoriteKey(wallet)]" class="loading loading-spinner loading-xs"></span>
-                        <span v-else>隔离</span>
-                      </button>
-                      <button
-                        v-else
-                        class="wallet-unquarantine-btn"
-                        type="button"
-                        :title="unquarantineButtonTitle(wallet)"
-                        :aria-label="unquarantineButtonTitle(wallet)"
-                        :disabled="quarantineBusy[walletFavoriteKey(wallet)]"
-                        @click.stop="unquarantineWallet(wallet)"
-                      >
-                        <span v-if="quarantineBusy[walletFavoriteKey(wallet)]" class="loading loading-spinner loading-xs"></span>
-                        <span v-else>解除</span>
-                      </button>
+                      <span v-else class="favorite-placeholder" aria-hidden="true">-</span>
                     </div>
                   </td>
                   <td class="rank-cell">
@@ -404,6 +382,32 @@
                   <td :class="pnlClass((wallet.observed || {}).our_pnl)">{{ walletObservedPnl(wallet) }}</td>
                   <td class="trade-time-cell">
                     <span>{{ timeAgo(wallet.last_esports_trade_at) }}</span>
+                  </td>
+                  <td class="wallet-end-action-cell">
+                    <button
+                      v-if="walletView !== 'quarantined'"
+                      class="wallet-quarantine-btn"
+                      type="button"
+                      :title="quarantineButtonTitle(wallet)"
+                      :aria-label="quarantineButtonTitle(wallet)"
+                      :disabled="quarantineBusy[walletFavoriteKey(wallet)]"
+                      @click.stop="quarantineWallet(wallet)"
+                    >
+                      <span v-if="quarantineBusy[walletFavoriteKey(wallet)]" class="loading loading-spinner loading-xs"></span>
+                      <span v-else class="wallet-quarantine-symbol" aria-hidden="true">⛔</span>
+                    </button>
+                    <button
+                      v-else
+                      class="wallet-unquarantine-btn"
+                      type="button"
+                      :title="unquarantineButtonTitle(wallet)"
+                      :aria-label="unquarantineButtonTitle(wallet)"
+                      :disabled="quarantineBusy[walletFavoriteKey(wallet)]"
+                      @click.stop="unquarantineWallet(wallet)"
+                    >
+                      <span v-if="quarantineBusy[walletFavoriteKey(wallet)]" class="loading loading-spinner loading-xs"></span>
+                      <span v-else>解除</span>
+                    </button>
                   </td>
                 </tr>
                 <tr v-if="!walletPageRows.length">

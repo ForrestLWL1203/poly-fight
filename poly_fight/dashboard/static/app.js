@@ -217,7 +217,7 @@ createApp({
       return "暂无生效钱包";
     },
     walletEmptyColspan() {
-      return 14;
+      return this.walletView === "quarantined" ? 16 : 15;
     },
     walletPageRows() {
       const rows = this.walletRowsByCategory;
