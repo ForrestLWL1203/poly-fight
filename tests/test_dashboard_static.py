@@ -134,6 +134,15 @@ class DashboardStaticTests(unittest.TestCase):
         self.assertIn("const ourEntry = Number(leg.our_entry_price);", body)
         self.assertIn("return ourEntry - walletEntry;", body)
 
+    def test_follow_and_event_lists_refresh_without_loading_overlay(self):
+        root = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static"
+        template = (root / "index.html").read_text()
+        styles = (root / "styles.css").read_text()
+
+        self.assertNotIn("panel-loading-mask", template)
+        self.assertNotIn(".panel-loading-mask", styles)
+        self.assertNotIn(".panel-loading-card", styles)
+
     def test_decimal_input_patterns_accept_integer_values(self):
         template_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "index.html"
         parser = _TemplateParser()

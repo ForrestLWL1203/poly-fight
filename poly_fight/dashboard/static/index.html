@@ -516,12 +516,6 @@
               <span>第 {{ followPage }} / {{ followPageCount }} 页</span>
               <button class="btn btn-xs" :disabled="followPage >= followPageCount" @click="setFollowPage(followPage + 1)">下一页</button>
             </div>
-            <div v-if="loading.follows" class="panel-loading-mask" role="status" aria-live="polite">
-              <div class="panel-loading-card">
-                <span class="loading loading-spinner loading-sm"></span>
-                <span>正在加载跟单列表</span>
-              </div>
-            </div>
           </section>
 
           <section v-show="activeTab === 'events'" class="data-panel console-panel">
@@ -655,12 +649,6 @@
               <button class="btn btn-xs" :disabled="eventPage <= 1" @click="setEventPage(eventPage - 1)">上一页</button>
               <span>第 {{ eventPage }} / {{ eventPageCount }} 页</span>
               <button class="btn btn-xs" :disabled="eventPage >= eventPageCount" @click="setEventPage(eventPage + 1)">下一页</button>
-            </div>
-            <div v-if="loading.events" class="panel-loading-mask" role="status" aria-live="polite">
-              <div class="panel-loading-card">
-                <span class="loading loading-spinner loading-sm"></span>
-                <span>正在加载赛事列表</span>
-              </div>
             </div>
           </section>
         </div>

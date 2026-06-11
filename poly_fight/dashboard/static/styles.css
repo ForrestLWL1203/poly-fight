@@ -1364,32 +1364,6 @@ body {
     rgba(17, 24, 29, 0.9);
 }
 
-.panel-loading-mask {
-  position: absolute;
-  inset: 4rem 0.9rem 0.9rem;
-  z-index: 6;
-  display: grid;
-  place-items: center;
-  border-radius: 6px;
-  background: rgba(7, 12, 15, 0.62);
-  backdrop-filter: blur(2px);
-}
-
-.panel-loading-card {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.6rem;
-  min-height: 2.45rem;
-  border: 1px solid rgba(86, 214, 201, 0.34);
-  border-radius: 999px;
-  background: rgba(17, 24, 29, 0.92);
-  color: #d9e8e8;
-  font-size: 0.82rem;
-  font-weight: 850;
-  padding: 0 0.95rem;
-  box-shadow: 0 1rem 2.4rem rgba(0, 0, 0, 0.28);
-}
-
 .leaderboard-table {
   margin-top: 0.15rem;
 }
