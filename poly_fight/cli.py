@@ -1461,6 +1461,25 @@ def market_records_from_events(events: list[dict[str, Any]]) -> dict[str, dict[s
     return records
 
 
+def resolution_market_records_from_markets(markets: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    records = {}
+    for market in markets:
+        condition_id = str(market.get("conditionId") or market.get("condition_id") or "").lower()
+        if not condition_id:
+            continue
+        prices = [
+            to_float(value)
+            for value in parse_jsonish(market.get("outcomePrices") or market.get("outcome_prices"), [])
+        ]
+        records[condition_id] = {
+            "condition_id": condition_id,
+            "outcome_prices": prices,
+            "closed": bool(market.get("closed")),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    return records
+
+
 def active_cache_market_rows(cached: dict[str, Any]) -> list[dict[str, Any]]:
     markets = cached.get("markets") if isinstance(cached, dict) else []
     if isinstance(markets, dict):
@@ -1931,6 +1950,26 @@ def fetch_resolutions_for_open_signals(
             winner = winner_outcome_index(market)
             if winner is not None:
                 resolutions[condition_id] = winner
+    missing = sorted(needed - set(resolutions))
+    if missing:
+        direct_markets = client.markets_by_condition_ids(missing, limit=len(missing))
+        direct_records = resolution_market_records_from_markets(direct_markets)
+        if direct_records:
+            closed_markets.update(direct_records)
+            if store:
+                store.save_market_cache(closed_markets, cache_kind="closed", updated_at=now_ts)
+            else:
+                state["closed_market_cache"] = {
+                    "updated_at": now_ts,
+                    "markets": list(closed_markets.values()),
+                }
+            for condition_id in missing:
+                market = direct_records.get(condition_id)
+                if not market:
+                    continue
+                winner = winner_outcome_index(market)
+                if winner is not None:
+                    resolutions[condition_id] = winner
     return resolutions
 
 

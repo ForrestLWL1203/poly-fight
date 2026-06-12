@@ -6940,6 +6940,42 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(resolutions, {"m1": 0})
             self.assertEqual(client.calls, 0)
 
+    def test_follow_resolution_lookup_queries_open_condition_ids_directly(self):
+        class FakeClient:
+            def __init__(self):
+                self.event_calls = 0
+                self.market_calls = []
+
+            def list_events_paginated(self, **_kwargs):
+                self.event_calls += 1
+                return []
+
+            def markets_by_condition_ids(self, condition_ids, *, limit=500):
+                self.market_calls.append(list(condition_ids))
+                return [
+                    {
+                        "conditionId": "m1",
+                        "outcomePrices": '["0", "1"]',
+                        "closed": True,
+                    }
+                ]
+
+        signal = {"condition_id": "m1", "match_start_time": datetime.fromtimestamp(500, timezone.utc).isoformat()}
+        client = FakeClient()
+
+        resolutions = fetch_resolutions_for_open_signals(
+            client,
+            [signal],
+            state={},
+            now_ts=1000,
+            gamma_pages=1,
+            ttl_seconds=900,
+        )
+
+        self.assertEqual(resolutions, {"m1": 1})
+        self.assertEqual(client.event_calls, 1)
+        self.assertEqual(client.market_calls, [["m1"]])
+
     def test_follow_tick_does_not_write_performance_json(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
