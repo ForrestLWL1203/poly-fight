@@ -138,12 +138,9 @@ from poly_fight.follow import (
     aggregate_follow_performance,
     apply_closing_line_snapshots,
     apply_contested_flags,
-    bootstrap_position_trades,
     compute_clv,
     contested_markets,
     desired_tick_interval,
-    detect_position_shadow_events,
-    detect_new_positions,
     eligible_follow_wallets,
     esports_match_imminent,
     evaluate_slippage,
@@ -152,12 +149,9 @@ from poly_fight.follow import (
     paper_pnl,
     process_follow_trades,
     follow_stake_for_signal,
-    match_position_trade_latency,
-    qualify_follow,
     quarantine_reason,
     select_new_trades,
     settle_open_signals,
-    should_retry_unqualified_position,
     summarize_wallet_fills,
     wallet_behavior_summary,
 )
@@ -5364,173 +5358,6 @@ class CoreTest(unittest.TestCase):
         self.assertFalse(esports_match_imminent(markets, now_ts=now + 3 * 3600, horizon_hours=12))
         self.assertTrue(esports_match_imminent([{"condition_id": "m3"}], now_ts=now, horizon_hours=12))
 
-    def test_follow_position_diff_cold_start_then_new_position(self):
-        positions = [{"conditionId": "m1", "outcomeIndex": 0, "size": 10}]
-
-        new_positions, snapshot, cold_start = detect_new_positions(None, positions)
-
-        self.assertTrue(cold_start)
-        self.assertEqual(new_positions, [])
-        self.assertEqual(snapshot, ["m1:0"])
-
-        next_positions = [*positions, {"conditionId": "m2", "outcomeIndex": 1, "size": 5}]
-        new_positions, snapshot, cold_start = detect_new_positions(snapshot, next_positions)
-
-        self.assertFalse(cold_start)
-        self.assertEqual([row["conditionId"] for row in new_positions], ["m2"])
-        self.assertEqual(snapshot, ["m1:0", "m2:1"])
-
-    def test_position_shadow_observer_cold_start_only_builds_baseline(self):
-        positions = [{"conditionId": "m1", "outcomeIndex": 0, "size": 10, "avgPrice": 0.5, "initialValue": 5}]
-
-        events, cursor, cold_start = detect_position_shadow_events(
-            None,
-            positions,
-            tracked_condition_ids={"m1"},
-            wallet="0xA",
-            category="esports",
-            seen_at=100,
-        )
-
-        self.assertTrue(cold_start)
-        self.assertEqual(events, [])
-        self.assertIn("m1:0", cursor)
-        self.assertEqual(cursor["m1:0"]["size"], 10)
-        self.assertEqual(cursor["m1:0"]["avgPrice"], 0.5)
-        self.assertEqual(cursor["m1:0"]["initialValue"], 5)
-        self.assertEqual(cursor["m1:0"]["first_seen_at"], 100)
-        self.assertEqual(cursor["m1:0"]["last_seen_at"], 100)
-
-    def test_position_shadow_observer_records_new_and_add_events(self):
-        events, cursor, cold_start = detect_position_shadow_events(
-            {},
-            [{"conditionId": "m1", "outcomeIndex": 0, "size": 10, "avgPrice": 0.5, "curPrice": 0.55, "initialValue": 5}],
-            tracked_condition_ids={"m1"},
-            wallet="0xA",
-            category="esports",
-            seen_at=100,
-        )
-
-        self.assertFalse(cold_start)
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["event_type"], "position_new")
-        self.assertEqual(events[0]["wallet"], "0xa")
-        self.assertEqual(events[0]["condition_id"], "m1")
-        self.assertEqual(events[0]["outcome_index"], 0)
-        self.assertEqual(events[0]["position_size"], 10)
-        self.assertEqual(events[0]["delta_size"], 10)
-        self.assertEqual(events[0]["estimated_delta_cash"], 5)
-        self.assertEqual(events[0]["avg_price"], 0.5)
-        self.assertEqual(events[0]["cur_price"], 0.55)
-
-        events, cursor, cold_start = detect_position_shadow_events(
-            cursor,
-            [{"conditionId": "m1", "outcomeIndex": 0, "size": 14, "avgPrice": 0.5, "initialValue": 7}],
-            tracked_condition_ids={"m1"},
-            wallet="0xA",
-            category="esports",
-            seen_at=160,
-        )
-
-        self.assertFalse(cold_start)
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["event_type"], "position_add")
-        self.assertEqual(events[0]["previous_size"], 10)
-        self.assertEqual(events[0]["delta_size"], 4)
-        self.assertEqual(events[0]["estimated_delta_cash"], 2)
-        self.assertEqual(events[0]["add_ratio_to_first"], 0.4)
-        self.assertEqual(cursor["m1:0"]["first_seen_at"], 100)
-        self.assertEqual(cursor["m1:0"]["last_seen_at"], 160)
-
-    def test_position_shadow_observer_filters_unwatched_conditions(self):
-        events, cursor, cold_start = detect_position_shadow_events(
-            {},
-            [{"conditionId": "m2", "outcomeIndex": 0, "size": 10, "avgPrice": 0.5, "initialValue": 5}],
-            tracked_condition_ids={"m1"},
-            wallet="0xA",
-            category="esports",
-            seen_at=100,
-        )
-
-        self.assertFalse(cold_start)
-        self.assertEqual(events, [])
-        self.assertEqual(cursor, {})
-
-    def test_position_trade_latency_matches_both_directions(self):
-        position_events = [
-            {
-                "event_type": "position_new",
-                "position_seen_at": 100,
-                "condition_id": "m1",
-                "outcome_index": 0,
-                "wallet": "0xa",
-                "category": "esports",
-            }
-        ]
-
-        annotated, matches, lead_values, position_seen, trade_seen = match_position_trade_latency(
-            position_events,
-            [{"id": "t1", "market": "m1", "outcomeIndex": 0, "side": "BUY"}],
-            wallet="0xA",
-            category="esports",
-            trade_seen_at=140,
-            position_seen_by_key={},
-            trade_seen_by_key={},
-        )
-
-        self.assertEqual(annotated[0]["position_seen_at"], 100)
-        self.assertEqual(matches[0]["position_before_trade_seconds"], 40)
-        self.assertEqual(lead_values, [40])
-        self.assertIn("esports:0xa:m1:0", position_seen)
-        self.assertIn("esports:0xa:m1:0", trade_seen)
-
-        annotated, matches, lead_values, _position_seen, _trade_seen = match_position_trade_latency(
-            [
-                {
-                    "event_type": "position_add",
-                    "position_seen_at": 200,
-                    "condition_id": "m1",
-                    "outcome_index": 0,
-                    "wallet": "0xa",
-                    "category": "esports",
-                }
-            ],
-            [],
-            wallet="0xA",
-            category="esports",
-            trade_seen_at=200,
-            position_seen_by_key={},
-            trade_seen_by_key={"esports:0xa:m1:0": 170},
-        )
-
-        self.assertEqual(annotated[0]["trade_before_position_seconds"], 30)
-        self.assertEqual(matches[0]["trade_before_position_seconds"], 30)
-        self.assertEqual(lead_values, [-30])
-
-    def test_follow_qualifies_only_before_match_start(self):
-        now = 1000
-        market = {
-            "condition_id": "m1",
-            "outcomes": ["A", "B"],
-            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
-            "closed": False,
-        }
-        position = {"conditionId": "m1", "outcomeIndex": 1, "size": 10, "avgPrice": 0.45}
-
-        qualified = qualify_follow(position, market, now_ts=now)
-        rejected = qualify_follow(position, market, now_ts=now + 7200)
-
-        self.assertTrue(qualified["qualified"])
-        self.assertEqual(qualified["outcome"], "B")
-        self.assertFalse(rejected["qualified"])
-        self.assertEqual(rejected["reason"], "after_match_start")
-
-    def test_follow_unqualified_retry_policy_keeps_only_transient_reasons(self):
-        self.assertTrue(should_retry_unqualified_position("unknown_market"))
-        self.assertFalse(should_retry_unqualified_position("after_match_start"))
-        self.assertFalse(should_retry_unqualified_position("closed_market"))
-        self.assertFalse(should_retry_unqualified_position("unknown_outcome"))
-
     def test_follow_v2_desired_tick_interval_curve(self):
         now = 1000
         far = {"condition_id": "m1", "match_start_time": datetime.fromtimestamp(now + 24 * 3600, timezone.utc).isoformat()}
@@ -6527,73 +6354,6 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(stats["exited_signal_count"], 1)
         self.assertEqual(signals[0]["status"], "exited")
         self.assertGreater(signals[0]["our_realized_pnl"], 0)
-
-    def test_follow_v2_bootstraps_existing_position_when_price_still_acceptable(self):
-        now = 1000
-        market = {
-            "condition_id": "m1",
-            "outcomes": ["A", "B"],
-            "outcome_prices": [0.49, 0.51],
-            "match_start_time": datetime.fromtimestamp(now + 7200, timezone.utc).isoformat(),
-        }
-        positions = [
-            {"conditionId": "m1", "outcomeIndex": 0, "size": 100, "avgPrice": 0.45},
-            {"conditionId": "m2", "outcomeIndex": 0, "size": 100, "avgPrice": 0.45},
-        ]
-
-        trades = bootstrap_position_trades(
-            positions,
-            wallet="0xA",
-            markets_by_condition={"m1": market},
-            now_ts=now,
-            max_slippage=0.05,
-        )
-
-        self.assertEqual(len(trades), 1)
-        self.assertEqual(trades[0]["side"], "BUY")
-        self.assertEqual(trades[0]["price"], 0.45)
-        self.assertTrue(trades[0]["bootstrap_position"])
-
-    def test_follow_v2_does_not_bootstrap_when_current_price_too_far(self):
-        now = 1000
-        market = {
-            "condition_id": "m1",
-            "outcomes": ["A", "B"],
-            "outcome_prices": [0.6, 0.4],
-            "match_start_time": datetime.fromtimestamp(now + 7200, timezone.utc).isoformat(),
-        }
-        positions = [{"conditionId": "m1", "outcomeIndex": 0, "size": 100, "avgPrice": 0.45}]
-
-        trades = bootstrap_position_trades(
-            positions,
-            wallet="0xA",
-            markets_by_condition={"m1": market},
-            now_ts=now,
-            max_slippage=0.05,
-        )
-
-        self.assertEqual(trades, [])
-
-    def test_follow_v2_does_not_bootstrap_low_entry_position(self):
-        now = 1000
-        market = {
-            "condition_id": "m1",
-            "outcomes": ["A", "B"],
-            "outcome_prices": [0.37, 0.63],
-            "match_start_time": datetime.fromtimestamp(now + 7200, timezone.utc).isoformat(),
-        }
-        positions = [{"conditionId": "m1", "outcomeIndex": 0, "size": 100, "avgPrice": 0.35}]
-
-        trades = bootstrap_position_trades(
-            positions,
-            wallet="0xA",
-            markets_by_condition={"m1": market},
-            now_ts=now,
-            max_slippage=0.05,
-            min_wallet_entry_price=0.4,
-        )
-
-        self.assertEqual(trades, [])
 
     def test_follow_v2_opposite_buy_dual_follows_by_default(self):
         now = 1000
@@ -7743,7 +7503,7 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(summary["new_signal_count"], 0, summary)
             self.assertEqual(snapshot["open_signals"], [])
 
-    def test_follow_tick_shadow_positions_observes_without_opening_signal(self):
+    def test_follow_tick_does_not_request_positions_or_write_shadow_state(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             now = datetime.now(timezone.utc)
@@ -7758,7 +7518,6 @@ class CoreTest(unittest.TestCase):
                     "esports:0xa": {
                         "last_trade_cursor": {"timestamp": 10, "id": "old"},
                         "last_seen_at": 10,
-                        "position_cursor_by_key": {},
                     },
                 },
                 open_signals=[],
@@ -7814,8 +7573,6 @@ class CoreTest(unittest.TestCase):
                     "1",
                     "--max-workers",
                     "1",
-                    "--position-observe-limit",
-                    "25",
                 ]
             )
             client = FakeClient()
@@ -7824,15 +7581,15 @@ class CoreTest(unittest.TestCase):
             snapshot = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_snapshot()
             state = snapshot["wallet_trade_state"]["esports:0xa"]
 
-            self.assertEqual(client.position_calls, [("0xa", 25)])
-            self.assertEqual(summary["position_request_count"], 1)
-            self.assertEqual(summary["position_observed_count"], 1)
-            self.assertEqual(summary["position_new_count"], 1)
+            self.assertEqual(client.position_calls, [])
+            self.assertNotIn("position_request_count", summary)
+            self.assertNotIn("position_observed_count", summary)
+            self.assertNotIn("position_new_count", summary)
             self.assertEqual(summary["new_signal_count"], 0)
             self.assertEqual(snapshot["open_signals"], [])
-            self.assertIn("m1:0", state["position_cursor_by_key"])
+            self.assertNotIn("position_cursor_by_key", state)
 
-    def test_follow_tick_position_failure_does_not_block_trade_follow(self):
+    def test_follow_tick_trade_follow_does_not_depend_on_positions(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             now = datetime.now(timezone.utc)
@@ -7901,8 +7658,8 @@ class CoreTest(unittest.TestCase):
             summary = command_follow(args, client=FakeClient(), emit=False)
             snapshot = FollowStore(data_dir / "follow" / "follow.db").load_dashboard_snapshot()
 
-            self.assertEqual(summary["position_request_count"], 1)
-            self.assertEqual(summary["position_fetch_error_count"], 1)
+            self.assertNotIn("position_request_count", summary)
+            self.assertNotIn("position_fetch_error_count", summary)
             self.assertEqual(summary["new_signal_count"], 1)
             self.assertEqual(len(snapshot["open_signals"]), 1)
 
@@ -15178,8 +14935,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.min_tick_seconds, 180)
         self.assertEqual(args.max_tick_seconds, 900)
         self.assertEqual(args.tick_seconds, 60)
-        self.assertEqual(args.position_observe_mode, "shadow")
-        self.assertEqual(args.position_observe_limit, 0)
+        self.assertFalse(hasattr(args, "positions_limit"))
+        self.assertFalse(hasattr(args, "position_observe_mode"))
+        self.assertFalse(hasattr(args, "position_observe_limit"))
         self.assertEqual(args.max_workers, 8)
         self.assertFalse(hasattr(args, "consensus_block_opposite"))
         self.assertFalse(hasattr(args, "conflict_policy"))
@@ -15218,8 +14976,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.resolution_cache_ttl_seconds, 60)
         self.assertEqual(args.resolution_gamma_pages, 2)
         self.assertEqual(args.tick_seconds, 60)
-        self.assertEqual(args.position_observe_mode, "shadow")
-        self.assertEqual(args.position_observe_limit, 0)
+        self.assertFalse(hasattr(args, "positions_limit"))
+        self.assertFalse(hasattr(args, "position_observe_mode"))
+        self.assertFalse(hasattr(args, "position_observe_limit"))
         self.assertEqual(args.market_batch_size, 50)
         self.assertEqual(args.market_batch_count, 2)
         self.assertFalse(hasattr(args, "consensus_block_opposite"))
@@ -15278,6 +15037,12 @@ class CoreTest(unittest.TestCase):
             ["run", "--stake-usdc", "1", "--conviction-stake-usdc", "5"],
             ["run", "--stake-usdc", "1", "--conviction-size-multiple", "2"],
             ["run", "--stake-usdc", "1", "--no-conviction-gate"],
+            ["follow", "--stake-usdc", "1", "--positions-limit", "25"],
+            ["follow", "--stake-usdc", "1", "--position-observe-mode", "shadow"],
+            ["follow", "--stake-usdc", "1", "--position-observe-limit", "25"],
+            ["run", "--stake-usdc", "1", "--positions-limit", "25"],
+            ["run", "--stake-usdc", "1", "--position-observe-mode", "shadow"],
+            ["run", "--stake-usdc", "1", "--position-observe-limit", "25"],
         ]
         for argv in removed_options:
             with self.subTest(argv=argv):

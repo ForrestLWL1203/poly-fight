@@ -92,268 +92,12 @@ def esports_match_imminent(
     return bool(markets) and not has_start_time
 
 
-def position_condition_id(position: dict[str, Any]) -> str:
-    return str(position.get("conditionId") or position.get("condition_id") or "").lower()
-
-
-def position_outcome_index(position: dict[str, Any]) -> int:
-    value = position.get("outcomeIndex")
-    if value is None or value == "":
-        value = position.get("outcome_index")
-    return to_int(value, -1)
-
-
-def position_size(position: dict[str, Any]) -> float:
-    return to_float(position.get("size") or position.get("amount") or position.get("balance"))
-
-
-def position_avg_price(position: dict[str, Any]) -> float:
-    return to_float(position.get("avgPrice") or position.get("avg_price") or position.get("averagePrice"))
-
-
-def position_initial_value(position: dict[str, Any]) -> float:
-    return to_float(position.get("initialValue") or position.get("initial_value") or position.get("cashValue"))
-
-
-def position_current_price(position: dict[str, Any]) -> float:
-    return to_float(position.get("curPrice") or position.get("currentPrice") or position.get("price"))
-
-
-def position_key(position: dict[str, Any]) -> str:
-    return f"{position_condition_id(position)}:{position_outcome_index(position)}"
-
-
-def current_position_keys(positions: list[dict[str, Any]]) -> list[str]:
-    keys = []
-    for position in positions:
-        if position_size(position) <= 0:
-            continue
-        condition_id = position_condition_id(position)
-        outcome_index = position_outcome_index(position)
-        if condition_id and outcome_index >= 0:
-            keys.append(f"{condition_id}:{outcome_index}")
-    return sorted(set(keys))
-
-
-def detect_new_positions(
-    previous_keys: list[str] | None,
-    current_positions: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[str], bool]:
-    current_keys = set(current_position_keys(current_positions))
-    if previous_keys is None:
-        return [], sorted(current_keys), True
-    previous = set(previous_keys)
-    new_positions = [
-        position
-        for position in current_positions
-        if position_size(position) > 0 and position_key(position) in current_keys - previous
-    ]
-    return new_positions, sorted(current_keys), False
-
-
-def _position_cursor_row(
-    position: dict[str, Any],
-    *,
-    seen_at: int,
-    previous: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    previous = previous or {}
-    first_seen_at = to_int(previous.get("first_seen_at")) or int(seen_at)
-    size = position_size(position)
-    avg_price = position_avg_price(position)
-    initial_value = position_initial_value(position)
-    first_cash = to_float(previous.get("firstCash"))
-    if first_cash <= 0:
-        first_cash = initial_value if initial_value > 0 else size * avg_price
-    return {
-        "size": size,
-        "avgPrice": avg_price,
-        "initialValue": initial_value,
-        "first_seen_at": first_seen_at,
-        "last_seen_at": int(seen_at),
-        "firstSize": to_float(previous.get("firstSize")) or size,
-        "firstInitialValue": to_float(previous.get("firstInitialValue")) or initial_value,
-        "firstCash": round(first_cash, 8),
-    }
-
-
-def detect_position_shadow_events(
-    previous_cursor_by_key: dict[str, dict[str, Any]] | None,
-    current_positions: list[dict[str, Any]],
-    *,
-    tracked_condition_ids: set[str],
-    wallet: str,
-    category: str,
-    seen_at: int,
-) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], bool]:
-    tracked = {str(condition_id or "").lower() for condition_id in tracked_condition_ids if condition_id}
-    wallet = normalize_wallet(wallet)
-    category = str(category or "esports").lower()
-    cold_start = previous_cursor_by_key is None
-    previous_cursor = previous_cursor_by_key or {}
-    next_cursor: dict[str, dict[str, Any]] = {}
-    events: list[dict[str, Any]] = []
-    for position in current_positions:
-        condition_id = position_condition_id(position)
-        outcome_index = position_outcome_index(position)
-        size = position_size(position)
-        if not condition_id or outcome_index < 0 or size <= 0:
-            continue
-        if condition_id not in tracked:
-            continue
-        key = f"{condition_id}:{outcome_index}"
-        previous = previous_cursor.get(key) if isinstance(previous_cursor.get(key), dict) else None
-        row = _position_cursor_row(position, seen_at=seen_at, previous=previous)
-        next_cursor[key] = row
-        if cold_start:
-            continue
-        previous_size = to_float((previous or {}).get("size"))
-        delta_size = round(size - previous_size, 10)
-        if previous is not None and delta_size <= 1e-9:
-            continue
-        event_type = "position_new" if previous is None else "position_add"
-        avg_price = position_avg_price(position)
-        previous_initial_value = to_float((previous or {}).get("initialValue"))
-        initial_value = position_initial_value(position)
-        delta_initial_value = round(initial_value - previous_initial_value, 10)
-        if avg_price > 0 and delta_size > 0:
-            estimated_delta_cash = delta_size * avg_price
-        else:
-            estimated_delta_cash = delta_initial_value if delta_initial_value > 0 else 0.0
-        first_cash = to_float(row.get("firstCash"))
-        add_ratio_to_first = round(float(estimated_delta_cash) / first_cash, 8) if first_cash > 0 else 0.0
-        would_follow = True
-        follow_block_reason = None
-        if event_type == "position_add" and add_ratio_to_first < MIN_ADD_RATIO_TO_FIRST:
-            would_follow = False
-            follow_block_reason = "small_add"
-        events.append(
-            {
-                "event_type": event_type,
-                "position_seen_at": int(seen_at),
-                "condition_id": condition_id,
-                "outcome_index": outcome_index,
-                "wallet": wallet,
-                "category": category,
-                "position_key": key,
-                "position_size": size,
-                "previous_size": previous_size,
-                "delta_size": round(delta_size, 10),
-                "estimated_delta_cash": round(float(estimated_delta_cash), 8),
-                "add_ratio_to_first": add_ratio_to_first,
-                "min_add_ratio_to_first": MIN_ADD_RATIO_TO_FIRST,
-                "would_follow": would_follow,
-                "avg_price": avg_price,
-                "cur_price": position_current_price(position),
-                "initial_value": initial_value,
-                "delta_initial_value": round(delta_initial_value, 8),
-            }
-        )
-        if follow_block_reason:
-            events[-1]["follow_block_reason"] = follow_block_reason
-    return events, next_cursor, cold_start
-
-
-def market_current_price(market: dict[str, Any], outcome_index: int, position: dict[str, Any] | None = None) -> float:
+def market_current_price(market: dict[str, Any], outcome_index: int, price_row: dict[str, Any] | None = None) -> float:
     prices = market.get("outcome_prices") or []
     if 0 <= outcome_index < len(prices):
         return to_float(prices[outcome_index])
-    position = position or {}
-    return to_float(position.get("curPrice") or position.get("currentPrice") or position.get("price"))
-
-
-def qualify_follow(
-    position: dict[str, Any],
-    market: dict[str, Any] | None,
-    *,
-    now_ts: int,
-    require_pre_match: bool = True,
-) -> dict[str, Any]:
-    if not market:
-        return {"qualified": False, "reason": "unknown_market"}
-    condition_id = position_condition_id(position)
-    if condition_id != str(market.get("condition_id") or "").lower():
-        return {"qualified": False, "reason": "condition_mismatch"}
-    outcome_index = position_outcome_index(position)
-    outcomes = market.get("outcomes") or []
-    if outcome_index < 0 or outcome_index >= len(outcomes):
-        return {"qualified": False, "reason": "unknown_outcome"}
-    start_ts = market_start_ts(market)
-    if require_pre_match and start_ts and now_ts >= start_ts:
-        return {"qualified": False, "reason": "after_match_start"}
-    if require_pre_match and not start_ts and market.get("closed"):
-        return {"qualified": False, "reason": "closed_market"}
-    return {
-        "qualified": True,
-        "condition_id": condition_id,
-        "outcome_index": outcome_index,
-        "outcome": outcomes[outcome_index],
-        "wallet_avg_price": position_avg_price(position),
-        "position_size": position_size(position),
-    }
-
-
-def should_retry_unqualified_position(reason: str | None) -> bool:
-    return reason in {"unknown_market"}
-
-
-def bootstrap_position_trades(
-    positions: list[dict[str, Any]],
-    *,
-    wallet: str,
-    markets_by_condition: dict[str, dict[str, Any]],
-    now_ts: int,
-    max_slippage: float,
-    min_wallet_entry_price: float = 0.4,
-    max_entry_price: float = 0.85,
-    eligible_market_types: set[str] | None = None,
-    eligible_buckets: set[str] | None = None,
-    eligible_category: str | None = None,
-    eligible_leagues: set[str] | None = None,
-    require_pre_match: bool = True,
-) -> list[dict[str, Any]]:
-    wallet = normalize_wallet(wallet)
-    trades: list[dict[str, Any]] = []
-    for position in positions:
-        condition_id = position_condition_id(position)
-        market = markets_by_condition.get(condition_id)
-        if eligible_category and str((market or {}).get("category") or "esports").lower() != str(eligible_category).lower():
-            continue
-        market_league = str((market or {}).get("league") or "").lower()
-        if eligible_leagues is not None and market_league not in eligible_leagues:
-            continue
-        market_type = str((market or {}).get("market_type") or "main_match")
-        market_bucket = bucket_key(str((market or {}).get("game_family") or market_league or "unknown"), market_type)
-        if eligible_buckets is not None and market_bucket not in eligible_buckets:
-            continue
-        if eligible_buckets is None and eligible_market_types is not None and market_type not in eligible_market_types:
-            continue
-        qualification = qualify_follow(position, market, now_ts=now_ts, require_pre_match=require_pre_match)
-        if not qualification.get("qualified"):
-            continue
-        outcome_index = int(qualification["outcome_index"])
-        current_price = market_current_price(market, outcome_index, position)
-        wallet_avg_price = to_float(qualification.get("wallet_avg_price"))
-        if min_wallet_entry_price > 0 and wallet_avg_price < min_wallet_entry_price:
-            continue
-        if max_entry_price > 0 and current_price > max_entry_price:
-            continue
-        if not evaluate_slippage(wallet_avg_price, current_price, max_slippage=max_slippage).get("would_follow"):
-            continue
-        trades.append(
-            {
-                "id": f"bootstrap:{wallet}:{condition_id}:{outcome_index}",
-                "proxyWallet": wallet,
-                "conditionId": condition_id,
-                "outcomeIndex": outcome_index,
-                "side": "BUY",
-                "price": wallet_avg_price,
-                "size": to_float(qualification.get("position_size")),
-                "timestamp": now_ts,
-                "bootstrap_position": True,
-            }
-        )
-    return trades
+    price_row = price_row or {}
+    return to_float(price_row.get("curPrice") or price_row.get("currentPrice") or price_row.get("price"))
 
 
 def desired_tick_interval(
@@ -396,7 +140,10 @@ def trade_condition_id(trade: dict[str, Any]) -> str:
 
 
 def trade_outcome_index(trade: dict[str, Any]) -> int:
-    return position_outcome_index(trade)
+    value = trade.get("outcomeIndex")
+    if value is None or value == "":
+        value = trade.get("outcome_index")
+    return to_int(value, -1)
 
 
 def trade_timestamp(trade: dict[str, Any]) -> int:
@@ -413,85 +160,6 @@ def trade_id(trade: dict[str, Any]) -> str:
 
 def trade_side(trade: dict[str, Any]) -> str:
     return str(trade.get("side") or trade.get("type") or "").upper()
-
-
-def position_trade_latency_key(*, category: str, wallet: str, condition_id: str, outcome_index: int) -> str:
-    return f"{str(category or 'esports').lower()}:{normalize_wallet(wallet)}:{str(condition_id or '').lower()}:{int(outcome_index)}"
-
-
-def match_position_trade_latency(
-    position_events: list[dict[str, Any]],
-    trades: list[dict[str, Any]],
-    *,
-    wallet: str,
-    category: str,
-    trade_seen_at: int,
-    position_seen_by_key: dict[str, int],
-    trade_seen_by_key: dict[str, int],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[float], dict[str, int], dict[str, int]]:
-    wallet = normalize_wallet(wallet)
-    category = str(category or "esports").lower()
-    next_position_seen = dict(position_seen_by_key or {})
-    next_trade_seen = dict(trade_seen_by_key or {})
-    annotated_position_events: list[dict[str, Any]] = []
-    match_events: list[dict[str, Any]] = []
-    lead_values: list[float] = []
-    for event in position_events:
-        condition_id = str(event.get("condition_id") or "").lower()
-        outcome_index = to_int(event.get("outcome_index"), -1)
-        position_seen_at = to_int(event.get("position_seen_at"))
-        if not condition_id or outcome_index < 0 or position_seen_at <= 0:
-            annotated_position_events.append(dict(event))
-            continue
-        key = position_trade_latency_key(category=category, wallet=wallet, condition_id=condition_id, outcome_index=outcome_index)
-        annotated = dict(event)
-        previous_trade_seen_at = to_int(next_trade_seen.get(key))
-        if previous_trade_seen_at > 0 and previous_trade_seen_at <= position_seen_at:
-            seconds = max(0, position_seen_at - previous_trade_seen_at)
-            annotated["trade_before_position_seconds"] = seconds
-            match_events.append(
-                {
-                    "event_type": "position_trade_latency",
-                    "wallet": wallet,
-                    "category": category,
-                    "condition_id": condition_id,
-                    "outcome_index": outcome_index,
-                    "position_seen_at": position_seen_at,
-                    "trade_seen_at": previous_trade_seen_at,
-                    "trade_before_position_seconds": seconds,
-                    "position_vs_trade_lead_seconds": -seconds,
-                }
-            )
-            lead_values.append(-float(seconds))
-        next_position_seen[key] = position_seen_at
-        annotated_position_events.append(annotated)
-    for trade in trades:
-        if trade_side(trade) and trade_side(trade) != "BUY":
-            continue
-        condition_id = trade_condition_id(trade)
-        outcome_index = trade_outcome_index(trade)
-        if not condition_id or outcome_index < 0:
-            continue
-        key = position_trade_latency_key(category=category, wallet=wallet, condition_id=condition_id, outcome_index=outcome_index)
-        next_trade_seen[key] = int(trade_seen_at)
-        position_seen_at = to_int(next_position_seen.get(key))
-        if position_seen_at > 0 and position_seen_at <= int(trade_seen_at):
-            seconds = max(0, int(trade_seen_at) - position_seen_at)
-            match_events.append(
-                {
-                    "event_type": "position_trade_latency",
-                    "wallet": wallet,
-                    "category": category,
-                    "condition_id": condition_id,
-                    "outcome_index": outcome_index,
-                    "position_seen_at": position_seen_at,
-                    "trade_seen_at": int(trade_seen_at),
-                    "position_before_trade_seconds": seconds,
-                    "position_vs_trade_lead_seconds": seconds,
-                }
-            )
-            lead_values.append(float(seconds))
-    return annotated_position_events, match_events, lead_values, next_position_seen, next_trade_seen
 
 
 def trade_price(trade: dict[str, Any]) -> float:
@@ -1092,8 +760,8 @@ def summarize_wallet_fills(
         trade_wallet = normalize_wallet(trade.get("proxyWallet") or trade.get("wallet") or trade.get("user"))
         if wallet and trade_wallet and trade_wallet != wallet:
             continue
-        trade_outcome_index = position_outcome_index(trade)
-        if outcome_index is not None and trade_outcome_index >= 0 and trade_outcome_index != outcome_index:
+        trade_outcome = trade_outcome_index(trade)
+        if outcome_index is not None and trade_outcome >= 0 and trade_outcome != outcome_index:
             continue
         price = to_float(trade.get("price") or trade.get("avgPrice"))
         size = to_float(trade.get("size") or trade.get("amount"))

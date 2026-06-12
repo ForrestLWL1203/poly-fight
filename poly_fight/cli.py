@@ -64,24 +64,18 @@ from .follow import (
     aggregate_follow_performance,
     apply_closing_line_snapshots,
     apply_contested_flags,
-    bootstrap_position_trades,
     contested_markets,
     desired_tick_interval,
-    detect_position_shadow_events,
-    detect_new_positions,
     eligible_follow_wallets,
     esports_match_imminent,
     evaluate_slippage,
     leg_actual_stake,
     market_current_price,
-    match_position_trade_latency,
     paper_exit_pnl,
     paper_pnl,
     process_follow_trades,
-    qualify_follow,
     select_new_trades,
     settle_open_signals,
-    should_retry_unqualified_position,
     summarize_wallet_fills,
     trade_condition_id,
     trade_timestamp,
@@ -6292,8 +6286,6 @@ def command_follow(
     contested_signal_count = 0
     closing_line_snapshot_count = 0
     cold_start_wallet_count = 0
-    bootstrap_position_count = 0
-    bootstrap_position_request_count = 0
     trade_request_count = 0
     insufficient_balance_count = 0
     low_entry_price_blocked_count = 0
@@ -6306,20 +6298,6 @@ def command_follow(
     wallet_fetch_seconds: list[float] = []
     observed_delay_values: list[int] = []
     index_lag_lower_bound_values: list[int] = []
-    position_observe_mode = str(getattr(args, "position_observe_mode", "shadow") or "off").lower()
-    position_observe_enabled = position_observe_mode == "shadow"
-    position_observe_limit = to_int(getattr(args, "position_observe_limit", 0))
-    if position_observe_limit <= 0:
-        position_observe_limit = to_int(getattr(args, "positions_limit", 100), 100)
-    position_request_count = 0
-    position_fetch_error_count = 0
-    position_fetch_seconds: list[float] = []
-    position_observed_count = 0
-    position_new_count = 0
-    position_add_count = 0
-    position_small_add_blocked_count = 0
-    position_shadow_events: list[dict[str, Any]] = []
-    position_vs_trade_lead_values: list[float] = []
     bankroll_usdc = effective_bankroll_usdc(args.bankroll_usdc)
     if account_balance_configured:
         bankroll_usdc = to_float(account_balance.get("balance_usdc")) + funded_open_exposure(open_signals)
@@ -6330,14 +6308,8 @@ def command_follow(
 
     tracked_condition_ids = {str(condition_id).lower() for condition_id in watched}
     tracked_condition_ids.update(str(signal.get("condition_id") or "").lower() for signal in open_signals)
-    markets_for_follow = {
-        condition_id: market
-        for condition_id, market in active_markets_for_follow.items()
-        if condition_id in tracked_condition_ids or condition_id in watched
-    }
-
     if gate_open and follow_wallets:
-        def fetch_trades_for_wallet(row: dict[str, Any]) -> tuple[str, list[dict], list[dict], dict[str, Any]]:
+        def fetch_trades_for_wallet(row: dict[str, Any]) -> tuple[str, list[dict], dict[str, Any]]:
             wallet = normalize_wallet(row.get("wallet"))
             scope_key = str(row.get("scope_key") or f"{str(row.get('category') or 'esports').lower()}:{wallet}")
             previous_state = wallet_trade_state.get(scope_key) or wallet_trade_state.get(wallet) or {}
@@ -6349,7 +6321,6 @@ def command_follow(
                 "previous_poll_at": to_int(previous_state.get("last_seen_at")),
             }
             trades: list[dict] = []
-            positions: list[dict] = []
             try:
                 trades = fetch_user_trades_until_cursor(
                     client,
@@ -6362,24 +6333,10 @@ def command_follow(
                 meta["fetch_completed_at"] = int(datetime.now(timezone.utc).timestamp())
                 meta["fetch_seconds"] = round(time.monotonic() - fetch_started_mono, 3)
                 meta["error"] = exc.__class__.__name__
-                return scope_key, [], [], meta
-            should_fetch_positions = scope_key in eligible_wallet_set and (
-                position_observe_enabled or previous_cursor is None
-            )
-            if should_fetch_positions:
-                position_fetch_started_mono = time.monotonic()
-                meta["position_requested"] = True
-                try:
-                    position_limit = position_observe_limit if position_observe_enabled else args.positions_limit
-                    positions = client.positions(wallet, limit=position_limit)
-                except Exception as exc:
-                    meta["position_error"] = exc.__class__.__name__
-                    positions = []
-                finally:
-                    meta["position_fetch_seconds"] = round(time.monotonic() - position_fetch_started_mono, 3)
+                return scope_key, [], meta
             meta["fetch_completed_at"] = int(datetime.now(timezone.utc).timestamp())
             meta["fetch_seconds"] = round(time.monotonic() - fetch_started_mono, 3)
-            return scope_key, trades, positions, meta
+            return scope_key, trades, meta
 
         wallet_fetch_started_mono = time.monotonic()
         trade_results = run_ordered_io_tasks(
@@ -6403,19 +6360,12 @@ def command_follow(
         for result in trade_results:
             if isinstance(result, Exception):
                 continue
-            scope_key, trades, positions, fetch_meta = result
+            scope_key, trades, fetch_meta = result
             fetch_seconds_value = to_float(fetch_meta.get("fetch_seconds")) if isinstance(fetch_meta, dict) else 0.0
             if fetch_seconds_value > 0:
                 wallet_fetch_seconds.append(fetch_seconds_value)
             if isinstance(fetch_meta, dict) and fetch_meta.get("error"):
                 wallet_fetch_error_count += 1
-            if isinstance(fetch_meta, dict) and fetch_meta.get("position_requested"):
-                position_request_count += 1
-                position_seconds_value = to_float(fetch_meta.get("position_fetch_seconds"))
-                if position_seconds_value >= 0:
-                    position_fetch_seconds.append(position_seconds_value)
-                if fetch_meta.get("position_error"):
-                    position_fetch_error_count += 1
             category, wallet = scope_key.split(":", 1)
             wallet_can_open_new = scope_key in eligible_wallet_set and category not in paused_new_signal_categories
             previous_wallet_state = wallet_trade_state.get(scope_key) or wallet_trade_state.get(wallet) or {}
@@ -6436,105 +6386,9 @@ def command_follow(
                 wallet_tracked_condition_ids = current_tracked_condition_ids
             else:
                 wallet_tracked_condition_ids = open_condition_ids_by_wallet.get(scope_key, set())
-            position_events: list[dict[str, Any]] = []
-            if position_observe_enabled and isinstance(fetch_meta, dict) and fetch_meta.get("position_requested"):
-                position_events, next_position_cursor, _position_cold_start = detect_position_shadow_events(
-                    previous_wallet_state.get("position_cursor_by_key"),
-                    positions,
-                    tracked_condition_ids={str(condition_id).lower() for condition_id in wallet_tracked_condition_ids},
-                    wallet=wallet,
-                    category=category,
-                    seen_at=observed_at,
-                )
-                next_wallet_state["position_cursor_by_key"] = next_position_cursor
-                position_observed_count += len(next_position_cursor)
-                position_new_count += sum(1 for event in position_events if event.get("event_type") == "position_new")
-                position_add_count += sum(1 for event in position_events if event.get("event_type") == "position_add")
-                position_small_add_blocked_count += sum(1 for event in position_events if event.get("follow_block_reason") == "small_add")
             new_trades, next_cursor, cold_start = select_new_trades(trades, previous_cursor)
             if cold_start:
                 cold_start_wallet_count += 1
-                if wallet_can_open_new:
-                    bootstrap_position_request_count += 1
-                if positions:
-                    bootstrap_trades = bootstrap_position_trades(
-                        positions,
-                        wallet=wallet,
-                        markets_by_condition=watched,
-                        now_ts=now_ts,
-                        max_slippage=args.max_slippage_over_entry,
-                        min_wallet_entry_price=args.min_wallet_entry_price,
-                        max_entry_price=args.max_entry_price,
-                        eligible_market_types=eligible_market_types_by_wallet.get(scope_key),
-                        eligible_buckets=eligible_buckets_by_wallet.get(scope_key),
-                        eligible_category=category,
-                        eligible_leagues=eligible_leagues_by_wallet.get(scope_key),
-                        require_pre_match=args.require_pre_match,
-                    )
-                    before_ids = {signal.get("signal_id") for signal in open_signals}
-                    open_signals, stats = process_follow_trades(
-                        open_signals,
-                        wallet=wallet,
-                        trades=bootstrap_trades,
-                        markets_by_condition=current_markets_for_follow or watched,
-                        now_ts=now_ts,
-                        observed_at=observed_at,
-                        previous_poll_at=previous_poll_at,
-                        stake_usdc=args.stake_usdc,
-                        max_follow_legs=args.max_follow_legs,
-                        max_slippage=args.max_slippage_over_entry,
-                        min_wallet_entry_price=args.min_wallet_entry_price,
-                        max_entry_price=args.max_entry_price,
-                        stake_ratio_percent=args.stake_ratio_percent,
-                        require_pre_match=args.require_pre_match,
-                        post_start_grace_seconds=args.post_start_trade_grace_seconds,
-                        quarantine_sell_frac=args.quarantine_sell_frac,
-                        eligible_market_types=eligible_market_types_by_wallet.get(scope_key),
-                        eligible_buckets=eligible_buckets_by_wallet.get(scope_key),
-                        eligible_category=category,
-                        eligible_leagues=eligible_leagues_by_wallet.get(scope_key),
-                        conflict_policy="dual_follow",
-                        bankroll_usdc=bankroll_usdc,
-                        max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
-                        max_signal_stake_usdc=max_signal_stake_usdc,
-                    )
-                    after_ids = {signal.get("signal_id") for signal in open_signals}
-                    new_signal_count += len(after_ids - before_ids)
-                    bootstrap_position_count += len(bootstrap_trades)
-                    for event in stats.get("quarantine_events") or []:
-                        event_category = str(event.get("category") or category).lower()
-                        event_wallet = normalize_wallet(event.get("wallet"))
-                        if f"{event_category}:{event_wallet}" in favorite_wallets or event_wallet in favorite_wallets:
-                            continue
-                        store.upsert_wallet_quarantine(event.get("wallet"), reason=str(event.get("reason") or ""), ts=int(event.get("timestamp") or now_ts), category=str(event.get("category") or category))
-                        quarantine_event_count += 1
-                    market_type_not_eligible_count += stats.get("market_type_not_eligible_count", 0)
-                    ignored_trade_count += stats.get("ignored_trade_count", 0)
-                    insufficient_balance_count += stats.get("insufficient_balance_count", 0)
-                    low_entry_price_blocked_count += stats.get("low_entry_price_blocked_count", 0)
-                    high_entry_price_blocked_count += stats.get("high_entry_price_blocked_count", 0)
-                    small_wallet_trade_blocked_count += stats.get("small_wallet_trade_blocked_count", 0)
-                    small_add_blocked_count += stats.get("small_add_blocked_count", 0)
-                    signal_cap_limited_count += stats.get("signal_cap_limited_count", 0)
-                    signal_cap_blocked_count += stats.get("signal_cap_blocked_count", 0)
-                    exited_signal_count += stats.get("exited_signal_count", 0)
-                    hedge_event_count += stats.get("hedge_event_count", 0)
-                    opposite_blocked_count += stats.get("opposite_blocked_count", 0)
-                if position_observe_enabled and position_events:
-                    annotated_position_events, latency_events, lead_values, position_seen_by_key, trade_seen_by_key = match_position_trade_latency(
-                        position_events,
-                        [],
-                        wallet=wallet,
-                        category=category,
-                        trade_seen_at=observed_at,
-                        position_seen_by_key=previous_wallet_state.get("position_seen_by_key") or {},
-                        trade_seen_by_key=previous_wallet_state.get("trade_seen_by_position_key") or {},
-                    )
-                    position_shadow_events.extend(annotated_position_events)
-                    position_shadow_events.extend(latency_events)
-                    position_vs_trade_lead_values.extend(lead_values)
-                    next_wallet_state["position_seen_by_key"] = position_seen_by_key
-                    next_wallet_state["trade_seen_by_position_key"] = trade_seen_by_key
                 next_wallet_state.update({
                     "last_trade_cursor": next_cursor,
                     "last_seen_at": now_ts,
@@ -6544,21 +6398,6 @@ def command_follow(
                 wallet_trade_state[scope_key] = next_wallet_state
                 continue
             watched_trades = [trade for trade in new_trades if trade_condition_id(trade) in wallet_tracked_condition_ids]
-            if position_observe_enabled and (position_events or watched_trades):
-                annotated_position_events, latency_events, lead_values, position_seen_by_key, trade_seen_by_key = match_position_trade_latency(
-                    position_events,
-                    watched_trades,
-                    wallet=wallet,
-                    category=category,
-                    trade_seen_at=observed_at,
-                    position_seen_by_key=previous_wallet_state.get("position_seen_by_key") or {},
-                    trade_seen_by_key=previous_wallet_state.get("trade_seen_by_position_key") or {},
-                )
-                position_shadow_events.extend(annotated_position_events)
-                position_shadow_events.extend(latency_events)
-                position_vs_trade_lead_values.extend(lead_values)
-                next_wallet_state["position_seen_by_key"] = position_seen_by_key
-                next_wallet_state["trade_seen_by_position_key"] = trade_seen_by_key
             record_observed_delay(watched_trades, observed_at=observed_at, previous_poll_at=previous_poll_at)
             before_ids = {signal.get("signal_id") for signal in open_signals}
             open_signals, stats = process_follow_trades(
@@ -6699,17 +6538,6 @@ def command_follow(
             "max": round(clean[-1], 3),
         }
 
-    def summarize_signed_seconds(values: list[int] | list[float]) -> dict[str, Any]:
-        clean = sorted(float(value) for value in values if value is not None)
-        if not clean:
-            return {"count": 0}
-        return {
-            "count": len(clean),
-            "p50": round(clean[int((len(clean) - 1) * 0.50)], 3),
-            "p90": round(clean[int((len(clean) - 1) * 0.90)], 3),
-            "max": round(clean[-1], 3),
-        }
-
     run_log_row = {
         "created_at": now_ts,
         "follow_wallet_count": len(follow_wallets),
@@ -6723,19 +6551,7 @@ def command_follow(
         "wallet_trade_fetch_seconds": summarize_seconds(wallet_fetch_seconds),
         "observed_trade_delay_seconds": summarize_seconds(observed_delay_values),
         "index_lag_lower_bound_seconds": summarize_seconds(index_lag_lower_bound_values),
-        "position_observe_mode": position_observe_mode,
-        "position_request_count": position_request_count,
-        "position_fetch_error_count": position_fetch_error_count,
-        "position_fetch_seconds": summarize_seconds(position_fetch_seconds),
-        "position_observed_count": position_observed_count,
-        "position_new_count": position_new_count,
-        "position_add_count": position_add_count,
-        "position_small_add_blocked_count": position_small_add_blocked_count,
-        "position_vs_trade_lead_seconds": summarize_signed_seconds(position_vs_trade_lead_values),
-        "position_shadow_events": position_shadow_events[-100:],
-        "bootstrap_position_request_count": bootstrap_position_request_count,
         "cold_start_wallet_count": cold_start_wallet_count,
-        "bootstrap_position_count": bootstrap_position_count,
         "total_new_trade_count": total_new_trade_count,
         "watched_new_trade_count": watched_new_trade_count,
         "new_trade_count": watched_new_trade_count,
@@ -7068,9 +6884,6 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
         subparser.add_argument("--run-log-retention-days", type=int, default=7)
         subparser.add_argument("--gamma-pages", type=int, default=3)
-        subparser.add_argument("--positions-limit", type=int, default=100)
-        subparser.add_argument("--position-observe-mode", choices=["off", "shadow"], default="shadow")
-        subparser.add_argument("--position-observe-limit", type=int, default=0)
         subparser.add_argument("--user-trades-limit", type=int, default=50)
         subparser.add_argument("--user-trades-max-pages", type=int, default=1)
         subparser.add_argument("--max-follow-legs", type=int, default=10)
@@ -7161,9 +6974,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--require-pre-match", dest="require_pre_match", action="store_true", default=False)
     run.add_argument("--no-require-pre-match", dest="require_pre_match", action="store_false")
     run.add_argument("--run-log-retention-days", type=int, default=7)
-    run.add_argument("--positions-limit", type=int, default=100)
-    run.add_argument("--position-observe-mode", choices=["off", "shadow"], default="shadow")
-    run.add_argument("--position-observe-limit", type=int, default=0)
     run.add_argument("--user-trades-limit", type=int, default=50)
     run.add_argument("--user-trades-max-pages", type=int, default=1)
     run.add_argument("--max-follow-legs", type=int, default=10)
