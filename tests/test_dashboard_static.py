@@ -143,6 +143,14 @@ class DashboardStaticTests(unittest.TestCase):
         self.assertNotIn(".panel-loading-mask", styles)
         self.assertNotIn(".panel-loading-card", styles)
 
+    def test_overview_shows_total_account_equity(self):
+        template_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "index.html"
+        template = template_path.read_text()
+
+        self.assertIn("总体资金", template)
+        self.assertIn("可动用余额 + 当前持仓花费成本", template)
+        self.assertIn("money(overview.account_total_equity_usdc)", template)
+
     def test_decimal_input_patterns_accept_integer_values(self):
         template_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "index.html"
         parser = _TemplateParser()

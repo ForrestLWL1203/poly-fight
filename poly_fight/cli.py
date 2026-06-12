@@ -6259,6 +6259,7 @@ def command_follow(
     insufficient_balance_count = 0
     low_entry_price_blocked_count = 0
     high_entry_price_blocked_count = 0
+    small_wallet_trade_blocked_count = 0
     small_add_blocked_count = 0
     signal_cap_limited_count = 0
     signal_cap_blocked_count = 0
@@ -6473,6 +6474,7 @@ def command_follow(
                     insufficient_balance_count += stats.get("insufficient_balance_count", 0)
                     low_entry_price_blocked_count += stats.get("low_entry_price_blocked_count", 0)
                     high_entry_price_blocked_count += stats.get("high_entry_price_blocked_count", 0)
+                    small_wallet_trade_blocked_count += stats.get("small_wallet_trade_blocked_count", 0)
                     small_add_blocked_count += stats.get("small_add_blocked_count", 0)
                     signal_cap_limited_count += stats.get("signal_cap_limited_count", 0)
                     signal_cap_blocked_count += stats.get("signal_cap_blocked_count", 0)
@@ -6555,6 +6557,7 @@ def command_follow(
             market_type_not_eligible_count += stats.get("market_type_not_eligible_count", 0)
             low_entry_price_blocked_count += stats.get("low_entry_price_blocked_count", 0)
             high_entry_price_blocked_count += stats.get("high_entry_price_blocked_count", 0)
+            small_wallet_trade_blocked_count += stats.get("small_wallet_trade_blocked_count", 0)
             small_add_blocked_count += stats.get("small_add_blocked_count", 0)
             signal_cap_limited_count += stats.get("signal_cap_limited_count", 0)
             signal_cap_blocked_count += stats.get("signal_cap_blocked_count", 0)
@@ -6702,6 +6705,7 @@ def command_follow(
         "market_type_not_eligible_count": market_type_not_eligible_count,
         "low_entry_price_blocked_count": low_entry_price_blocked_count,
         "high_entry_price_blocked_count": high_entry_price_blocked_count,
+        "small_wallet_trade_blocked_count": small_wallet_trade_blocked_count,
         "small_add_blocked_count": small_add_blocked_count,
         "signal_cap_limited_count": signal_cap_limited_count,
         "signal_cap_blocked_count": signal_cap_blocked_count,

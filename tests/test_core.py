@@ -5992,6 +5992,42 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(leg["follow_block_reasons"], ["high_entry_price"])
         self.assertEqual(leg["max_entry_price"], 0.85)
 
+    def test_process_follow_trades_blocks_wallet_buy_under_ten_usdc(self):
+        now = 1000
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.5, 0.5],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "Match",
+            "market_type": "main_match",
+        }
+        trades = [{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 18, "timestamp": now}]
+
+        signals, stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=trades,
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            stake_usdc=1,
+            stake_ratio_percent=10,
+            max_follow_legs=10,
+            max_slippage=0.05,
+            bankroll_usdc=1000,
+        )
+
+        self.assertEqual(stats["small_wallet_trade_blocked_count"], 1)
+        self.assertEqual(stats["ignored_trade_count"], 0)
+        leg = signals[0]["legs"][0]
+        self.assertEqual(leg["wallet_trade_cash"], 9.0)
+        self.assertFalse(leg["would_follow"])
+        self.assertEqual(leg["funding_status"], "blocked")
+        self.assertEqual(leg["funded_stake"], 0)
+        self.assertEqual(leg["follow_block_reason"], "small_wallet_trade")
+        self.assertEqual(leg["follow_block_reasons"], ["small_wallet_trade"])
+        self.assertEqual(leg["min_wallet_trade_cash_usdc"], 10.0)
+
     def test_process_follow_trades_recalculates_ratio_for_each_add(self):
         now = 1000
         market = {
@@ -6078,8 +6114,8 @@ class CoreTest(unittest.TestCase):
             "title": "Match",
         }
         trades = [
-            {"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 10, "timestamp": now},
-            {"id": "b2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.46, "size": 5, "timestamp": now + 1},
+            {"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 30, "timestamp": now},
+            {"id": "b2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.46, "size": 25, "timestamp": now + 1},
         ]
 
         signals, stats = process_follow_trades(
@@ -6104,7 +6140,7 @@ class CoreTest(unittest.TestCase):
         signals, stats = process_follow_trades(
             signals,
             wallet="0xA",
-            trades=[{"id": "s1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.61, "size": 15, "timestamp": now + 2}],
+            trades=[{"id": "s1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.61, "size": 55, "timestamp": now + 2}],
             markets_by_condition={"m1": sell_market},
             now_ts=now + 2,
             stake_usdc=1,
@@ -6114,7 +6150,7 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(stats["exited_signal_count"], 1)
         self.assertEqual(signals[0]["status"], "exited")
-        self.assertEqual(signals[0]["wallet_sell_size"], 15)
+        self.assertEqual(signals[0]["wallet_sell_size"], 55)
         self.assertTrue(wallet_behavior_summary(signals[0])["sold_before_resolution"])
         self.assertEqual(signals[0]["exit_price"], 0.6)
         self.assertGreater(signals[0]["our_realized_pnl"], 0)
@@ -6570,7 +6606,7 @@ class CoreTest(unittest.TestCase):
         signals, _stats = process_follow_trades(
             [],
             wallet="0xA",
-            trades=[{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 10, "timestamp": now}],
+            trades=[{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 30, "timestamp": now}],
             markets_by_condition={"m1": market},
             now_ts=now,
             stake_usdc=1,
@@ -6581,7 +6617,7 @@ class CoreTest(unittest.TestCase):
         signals, stats = process_follow_trades(
             signals,
             wallet="0xA",
-            trades=[{"id": "b2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 1, "side": "BUY", "price": 0.48, "size": 1, "timestamp": now + 1}],
+            trades=[{"id": "b2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 1, "side": "BUY", "price": 0.48, "size": 25, "timestamp": now + 1}],
             markets_by_condition={"m1": market},
             now_ts=now + 1,
             stake_usdc=1,
@@ -9536,6 +9572,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             store = FollowStore(data_dir / "follow" / "follow.db")
+            store.set_account_balance(97, ts=100, source="manual")
             store.save_follow_snapshot(
                 wallet_trade_state={},
                 open_signals=[
@@ -9571,6 +9608,8 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(overview["wallet_basis_realized_pnl"], 1.0)
             self.assertEqual(overview["total_stake"], 4.0)
             self.assertEqual(overview["resolved_stake"], 1.0)
+            self.assertEqual(overview["open_exposure"], 3.0)
+            self.assertEqual(overview["account_total_equity_usdc"], 100.0)
             self.assertEqual(overview["realized_roi"], 0.8)
             self.assertEqual(overview["wallet_basis_realized_roi"], 1.0)
             self.assertAlmostEqual(overview["delay_cost"], 0.2)

@@ -830,6 +830,9 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
     behavior = _behavior_counts(all_signals)
     tracking_started_at = _tracking_started_at(all_signals)
     now_ts = int(time.time())
+    open_exposure = sum(sum(_leg_actual_stake(leg) for leg in signal.get("legs") or []) for signal in open_signals)
+    account_balance_usdc = _to_float(account_balance.get("balance_usdc")) if account_balance.get("configured") else float("nan")
+    account_total_equity_usdc = account_balance_usdc + open_exposure if math.isfinite(account_balance_usdc) else None
     overview = {
         "db_ready": bool(snapshot.get("db_ready")),
         "open_signal_count": len(open_signals),
@@ -848,7 +851,8 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
         "would_follow_capture_rate": (len(would_follow) / len(legs)) if legs else None,
         **quality,
         "avg_wallet_clv": (sum(clv_values) / len(clv_values)) if clv_values else None,
-        "open_exposure": sum(sum(_leg_actual_stake(leg) for leg in signal.get("legs") or []) for signal in open_signals),
+        "open_exposure": open_exposure,
+        "account_total_equity_usdc": account_total_equity_usdc,
         "account_balance": account_balance,
         "behavior_counts": behavior,
         "performance": snapshot.get("performance") or {},

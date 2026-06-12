@@ -7,6 +7,7 @@ from typing import Any
 from .core import SECONDS_PER_DAY, bucket_key, bucket_label, normalize_wallet, parse_dt, to_float, to_int
 
 MIN_ADD_RATIO_TO_FIRST = 0.10
+MIN_WALLET_TRADE_CASH_USDC = 10.0
 
 
 def eligible_follow_wallets(
@@ -731,6 +732,7 @@ def process_follow_trades(
     max_slippage: float,
     min_wallet_entry_price: float = 0.4,
     max_entry_price: float = 0.85,
+    min_wallet_trade_cash_usdc: float = MIN_WALLET_TRADE_CASH_USDC,
     stake_ratio_percent: float = 10.0,
     require_pre_match: bool = True,
     post_start_grace_seconds: int = 0,
@@ -757,6 +759,7 @@ def process_follow_trades(
         "opposite_blocked_count": 0,
         "low_entry_price_blocked_count": 0,
         "high_entry_price_blocked_count": 0,
+        "small_wallet_trade_blocked_count": 0,
         "insufficient_balance_count": 0,
         "small_add_blocked_count": 0,
         "signal_cap_limited_count": 0,
@@ -869,6 +872,8 @@ def process_follow_trades(
         wallet_fill_price = trade_price(trade)
         slippage = evaluate_slippage(wallet_fill_price, current_price, max_slippage=max_slippage)
         follow_block_reasons = []
+        wallet_cash = round(trade_size(trade) * wallet_fill_price, 8)
+        min_wallet_trade_cash = to_float(min_wallet_trade_cash_usdc)
         if min_wallet_entry_price > 0 and wallet_fill_price < min_wallet_entry_price:
             slippage["would_follow"] = False
             follow_block_reasons.append("low_entry_price")
@@ -877,11 +882,14 @@ def process_follow_trades(
             slippage["would_follow"] = False
             follow_block_reasons.append("high_entry_price")
             stats["high_entry_price_blocked_count"] += 1
+        if min_wallet_trade_cash > 0 and wallet_cash < min_wallet_trade_cash:
+            slippage["would_follow"] = False
+            follow_block_reasons.append("small_wallet_trade")
+            stats["small_wallet_trade_blocked_count"] += 1
         if not slippage["would_follow"] and slippage["slippage_over_wallet_entry"] > max_slippage:
             follow_block_reasons.append("slippage_over_entry")
         stake_mode = None
         stake_ratio = None
-        wallet_cash = round(trade_size(trade) * wallet_fill_price, 8)
         available_balance = bankroll_usdc - _open_signals_exposure(open_signals)
         target_stake, target_stake_mode, _ = target_stake_for_signal(
             wallet_trade_cash=wallet_cash,
@@ -951,6 +959,7 @@ def process_follow_trades(
             "would_follow_if_funded": slippage["would_follow"],
             "min_wallet_entry_price": round(min_wallet_entry_price, 8),
             "max_entry_price": round(to_float(max_entry_price), 8),
+            "min_wallet_trade_cash_usdc": round(min_wallet_trade_cash, 8),
             "stake": leg_stake,
             "target_stake": target_stake,
             "target_stake_mode": target_stake_mode,

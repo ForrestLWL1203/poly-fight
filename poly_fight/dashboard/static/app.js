@@ -1780,7 +1780,15 @@ createApp({
     legStatusText(leg, signal) {
       const funding = String(leg?.funding_status || "");
       if (funding === "insufficient_balance") return "余额不足";
-      if (funding === "blocked") return "未跟";
+      if (funding === "blocked") {
+        const reason = String(leg?.follow_block_reason || "");
+        if (reason === "small_wallet_trade") return "单笔<10";
+        if (reason === "small_add") return "小额追加";
+        if (reason === "high_entry_price") return "价格过高";
+        if (reason === "low_entry_price") return "低价单";
+        if (reason === "signal_cap_reached") return "单场上限";
+        return "未跟";
+      }
       return this.signalStatusText(signal);
     },
     followSettlementTypeText(follow) {

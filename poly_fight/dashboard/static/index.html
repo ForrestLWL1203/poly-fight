@@ -239,6 +239,10 @@
                   <span>当前持仓金额</span>
                   <b>{{ money(overview.open_exposure) }}</b>
                 </div>
+                <div title="可动用余额 + 当前持仓花费成本">
+                  <span>总体资金</span>
+                  <b>{{ money(overview.account_total_equity_usdc) }}</b>
+                </div>
               </div>
             </article>
             <article class="overview-analysis-card">
