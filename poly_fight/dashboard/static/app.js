@@ -75,6 +75,7 @@ createApp({
       toasts: [],
       intervals: [],
       eventSource: null,
+      runnerStopPollTimer: null,
       pollingFallback: false,
       liveStatus: "starting",
       streamRetryMs: 2000,
@@ -100,7 +101,22 @@ createApp({
         ? "/icons/flaticon/play.png"
         : "/icons/flaticon/stop.png";
     },
+    runnerBusy() {
+      return Boolean(this.loading.runner) || this.runner.status === "stopping";
+    },
+    runnerControlsLocked() {
+      return this.runner.status === "running" || this.runnerBusy;
+    },
+    runnerBusyMessage() {
+      if (this.runner.status === "stopping") return "正在停止跟单脚本";
+      return this.runnerActionText || "正在处理跟单脚本";
+    },
+    runnerBusyDetail() {
+      if (this.runner.status === "stopping") return "等待进程退出，完成后页面会自动恢复";
+      return "完成刷新后页面会自动恢复";
+    },
     runnerControlLabel() {
+      if (this.runner.status === "stopping") return "停止中";
       return this.runner.status === "running" ? "停止跟单" : "启动跟单";
     },
     runnerControlIcon() {
@@ -110,6 +126,7 @@ createApp({
       return Number(this.wallets?.count || (this.wallets?.wallets || []).length || 0) > 0;
     },
     runnerStartBlocked() {
+      if (this.runner.status === "stopping") return true;
       return this.runner.status !== "running" && (
         !this.hasFollowWallets
         || !this.runnerStakeRatioValid
@@ -143,6 +160,7 @@ createApp({
       return this.runnerSignalStakePercentValue >= 0;
     },
     runnerControlTitle() {
+      if (this.runner.status === "stopping") return "正在停止跟单脚本";
       if (this.runner.status !== "running" && !this.hasFollowWallets) return "需先采集目标跟单钱包";
       if (this.runner.status !== "running" && !this.runnerStakeRatioValid) return "需填写跟单比例";
       if (this.runner.status !== "running" && !this.runnerMaxStakeValid) return "单笔跟单限额格式不正确";
@@ -440,6 +458,10 @@ createApp({
         this.eventSource.close();
         this.eventSource = null;
       }
+      if (this.runnerStopPollTimer) {
+        clearTimeout(this.runnerStopPollTimer);
+        this.runnerStopPollTimer = null;
+      }
       if (this.streamRetryTimer) {
         clearTimeout(this.streamRetryTimer);
         this.streamRetryTimer = null;
@@ -460,6 +482,7 @@ createApp({
       if (payload.runner) {
         this.runner = payload.runner;
         this.syncRunnerInputs();
+        this.ensureRunnerStopPolling();
       }
       if (payload.refresh) this.refreshStatus = payload.refresh;
       if (this.refreshStatus?.status !== "running") this.walletRefreshStartedLocal = 0;
@@ -558,6 +581,7 @@ createApp({
     async loadRunner() {
       this.runner = await this.request("/api/runner");
       this.syncRunnerInputs();
+      this.ensureRunnerStopPolling();
     },
     async refreshAfterRunnerChange() {
       await Promise.allSettled([
@@ -624,18 +648,45 @@ createApp({
       } finally {
         this.loading.runner = false;
         this.runnerActionText = "";
+        this.ensureRunnerStopPolling();
       }
     },
+    ensureRunnerStopPolling() {
+      if (this.runner.status !== "stopping") {
+        if (this.runnerStopPollTimer) {
+          clearTimeout(this.runnerStopPollTimer);
+          this.runnerStopPollTimer = null;
+        }
+        return;
+      }
+      if (this.runnerStopPollTimer || !this.authenticated) return;
+      this.runnerStopPollTimer = setTimeout(async () => {
+        this.runnerStopPollTimer = null;
+        if (this.runner.status !== "stopping" || !this.authenticated) return;
+        try {
+          await this.loadRunner();
+        } catch (_error) {
+          this.ensureRunnerStopPolling();
+        }
+      }, 1500);
+    },
     syncRunnerInputs() {
-      if (this.runner.status === "running" && this.runner.stake_ratio_percent) {
-        this.runnerStakeRatioInput = String(this.runner.stake_ratio_percent);
+      const ratio = Number(this.runner.stake_ratio_percent);
+      if (Number.isFinite(ratio) && ratio > 0 && (
+        this.runner.status === "running" || !String(this.runnerStakeRatioInput || "").trim()
+      )) {
+        this.runnerStakeRatioInput = String(ratio);
       }
       const maxStake = Number(this.runner.max_stake_usdc);
-      if (this.runner.status === "running" && Number.isFinite(maxStake) && maxStake > 0) {
+      if (Number.isFinite(maxStake) && maxStake > 0 && (
+        this.runner.status === "running" || !String(this.runnerMaxStakeInput || "").trim()
+      )) {
         this.runnerMaxStakeInput = String(maxStake);
       }
       const signalStakePercent = Number(this.runner.max_signal_stake_balance_percent);
-      if (this.runner.status === "running" && Number.isFinite(signalStakePercent) && signalStakePercent > 0) {
+      if (Number.isFinite(signalStakePercent) && signalStakePercent > 0 && (
+        this.runner.status === "running" || !String(this.runnerSignalStakePercentInput || "").trim()
+      )) {
         this.runnerSignalStakePercentInput = String(signalStakePercent);
       }
     },
@@ -920,6 +971,10 @@ createApp({
       this.eventPage = 1;
     },
     async toggleRunner() {
+      if (this.runner.status === "stopping") {
+        this.showToast("跟单脚本正在停止，请稍等");
+        return;
+      }
       if (this.runnerStartBlocked) {
         this.showToast("需先采集目标跟单钱包", "error");
         return;

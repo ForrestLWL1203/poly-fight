@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+LEADERBOARD_SCHEMA_VERSION = 2
+FOLLOW_SCHEMA_VERSION = 2
+SCHEMA_VERSION = FOLLOW_SCHEMA_VERSION
 
 
 def _dumps(value: Any) -> str:
@@ -17,6 +21,160 @@ def _loads(value: str | None, default: Any) -> Any:
     if not value:
         return default
     return json.loads(value)
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _timestamp(value: Any) -> int:
+    if value in (None, ""):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return 0
+    try:
+        return int(float(text))
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {
+        str(row["name"])
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    for name, ddl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def _table_names(conn: sqlite3.Connection) -> set[str]:
+    return {
+        str(row["name"])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+
+
+def _first_value(row: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _best_bucket(row: dict[str, Any]) -> str:
+    direct = str(row.get("best_bucket") or "").strip()
+    if direct:
+        return direct
+    buckets = row.get("eligible_buckets")
+    if isinstance(buckets, list) and buckets:
+        return str(buckets[0] or "")
+    per_game = row.get("per_game_type") or row.get("per_game_type_grades")
+    if isinstance(per_game, dict) and per_game:
+        return str(next(iter(per_game)))
+    return str(row.get("best_market_type") or row.get("market_type") or "")
+
+
+def _best_bucket_score(row: dict[str, Any]) -> float:
+    direct = row.get("best_bucket_score")
+    if direct not in (None, ""):
+        return _to_float(direct)
+    bucket = _best_bucket(row)
+    for key in ("per_game_type", "per_game_type_grades", "per_type", "per_type_grades"):
+        values = row.get(key)
+        if isinstance(values, dict) and isinstance(values.get(bucket), dict):
+            bucket_row = values[bucket]
+            return _to_float(
+                _first_value(
+                    bucket_row,
+                    ("score", "quality_score", "bucket_score", "wilson_win_rate_lower_bound", "positive_market_rate"),
+                )
+            )
+    return _to_float(_first_value(row, ("score", "quality_score", "wilson_win_rate_lower_bound", "positive_market_rate")))
+
+
+def _last_trade_at(row: dict[str, Any]) -> int:
+    return _timestamp(
+        _first_value(
+            row,
+            (
+                "last_trade_at",
+                "best_bucket_last_trade_at",
+                "last_esports_trade_at",
+                "last_sports_trade_at",
+                "last_category_trade_at",
+                "profiled_at",
+            ),
+        )
+    )
+
+
+def _market_count(row: dict[str, Any]) -> int:
+    return _to_int(
+        _first_value(
+            row,
+            (
+                "participated_market_count",
+                "historical_trade_behavior_market_count",
+                "esports_closed_count",
+                "sports_closed_count",
+                "closed_market_count",
+                "market_count",
+            ),
+        )
+    )
+
+
+def _cash_volume(row: dict[str, Any]) -> float:
+    return _to_float(
+        _first_value(
+            row,
+            (
+                "total_cash_volume",
+                "cash_volume",
+                "esports_total_cash_volume",
+                "sports_total_cash_volume",
+                "esports_total_cost",
+                "sports_total_cost",
+                "total_cost",
+                "total_holder_usd",
+            ),
+        )
+    )
+
+
+def _avg_market_cash(row: dict[str, Any]) -> float:
+    direct = _to_float(_first_value(row, ("avg_market_cash", "avg_market_usd", "avg_position_size")))
+    if direct:
+        return direct
+    count = _market_count(row)
+    total = _cash_volume(row)
+    return round(total / count, 8) if count > 0 and total else 0.0
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -73,12 +231,171 @@ class LeaderboardStore:
                     wallet TEXT NOT NULL,
                     rank INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
+                    grade TEXT,
+                    league TEXT,
+                    best_bucket TEXT,
+                    best_bucket_score REAL,
+                    scoring_version INTEGER,
+                    last_trade_at INTEGER,
+                    positive_market_rate REAL,
+                    avg_market_cash REAL,
+                    participated_market_count INTEGER,
+                    total_cash_volume REAL,
                     raw_json TEXT NOT NULL,
                     PRIMARY KEY (category, wallet)
                 );
+                CREATE TABLE IF NOT EXISTS wallet_profiles (
+                    category TEXT NOT NULL,
+                    wallet TEXT NOT NULL,
+                    grade TEXT,
+                    profile_state TEXT,
+                    profiled_at INTEGER,
+                    scoring_version INTEGER,
+                    last_trade_at INTEGER,
+                    profile_lookback_days INTEGER,
+                    best_bucket TEXT,
+                    esports_roi REAL,
+                    positive_market_rate REAL,
+                    avg_market_cash REAL,
+                    participated_market_count INTEGER,
+                    raw_json TEXT NOT NULL,
+                    PRIMARY KEY (category, wallet)
+                );
+                CREATE TABLE IF NOT EXISTS collection_runs (
+                    run_id TEXT PRIMARY KEY,
+                    category TEXT NOT NULL,
+                    collector TEXT,
+                    created_at INTEGER,
+                    published_at INTEGER NOT NULL,
+                    classification_market_count INTEGER,
+                    target_market_count INTEGER,
+                    seed_wallet_count INTEGER,
+                    profile_wallet_count INTEGER,
+                    profiled_wallet_count INTEGER,
+                    leaderboard_wallet_count INTEGER,
+                    raw_json TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_leaderboard_wallets_category_rank
                     ON leaderboard_wallets(category, rank);
+                CREATE INDEX IF NOT EXISTS idx_wallet_profiles_category_wallet
+                    ON wallet_profiles(category, wallet);
+                CREATE INDEX IF NOT EXISTS idx_collection_runs_category_published
+                    ON collection_runs(category, published_at);
                 """
+            )
+            _ensure_columns(
+                conn,
+                "leaderboard_wallets",
+                {
+                    "grade": "TEXT",
+                    "league": "TEXT",
+                    "best_bucket": "TEXT",
+                    "best_bucket_score": "REAL",
+                    "scoring_version": "INTEGER",
+                    "last_trade_at": "INTEGER",
+                    "positive_market_rate": "REAL",
+                    "avg_market_cash": "REAL",
+                    "participated_market_count": "INTEGER",
+                    "total_cash_volume": "REAL",
+                },
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+                (str(LEADERBOARD_SCHEMA_VERSION),),
+            )
+
+    def _insert_leaderboard_rows(
+        self,
+        conn: sqlite3.Connection,
+        rows: list[dict[str, Any]],
+        *,
+        category: str,
+        updated_at: int,
+    ) -> None:
+        conn.execute("DELETE FROM leaderboard_wallets WHERE category = ?", (category,))
+        for index, row in enumerate(rows, start=1):
+            if not isinstance(row, dict):
+                continue
+            wallet = str(row.get("wallet") or "").lower()
+            if not wallet:
+                continue
+            payload = dict(row)
+            payload.setdefault("category", category)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO leaderboard_wallets(
+                    category, wallet, rank, updated_at, grade, league, best_bucket,
+                    best_bucket_score, scoring_version, last_trade_at,
+                    positive_market_rate, avg_market_cash, participated_market_count,
+                    total_cash_volume, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    category,
+                    wallet,
+                    index,
+                    updated_at,
+                    str(payload.get("grade") or ""),
+                    str(payload.get("league") or ""),
+                    _best_bucket(payload),
+                    _best_bucket_score(payload),
+                    _to_int(payload.get("scoring_version")),
+                    _last_trade_at(payload),
+                    _to_float(payload.get("positive_market_rate")),
+                    _avg_market_cash(payload),
+                    _market_count(payload),
+                    _cash_volume(payload),
+                    _dumps(payload),
+                ),
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+            (f"{category}:updated_at", str(updated_at)),
+        )
+
+    def _insert_wallet_profiles(
+        self,
+        conn: sqlite3.Connection,
+        profiles: list[dict[str, Any]],
+        *,
+        category: str,
+    ) -> None:
+        conn.execute("DELETE FROM wallet_profiles WHERE category = ?", (category,))
+        for row in profiles:
+            if not isinstance(row, dict):
+                continue
+            wallet = str(row.get("wallet") or "").lower()
+            if not wallet:
+                continue
+            payload = dict(row)
+            payload.setdefault("category", category)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO wallet_profiles(
+                    category, wallet, grade, profile_state, profiled_at,
+                    scoring_version, last_trade_at, profile_lookback_days,
+                    best_bucket, esports_roi, positive_market_rate, avg_market_cash,
+                    participated_market_count, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    category,
+                    wallet,
+                    str(payload.get("grade") or ""),
+                    str(payload.get("profile_state") or payload.get("state") or ""),
+                    _timestamp(payload.get("profiled_at")),
+                    _to_int(payload.get("scoring_version")),
+                    _last_trade_at(payload),
+                    _to_int(payload.get("profile_lookback_days") or payload.get("lookback_days")),
+                    _best_bucket(payload),
+                    _to_float(payload.get("esports_roi")),
+                    _to_float(payload.get("positive_market_rate")),
+                    _avg_market_cash(payload),
+                    _market_count(payload),
+                    _dumps(payload),
+                ),
             )
 
     def replace_leaderboard(self, rows: list[dict[str, Any]], *, category: str, updated_at: int) -> None:
@@ -87,27 +404,68 @@ class LeaderboardStore:
         self.init_db()
         with self.connect() as conn:
             conn.execute("BEGIN")
-            conn.execute("DELETE FROM leaderboard_wallets WHERE category = ?", (category,))
-            for index, row in enumerate(rows, start=1):
-                if not isinstance(row, dict):
-                    continue
-                wallet = str(row.get("wallet") or "").lower()
-                if not wallet:
-                    continue
-                payload = dict(row)
-                payload.setdefault("category", category)
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO leaderboard_wallets(category, wallet, rank, updated_at, raw_json)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (category, wallet, index, updated_at, _dumps(payload)),
+            self._insert_leaderboard_rows(conn, rows, category=category, updated_at=updated_at)
+            conn.execute("COMMIT")
+
+    def publish_collection(
+        self,
+        *,
+        category: str,
+        leaderboard: list[dict[str, Any]],
+        profiles: list[dict[str, Any]] | dict[str, dict[str, Any]],
+        summary: dict[str, Any] | None,
+        updated_at: int,
+    ) -> dict[str, Any]:
+        category = str(category or "esports").lower()
+        updated_at = int(updated_at or time.time())
+        profile_rows = list(profiles.values()) if isinstance(profiles, dict) else list(profiles or [])
+        summary_payload = dict(summary) if isinstance(summary, dict) else {}
+        summary_payload.setdefault("category", category)
+        summary_payload.setdefault("published_at", updated_at)
+        summary_payload.setdefault("updated_at", updated_at)
+        summary_payload.setdefault("profile_wallet_count", len(profile_rows))
+        summary_payload.setdefault("profiled_wallet_count", len(profile_rows))
+        summary_payload.setdefault("leaderboard_wallet_count", len(leaderboard or []))
+        created_at = _timestamp(summary_payload.get("created_at")) or updated_at
+        digest = hashlib.sha1(_dumps(summary_payload).encode("utf-8")).hexdigest()[:12]
+        run_id = str(summary_payload.get("run_id") or f"{category}:{updated_at}:{digest}")
+        summary_payload["run_id"] = run_id
+        self.init_db()
+        with self.connect() as conn:
+            conn.execute("BEGIN")
+            self._insert_leaderboard_rows(conn, leaderboard or [], category=category, updated_at=updated_at)
+            self._insert_wallet_profiles(conn, profile_rows, category=category)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO collection_runs(
+                    run_id, category, collector, created_at, published_at,
+                    classification_market_count, target_market_count, seed_wallet_count,
+                    profile_wallet_count, profiled_wallet_count, leaderboard_wallet_count,
+                    raw_json
                 )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    category,
+                    str(summary_payload.get("collector") or ""),
+                    created_at,
+                    updated_at,
+                    _to_int(summary_payload.get("classification_market_count")),
+                    _to_int(summary_payload.get("target_market_count") or summary_payload.get("discovery_market_count")),
+                    _to_int(summary_payload.get("seed_wallet_count") or summary_payload.get("candidate_wallet_count")),
+                    _to_int(summary_payload.get("profile_wallet_count")),
+                    _to_int(summary_payload.get("profiled_wallet_count")),
+                    _to_int(summary_payload.get("leaderboard_wallet_count")),
+                    _dumps(summary_payload),
+                ),
+            )
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
-                (f"{category}:updated_at", str(updated_at)),
+                (f"{category}:collection_run_updated_at", str(updated_at)),
             )
             conn.execute("COMMIT")
+        return summary_payload
 
     def load_leaderboard(self, *, category: str | None = None) -> tuple[list[dict[str, Any]], dict[str, int]]:
         conn = self.connect_readonly()
@@ -137,6 +495,115 @@ class LeaderboardStore:
                 if key.endswith(":updated_at"):
                     mtimes[key.split(":", 1)[0]] = int(row["value"] or 0)
             return values, mtimes
+        finally:
+            conn.close()
+
+    def load_wallet_profiles(self, *, category: str | None = None) -> list[dict[str, Any]]:
+        conn = self.connect_readonly()
+        if conn is None:
+            return []
+        try:
+            if "wallet_profiles" not in _table_names(conn):
+                return []
+            params: tuple[Any, ...] = ()
+            where = ""
+            if category:
+                where = "WHERE category = ?"
+                params = (str(category).lower(),)
+            rows = conn.execute(
+                f"SELECT category, wallet, raw_json FROM wallet_profiles {where} ORDER BY category, wallet",
+                params,
+            ).fetchall()
+            values = []
+            for row in rows:
+                payload = _loads(row["raw_json"], {})
+                if isinstance(payload, dict):
+                    payload.setdefault("category", str(row["category"] or "").lower())
+                    payload.setdefault("wallet", str(row["wallet"] or "").lower())
+                    values.append(payload)
+            return values
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+
+    def load_latest_collection_run(self, *, category: str | None = None) -> dict[str, Any]:
+        conn = self.connect_readonly()
+        if conn is None:
+            return {}
+        try:
+            if "collection_runs" not in _table_names(conn):
+                return {}
+            params: tuple[Any, ...] = ()
+            where = ""
+            if category:
+                where = "WHERE category = ?"
+                params = (str(category).lower(),)
+            row = conn.execute(
+                f"""
+                SELECT *
+                FROM collection_runs
+                {where}
+                ORDER BY published_at DESC, run_id DESC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+            if not row:
+                return {}
+            payload = _loads(row["raw_json"], {})
+            if not isinstance(payload, dict):
+                payload = {}
+            for key in (
+                "run_id",
+                "category",
+                "collector",
+                "created_at",
+                "published_at",
+                "classification_market_count",
+                "target_market_count",
+                "seed_wallet_count",
+                "profile_wallet_count",
+                "profiled_wallet_count",
+                "leaderboard_wallet_count",
+            ):
+                payload.setdefault(key, row[key])
+            return payload
+        except sqlite3.Error:
+            return {}
+        finally:
+            conn.close()
+
+    def latest_scoring_version(self, *, category: str | None = None) -> int | None:
+        conn = self.connect_readonly()
+        if conn is None:
+            return None
+        try:
+            tables = _table_names(conn)
+            params: tuple[Any, ...] = ()
+            where = ""
+            if category:
+                where = "WHERE category = ?"
+                params = (str(category).lower(),)
+            versions: list[int] = []
+            if "leaderboard_wallets" in tables:
+                row = conn.execute(
+                    f"SELECT MAX(COALESCE(scoring_version, 0)) AS version FROM leaderboard_wallets {where}",
+                    params,
+                ).fetchone()
+                if row:
+                    versions.append(_to_int(row["version"]))
+            if "wallet_profiles" in tables:
+                row = conn.execute(
+                    f"SELECT MAX(COALESCE(scoring_version, 0)) AS version FROM wallet_profiles {where}",
+                    params,
+                ).fetchone()
+                if row:
+                    versions.append(_to_int(row["version"]))
+            version = max(versions or [0])
+            return version or None
+        except sqlite3.Error:
+            return None
         finally:
             conn.close()
 
@@ -185,9 +652,31 @@ class FollowStore:
                     raw_json TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS market_cache (
-                    condition_id TEXT PRIMARY KEY,
-                    cache_kind TEXT NOT NULL DEFAULT 'active',
+                    cache_kind TEXT NOT NULL,
+                    condition_id TEXT NOT NULL,
+                    category TEXT,
+                    league TEXT,
+                    market_type TEXT,
+                    event_slug TEXT,
+                    title TEXT,
+                    question TEXT,
+                    match_start_ts INTEGER,
+                    end_ts INTEGER,
                     updated_at INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    PRIMARY KEY (cache_kind, condition_id)
+                );
+                CREATE TABLE IF NOT EXISTS run_ticks (
+                    tick_id TEXT PRIMARY KEY,
+                    created_at INTEGER NOT NULL,
+                    status TEXT,
+                    gate_open INTEGER,
+                    watched_market_count INTEGER,
+                    open_signal_count INTEGER,
+                    new_signal_count INTEGER,
+                    tick_runtime_seconds REAL,
+                    desired_next_interval_seconds INTEGER,
+                    error TEXT,
                     raw_json TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS follow_signals (
@@ -270,17 +759,152 @@ class FollowStore:
                 CREATE INDEX IF NOT EXISTS idx_follow_behavior_events_signal_id ON follow_behavior_events(signal_id);
                 CREATE INDEX IF NOT EXISTS idx_follow_behavior_events_kind_ts ON follow_behavior_events(kind, timestamp);
                 CREATE INDEX IF NOT EXISTS idx_follow_results_status_resolved_at ON follow_results(status, resolved_at);
-                CREATE INDEX IF NOT EXISTS idx_market_cache_kind ON market_cache(cache_kind);
+                CREATE INDEX IF NOT EXISTS idx_run_ticks_created_at ON run_ticks(created_at);
                 CREATE INDEX IF NOT EXISTS idx_wallet_quarantine_ts ON wallet_quarantine(quarantined_at);
                 CREATE INDEX IF NOT EXISTS idx_wallet_favorites_category_ts ON wallet_favorites(category, favorited_at);
                 CREATE INDEX IF NOT EXISTS idx_account_balance_ledger_created_at ON account_balance_ledger(created_at);
                 """
             )
+            self._migrate_market_cache_schema(conn)
+            _ensure_columns(
+                conn,
+                "market_cache",
+                {
+                    "category": "TEXT",
+                    "league": "TEXT",
+                    "market_type": "TEXT",
+                    "event_slug": "TEXT",
+                    "title": "TEXT",
+                    "question": "TEXT",
+                    "match_start_ts": "INTEGER",
+                    "end_ts": "INTEGER",
+                },
+            )
+            conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_market_cache_kind ON market_cache(cache_kind);
+                CREATE INDEX IF NOT EXISTS idx_market_cache_kind_start ON market_cache(cache_kind, match_start_ts);
+                """
+            )
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
-                (str(SCHEMA_VERSION),),
+                (str(FOLLOW_SCHEMA_VERSION),),
             )
         self._initialized = True
+
+    def _create_market_cache_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_cache (
+                cache_kind TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                category TEXT,
+                league TEXT,
+                market_type TEXT,
+                event_slug TEXT,
+                title TEXT,
+                question TEXT,
+                match_start_ts INTEGER,
+                end_ts INTEGER,
+                updated_at INTEGER NOT NULL,
+                raw_json TEXT NOT NULL,
+                PRIMARY KEY (cache_kind, condition_id)
+            )
+            """
+        )
+
+    def _migrate_market_cache_schema(self, conn: sqlite3.Connection) -> None:
+        if "market_cache" not in _table_names(conn):
+            self._create_market_cache_table(conn)
+            return
+        info = conn.execute("PRAGMA table_info(market_cache)").fetchall()
+        pk_columns = [
+            str(row["name"])
+            for row in sorted((row for row in info if int(row["pk"] or 0)), key=lambda row: int(row["pk"] or 0))
+        ]
+        if pk_columns == ["cache_kind", "condition_id"]:
+            return
+        columns = {str(row["name"]) for row in info}
+        select_columns = [
+            "condition_id" if "condition_id" in columns else "'' AS condition_id",
+            "cache_kind" if "cache_kind" in columns else "'active' AS cache_kind",
+            "updated_at" if "updated_at" in columns else "0 AS updated_at",
+            "raw_json" if "raw_json" in columns else "'{}' AS raw_json",
+        ]
+        rows = conn.execute(f"SELECT {', '.join(select_columns)} FROM market_cache").fetchall()
+        conn.execute("DROP TABLE IF EXISTS market_cache_old")
+        conn.execute("ALTER TABLE market_cache RENAME TO market_cache_old")
+        self._create_market_cache_table(conn)
+        for row in rows:
+            condition_id = str(row["condition_id"] or "").lower()
+            if not condition_id:
+                continue
+            cache_kind = str(row["cache_kind"] or "active").lower()
+            updated_at = _to_int(row["updated_at"])
+            payload = _loads(row["raw_json"], {})
+            if not isinstance(payload, dict):
+                payload = {}
+            payload.setdefault("condition_id", condition_id)
+            self._upsert_market_cache_item(conn, cache_kind, condition_id, payload, updated_at=updated_at)
+        conn.execute("DROP TABLE IF EXISTS market_cache_old")
+
+    def _market_cache_values(
+        self,
+        cache_kind: str,
+        condition_id: str,
+        market: dict[str, Any],
+        *,
+        updated_at: int,
+    ) -> tuple[Any, ...] | None:
+        condition_id = str(condition_id or market.get("condition_id") or market.get("conditionId") or "").lower()
+        if not condition_id:
+            return None
+        payload = dict(market)
+        payload["condition_id"] = condition_id
+        payload.setdefault("cache_kind", cache_kind)
+        payload.setdefault("updated_at", updated_at)
+        return (
+            str(cache_kind or "active").lower(),
+            condition_id,
+            str(payload.get("category") or "").lower(),
+            str(payload.get("league") or "").lower(),
+            str(payload.get("market_type") or "").lower(),
+            str(payload.get("event_slug") or payload.get("eventSlug") or payload.get("slug") or ""),
+            str(payload.get("title") or ""),
+            str(payload.get("question") or ""),
+            _timestamp(
+                _first_value(
+                    payload,
+                    ("match_start_ts", "match_start_time", "market_start_time", "startTime", "eventStartTime", "gameStartTime"),
+                )
+            ),
+            _timestamp(_first_value(payload, ("end_ts", "end_date", "endDate", "endTime"))),
+            int(updated_at or time.time()),
+            _dumps(payload),
+        )
+
+    def _upsert_market_cache_item(
+        self,
+        conn: sqlite3.Connection,
+        cache_kind: str,
+        condition_id: str,
+        market: dict[str, Any],
+        *,
+        updated_at: int,
+    ) -> None:
+        values = self._market_cache_values(cache_kind, condition_id, market, updated_at=updated_at)
+        if values is None:
+            return
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO market_cache(
+                cache_kind, condition_id, category, league, market_type, event_slug,
+                title, question, match_start_ts, end_ts, updated_at, raw_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
 
     def index_names(self) -> set[str]:
         self.init_db()
@@ -593,17 +1217,65 @@ class FollowStore:
         return f"{category}:{wallet}" in self.load_wallet_favorites()
 
     def save_market_cache(self, markets: dict[str, dict[str, Any]], *, cache_kind: str, updated_at: int) -> None:
+        cache_kind = str(cache_kind or "active").lower()
+        updated_at = int(updated_at or time.time())
         self.init_db()
         with self.connect() as conn:
             conn.execute("DELETE FROM market_cache WHERE cache_kind = ?", (cache_kind,))
             for condition_id, market in sorted(markets.items()):
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO market_cache(condition_id, cache_kind, updated_at, raw_json)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (condition_id, cache_kind, updated_at, _dumps(market)),
-                )
+                if isinstance(market, dict):
+                    self._upsert_market_cache_item(conn, cache_kind, str(condition_id), market, updated_at=updated_at)
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                (f"market_cache:{cache_kind}:updated_at", str(updated_at)),
+            )
+
+    def upsert_market_cache_item(
+        self,
+        cache_kind: str,
+        condition_id: str,
+        market: dict[str, Any],
+        *,
+        updated_at: int | None = None,
+    ) -> None:
+        cache_kind = str(cache_kind or "active").lower()
+        updated_at = int(updated_at or time.time())
+        self.init_db()
+        with self.connect() as conn:
+            self._upsert_market_cache_item(conn, cache_kind, condition_id, market, updated_at=updated_at)
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                (f"market_cache:{cache_kind}:updated_at", str(updated_at)),
+            )
+
+    def _load_market_cache_from_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        cache_kind: str,
+        now_ts: int,
+        ttl_seconds: int,
+    ) -> tuple[dict[str, dict[str, Any]], int, bool]:
+        try:
+            if "market_cache" not in _table_names(conn):
+                return {}, 0, False
+            rows = conn.execute(
+                "SELECT condition_id, updated_at, raw_json FROM market_cache WHERE cache_kind = ?",
+                (str(cache_kind or "active").lower(),),
+            ).fetchall()
+        except sqlite3.Error:
+            return {}, 0, False
+        if not rows:
+            return {}, 0, False
+        updated_at = max(int(row["updated_at"] or 0) for row in rows)
+        fresh = int(now_ts or time.time()) - updated_at < int(ttl_seconds or 0)
+        markets = {}
+        for row in rows:
+            payload = _loads(row["raw_json"], {})
+            if isinstance(payload, dict):
+                payload.setdefault("condition_id", str(row["condition_id"]).lower())
+                markets[str(row["condition_id"]).lower()] = payload
+        return markets, updated_at, fresh
 
     def load_market_cache(
         self,
@@ -614,16 +1286,132 @@ class FollowStore:
     ) -> tuple[dict[str, dict[str, Any]], int, bool]:
         self.init_db()
         with self.connect() as conn:
-            rows = conn.execute(
-                "SELECT condition_id, updated_at, raw_json FROM market_cache WHERE cache_kind = ?",
-                (cache_kind,),
-            ).fetchall()
-        if not rows:
+            return self._load_market_cache_from_conn(
+                conn,
+                cache_kind=cache_kind,
+                now_ts=now_ts,
+                ttl_seconds=ttl_seconds,
+            )
+
+    def load_market_cache_readonly(
+        self,
+        *,
+        cache_kind: str,
+        now_ts: int,
+        ttl_seconds: int,
+    ) -> tuple[dict[str, dict[str, Any]], int, bool]:
+        conn = self.connect_readonly()
+        if conn is None:
             return {}, 0, False
-        updated_at = max(int(row["updated_at"] or 0) for row in rows)
-        fresh = now_ts - updated_at < ttl_seconds
-        markets = {str(row["condition_id"]): _loads(row["raw_json"], {}) for row in rows}
-        return markets, updated_at, fresh
+        try:
+            return self._load_market_cache_from_conn(
+                conn,
+                cache_kind=cache_kind,
+                now_ts=now_ts,
+                ttl_seconds=ttl_seconds,
+            )
+        finally:
+            conn.close()
+
+    def get_market_cache_item(self, cache_kind: str, condition_id: str) -> dict[str, Any]:
+        self.init_db()
+        with self.connect() as conn:
+            return self._get_market_cache_item_from_conn(conn, cache_kind, condition_id)
+
+    def get_market_cache_item_readonly(self, cache_kind: str, condition_id: str) -> dict[str, Any]:
+        conn = self.connect_readonly()
+        if conn is None:
+            return {}
+        try:
+            return self._get_market_cache_item_from_conn(conn, cache_kind, condition_id)
+        finally:
+            conn.close()
+
+    def _get_market_cache_item_from_conn(
+        self,
+        conn: sqlite3.Connection,
+        cache_kind: str,
+        condition_id: str,
+    ) -> dict[str, Any]:
+        try:
+            if "market_cache" not in _table_names(conn):
+                return {}
+            row = conn.execute(
+                "SELECT raw_json FROM market_cache WHERE cache_kind = ? AND condition_id = ?",
+                (str(cache_kind or "active").lower(), str(condition_id or "").lower()),
+            ).fetchone()
+        except sqlite3.Error:
+            return {}
+        if not row:
+            return {}
+        payload = _loads(row["raw_json"], {})
+        return payload if isinstance(payload, dict) else {}
+
+    def save_run_tick(self, row: dict[str, Any]) -> dict[str, Any]:
+        self.init_db()
+        payload = dict(row or {})
+        created_at = _timestamp(payload.get("created_at")) or int(time.time())
+        payload["created_at"] = created_at
+        payload["status"] = str(payload.get("status") or ("run_iteration_error" if payload.get("error") else "ok"))
+        digest = hashlib.sha1(_dumps(payload).encode("utf-8")).hexdigest()[:12]
+        tick_id = str(payload.get("tick_id") or f"{created_at}:{digest}")
+        payload["tick_id"] = tick_id
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO run_ticks(
+                    tick_id, created_at, status, gate_open, watched_market_count,
+                    open_signal_count, new_signal_count, tick_runtime_seconds,
+                    desired_next_interval_seconds, error, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tick_id,
+                    created_at,
+                    str(payload.get("status") or "ok"),
+                    1 if payload.get("gate_open") else 0,
+                    _to_int(payload.get("watched_market_count")),
+                    _to_int(payload.get("open_signal_count")),
+                    _to_int(payload.get("new_signal_count")),
+                    _to_float(payload.get("tick_runtime_seconds")),
+                    _to_int(payload.get("desired_next_interval_seconds")),
+                    str(payload.get("error") or ""),
+                    _dumps(payload),
+                ),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('run_ticks_updated_at', ?)",
+                (str(max(created_at, int(time.time()))),),
+            )
+        return payload
+
+    def load_run_ticks(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        conn = self.connect_readonly()
+        if conn is None:
+            return []
+        try:
+            if "run_ticks" not in _table_names(conn):
+                return []
+            rows = conn.execute(
+                "SELECT raw_json, gate_open FROM run_ticks ORDER BY created_at DESC, tick_id DESC LIMIT ?",
+                (max(1, int(limit or 100)),),
+            ).fetchall()
+            ticks = []
+            for row in rows:
+                payload = _loads(row["raw_json"], {})
+                if isinstance(payload, dict):
+                    payload["gate_open"] = bool(payload.get("gate_open") or row["gate_open"])
+                    ticks.append(payload)
+            return list(reversed(ticks))
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+
+    def latest_run_tick(self) -> dict[str, Any]:
+        rows = self.load_run_ticks(limit=1)
+        return rows[-1] if rows else {}
 
     def load_performance(self) -> dict[str, Any]:
         self.init_db()

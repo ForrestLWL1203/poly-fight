@@ -718,11 +718,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def _latest_collection_summary(data_dir: Path) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    for category, category_dir in category_data_dirs(data_dir).items():
+        row = LeaderboardStore(category_dir / "leaderboard.db").load_latest_collection_run(category=category)
+        if row:
+            candidates.append(row)
+    legacy_row = LeaderboardStore(data_dir / "leaderboard.db").load_latest_collection_run(category="esports")
+    if legacy_row:
+        candidates.append(legacy_row)
+    if candidates:
+        return max(
+            candidates,
+            key=lambda row: _parse_timestamp(row.get("published_at") or row.get("updated_at") or row.get("created_at")),
+        )
+    root_summary = _read_json(data_dir / "build_summary.json", {})
+    if isinstance(root_summary, dict) and root_summary:
+        return root_summary
+    category_summaries = []
+    for _category, category_dir in category_data_dirs(data_dir).items():
+        value = _read_json(category_dir / "build_summary.json", {})
+        if isinstance(value, dict) and value:
+            category_summaries.append(value)
+    if category_summaries:
+        return max(category_summaries, key=lambda row: _parse_timestamp(row.get("created_at") or row.get("updated_at")))
+    return {}
+
+
 def build_health(data_dir: Path, *, started_at: float, log_dir: Path | None = None, follow_dir: Path | None = None) -> dict[str, Any]:
-    rows = _read_follow_run_logs(data_dir, log_dir=log_dir, follow_dir=follow_dir)
-    db_ready = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).dashboard_db_ready()
+    store = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir))
+    rows = store.load_run_ticks(limit=100)
+    if not rows:
+        rows = _read_follow_run_logs(data_dir, log_dir=log_dir, follow_dir=follow_dir)
+    db_ready = store.dashboard_db_ready()
     last_tick = rows[-1] if rows else {}
-    build_summary = _read_json(data_dir / "build_summary.json", {})
+    build_summary = _latest_collection_summary(data_dir)
     leaderboard_updated_at = max(_category_leaderboard_mtimes(data_dir).values() or [0])
     last_tick_at = int(last_tick.get("created_at") or 0)
     interval = int(last_tick.get("desired_next_interval_seconds") or 900)
@@ -770,12 +800,15 @@ def read_stream_signal(
 ) -> StreamSignal:
     follow_root = _follow_dir_from(data_dir, follow_dir=follow_dir)
     store = store or FollowStore(_follow_db_file(data_dir, follow_dir=follow_root))
-    return StreamSignal(
-        snapshot_updated_at=store.read_meta_int("follow_snapshot_updated_at", conn=conn),
-        run_log_mtime=max(
+    run_ticks_updated_at = store.read_meta_int("run_ticks_updated_at", conn=conn)
+    if not run_ticks_updated_at:
+        run_ticks_updated_at = max(
             _file_mtime(_follow_run_log_path(data_dir, log_dir=log_dir)),
             _file_mtime(_legacy_follow_run_log_path(data_dir, follow_dir=follow_root)),
-        ),
+        )
+    return StreamSignal(
+        snapshot_updated_at=store.read_meta_int("follow_snapshot_updated_at", conn=conn),
+        run_log_mtime=run_ticks_updated_at,
         control_mtime=_file_mtime(follow_root / "follow_control.json"),
         leaderboard_mtime=max(_category_leaderboard_mtimes(data_dir).values() or [0]),
     )
@@ -1885,6 +1918,29 @@ def _unique_nonempty(values: Any) -> list[str]:
     return result
 
 
+def _active_market_cache_rows(data_dir: Path, *, follow_dir: Path | None = None) -> tuple[list[dict[str, Any]], int, bool]:
+    now_ts = int(time.time())
+    store = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir))
+    markets, updated_at, fresh = store.load_market_cache_readonly(
+        cache_kind="active",
+        now_ts=now_ts,
+        ttl_seconds=15 * 60,
+    )
+    if markets:
+        return list(markets.values()), updated_at, fresh
+    cache_path = _follow_dir_from(data_dir, follow_dir=follow_dir) / "active_market_cache.json"
+    cached = _read_json(cache_path, {})
+    updated_at = int(cached.get("updated_at") or 0) if isinstance(cached, dict) else 0
+    markets_value = cached.get("markets") if isinstance(cached, dict) else []
+    if isinstance(markets_value, dict):
+        rows = list(markets_value.values())
+    elif isinstance(markets_value, list):
+        rows = markets_value
+    else:
+        rows = []
+    return [row for row in rows if isinstance(row, dict)], updated_at, bool(updated_at and now_ts - updated_at <= 15 * 60)
+
+
 def build_events(
     data_dir: Path,
     *,
@@ -1892,17 +1948,8 @@ def build_events(
     post_start_grace_seconds: int = 900,
     follow_dir: Path | None = None,
 ) -> dict[str, Any]:
-    cache_path = _follow_dir_from(data_dir, follow_dir=follow_dir) / "active_market_cache.json"
-    cached = _read_json(cache_path, {})
     logo_cache = _load_team_logo_cache(data_dir)
-    updated_at = int(cached.get("updated_at") or 0) if isinstance(cached, dict) else 0
-    markets = cached.get("markets") if isinstance(cached, dict) else []
-    if isinstance(markets, dict):
-        rows = list(markets.values())
-    elif isinstance(markets, list):
-        rows = markets
-    else:
-        rows = []
+    rows, updated_at, fresh = _active_market_cache_rows(data_dir, follow_dir=follow_dir)
     market_by_condition = {
         str(market.get("condition_id") or market.get("conditionId") or "").lower(): market
         for market in rows
@@ -2084,7 +2131,7 @@ def build_events(
         "count": len(events),
         "archived_count": len(archived_events),
         "cache_updated_at": updated_at,
-        "cache_stale": bool(not updated_at or now_ts - updated_at > 15 * 60),
+        "cache_stale": not fresh,
     }
 
 
@@ -2164,6 +2211,10 @@ def _normalize_logo_key(value: str) -> str:
 
 
 def _active_market_by_condition(data_dir: Path, condition_id: str, *, follow_dir: Path | None = None) -> dict[str, Any]:
+    condition_id = str(condition_id or "").lower()
+    cached_item = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).get_market_cache_item_readonly("active", condition_id)
+    if cached_item:
+        return cached_item
     cached = _read_json(_follow_dir_from(data_dir, follow_dir=follow_dir) / "active_market_cache.json", {})
     markets = cached.get("markets") if isinstance(cached, dict) else []
     if isinstance(markets, dict):
@@ -2210,40 +2261,29 @@ def _market_price_record(market: dict[str, Any]) -> dict[str, Any]:
 
 
 def _update_active_market_price_cache(data_dir: Path, condition_id: str, record: dict[str, Any], *, follow_dir: Path | None = None) -> None:
-    cache_path = _follow_dir_from(data_dir, follow_dir=follow_dir) / "active_market_cache.json"
-    cached = _read_json(cache_path, {})
-    markets = cached.get("markets") if isinstance(cached, dict) else []
-    if isinstance(markets, dict):
-        rows = list(markets.values())
-    elif isinstance(markets, list):
-        rows = list(markets)
-    else:
-        rows = []
-    updated = False
-    for market in rows:
-        if not isinstance(market, dict):
-            continue
-        current = str(market.get("condition_id") or market.get("conditionId") or "").lower()
-        if current != condition_id:
-            continue
+    store = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir))
+    current = store.get_market_cache_item("active", condition_id) or _active_market_by_condition(data_dir, condition_id, follow_dir=follow_dir)
+    if current:
+        market = dict(current)
         market["outcomes"] = record.get("outcomes")
         market["outcome_prices"] = record.get("outcome_prices")
         market["price_refreshed_at"] = record.get("updated_at")
-        updated = True
-        break
-    if not updated:
-        rows.append(
-            {
-                "condition_id": condition_id,
-                "title": record.get("title"),
-                "question": record.get("question"),
-                "event_slug": record.get("event_slug"),
-                "outcomes": record.get("outcomes"),
-                "outcome_prices": record.get("outcome_prices"),
-                "price_refreshed_at": record.get("updated_at"),
-            }
-        )
-    _write_json(cache_path, {"updated_at": int(cached.get("updated_at") or time.time()) if isinstance(cached, dict) else int(time.time()), "markets": rows})
+        store.upsert_market_cache_item("active", condition_id, market, updated_at=int(record.get("updated_at") or time.time()))
+        return
+    store.upsert_market_cache_item(
+        "active",
+        condition_id,
+        {
+            "condition_id": condition_id,
+            "title": record.get("title"),
+            "question": record.get("question"),
+            "event_slug": record.get("event_slug"),
+            "outcomes": record.get("outcomes"),
+            "outcome_prices": record.get("outcome_prices"),
+            "price_refreshed_at": record.get("updated_at"),
+        },
+        updated_at=int(record.get("updated_at") or time.time()),
+    )
 
 
 CATEGORIES = ("esports", "sports")
@@ -2311,20 +2351,25 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
     follow_dir = _follow_dir(config)
     control = read_follow_control(follow_dir)
     recorded = control.get("runner") if isinstance(control.get("runner"), dict) else {}
-    processes = _find_runner_processes(config)
+    defaults = _runner_default_params(config)
     recorded_pid = int(recorded.get("pid") or 0) if isinstance(recorded, dict) else 0
+    if recorded_pid:
+        _reap_child_process(recorded_pid)
+    processes = _find_runner_processes(config)
     matched = next((row for row in processes if int(row.get("pid") or 0) == recorded_pid), None)
     if matched is None and processes:
         matched = processes[0]
     if matched:
         source = "dashboard" if int(matched.get("pid") or 0) == recorded_pid else "external"
+        status = "stopping" if source == "dashboard" and recorded.get("status") == "stopping" else "running"
         return {
-            "status": "running",
+            "status": status,
             "pid": int(matched.get("pid") or 0),
             "pgid": int(matched.get("pgid") or 0),
             "source": source,
             "command": matched.get("command") or recorded.get("command"),
             "started_at": recorded.get("started_at") if source == "dashboard" else None,
+            "stop_requested_at": recorded.get("stop_requested_at") if status == "stopping" else None,
             "stake_usdc": recorded.get("stake_usdc"),
             "stake_ratio_percent": recorded.get("stake_ratio_percent"),
             "max_stake_usdc": recorded.get("max_stake_usdc"),
@@ -2334,14 +2379,27 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
             "follow_dir": str(follow_dir),
         }
     if recorded:
-        return {
+        stopped = {
+            **defaults,
             **recorded,
             "status": "stopped",
             "pid": recorded_pid or None,
             "data_dir": str(config.data_dir),
             "follow_dir": str(follow_dir),
         }
-    return {"status": "stopped", "data_dir": str(config.data_dir), "follow_dir": str(follow_dir)}
+        if recorded.get("status") != "stopped":
+            _update_runner_control(follow_dir, stopped)
+        return stopped
+    return {"status": "stopped", **defaults, "data_dir": str(config.data_dir), "follow_dir": str(follow_dir)}
+
+
+def _runner_default_params(config: DashboardConfig) -> dict[str, Any]:
+    return {
+        "stake_usdc": to_float(config.runner_stake_usdc),
+        "stake_ratio_percent": to_float(config.runner_stake_ratio_percent),
+        "max_stake_usdc": to_float(config.runner_max_stake_usdc),
+        "max_signal_stake_balance_percent": to_float(config.runner_max_signal_stake_balance_percent),
+    }
 
 
 def start_runner(
@@ -2502,7 +2560,12 @@ def _find_runner_processes(config: DashboardConfig) -> list[dict[str, Any]]:
 
 
 def _system_processes() -> list[dict[str, Any]]:
-    for command in (["ps", "-axo", "pid=,ppid=,pgid=,command="], ["ps", "-eo", "pid=,ppid=,pgid=,command="]):
+    for command in (
+        ["ps", "-axo", "pid=,ppid=,pgid=,stat=,command="],
+        ["ps", "-eo", "pid=,ppid=,pgid=,stat=,command="],
+        ["ps", "-axo", "pid=,ppid=,pgid=,command="],
+        ["ps", "-eo", "pid=,ppid=,pgid=,command="],
+    ):
         try:
             result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         except OSError:
@@ -2513,9 +2576,17 @@ def _system_processes() -> list[dict[str, Any]]:
 
 
 def _parse_ps_line(line: str) -> dict[str, Any]:
-    parts = line.strip().split(None, 3)
+    parts = line.strip().split(None, 4)
     if len(parts) < 4:
         return {}
+    if len(parts) >= 5:
+        return {
+            "pid": _safe_int(parts[0]),
+            "ppid": _safe_int(parts[1]),
+            "pgid": _safe_int(parts[2]),
+            "stat": parts[3],
+            "command": parts[4],
+        }
     return {
         "pid": _safe_int(parts[0]),
         "ppid": _safe_int(parts[1]),
@@ -2531,13 +2602,17 @@ def _normalize_process_row(row: Any) -> dict[str, Any]:
         "pid": _safe_int(row.get("pid")),
         "ppid": _safe_int(row.get("ppid")),
         "pgid": _safe_int(row.get("pgid")),
+        "stat": str(row.get("stat") or ""),
         "command": str(row.get("command") or ""),
     }
 
 
 def _process_matches_runner(row: dict[str, Any], data_dir: Path) -> bool:
     command = str(row.get("command") or "")
+    stat = str(row.get("stat") or "").upper()
     pid = int(row.get("pid") or 0)
+    if stat.startswith("Z") or "<defunct>" in command:
+        return False
     tokens = _command_tokens(command)
     if pid <= 0 or not _is_poly_fight_run_command(tokens, command):
         return False
@@ -2607,6 +2682,17 @@ def _terminate_runner_process(status: dict[str, Any]) -> None:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             return
+
+
+def _reap_child_process(pid: int) -> None:
+    if pid <= 0:
+        return
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return
+    except OSError:
+        return
 
 
 def _process_group_id(pid: int) -> int:
@@ -2874,6 +2960,16 @@ def _file_mtime(path: Path) -> int:
 
 
 def _latest_scoring_version(data_dir: Path) -> int | None:
+    versions: list[int] = []
+    for category, category_dir in category_data_dirs(data_dir).items():
+        version = LeaderboardStore(category_dir / "leaderboard.db").latest_scoring_version(category=category)
+        if version:
+            versions.append(int(version))
+    legacy_version = LeaderboardStore(data_dir / "leaderboard.db").latest_scoring_version(category="esports")
+    if legacy_version:
+        versions.append(int(legacy_version))
+    if versions:
+        return max(versions)
     leaderboard = [row for _category, _dir, rows, _mtime in _category_leaderboards(data_dir) for row in rows]
     versions = [int(row.get("scoring_version") or 0) for row in leaderboard if isinstance(row, dict)]
     version = max(versions or [0])

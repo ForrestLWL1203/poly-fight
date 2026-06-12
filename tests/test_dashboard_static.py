@@ -118,6 +118,36 @@ class DashboardStaticTests(unittest.TestCase):
         self.assertEqual(1, len(ratio_inputs))
         self.assertNotIn("placeholder", ratio_inputs[0].attrs)
 
+    def test_runner_inputs_sync_from_stopped_status_when_empty(self):
+        app_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "app.js"
+        app = app_path.read_text()
+        start = app.index("    syncRunnerInputs()")
+        end = app.index("syncAccountBalanceInput", start)
+        sync_body = app[start:end]
+
+        self.assertIn("const ratio = Number(this.runner.stake_ratio_percent);", sync_body)
+        self.assertIn("!String(this.runnerStakeRatioInput || \"\").trim()", sync_body)
+        self.assertNotIn("this.runner.status === \"running\" && this.runner.stake_ratio_percent", sync_body)
+
+    def test_runner_stopping_uses_global_overlay_and_locks_controls(self):
+        root = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static"
+        template = (root / "index.html").read_text()
+        app = (root / "app.js").read_text()
+
+        self.assertIn(':disabled="runnerBusy || resetModal.loading"', template)
+        self.assertIn(':disabled="runnerBusy || runnerStartBlocked"', template)
+        self.assertIn(':disabled="runnerControlsLocked"', template)
+        self.assertIn('v-if="runnerBusy"', template)
+        self.assertIn('{{ runnerBusyMessage }}', template)
+        self.assertIn('walletRefreshBusy && !runnerBusy', template)
+
+        self.assertIn("runnerBusy()", app)
+        self.assertIn('this.runner.status === "stopping"', app)
+        self.assertIn("runnerControlsLocked()", app)
+        self.assertIn("runnerBusyMessage()", app)
+        self.assertIn("ensureRunnerStopPolling()", app)
+        self.assertIn("this.ensureRunnerStopPolling();", app)
+
     def test_follow_detail_slippage_uses_our_price_minus_wallet_price(self):
         root = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static"
         template = (root / "index.html").read_text()

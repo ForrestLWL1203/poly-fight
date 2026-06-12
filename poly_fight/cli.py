@@ -1555,6 +1555,7 @@ def load_active_market_cache(
     state: dict[str, Any],
     *,
     cache_path: Path | None = None,
+    store: FollowStore | None = None,
     now_ts: int,
     gamma_pages: int,
     ttl_seconds: int,
@@ -1582,7 +1583,17 @@ def load_active_market_cache(
         }
 
     legacy_cached = state.pop("active_market_cache", None) or {}
-    if cache_path and legacy_cached:
+    if store and legacy_cached:
+        markets = rows_to_markets(active_cache_market_rows(legacy_cached))
+        if markets:
+            store.save_market_cache(markets, cache_kind="active", updated_at=int(legacy_cached.get("updated_at") or now_ts))
+        if (
+            markets
+            and now_ts - int(legacy_cached.get("updated_at") or 0) < ttl_seconds
+            and active_cache_has_required_categories({"updated_at": legacy_cached.get("updated_at") or now_ts, "categories": sorted(allowed), "markets": list(markets.values())})
+        ):
+            return markets, state, "legacy_state_cache"
+    elif cache_path and legacy_cached:
         if now_ts - int(legacy_cached.get("updated_at") or 0) < ttl_seconds and active_cache_has_required_categories(legacy_cached):
             markets = rows_to_markets(active_cache_market_rows(legacy_cached))
             write_json(
@@ -1591,8 +1602,31 @@ def load_active_market_cache(
             )
             return markets, state, "legacy_state_cache"
         write_json(cache_path, legacy_cached)
+    if store:
+        db_markets, db_updated_at, db_fresh = store.load_market_cache(
+            cache_kind="active",
+            now_ts=now_ts,
+            ttl_seconds=ttl_seconds,
+        )
+        db_markets = rows_to_markets(list(db_markets.values()))
+        if db_markets and db_fresh and active_cache_has_required_categories(
+            {"updated_at": db_updated_at, "categories": sorted(allowed), "markets": list(db_markets.values())}
+        ):
+            return db_markets, state, "db_cache"
+        if cache_path and not db_markets:
+            cached = read_json(cache_path, {})
+            if cached:
+                markets = rows_to_markets(active_cache_market_rows(cached))
+                if markets:
+                    store.save_market_cache(markets, cache_kind="active", updated_at=int(cached.get("updated_at") or now_ts))
+                if (
+                    markets
+                    and now_ts - int(cached.get("updated_at") or 0) < ttl_seconds
+                    and active_cache_has_required_categories({"updated_at": cached.get("updated_at") or now_ts, "categories": sorted(allowed), "markets": list(markets.values())})
+                ):
+                    return markets, state, "legacy_file_cache"
     cached = read_json(cache_path, {}) if cache_path else {}
-    if cached and now_ts - int(cached.get("updated_at") or 0) < ttl_seconds and active_cache_has_required_categories(cached):
+    if not store and cached and now_ts - int(cached.get("updated_at") or 0) < ttl_seconds and active_cache_has_required_categories(cached):
         markets = rows_to_markets(active_cache_market_rows(cached))
         if cache_path and len(markets) != len(active_cache_market_rows(cached)):
             write_json(
@@ -1620,7 +1654,9 @@ def load_active_market_cache(
         "categories": fetched_categories,
         "markets": list(scoped_markets.values()),
     }
-    if cache_path:
+    if store:
+        store.save_market_cache(scoped_markets, cache_kind="active", updated_at=now_ts)
+    elif cache_path:
         write_json(cache_path, cache_value)
     else:
         state["active_market_cache"] = cache_value
@@ -1638,6 +1674,8 @@ SPORTS_TITLE_TEAMS_RE = re.compile(r"^(.+?)\s+vs\.?\s+(.+?)(?:\s+-\s+(.+))?$", r
 def refresh_team_logo_cache_from_active_markets(
     data_dir: Path,
     *,
+    active_markets: Any = None,
+    store: FollowStore | None = None,
     timeout_seconds: int = 8,
     max_workers: int = 8,
     max_events: int = 0,
@@ -1646,10 +1684,22 @@ def refresh_team_logo_cache_from_active_markets(
     fetch_html: Any = None,
     fetch_logo_bytes: Any = None,
 ) -> dict[str, Any]:
-    active_cache = read_json(data_dir / "follow" / "active_market_cache.json", {})
-    markets = active_cache.get("markets") if isinstance(active_cache, dict) else []
-    if not isinstance(markets, list):
-        markets = list(markets.values()) if isinstance(markets, dict) else []
+    if active_markets is None and store is not None:
+        loaded, _updated_at, _fresh = store.load_market_cache(
+            cache_kind="active",
+            now_ts=int(now_ts if now_ts is not None else time.time()),
+            ttl_seconds=24 * 3600,
+        )
+        markets = list(loaded.values())
+    elif active_markets is None:
+        active_cache = read_json(data_dir / "follow" / "active_market_cache.json", {})
+        markets = active_cache.get("markets") if isinstance(active_cache, dict) else []
+        if not isinstance(markets, list):
+            markets = list(markets.values()) if isinstance(markets, dict) else []
+    elif isinstance(active_markets, dict):
+        markets = list(active_markets.values())
+    else:
+        markets = list(active_markets or [])
     by_slug: dict[str, dict[str, Any]] = {}
     current_ts = int(now_ts if now_ts is not None else time.time())
     window_seconds = int(observe_window_hours * 3600)
@@ -5519,11 +5569,6 @@ def publish_collector_dashboard_outputs(
     data_dir.mkdir(parents=True, exist_ok=True)
     write_json(data_dir / "smart_wallet_leaderboard.json", leaderboard)
     write_json(data_dir / "wallet_profiles.json", profiles)
-    LeaderboardStore(data_dir / "leaderboard.db").replace_leaderboard(
-        leaderboard,
-        category="esports",
-        updated_at=now_ts,
-    )
     publish_summary = {
         "published": True,
         "collector": COLLECTOR_NAME,
@@ -5543,6 +5588,13 @@ def publish_collector_dashboard_outputs(
             "profiled_wallet_count": len(profiles),
             "dashboard_publish": publish_summary,
         }
+    )
+    LeaderboardStore(data_dir / "leaderboard.db").publish_collection(
+        category="esports",
+        leaderboard=leaderboard,
+        profiles=profiles,
+        summary=dashboard_summary,
+        updated_at=now_ts,
     )
     write_json(data_dir / "build_summary.json", dashboard_summary)
     return publish_summary
@@ -6005,11 +6057,6 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         max_age_days=args.profile_store_max_age_days,
     )
     write_json(data_dir / "wallet_profiles.json", list(profiles_by_wallet.values()))
-    LeaderboardStore(data_dir / "leaderboard.db").replace_leaderboard(
-        leaderboard,
-        category=category,
-        updated_at=now_ts,
-    )
     write_json(data_dir / "leaderboard_wallet_overlap.json", overlap_report)
 
     summary = {
@@ -6039,6 +6086,13 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         "diagnostics": diagnostics,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    LeaderboardStore(data_dir / "leaderboard.db").publish_collection(
+        category=category,
+        leaderboard=leaderboard,
+        profiles=list(profiles_by_wallet.values()),
+        summary=summary,
+        updated_at=now_ts,
+    )
     write_json(data_dir / "build_summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
     print()
@@ -6229,6 +6283,7 @@ def command_follow(
         client,
         state,
         cache_path=active_cache_path,
+        store=store,
         now_ts=now_ts,
         gamma_pages=args.gamma_pages,
         ttl_seconds=args.event_cache_ttl_minutes * 60,
@@ -6247,6 +6302,8 @@ def command_follow(
     try:
         refresh_team_logo_cache_from_active_markets(
             data_dir,
+            active_markets=list(active_markets.values()),
+            store=store,
             timeout_seconds=4,
             max_workers=min(max(1, int(args.max_workers)), 4),
             max_events=40,
@@ -6603,6 +6660,7 @@ def command_follow(
         result_events=result_events,
         performance=performance,
     )
+    store.save_run_tick(run_log_row)
     state = {
         "updated_at": now_ts,
         "db_path": str(follow_dir / "follow.db"),

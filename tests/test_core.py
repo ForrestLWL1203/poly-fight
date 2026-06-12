@@ -2973,6 +2973,65 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(store.load_market_cache(cache_kind="closed", now_ts=200, ttl_seconds=900)[0]["m1"]["condition_id"], "m1")
             self.assertEqual(store.load_market_cache(cache_kind="active", now_ts=200, ttl_seconds=900)[0], {})
 
+    def test_follow_store_market_cache_migrates_to_cache_kind_primary_key(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "follow.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    CREATE TABLE market_cache (
+                        condition_id TEXT PRIMARY KEY,
+                        cache_kind TEXT NOT NULL DEFAULT 'active',
+                        updated_at INTEGER NOT NULL,
+                        raw_json TEXT NOT NULL
+                    );
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO market_cache(condition_id, cache_kind, updated_at, raw_json) VALUES (?, ?, ?, ?)",
+                    ("m1", "closed", 100, json.dumps({"condition_id": "m1", "outcome_prices": [1, 0]})),
+                )
+
+            store = FollowStore(db_path)
+            store.init_db()
+            store.save_market_cache({"m1": {"condition_id": "m1", "title": "Active M1"}}, cache_kind="active", updated_at=200)
+
+            closed, closed_updated_at, closed_fresh = store.load_market_cache(cache_kind="closed", now_ts=250, ttl_seconds=900)
+            active, active_updated_at, active_fresh = store.load_market_cache(cache_kind="active", now_ts=250, ttl_seconds=900)
+
+            self.assertTrue(closed_fresh)
+            self.assertTrue(active_fresh)
+            self.assertEqual(closed_updated_at, 100)
+            self.assertEqual(active_updated_at, 200)
+            self.assertEqual(closed["m1"]["outcome_prices"], [1, 0])
+            self.assertEqual(active["m1"]["title"], "Active M1")
+
+    def test_follow_store_run_ticks_round_trip(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            store.save_run_tick(
+                {
+                    "created_at": 123,
+                    "status": "ok",
+                    "gate_open": True,
+                    "watched_market_count": 2,
+                    "open_signal_count": 1,
+                    "new_signal_count": 1,
+                    "tick_runtime_seconds": 0.25,
+                    "desired_next_interval_seconds": 30,
+                }
+            )
+
+            latest = store.latest_run_tick()
+            ticks = store.load_run_ticks(limit=10)
+
+            self.assertEqual(latest["created_at"], 123)
+            self.assertEqual(latest["status"], "ok")
+            self.assertTrue(latest["gate_open"])
+            self.assertEqual(latest["watched_market_count"], 2)
+            self.assertEqual(len(ticks), 1)
+
     def test_category_follow_db_migration_is_guarded_and_dedupes_behavior_events(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp) / "data"
@@ -6801,6 +6860,47 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(health["last_tick_at"], 200)
             self.assertGreater(signal.run_log_mtime, 0)
 
+    def test_dashboard_health_prefers_sqlite_collection_summary_and_run_tick(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            follow_store = FollowStore(data_dir / "follow" / "follow.db")
+            follow_store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[],
+                result_events=[],
+                performance={},
+            )
+            follow_store.save_run_tick(
+                {
+                    "created_at": 300,
+                    "status": "ok",
+                    "gate_open": True,
+                    "watched_market_count": 3,
+                    "open_signal_count": 1,
+                    "new_signal_count": 1,
+                    "desired_next_interval_seconds": 30,
+                }
+            )
+            write_jsonl(data_dir / "logs" / "follow" / "follow_run_log.jsonl", [{"created_at": 100, "desired_next_interval_seconds": 10}])
+            write_json(data_dir / "build_summary.json", {"collector": "legacy", "leaderboard_wallet_count": 99})
+            storage_module.LeaderboardStore(data_dir / "esports" / "leaderboard.db").publish_collection(
+                category="esports",
+                leaderboard=[{"wallet": "0xabc", "grade": "A", "scoring_version": 7}],
+                profiles=[{"wallet": "0xabc", "grade": "A", "profile_state": "qualified", "scoring_version": 7}],
+                summary={"collector": "sqlite", "leaderboard_wallet_count": 1, "profiled_wallet_count": 1},
+                updated_at=250,
+            )
+
+            health = build_health(data_dir, started_at=time.time())
+            signal = read_stream_signal(data_dir)
+
+            self.assertEqual(health["last_tick_at"], 300)
+            self.assertEqual(health["watched_market_count"], 3)
+            self.assertEqual(health["build_summary"]["collector"], "sqlite")
+            self.assertEqual(health["build_summary"]["leaderboard_wallet_count"], 1)
+            self.assertEqual(health["scoring_version"], 7)
+            self.assertGreaterEqual(signal.run_log_mtime, 300)
+
     def test_follow_tick_preloads_team_logos_from_watched_events(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -7096,6 +7196,35 @@ class CoreTest(unittest.TestCase):
             )
             self.assertEqual(events["events"][0]["team_logos"]["teamA"], "/team_logos/dodgers.png")
             self.assertEqual(events["events"][0]["team_logos"]["teamB"], "/team_logos/padres.png")
+
+    def test_dashboard_events_read_active_markets_from_follow_db(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            start = datetime.now(timezone.utc) + timedelta(hours=2)
+            FollowStore(data_dir / "follow" / "follow.db").save_market_cache(
+                {
+                    "m1": {
+                        "condition_id": "m1",
+                        "category": "esports",
+                        "league": "cs2",
+                        "market_type": "main_match",
+                        "title": "Counter-Strike: A vs B",
+                        "question": "Counter-Strike: A vs B",
+                        "match_start_time": start.isoformat(),
+                        "outcomes": ["A", "B"],
+                        "outcome_prices": [0.42, 0.58],
+                    }
+                },
+                cache_kind="active",
+                updated_at=123,
+            )
+
+            events = build_events(data_dir)
+
+            self.assertEqual(events["count"], 1)
+            self.assertEqual(events["cache_updated_at"], 123)
+            self.assertEqual(events["events"][0]["condition_id"], "m1")
+            self.assertEqual(events["events"][0]["outcome_prices"], [0.42, 0.58])
 
     def test_sports_watched_events_missing_logos_trigger_refresh_scan(self):
         with TemporaryDirectory() as tmp:
@@ -8754,6 +8883,137 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(status["source"], "external")
         self.assertEqual(status["pid"], 3234)
 
+    def test_dashboard_runner_ignores_zombie_process_and_marks_stopped(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            follow_dir = data_dir / "follow"
+            write_follow_control(
+                follow_dir,
+                {
+                    "runner": {
+                        "status": "stopping",
+                        "pid": 777,
+                        "pgid": 777,
+                        "source": "dashboard",
+                        "started_at": 100,
+                    }
+                },
+            )
+            config = DashboardConfig(
+                data_dir=data_dir,
+                follow_dir=follow_dir,
+                username="admin",
+                password="pw",
+                cookie_secret="secret",
+                runner_process_lister=lambda: [
+                    {
+                        "pid": 777,
+                        "ppid": 1,
+                        "pgid": 777,
+                        "stat": "Z",
+                        "command": f"{sys.executable} -m poly_fight.cli --data-dir {data_dir} run --stake-usdc 1",
+                    }
+                ],
+            )
+
+            status = build_runner_status(config)
+
+            self.assertEqual(status["status"], "stopped")
+            self.assertEqual(read_follow_control(follow_dir)["runner"]["status"], "stopped")
+
+    def test_dashboard_runner_stale_stopping_control_is_persisted_as_stopped(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            follow_dir = data_dir / "follow"
+            write_follow_control(
+                follow_dir,
+                {
+                    "runner": {
+                        "status": "stopping",
+                        "pid": 777,
+                        "pgid": 777,
+                        "source": "dashboard",
+                        "started_at": 100,
+                    }
+                },
+            )
+            config = DashboardConfig(
+                data_dir=data_dir,
+                follow_dir=follow_dir,
+                username="admin",
+                password="pw",
+                cookie_secret="secret",
+                runner_process_lister=lambda: [],
+            )
+
+            status = build_runner_status(config)
+
+            self.assertEqual(status["status"], "stopped")
+            self.assertEqual(read_follow_control(follow_dir)["runner"]["status"], "stopped")
+
+    def test_dashboard_runner_preserves_stopping_status_while_process_exits(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            follow_dir = data_dir / "follow"
+            write_follow_control(
+                follow_dir,
+                {
+                    "runner": {
+                        "status": "stopping",
+                        "pid": 777,
+                        "pgid": 777,
+                        "source": "dashboard",
+                        "started_at": 100,
+                        "stop_requested_at": 120,
+                    }
+                },
+            )
+            config = DashboardConfig(
+                data_dir=data_dir,
+                follow_dir=follow_dir,
+                username="admin",
+                password="pw",
+                cookie_secret="secret",
+                runner_process_lister=lambda: [
+                    {
+                        "pid": 777,
+                        "ppid": 1,
+                        "pgid": 777,
+                        "stat": "S",
+                        "command": f"{sys.executable} -m poly_fight.cli --data-dir {data_dir} run --stake-usdc 1",
+                    }
+                ],
+            )
+
+            status = build_runner_status(config)
+
+            self.assertEqual("stopping", status["status"])
+            self.assertEqual(777, status["pid"])
+            self.assertEqual(120, status["stop_requested_at"])
+
+    def test_dashboard_runner_stopped_status_includes_default_runner_inputs(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            config = DashboardConfig(
+                data_dir=data_dir,
+                username="admin",
+                password="pw",
+                cookie_secret="secret",
+                runner_process_lister=lambda: [],
+                runner_stake_usdc=2.0,
+                runner_stake_ratio_percent=12.5,
+                runner_max_stake_usdc=7.0,
+                runner_max_signal_stake_balance_percent=15.0,
+            )
+
+            status = build_runner_status(config)
+
+            self.assertEqual(status["status"], "stopped")
+            self.assertEqual(status["stake_usdc"], 2.0)
+            self.assertEqual(status["stake_ratio_percent"], 12.5)
+            self.assertEqual(status["max_stake_usdc"], 7.0)
+            self.assertEqual(status["max_signal_stake_balance_percent"], 15.0)
+
     def test_dashboard_runner_start_writes_control_and_blocks_duplicate(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -10083,29 +10343,27 @@ class CoreTest(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_json(
-                data_dir / "follow" / "active_market_cache.json",
+            FollowStore(data_dir / "follow" / "follow.db").save_market_cache(
                 {
-                    "updated_at": 100,
-                    "markets": [
-                        {
-                            "condition_id": "m1",
-                            "outcomes": ["A", "B"],
-                            "outcome_prices": [0.4, 0.6],
-                        }
-                    ],
+                    "m1": {
+                        "condition_id": "m1",
+                        "outcomes": ["A", "B"],
+                        "outcome_prices": [0.4, 0.6],
+                    }
                 },
+                cache_kind="active",
+                updated_at=100,
             )
 
             client = FakeClient()
             result = fetch_market_prices(data_dir, client, "m1")
-            cached = read_json(data_dir / "follow" / "active_market_cache.json", {})
+            cached = FollowStore(data_dir / "follow" / "follow.db").get_market_cache_item("active", "m1")
 
             self.assertEqual(client.path, "/markets")
             self.assertEqual(client.params["condition_ids"], "m1")
             self.assertEqual(result["outcomes"], ["A", "B"])
             self.assertEqual(result["outcome_prices"], [0.44, 0.56])
-            self.assertEqual(cached["markets"][0]["outcome_prices"], [0.44, 0.56])
+            self.assertEqual(cached["outcome_prices"], [0.44, 0.56])
 
     def test_dashboard_follow_detail_uses_condition_sql_not_full_snapshot(self):
         with TemporaryDirectory() as tmp:
@@ -10650,6 +10908,66 @@ class CoreTest(unittest.TestCase):
             dashboard_summary = read_json(data_dir / "build_summary.json", {})
             self.assertEqual(dashboard_summary["collector"], "wallet_collector")
             self.assertEqual(dashboard_summary["dashboard_publish"]["collector_output_dir"], str(collector_dir))
+
+    def test_leaderboard_store_publish_collection_persists_profiles_and_summary(self):
+        with TemporaryDirectory() as tmp:
+            store = storage_module.LeaderboardStore(Path(tmp) / "leaderboard.db")
+
+            store.publish_collection(
+                category="esports",
+                leaderboard=[
+                    {
+                        "wallet": "0xaaa",
+                        "grade": "A",
+                        "league": "cs2",
+                        "best_bucket": "cs2:main_match",
+                        "best_bucket_score": 0.91,
+                        "scoring_version": 7,
+                        "last_trade_at": 111,
+                        "positive_market_rate": 0.88,
+                        "avg_market_cash": 1234,
+                        "participated_market_count": 8,
+                        "total_cash_volume": 9876,
+                    }
+                ],
+                profiles=[
+                    {
+                        "wallet": "0xaaa",
+                        "grade": "A",
+                        "profile_state": "qualified",
+                        "profiled_at": 110,
+                        "scoring_version": 7,
+                        "last_trade_at": 111,
+                        "profile_lookback_days": 60,
+                        "best_bucket": "cs2:main_match",
+                        "esports_roi": 0.42,
+                        "positive_market_rate": 0.88,
+                        "avg_market_cash": 1234,
+                        "participated_market_count": 8,
+                    }
+                ],
+                summary={
+                    "collector": "wallet_collector",
+                    "classification_market_count": 10,
+                    "target_market_count": 5,
+                    "seed_wallet_count": 4,
+                    "profile_wallet_count": 3,
+                    "profiled_wallet_count": 2,
+                    "leaderboard_wallet_count": 1,
+                },
+                updated_at=222,
+            )
+
+            leaderboard_rows, mtimes = store.load_leaderboard(category="esports")
+            profile_rows = store.load_wallet_profiles(category="esports")
+            run = store.load_latest_collection_run(category="esports")
+
+            self.assertEqual(mtimes["esports"], 222)
+            self.assertEqual(leaderboard_rows[0]["wallet"], "0xaaa")
+            self.assertEqual(profile_rows[0]["wallet"], "0xaaa")
+            self.assertEqual(profile_rows[0]["esports_roi"], 0.42)
+            self.assertEqual(run["collector"], "wallet_collector")
+            self.assertEqual(run["leaderboard_wallet_count"], 1)
 
     def test_dashboard_wallets_use_observed_follow_trade_time(self):
         with TemporaryDirectory() as tmp:

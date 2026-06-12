@@ -51,7 +51,7 @@
                 type="button"
                 title="清除本地历史数据并回到空状态"
                 @click="openResetModal"
-                :disabled="loading.runner || resetModal.loading"
+                :disabled="runnerBusy || resetModal.loading"
               >
                 <span class="reset-cross-icon" aria-hidden="true"></span>
                 <span>重置数据</span>
@@ -62,9 +62,9 @@
                 :aria-label="runnerControlTitle"
                 :title="runnerControlTitle"
                 @click="toggleRunner"
-                :disabled="loading.runner || runnerStartBlocked"
+                :disabled="runnerBusy || runnerStartBlocked"
               >
-                <span v-if="loading.runner" class="loading loading-spinner loading-xs"></span>
+                <span v-if="runnerBusy" class="loading loading-spinner loading-xs"></span>
                 <template v-else>
                   <span v-if="runner.status === 'running'" class="stop-square-icon" aria-hidden="true"></span>
                   <img
@@ -126,7 +126,7 @@
                   type="text"
                   inputmode="decimal"
                   pattern="[0-9]*\.?[0-9]*"
-                  :disabled="runner.status === 'running' || loading.runner"
+                  :disabled="runnerControlsLocked"
                   required
                 />
                 <span>%</span>
@@ -138,7 +138,7 @@
                   type="text"
                   inputmode="decimal"
                   pattern="[0-9]*\.?[0-9]*"
-                  :disabled="runner.status === 'running' || loading.runner"
+                  :disabled="runnerControlsLocked"
                 />
               </label>
               <label class="runner-stake-field runner-signal-limit-field" title="同一钱包、同一场比赛、同一方向的累计跟单金额，不超过当前余额总额的该比例；留空表示不限额">
@@ -149,7 +149,7 @@
                   inputmode="decimal"
                   pattern="[0-9]*\.?[0-9]*"
                   placeholder="0"
-                  :disabled="runner.status === 'running' || loading.runner"
+                  :disabled="runnerControlsLocked"
                 />
                 <span>%</span>
               </label>
@@ -885,15 +885,15 @@
         <form class="modal-backdrop" method="dialog"><button @click.prevent="closeResetModal">取消</button></form>
       </dialog>
 
-      <div v-if="loading.runner" class="global-loading" role="status" aria-live="polite">
+      <div v-if="runnerBusy" class="global-loading" role="status" aria-live="polite">
         <div class="global-loading-panel">
           <span class="loading loading-spinner loading-lg"></span>
-          <strong>{{ runnerActionText || "正在处理跟单脚本" }}</strong>
-          <small>完成刷新后页面会自动恢复</small>
+          <strong>{{ runnerBusyMessage }}</strong>
+          <small>{{ runnerBusyDetail }}</small>
         </div>
       </div>
 
-      <div v-if="walletRefreshBusy && !loading.runner" class="global-loading" role="status" aria-live="polite">
+      <div v-if="walletRefreshBusy && !runnerBusy" class="global-loading" role="status" aria-live="polite">
         <div class="global-loading-panel">
           <span class="loading loading-spinner loading-lg"></span>
           <strong>正在采样候选钱包</strong>
