@@ -104,7 +104,7 @@ class DashboardStaticTests(unittest.TestCase):
         self.assertIn("wallet-quarantine-bar", end_action_classes)
         self.assertIn("wallet-unquarantine-btn", end_action_classes)
 
-    def test_runner_stake_ratio_input_has_no_placeholder(self):
+    def test_strategy_ratio_input_has_no_placeholder(self):
         template_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "index.html"
         parser = _TemplateParser()
         parser.feed(template_path.read_text())
@@ -112,22 +112,22 @@ class DashboardStaticTests(unittest.TestCase):
         ratio_inputs = [
             node
             for node in _walk(parser.root)
-            if node.tag == "input" and node.attrs.get("v-model") == "runnerStakeRatioInput"
+            if node.tag == "input" and node.attrs.get("v-model") == "followStrategy.stake_sizing.ratio_percent"
         ]
 
         self.assertEqual(1, len(ratio_inputs))
         self.assertNotIn("placeholder", ratio_inputs[0].attrs)
 
-    def test_runner_inputs_sync_from_stopped_status_when_empty(self):
+    def test_runner_start_uses_saved_strategy_not_inline_stake_body(self):
         app_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "app.js"
         app = app_path.read_text()
-        start = app.index("    syncRunnerInputs()")
-        end = app.index("syncAccountBalanceInput", start)
-        sync_body = app[start:end]
+        start = app.index("    async startRunner()")
+        end = app.index("ensureRunnerStopPolling", start)
+        start_body = app[start:end]
 
-        self.assertIn("const ratio = Number(this.runner.stake_ratio_percent);", sync_body)
-        self.assertIn("!String(this.runnerStakeRatioInput || \"\").trim()", sync_body)
-        self.assertNotIn("this.runner.status === \"running\" && this.runner.stake_ratio_percent", sync_body)
+        self.assertIn('this.followStrategyReady', start_body)
+        self.assertIn('body: JSON.stringify({})', start_body)
+        self.assertNotIn("stake_ratio_percent", start_body)
 
     def test_runner_stopping_uses_global_overlay_and_locks_controls(self):
         root = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static"
@@ -136,7 +136,7 @@ class DashboardStaticTests(unittest.TestCase):
 
         self.assertIn(':disabled="runnerBusy || resetModal.loading"', template)
         self.assertIn(':disabled="runnerBusy || runnerStartBlocked"', template)
-        self.assertIn(':disabled="runnerControlsLocked"', template)
+        self.assertIn(':disabled="strategyInputsLocked"', template)
         self.assertIn('v-if="runnerBusy"', template)
         self.assertIn('{{ runnerBusyMessage }}', template)
         self.assertIn('walletRefreshBusy && !runnerBusy', template)

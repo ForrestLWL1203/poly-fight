@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .follow_strategy import ACTIVE_FOLLOW_STRATEGY_ID, normalize_follow_strategy, validate_follow_strategy
+
 LEADERBOARD_SCHEMA_VERSION = 2
 FOLLOW_SCHEMA_VERSION = 2
 SCHEMA_VERSION = FOLLOW_SCHEMA_VERSION
@@ -752,6 +754,12 @@ class FollowStore:
                     trade_id TEXT,
                     raw_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS follow_strategy (
+                    id TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_follow_signals_status ON follow_signals(status);
                 CREATE INDEX IF NOT EXISTS idx_follow_signals_wallet ON follow_signals(wallet);
                 CREATE INDEX IF NOT EXISTS idx_follow_signals_condition_id ON follow_signals(condition_id);
@@ -929,6 +937,80 @@ class FollowStore:
         with self.connect() as conn:
             rows = conn.execute("SELECT raw_json FROM follow_results ORDER BY resolved_at, signal_id").fetchall()
         return [_loads(row["raw_json"], {}) for row in rows]
+
+    def save_follow_strategy(self, strategy: dict[str, Any], *, ts: int | None = None) -> dict[str, Any]:
+        self.init_db()
+        updated_at = int(ts or time.time())
+        normalized = normalize_follow_strategy(strategy, updated_at=updated_at)
+        normalized["configured"] = True
+        valid, errors = validate_follow_strategy(normalized)
+        if not valid:
+            raise ValueError(",".join(errors))
+        balance = round(_to_float((normalized.get("balance") or {}).get("usable_balance_usdc")), 8)
+        normalized["balance"]["usable_balance_usdc"] = balance
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO follow_strategy(id, schema_version, updated_at, raw_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    ACTIVE_FOLLOW_STRATEGY_ID,
+                    int(normalized.get("schema_version") or FOLLOW_SCHEMA_VERSION),
+                    updated_at,
+                    _dumps(normalized),
+                ),
+            )
+            if balance > 0:
+                balance_row = {
+                    "configured": True,
+                    "balance_usdc": balance,
+                    "source": "strategy",
+                    "updated_at": updated_at,
+                }
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO account_balance(id, balance_usdc, source, updated_at, raw_json)
+                    VALUES (1, ?, ?, ?, ?)
+                    """,
+                    (balance, "strategy", updated_at, _dumps(balance_row)),
+                )
+            else:
+                conn.execute("DELETE FROM account_balance WHERE id = 1")
+        return normalized
+
+    def load_follow_strategy(self, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+        def read_from(active: sqlite3.Connection) -> dict[str, Any]:
+            try:
+                if "follow_strategy" not in _table_names(active):
+                    return normalize_follow_strategy(None)
+                row = active.execute(
+                    "SELECT raw_json FROM follow_strategy WHERE id = ?",
+                    (ACTIVE_FOLLOW_STRATEGY_ID,),
+                ).fetchone()
+            except sqlite3.Error:
+                return normalize_follow_strategy(None)
+            if not row:
+                return normalize_follow_strategy(None)
+            payload = _loads(row["raw_json"], {})
+            if not isinstance(payload, dict):
+                return normalize_follow_strategy(None)
+            return normalize_follow_strategy(payload)
+
+        if conn is not None:
+            return read_from(conn)
+        self.init_db()
+        with self.connect() as active:
+            return read_from(active)
+
+    def load_follow_strategy_readonly(self) -> dict[str, Any]:
+        readonly = self.connect_readonly()
+        if readonly is None:
+            return normalize_follow_strategy(None)
+        try:
+            return self.load_follow_strategy(readonly)
+        finally:
+            readonly.close()
 
     def set_account_balance(self, balance_usdc: float, *, ts: int | None = None, source: str = "manual") -> dict[str, Any]:
         self.init_db()

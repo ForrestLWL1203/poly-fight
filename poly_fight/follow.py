@@ -5,6 +5,7 @@ from statistics import median
 from typing import Any
 
 from .core import SECONDS_PER_DAY, bucket_key, bucket_label, normalize_wallet, parse_dt, to_float, to_int
+from .follow_strategy import evaluate_follow_candidate, normalize_follow_strategy
 
 MIN_ADD_RATIO_TO_FIRST = 0.10
 MIN_WALLET_TRADE_CASH_USDC = 10.0
@@ -388,6 +389,38 @@ def first_leg_wallet_trade_cash(signal: dict[str, Any] | None) -> float:
     return 0.0
 
 
+def _condition_strategy_counts(
+    open_signals: list[dict[str, Any]],
+    *,
+    condition_id: str,
+    wallet: str,
+) -> dict[str, float | int]:
+    normalized_condition = str(condition_id or "").lower()
+    normalized_wallet = normalize_wallet(wallet)
+    funded_stake = 0.0
+    funded_order_count = 0
+    wallet_funded_order_count = 0
+    for signal in open_signals:
+        if (signal.get("status") or "open") != "open":
+            continue
+        if str(signal.get("condition_id") or "").lower() != normalized_condition:
+            continue
+        signal_wallet = normalize_wallet(signal.get("wallet"))
+        for leg in signal.get("legs") or []:
+            stake = leg_actual_stake(leg)
+            if stake <= 0:
+                continue
+            funded_stake = round(funded_stake + stake, 8)
+            funded_order_count += 1
+            if signal_wallet == normalized_wallet:
+                wallet_funded_order_count += 1
+    return {
+        "condition_funded_stake_usdc": funded_stake,
+        "condition_funded_order_count": funded_order_count,
+        "wallet_condition_funded_order_count": wallet_funded_order_count,
+    }
+
+
 def leg_hypothetical_stake(leg: dict[str, Any]) -> float:
     if not isinstance(leg, dict):
         return 0.0
@@ -421,8 +454,10 @@ def process_follow_trades(
     bankroll_usdc: float = float("inf"),
     max_stake_usdc: float = 0.0,
     max_signal_stake_usdc: float = 0.0,
+    follow_strategy: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     wallet = normalize_wallet(wallet)
+    active_strategy = normalize_follow_strategy(follow_strategy) if isinstance(follow_strategy, dict) else None
     observed_ts = to_int(observed_at) or now_ts
     previous_poll_ts = to_int(previous_poll_at)
     stats: dict[str, Any] = {
@@ -440,6 +475,11 @@ def process_follow_trades(
         "small_add_blocked_count": 0,
         "signal_cap_limited_count": 0,
         "signal_cap_blocked_count": 0,
+        "strategy_invalid_count": 0,
+        "stake_below_minimum_count": 0,
+        "condition_order_cap_blocked_count": 0,
+        "wallet_condition_order_cap_blocked_count": 0,
+        "condition_stake_cap_blocked_count": 0,
         "funded_stake_usdc": 0.0,
         "unfunded_intent_count": 0,
         "quarantine_events": [],
@@ -535,9 +575,25 @@ def process_follow_trades(
             continue
 
         wallet_fill_price = trade_price(trade)
+        wallet_cash = round(trade_size(trade) * wallet_fill_price, 8)
+        condition_counts = _condition_strategy_counts(open_signals, condition_id=condition_id, wallet=wallet)
+        strategy_decision: dict[str, Any] | None = None
+        if active_strategy is not None:
+            strategy_decision = evaluate_follow_candidate(
+                strategy=active_strategy,
+                target_wallet_order_cash_usdc=wallet_cash,
+                available_balance_usdc=bankroll_usdc - _open_signals_exposure(open_signals),
+                condition_funded_stake_usdc=to_float(condition_counts["condition_funded_stake_usdc"]),
+                condition_funded_order_count=to_int(condition_counts["condition_funded_order_count"]),
+                wallet_condition_funded_order_count=to_int(condition_counts["wallet_condition_funded_order_count"]),
+            )
+            if strategy_decision.get("block_reason") == "small_target_wallet_order":
+                stats["small_wallet_trade_blocked_count"] += 1
+                stats["ignored_trade_count"] += 0
+                continue
+
         slippage = evaluate_slippage(wallet_fill_price, current_price, max_slippage=max_slippage)
         follow_block_reasons = []
-        wallet_cash = round(trade_size(trade) * wallet_fill_price, 8)
         min_wallet_trade_cash = to_float(min_wallet_trade_cash_usdc)
         if min_wallet_entry_price > 0 and wallet_fill_price < min_wallet_entry_price:
             slippage["would_follow"] = False
@@ -556,50 +612,73 @@ def process_follow_trades(
         stake_mode = None
         stake_ratio = None
         available_balance = bankroll_usdc - _open_signals_exposure(open_signals)
-        target_stake, target_stake_mode, _ = target_stake_for_signal(
-            wallet_trade_cash=wallet_cash,
-            stake_ratio_percent=stake_ratio_percent,
-            min_stake_usdc=stake_usdc,
-            max_stake_usdc=max_stake_usdc,
-        )
-        leg_stake, stake_mode, stake_ratio = follow_stake_for_signal(
-            wallet_trade_cash=wallet_cash,
-            stake_ratio_percent=stake_ratio_percent,
-            min_stake_usdc=stake_usdc,
-            available_balance=available_balance,
-            max_stake_usdc=max_stake_usdc,
-        )
-        funded_stake = leg_stake
-        funding_status = "funded"
-        would_follow = slippage["would_follow"]
-        if leg_stake <= 0:
-            stats["insufficient_balance_count"] += 1
-            stats["unfunded_intent_count"] += 1
+        if active_strategy is not None and strategy_decision is not None:
+            target_stake = to_float(strategy_decision.get("target_stake"))
+            target_stake_mode = str(strategy_decision.get("stake_mode") or "strategy")
             leg_stake = target_stake
-            funded_stake = 0.0
-            stake_mode = "skipped"
-            funding_status = "insufficient_balance"
-            would_follow = False
-            follow_block_reasons.append("insufficient_balance")
-        if stake_mode == "capped":
-            stats["insufficient_balance_count"] += 1
-        if funding_status == "funded" and not would_follow:
-            funded_stake = 0.0
-            funding_status = "blocked"
+            funded_stake = to_float(strategy_decision.get("funded_stake"))
+            stake_mode = str(strategy_decision.get("stake_mode") or "strategy")
+            stake_ratio = round(to_float((active_strategy.get("stake_sizing") or {}).get("ratio_percent")) / 100.0, 6)
+            funding_status = "funded" if strategy_decision.get("would_follow") else "blocked"
+            would_follow = bool(strategy_decision.get("would_follow")) and bool(slippage["would_follow"])
+            if not strategy_decision.get("would_follow"):
+                reason = str(strategy_decision.get("block_reason") or "strategy_blocked")
+                follow_block_reasons.append(reason)
+                if reason == "stake_below_minimum":
+                    stats["stake_below_minimum_count"] += 1
+                elif reason == "insufficient_balance":
+                    stats["insufficient_balance_count"] += 1
+                    stats["unfunded_intent_count"] += 1
+                elif reason == "condition_order_cap_reached":
+                    stats["condition_order_cap_blocked_count"] += 1
+                elif reason == "wallet_condition_order_cap_reached":
+                    stats["wallet_condition_order_cap_blocked_count"] += 1
+                elif reason == "condition_stake_cap_reached":
+                    stats["condition_stake_cap_blocked_count"] += 1
+                elif reason == "invalid_strategy":
+                    stats["strategy_invalid_count"] += 1
+                funded_stake = 0.0
+            if funding_status == "funded" and not slippage["would_follow"]:
+                funded_stake = 0.0
+                funding_status = "blocked"
+        else:
+            target_stake, target_stake_mode, _ = target_stake_for_signal(
+                wallet_trade_cash=wallet_cash,
+                stake_ratio_percent=stake_ratio_percent,
+                min_stake_usdc=stake_usdc,
+                max_stake_usdc=max_stake_usdc,
+            )
+            leg_stake, stake_mode, stake_ratio = follow_stake_for_signal(
+                wallet_trade_cash=wallet_cash,
+                stake_ratio_percent=stake_ratio_percent,
+                min_stake_usdc=stake_usdc,
+                available_balance=available_balance,
+                max_stake_usdc=max_stake_usdc,
+            )
+            funded_stake = leg_stake
+            funding_status = "funded"
+            would_follow = slippage["would_follow"]
+            if leg_stake <= 0:
+                stats["insufficient_balance_count"] += 1
+                stats["unfunded_intent_count"] += 1
+                leg_stake = target_stake
+                funded_stake = 0.0
+                stake_mode = "skipped"
+                funding_status = "insufficient_balance"
+                would_follow = False
+                follow_block_reasons.append("insufficient_balance")
+            if stake_mode == "capped":
+                stats["insufficient_balance_count"] += 1
+            if funding_status == "funded" and not would_follow:
+                funded_stake = 0.0
+                funding_status = "blocked"
         add_ratio_to_first = None
         if existing:
             first_wallet_cash = first_leg_wallet_trade_cash(existing)
             add_ratio_to_first = round(wallet_cash / first_wallet_cash, 8) if first_wallet_cash > 0 else None
-            if add_ratio_to_first is not None and add_ratio_to_first < MIN_ADD_RATIO_TO_FIRST:
-                would_follow = False
-                funded_stake = 0.0
-                funding_status = "blocked"
-                stake_mode = "small_add"
-                follow_block_reasons.append("small_add")
-                stats["small_add_blocked_count"] += 1
         signal_stake_before = sum(leg_actual_stake(leg) for leg in (existing or {}).get("legs") or [])
         max_signal_stake = to_float(max_signal_stake_usdc)
-        if max_signal_stake > 0 and funding_status == "funded" and would_follow and funded_stake > 0:
+        if active_strategy is None and max_signal_stake > 0 and funding_status == "funded" and would_follow and funded_stake > 0:
             remaining_signal_stake = max(0.0, max_signal_stake - signal_stake_before)
             if remaining_signal_stake + 1e-9 < stake_usdc:
                 would_follow = False
@@ -637,13 +716,25 @@ def process_follow_trades(
             "wallet_trade_at": trade_ts,
             "wallet_trade_size": round(trade_size(trade), 8),
             "wallet_trade_cash": wallet_cash,
+            "target_wallet_order_cash_usdc": wallet_cash,
             "stake_mode": stake_mode,
             "stake_ratio_percent": round(stake_ratio_percent, 8),
             "max_stake_usdc": round(to_float(max_stake_usdc), 8),
             "max_signal_stake_usdc": round(max_signal_stake, 8),
             "signal_stake_before": round(signal_stake_before, 8),
+            "condition_funded_stake_before": round(to_float(condition_counts["condition_funded_stake_usdc"]), 8),
+            "condition_funded_order_count_before": to_int(condition_counts["condition_funded_order_count"]),
+            "wallet_condition_funded_order_count_before": to_int(condition_counts["wallet_condition_funded_order_count"]),
             "observed_at": observed_ts,
         }
+        if strategy_decision is not None:
+            leg["strategy_schema_version"] = to_int(strategy_decision.get("strategy_schema_version"))
+            leg["strategy_mode"] = str((active_strategy.get("stake_sizing") or {}).get("mode") or "")
+            leg["strategy_snapshot"] = strategy_decision.get("strategy_snapshot") or active_strategy
+            leg["min_target_wallet_order_cash_usdc"] = round(
+                to_float(((active_strategy.get("prefilters") or {}).get("min_target_wallet_order_cash_usdc"))),
+                8,
+            )
         if funding_status == "signal_cap":
             leg["signal_cap_limited"] = True
         if add_ratio_to_first is not None:
@@ -717,6 +808,9 @@ def process_follow_trades(
                     "exit_count": 0,
                 },
             }
+            if strategy_decision is not None:
+                signal["strategy_schema_version"] = leg.get("strategy_schema_version")
+                signal["strategy_mode"] = leg.get("strategy_mode")
             if detected_after_start:
                 signal["detected_after_start"] = True
             open_signals.append(signal)

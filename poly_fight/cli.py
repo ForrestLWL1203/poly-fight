@@ -82,6 +82,7 @@ from .follow import (
     trade_timestamp,
     winner_outcome_index,
 )
+from .follow_strategy import strategy_from_legacy_args, strategy_summary, validate_follow_strategy
 from .storage import FollowStore, LeaderboardStore
 from .control import read_follow_control, set_pause_new_signals
 
@@ -6352,6 +6353,11 @@ def command_follow(
     small_add_blocked_count = 0
     signal_cap_limited_count = 0
     signal_cap_blocked_count = 0
+    strategy_invalid_count = 0
+    stake_below_minimum_count = 0
+    condition_order_cap_blocked_count = 0
+    wallet_condition_order_cap_blocked_count = 0
+    condition_stake_cap_blocked_count = 0
     wallet_fetch_error_count = 0
     wallet_fetch_seconds: list[float] = []
     observed_delay_values: list[int] = []
@@ -6363,6 +6369,29 @@ def command_follow(
     max_signal_stake_balance_percent = to_float(getattr(args, "max_signal_stake_balance_percent", 0.0))
     if max_signal_stake_usdc <= 0 and max_signal_stake_balance_percent > 0 and math.isfinite(bankroll_usdc):
         max_signal_stake_usdc = round(bankroll_usdc * max_signal_stake_balance_percent / 100.0, 8)
+    strategy_source = str(getattr(args, "strategy_source", "auto") or "auto").lower()
+    db_strategy = store.load_follow_strategy() if strategy_source in {"auto", "db"} else {"configured": False}
+    follow_strategy = None
+    legacy_follow_strategy = None
+    strategy_loaded_from = "legacy"
+    if strategy_source in {"auto", "db"} and db_strategy.get("configured"):
+        valid_strategy, strategy_errors = validate_follow_strategy(db_strategy)
+        if not valid_strategy and strategy_source == "db":
+            raise RuntimeError(f"invalid_follow_strategy:{','.join(strategy_errors)}")
+        if valid_strategy:
+            follow_strategy = db_strategy
+            strategy_loaded_from = "db"
+    if follow_strategy is None:
+        if strategy_source == "db":
+            raise RuntimeError("follow_strategy_required")
+        legacy_follow_strategy = strategy_from_legacy_args(
+            stake_usdc=args.stake_usdc,
+            stake_ratio_percent=args.stake_ratio_percent,
+            max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
+            max_signal_stake_usdc=max_signal_stake_usdc,
+            min_wallet_trade_cash_usdc=10.0,
+            balance_usdc=account_balance.get("balance_usdc") if account_balance_configured else None,
+        )
 
     tracked_condition_ids = {str(condition_id).lower() for condition_id in watched}
     tracked_condition_ids.update(str(signal.get("condition_id") or "").lower() for signal in open_signals)
@@ -6483,6 +6512,7 @@ def command_follow(
                 bankroll_usdc=bankroll_usdc,
                 max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
                 max_signal_stake_usdc=max_signal_stake_usdc,
+                follow_strategy=follow_strategy,
             )
             after_ids = {signal.get("signal_id") for signal in open_signals}
             new_signal_count += len(after_ids - before_ids)
@@ -6497,6 +6527,11 @@ def command_follow(
             small_add_blocked_count += stats.get("small_add_blocked_count", 0)
             signal_cap_limited_count += stats.get("signal_cap_limited_count", 0)
             signal_cap_blocked_count += stats.get("signal_cap_blocked_count", 0)
+            strategy_invalid_count += stats.get("strategy_invalid_count", 0)
+            stake_below_minimum_count += stats.get("stake_below_minimum_count", 0)
+            condition_order_cap_blocked_count += stats.get("condition_order_cap_blocked_count", 0)
+            wallet_condition_order_cap_blocked_count += stats.get("wallet_condition_order_cap_blocked_count", 0)
+            condition_stake_cap_blocked_count += stats.get("condition_stake_cap_blocked_count", 0)
             exited_signal_count += stats.get("exited_signal_count", 0)
             hedge_event_count += stats.get("hedge_event_count", 0)
             opposite_blocked_count += stats.get("opposite_blocked_count", 0)
@@ -6622,6 +6657,14 @@ def command_follow(
         "small_add_blocked_count": small_add_blocked_count,
         "signal_cap_limited_count": signal_cap_limited_count,
         "signal_cap_blocked_count": signal_cap_blocked_count,
+        "strategy_source": strategy_loaded_from,
+        "strategy_configured": bool((follow_strategy or legacy_follow_strategy or {}).get("configured")),
+        "strategy_summary": strategy_summary(follow_strategy or legacy_follow_strategy),
+        "strategy_invalid_count": strategy_invalid_count,
+        "stake_below_minimum_count": stake_below_minimum_count,
+        "condition_order_cap_blocked_count": condition_order_cap_blocked_count,
+        "wallet_condition_order_cap_blocked_count": wallet_condition_order_cap_blocked_count,
+        "condition_stake_cap_blocked_count": condition_stake_cap_blocked_count,
         "max_signal_stake_usdc": max_signal_stake_usdc,
         "max_signal_stake_balance_percent": max_signal_stake_balance_percent,
         "opposite_blocked_count": opposite_blocked_count,
@@ -6924,7 +6967,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_follow_arguments(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--follow-dir")
-        subparser.add_argument("--stake-usdc", type=float, required=True, help="minimum paper stake per followed BUY leg")
+        subparser.add_argument("--strategy-source", choices=("auto", "db", "legacy"), default="auto", help="follow strategy source: db requires saved follow.db strategy; legacy uses CLI stake flags")
+        subparser.add_argument("--stake-usdc", type=float, default=1.0, help="legacy minimum paper stake per followed BUY leg")
         subparser.add_argument("--stake-ratio-percent", type=float, default=10.0, help="target-wallet cash replication ratio per BUY leg")
         subparser.add_argument("--max-stake-usdc", type=float, default=0.0, help="optional maximum paper stake per followed BUY leg; 0 disables the cap")
         subparser.add_argument("--max-signal-stake-usdc", type=float, default=0.0, help="optional maximum funded stake per wallet/market/outcome signal; 0 disables the cap")
@@ -7015,7 +7059,8 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="run paper follow loop with scheduled pool refresh")
     add_build_arguments(run)
     run.add_argument("--follow-dir")
-    run.add_argument("--stake-usdc", type=float, required=True, help="minimum paper stake per followed BUY leg")
+    run.add_argument("--strategy-source", choices=("auto", "db", "legacy"), default="auto", help="follow strategy source: db requires saved follow.db strategy; legacy uses CLI stake flags")
+    run.add_argument("--stake-usdc", type=float, default=1.0, help="legacy minimum paper stake per followed BUY leg")
     run.add_argument("--stake-ratio-percent", type=float, default=10.0, help="target-wallet cash replication ratio per BUY leg")
     run.add_argument("--max-stake-usdc", type=float, default=0.0, help="optional maximum paper stake per followed BUY leg; 0 disables the cap")
     run.add_argument("--max-signal-stake-usdc", type=float, default=0.0, help="optional maximum funded stake per wallet/market/outcome signal; 0 disables the cap")

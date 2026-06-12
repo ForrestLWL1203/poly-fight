@@ -26,6 +26,7 @@ from typing import Any
 from .control import read_follow_control, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
 from .core import LEAGUE_LABELS, MIN_A_POSITIVE_MARKET_RATE, bucket_label, parse_dt, parse_jsonish, to_float
 from .cli import enrich_esports_bucket_scores, prepare_category_refresh_dir
+from .follow_strategy import default_follow_strategy, strategy_summary, validate_follow_strategy
 from .storage import FollowStore, LeaderboardStore
 
 
@@ -216,6 +217,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/account-balance":
                 self._account_balance()
                 return
+            if parsed.path == "/api/follow-strategy":
+                self._follow_strategy()
+                return
             if parsed.path == "/api/runner/start":
                 self._runner_start()
                 return
@@ -244,6 +248,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/overview":
             self._ok(build_overview(self.dashboard_config.data_dir, follow_dir=follow_dir))
+            return
+        if parsed.path == "/api/follow-strategy":
+            store = FollowStore(_follow_db_path(self.dashboard_config))
+            strategy = store.load_follow_strategy_readonly()
+            if not strategy.get("configured"):
+                balance = store.load_account_balance_readonly()
+                balance_value = to_float(balance.get("balance_usdc")) if balance.get("configured") else None
+                strategy = default_follow_strategy(balance_usdc=balance_value)
+                strategy["configured"] = False
+            self._ok(strategy)
             return
         if parsed.path == "/api/wallets":
             self._ok(build_wallets(self.dashboard_config.data_dir, follow_dir=follow_dir))
@@ -443,30 +457,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if current.get("status") == "running":
             self._json({"ok": False, "error": "runner_already_running", "data": current}, status=HTTPStatus.CONFLICT)
             return
-        form = self._read_request_form()
-        stake_ratio_percent = to_float(form.get("stake_ratio_percent") or form.get("stake_ratio"))
-        if not math.isfinite(stake_ratio_percent) or stake_ratio_percent <= 0:
-            self._error("invalid_stake_ratio_percent", status=HTTPStatus.BAD_REQUEST)
-            return
-        max_stake_usdc = to_float(form.get("max_stake_usdc") or form.get("max_stake") or 0)
-        if not math.isfinite(max_stake_usdc) or max_stake_usdc < 0:
-            self._error("invalid_max_stake_usdc", status=HTTPStatus.BAD_REQUEST)
-            return
-        max_signal_stake_balance_percent = to_float(
-            form.get("max_signal_stake_balance_percent") or form.get("max_signal_stake_percent") or 0
-        )
-        if not math.isfinite(max_signal_stake_balance_percent) or max_signal_stake_balance_percent < 0:
-            self._error("invalid_max_signal_stake_balance_percent", status=HTTPStatus.BAD_REQUEST)
-            return
         try:
-            status = start_runner(
-                self.dashboard_config,
-                stake_ratio_percent=stake_ratio_percent,
-                max_stake_usdc=max_stake_usdc,
-                max_signal_stake_balance_percent=max_signal_stake_balance_percent,
-            )
+            status = start_runner(self.dashboard_config)
         except RunnerAlreadyRunning as exc:
             self._json({"ok": False, "error": "runner_already_running", "data": exc.status}, status=HTTPStatus.CONFLICT)
+            return
+        except ValueError as exc:
+            self._error(str(exc), status=HTTPStatus.BAD_REQUEST)
             return
         self._json({"ok": True, "data": status, "generated_at": int(time.time())}, status=HTTPStatus.ACCEPTED)
 
@@ -483,6 +480,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
         store = FollowStore(_follow_db_path(self.dashboard_config))
         state = store.set_account_balance(balance, ts=int(time.time()), source="manual")
         self._ok(state)
+
+    def _follow_strategy(self) -> None:
+        current = build_runner_status(self.dashboard_config)
+        if current.get("status") in {"running", "stopping"}:
+            self._json({"ok": False, "error": "follow_strategy_locked", "data": current}, status=HTTPStatus.CONFLICT)
+            return
+        strategy = self._read_request_form()
+        valid, errors = validate_follow_strategy(strategy)
+        if not valid:
+            self._json(
+                {"ok": False, "error": "invalid_follow_strategy", "errors": errors},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        store = FollowStore(_follow_db_path(self.dashboard_config))
+        try:
+            saved = store.save_follow_strategy(strategy, ts=int(time.time()))
+        except ValueError as exc:
+            self._json(
+                {"ok": False, "error": "invalid_follow_strategy", "detail": str(exc)},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        self._ok(saved)
 
     def _runner_stop(self) -> None:
         status = stop_runner(self.dashboard_config)
@@ -2374,6 +2395,9 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
             "stake_ratio_percent": recorded.get("stake_ratio_percent"),
             "max_stake_usdc": recorded.get("max_stake_usdc"),
             "max_signal_stake_balance_percent": recorded.get("max_signal_stake_balance_percent"),
+            "strategy_configured": recorded.get("strategy_configured", defaults.get("strategy_configured")),
+            "strategy_updated_at": recorded.get("strategy_updated_at", defaults.get("strategy_updated_at")),
+            "strategy_summary": recorded.get("strategy_summary", defaults.get("strategy_summary")),
             "log_path": recorded.get("log_path") if source == "dashboard" else None,
             "data_dir": str(config.data_dir),
             "follow_dir": str(follow_dir),
@@ -2394,11 +2418,16 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
 
 
 def _runner_default_params(config: DashboardConfig) -> dict[str, Any]:
+    strategy = FollowStore(_follow_db_path(config)).load_follow_strategy_readonly()
+    strategy_configured = bool(strategy.get("configured"))
     return {
         "stake_usdc": to_float(config.runner_stake_usdc),
         "stake_ratio_percent": to_float(config.runner_stake_ratio_percent),
         "max_stake_usdc": to_float(config.runner_max_stake_usdc),
         "max_signal_stake_balance_percent": to_float(config.runner_max_signal_stake_balance_percent),
+        "strategy_configured": strategy_configured,
+        "strategy_updated_at": strategy.get("updated_at") if strategy_configured else None,
+        "strategy_summary": strategy_summary(strategy) if strategy_configured else "",
     }
 
 
@@ -2415,22 +2444,15 @@ def start_runner(
     min_stake = to_float(config.runner_stake_usdc)
     if not math.isfinite(min_stake) or min_stake <= 0:
         raise ValueError("invalid_stake_usdc")
-    stake_ratio = to_float(config.runner_stake_ratio_percent if stake_ratio_percent is None else stake_ratio_percent)
-    if not math.isfinite(stake_ratio) or stake_ratio <= 0:
-        raise ValueError("invalid_stake_ratio_percent")
-    max_stake = to_float(config.runner_max_stake_usdc if max_stake_usdc is None else max_stake_usdc)
-    if not math.isfinite(max_stake) or max_stake < 0:
-        raise ValueError("invalid_max_stake_usdc")
-    max_signal_stake_percent = to_float(
-        config.runner_max_signal_stake_balance_percent
-        if max_signal_stake_balance_percent is None
-        else max_signal_stake_balance_percent
-    )
-    if not math.isfinite(max_signal_stake_percent) or max_signal_stake_percent < 0:
-        raise ValueError("invalid_max_signal_stake_balance_percent")
     now_ts = int(time.time())
     follow_dir = _follow_dir(config)
     follow_dir.mkdir(parents=True, exist_ok=True)
+    strategy = FollowStore(follow_dir / "follow.db").load_follow_strategy()
+    if not strategy.get("configured"):
+        raise ValueError("follow_strategy_required")
+    strategy_valid, strategy_errors = validate_follow_strategy(strategy)
+    if not strategy_valid:
+        raise ValueError("invalid_follow_strategy")
     log_dir = _follow_log_dir(config.data_dir, log_dir=config.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"dashboard-runner-{now_ts}.out"
@@ -2446,16 +2468,10 @@ def start_runner(
         "run",
         "--follow-dir",
         str(follow_dir),
-        "--stake-usdc",
-        str(min_stake),
-        "--stake-ratio-percent",
-        str(stake_ratio),
         "--skip-initial-build",
+        "--strategy-source",
+        "db",
     ]
-    if max_stake > 0:
-        command.extend(["--max-stake-usdc", str(max_stake)])
-    if max_signal_stake_percent > 0:
-        command.extend(["--max-signal-stake-balance-percent", str(max_signal_stake_percent)])
     if config.runner_process_starter is not None:
         process = config.runner_process_starter(command, log_path)
         pid = int(getattr(process, "pid", process if isinstance(process, int) else 0) or 0)
@@ -2479,9 +2495,12 @@ def start_runner(
         "started_at": now_ts,
         "command": command,
         "stake_usdc": min_stake,
-        "stake_ratio_percent": stake_ratio,
-        "max_stake_usdc": max_stake,
-        "max_signal_stake_balance_percent": max_signal_stake_percent,
+        "stake_ratio_percent": to_float(config.runner_stake_ratio_percent),
+        "max_stake_usdc": to_float(config.runner_max_stake_usdc),
+        "max_signal_stake_balance_percent": to_float(config.runner_max_signal_stake_balance_percent),
+        "strategy_configured": True,
+        "strategy_updated_at": strategy.get("updated_at"),
+        "strategy_summary": strategy_summary(strategy),
         "log_path": str(log_path),
         "data_dir": str(config.data_dir),
         "follow_dir": str(follow_dir),

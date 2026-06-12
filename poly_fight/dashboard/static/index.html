@@ -88,71 +88,15 @@
                 <span v-if="runnerWarningMessage" class="runner-warning-popover">{{ runnerWarningMessage }}</span>
               </button>
               <button
-                v-else-if="runner.status !== 'running' && !runnerStakeRatioValid"
+                v-else-if="runner.status !== 'running' && !followStrategyReady"
                 class="runner-start-warning"
                 type="button"
-                aria-label="需填写跟单比例"
-                @click="showRunnerWarning('需填写跟单比例')"
+                :aria-label="followStrategyBlockReason"
+                @click="showRunnerWarning(followStrategyBlockReason)"
               >
                 !
                 <span v-if="runnerWarningMessage" class="runner-warning-popover">{{ runnerWarningMessage }}</span>
               </button>
-              <button
-                v-else-if="runner.status !== 'running' && !runnerMaxStakeValid"
-                class="runner-start-warning"
-                type="button"
-                aria-label="单笔跟单限额格式不正确"
-                @click="showRunnerWarning('单笔跟单限额格式不正确')"
-              >
-                !
-                <span v-if="runnerWarningMessage" class="runner-warning-popover">{{ runnerWarningMessage }}</span>
-              </button>
-              <button
-                v-else-if="runner.status !== 'running' && !runnerSignalStakePercentValid"
-                class="runner-start-warning"
-                type="button"
-                aria-label="单场余额比例格式不正确"
-                @click="showRunnerWarning('单场余额比例格式不正确')"
-              >
-                !
-                <span v-if="runnerWarningMessage" class="runner-warning-popover">{{ runnerWarningMessage }}</span>
-              </button>
-            </div>
-            <div class="runner-control-group">
-              <label class="runner-stake-field runner-ratio-field" title="按目标钱包买入金额的固定比例跟单，最低 1 USDC">
-                <span class="runner-stake-label">目标金额比例</span>
-                <input
-                  v-model="runnerStakeRatioInput"
-                  type="text"
-                  inputmode="decimal"
-                  pattern="[0-9]*\.?[0-9]*"
-                  :disabled="runnerControlsLocked"
-                  required
-                />
-                <span>%</span>
-              </label>
-              <label class="runner-stake-field runner-limit-field" title="单笔跟单限额，留空表示不限额">
-                <span class="runner-stake-label">单笔限额</span>
-                <input
-                  v-model="runnerMaxStakeInput"
-                  type="text"
-                  inputmode="decimal"
-                  pattern="[0-9]*\.?[0-9]*"
-                  :disabled="runnerControlsLocked"
-                />
-              </label>
-              <label class="runner-stake-field runner-signal-limit-field" title="同一钱包、同一场比赛、同一方向的累计跟单金额，不超过当前余额总额的该比例；留空表示不限额">
-                <span class="runner-stake-label">单场余额上限</span>
-                <input
-                  v-model="runnerSignalStakePercentInput"
-                  type="text"
-                  inputmode="decimal"
-                  pattern="[0-9]*\.?[0-9]*"
-                  placeholder="0"
-                  :disabled="runnerControlsLocked"
-                />
-                <span>%</span>
-              </label>
             </div>
           </div>
         </header>
@@ -170,6 +114,110 @@
           <div class="notice-copy">
             <strong>等待跟单脚本</strong>
             <span>还没有可读的 follow.db。跟单进程启动并写入第一轮快照后，这里会自动填充。</span>
+          </div>
+        </section>
+
+        <section class="strategy-console" :class="{ 'is-locked': strategyInputsLocked }" aria-label="跟单策略">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Follow Strategy</p>
+              <h2>跟单策略</h2>
+            </div>
+            <div class="strategy-actions">
+              <span class="strategy-state" :class="followStrategyReady ? 'status-healthy' : 'status-stale'">
+                {{ followStrategyReady ? '已保存' : (strategyDirty ? '未保存' : '未就绪') }}
+              </span>
+              <button
+                class="strategy-save-btn"
+                type="button"
+                :disabled="strategyInputsLocked || !followStrategyValid || (!strategyDirty && followStrategy.configured)"
+                @click="saveFollowStrategy"
+              >
+                <span v-if="strategySaving" class="loading loading-spinner loading-xs"></span>
+                <span v-else>保存策略</span>
+              </button>
+            </div>
+          </div>
+          <div class="strategy-grid">
+            <article class="strategy-block">
+              <h3>单笔金额</h3>
+              <div class="strategy-option-row">
+                <label><input type="radio" value="proportional" v-model="followStrategy.stake_sizing.mode" :disabled="strategyInputsLocked" @change="markStrategyDirty" /> 按目标钱包比例</label>
+                <label><input type="radio" value="fixed" v-model="followStrategy.stake_sizing.mode" :disabled="strategyInputsLocked" @change="markStrategyDirty" /> 固定金额</label>
+                <label><input type="radio" value="balance_percent" v-model="followStrategy.stake_sizing.mode" :disabled="strategyInputsLocked" @change="markStrategyDirty" /> 按余额百分比</label>
+              </div>
+              <label v-if="followStrategy.stake_sizing.mode === 'proportional'" class="strategy-field">
+                <span>目标钱包比例</span>
+                <input v-model="followStrategy.stake_sizing.ratio_percent" type="text" inputmode="decimal" pattern="[0-9]*\.?[0-9]*" :disabled="strategyInputsLocked" @input="markStrategyDirty" />
+                <b>%</b>
+              </label>
+              <label v-if="followStrategy.stake_sizing.mode === 'proportional'" class="strategy-check">
+                <input type="checkbox" v-model="followStrategy.stake_sizing.per_order_cap_enabled" :disabled="strategyInputsLocked" @change="markStrategyDirty" />
+                <span>单笔限额</span>
+              </label>
+              <label v-if="followStrategy.stake_sizing.mode === 'proportional' && followStrategy.stake_sizing.per_order_cap_enabled" class="strategy-field">
+                <span>限额</span>
+                <input v-model="followStrategy.stake_sizing.per_order_cap_usdc" type="text" inputmode="decimal" pattern="[0-9]*\.?[0-9]*" :disabled="strategyInputsLocked" @input="markStrategyDirty" />
+                <b>USDC</b>
+              </label>
+              <label v-if="followStrategy.stake_sizing.mode === 'fixed'" class="strategy-field">
+                <span>每笔金额</span>
+                <input v-model="followStrategy.stake_sizing.fixed_usdc" type="text" inputmode="decimal" pattern="[0-9]*\.?[0-9]*" :disabled="strategyInputsLocked" @input="markStrategyDirty" />
+                <b>USDC</b>
+              </label>
+              <label v-if="followStrategy.stake_sizing.mode === 'balance_percent'" class="strategy-field">
+                <span>余额占比</span>
+                <input v-model="followStrategy.stake_sizing.balance_percent" type="text" inputmode="decimal" pattern="[0-9]*\.?[0-9]*" :disabled="strategyInputsLocked" @input="markStrategyDirty" />
+                <b>%</b>
+              </label>
+            </article>
+
+            <article class="strategy-block">
+              <h3>前置过滤</h3>
+              <label class="strategy-field">
+                <span>目标钱包单笔下单小于</span>
+                <input v-model="followStrategy.prefilters.min_target_wallet_order_cash_usdc" type="text" inputmode="decimal" pattern="[0-9]*\.?[0-9]*" :disabled="strategyInputsLocked" @input="markStrategyDirty" />
+                <b>USDC</b>
+              </label>
+              <label class="strategy-field">
+                <span>可动用金额</span>
+                <input v-model="followStrategy.balance.usable_balance_usdc" type="text" inputmode="decimal" pattern="[0-9]*\.?[0-9]*" placeholder="不限" :disabled="strategyInputsLocked" @input="markStrategyDirty" />
+                <b>USDC</b>
+              </label>
+            </article>
+
+            <article class="strategy-block">
+              <h3>condition 笔数</h3>
+              <div class="strategy-option-row">
+                <label><input type="radio" value="none" v-model="followStrategy.condition_limits.order_count_mode" :disabled="strategyInputsLocked" @change="markStrategyDirty" /> 不限制</label>
+                <label><input type="radio" value="condition" v-model="followStrategy.condition_limits.order_count_mode" :disabled="strategyInputsLocked" @change="markStrategyDirty" /> 按 condition</label>
+                <label><input type="radio" value="wallet" v-model="followStrategy.condition_limits.order_count_mode" :disabled="strategyInputsLocked" @change="markStrategyDirty" /> 按钱包</label>
+              </div>
+              <label v-if="followStrategy.condition_limits.order_count_mode !== 'none'" class="strategy-field">
+                <span>最大笔数</span>
+                <input v-model="followStrategy.condition_limits.max_orders" type="text" inputmode="numeric" pattern="[0-9]*" :disabled="strategyInputsLocked" @input="markStrategyDirty" />
+                <b>笔</b>
+              </label>
+            </article>
+
+            <article class="strategy-block">
+              <h3>condition 投入</h3>
+              <div class="strategy-option-row">
+                <label><input type="radio" value="none" v-model="followStrategy.condition_limits.stake_cap_mode" :disabled="strategyInputsLocked" @change="markStrategyDirty" /> 不限制</label>
+                <label><input type="radio" value="fixed" v-model="followStrategy.condition_limits.stake_cap_mode" :disabled="strategyInputsLocked" @change="markStrategyDirty" /> 固定 cap</label>
+                <label><input type="radio" value="balance_percent" v-model="followStrategy.condition_limits.stake_cap_mode" :disabled="strategyInputsLocked" @change="markStrategyDirty" /> 余额百分比</label>
+              </div>
+              <label v-if="followStrategy.condition_limits.stake_cap_mode === 'fixed'" class="strategy-field">
+                <span>最大投入</span>
+                <input v-model="followStrategy.condition_limits.stake_cap_usdc" type="text" inputmode="decimal" pattern="[0-9]*\.?[0-9]*" :disabled="strategyInputsLocked" @input="markStrategyDirty" />
+                <b>USDC</b>
+              </label>
+              <label v-if="followStrategy.condition_limits.stake_cap_mode === 'balance_percent'" class="strategy-field">
+                <span>最大占比</span>
+                <input v-model="followStrategy.condition_limits.stake_cap_balance_percent" type="text" inputmode="decimal" pattern="[0-9]*\.?[0-9]*" :disabled="strategyInputsLocked" @input="markStrategyDirty" />
+                <b>%</b>
+              </label>
+            </article>
           </div>
         </section>
 
@@ -195,41 +243,11 @@
                   <span>已结算盈亏</span>
                   <strong :class="pnlClass(overview.our_realized_pnl)">{{ signedMoney(overview.our_realized_pnl) }}</strong>
                 </div>
-                <form class="overview-money-block overview-balance-block" @submit.prevent="saveAccountBalance">
+                <div class="overview-money-block overview-balance-block">
                   <span>钱包余额</span>
                   <strong :title="accountBalanceTitle">{{ accountBalanceText }}</strong>
-                  <span class="account-usable-label">可动用</span>
-                  <div class="account-balance-controls">
-                    <label class="account-balance-input" title="手动设置本轮跟单可动用金额上限">
-                      <input
-                        v-model="accountBalanceInput"
-                        type="text"
-                        inputmode="decimal"
-                        pattern="[0-9]*\.?[0-9]*"
-                        placeholder="金额上限"
-                        :disabled="accountBalanceLocked"
-                        @input="accountBalanceDirty = true"
-                      />
-                      <span>USDC</span>
-                    </label>
-                    <button
-                      class="account-balance-max"
-                      type="button"
-                      :disabled="accountBalanceMaxDisabled"
-                      :title="accountBalanceMaxDisabled ? '暂无可用钱包余额' : '填满当前钱包余额'"
-                      @click="fillAccountBalanceMax"
-                    >Max</button>
-                    <button
-                      class="account-balance-save"
-                      type="submit"
-                      :disabled="accountBalanceSaveBlocked"
-                      :title="accountBalanceLocked ? '跟单运行中不可修改' : '保存可动用金额上限'"
-                    >
-                      <span v-if="accountBalanceSaving" class="loading loading-spinner loading-xs"></span>
-                      <span v-else>保存</span>
-                    </button>
-                  </div>
-                </form>
+                  <span class="account-usable-label">{{ followStrategyReady ? runner.strategy_summary : '策略未就绪' }}</span>
+                </div>
               </div>
               <div class="pnl-metrics">
                 <div><span>累计投入</span><b>{{ money(overview.total_stake) }}</b></div>

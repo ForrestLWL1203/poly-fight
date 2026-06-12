@@ -283,6 +283,7 @@ body {
 }
 
 .overview-console,
+.strategy-console,
 .leaderboard-console,
 .console-panel {
   display: grid;
@@ -293,6 +294,138 @@ body {
     linear-gradient(135deg, rgba(86, 214, 201, 0.08), rgba(17, 24, 29, 0.92) 42%),
     rgba(17, 24, 29, 0.9);
   padding: 0.9rem;
+}
+
+.strategy-console {
+  margin-bottom: 0.9rem;
+}
+
+.strategy-console.is-locked {
+  opacity: 0.86;
+}
+
+.strategy-actions,
+.strategy-option-row,
+.strategy-field,
+.strategy-check {
+  display: flex;
+  align-items: center;
+}
+
+.strategy-actions {
+  gap: 0.55rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.strategy-state {
+  min-height: 2rem;
+  border: 1px solid rgba(141, 160, 169, 0.24);
+  border-radius: 999px;
+  padding: 0.42rem 0.72rem;
+  font-size: 0.78rem;
+  font-weight: 850;
+}
+
+.strategy-save-btn {
+  min-height: 2.25rem;
+  border: 1px solid rgba(86, 214, 201, 0.38);
+  border-radius: 7px;
+  background: rgba(86, 214, 201, 0.14);
+  color: var(--pf-text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 850;
+  padding: 0 0.82rem;
+}
+
+.strategy-save-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.54;
+}
+
+.strategy-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.strategy-block {
+  display: grid;
+  align-content: start;
+  gap: 0.62rem;
+  min-height: 11rem;
+  border: 1px solid rgba(141, 160, 169, 0.18);
+  border-radius: 8px;
+  background: rgba(7, 12, 15, 0.38);
+  padding: 0.78rem;
+}
+
+.strategy-block h3 {
+  margin: 0;
+  color: var(--pf-text);
+  font-size: 0.9rem;
+  font-weight: 850;
+}
+
+.strategy-option-row {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 0.38rem;
+}
+
+.strategy-option-row label,
+.strategy-check {
+  gap: 0.42rem;
+  color: #b8c7cd;
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 760;
+}
+
+.strategy-option-row input,
+.strategy-check input {
+  accent-color: var(--pf-cyan);
+}
+
+.strategy-field {
+  gap: 0.4rem;
+  justify-content: space-between;
+  min-height: 2.35rem;
+  border: 1px solid rgba(141, 160, 169, 0.22);
+  border-radius: 7px;
+  background: rgba(8, 12, 15, 0.44);
+  color: #9db2bb;
+  padding: 0 0.58rem;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.strategy-field span {
+  min-width: 0;
+}
+
+.strategy-field input {
+  width: 5rem;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--pf-text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.strategy-field input::placeholder {
+  color: rgba(184, 199, 205, 0.5);
+}
+
+.strategy-field b {
+  color: var(--pf-muted);
+  font-size: 0.72rem;
+  font-weight: 850;
 }
 
 .overview-grid {
@@ -2959,6 +3092,10 @@ body {
 }
 
 @media (max-width: 900px) {
+  .strategy-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .overview-grid {
     grid-template-columns: 1fr;
   }
@@ -3020,6 +3157,7 @@ body {
   }
 
   .panel-grid,
+  .strategy-grid,
   .overview-money-row,
   .pnl-metrics,
   .quality-row,

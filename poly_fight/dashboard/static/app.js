@@ -22,6 +22,28 @@ createApp({
       runnerStakeRatioInput: "",
       runnerMaxStakeInput: "",
       runnerSignalStakePercentInput: "",
+      followStrategy: {
+        configured: false,
+        stake_sizing: {
+          mode: "proportional",
+          ratio_percent: 10,
+          per_order_cap_enabled: false,
+          per_order_cap_usdc: "",
+          fixed_usdc: "",
+          balance_percent: "",
+        },
+        prefilters: { min_target_wallet_order_cash_usdc: 10 },
+        condition_limits: {
+          order_count_mode: "none",
+          max_orders: "",
+          stake_cap_mode: "none",
+          stake_cap_usdc: "",
+          stake_cap_balance_percent: "",
+        },
+        balance: { required: false, usable_balance_usdc: "" },
+      },
+      strategyDirty: false,
+      strategySaving: false,
       accountBalanceInput: "",
       accountBalanceDirty: false,
       accountBalanceSaving: false,
@@ -129,10 +151,48 @@ createApp({
       if (this.runner.status === "stopping") return true;
       return this.runner.status !== "running" && (
         !this.hasFollowWallets
-        || !this.runnerStakeRatioValid
-        || !this.runnerMaxStakeValid
-        || !this.runnerSignalStakePercentValid
+        || !this.followStrategyReady
       );
+    },
+    followStrategyReady() {
+      return Boolean(this.followStrategy?.configured) && !this.strategyDirty && this.followStrategyValid;
+    },
+    followStrategyValid() {
+      const sizing = this.followStrategy?.stake_sizing || {};
+      const prefilters = this.followStrategy?.prefilters || {};
+      const limits = this.followStrategy?.condition_limits || {};
+      const balance = this.followStrategy?.balance || {};
+      const mode = String(sizing.mode || "");
+      const ratio = Number(sizing.ratio_percent);
+      const fixed = Number(sizing.fixed_usdc);
+      const balancePercent = Number(sizing.balance_percent);
+      const perOrderCap = Number(sizing.per_order_cap_usdc);
+      const minTargetOrder = Number(prefilters.min_target_wallet_order_cash_usdc);
+      const maxOrders = Number(limits.max_orders);
+      const stakeCap = Number(limits.stake_cap_usdc);
+      const stakeCapPercent = Number(limits.stake_cap_balance_percent);
+      const usableBalance = Number(balance.usable_balance_usdc);
+      if (!["proportional", "fixed", "balance_percent"].includes(mode)) return false;
+      if (mode === "proportional" && (!Number.isFinite(ratio) || ratio <= 0)) return false;
+      if (sizing.per_order_cap_enabled && (!Number.isFinite(perOrderCap) || perOrderCap <= 0)) return false;
+      if (mode === "fixed" && (!Number.isFinite(fixed) || fixed <= 0)) return false;
+      if (mode === "balance_percent" && (!Number.isFinite(balancePercent) || balancePercent <= 0)) return false;
+      if (!Number.isFinite(minTargetOrder) || minTargetOrder < 0) return false;
+      if (limits.order_count_mode !== "none" && (!Number.isFinite(maxOrders) || maxOrders < 1)) return false;
+      if (limits.stake_cap_mode === "fixed" && (!Number.isFinite(stakeCap) || stakeCap <= 0)) return false;
+      if (limits.stake_cap_mode === "balance_percent" && (!Number.isFinite(stakeCapPercent) || stakeCapPercent <= 0)) return false;
+      if ((mode === "balance_percent" || limits.stake_cap_mode === "balance_percent") && (!Number.isFinite(usableBalance) || usableBalance <= 0)) return false;
+      return true;
+    },
+    followStrategyBlockReason() {
+      if (!this.hasFollowWallets) return "需先采集目标跟单钱包";
+      if (this.strategyDirty) return "跟单策略有未保存改动";
+      if (!this.followStrategy?.configured) return "需先保存跟单策略";
+      if (!this.followStrategyValid) return "跟单策略配置不完整";
+      return "";
+    },
+    strategyInputsLocked() {
+      return this.runner.status === "running" || this.runner.status === "stopping" || this.strategySaving;
     },
     runnerStakeRatioValue() {
       const value = Number(this.runnerStakeRatioInput);
@@ -162,9 +222,7 @@ createApp({
     runnerControlTitle() {
       if (this.runner.status === "stopping") return "正在停止跟单脚本";
       if (this.runner.status !== "running" && !this.hasFollowWallets) return "需先采集目标跟单钱包";
-      if (this.runner.status !== "running" && !this.runnerStakeRatioValid) return "需填写跟单比例";
-      if (this.runner.status !== "running" && !this.runnerMaxStakeValid) return "单笔跟单限额格式不正确";
-      if (this.runner.status !== "running" && !this.runnerSignalStakePercentValid) return "单场余额比例格式不正确";
+      if (this.runner.status !== "running" && !this.followStrategyReady) return this.followStrategyBlockReason;
       return this.runner.status === "running" ? "停止跟单脚本" : "启动跟单脚本";
     },
     accountBalanceState() {
@@ -403,6 +461,7 @@ createApp({
         this.loadFollows(),
         this.loadEvents(),
         this.loadWalletRefreshStatus(),
+        this.loadFollowStrategy(),
         this.loadRunner(),
       ]);
     },
@@ -583,6 +642,11 @@ createApp({
       this.syncRunnerInputs();
       this.ensureRunnerStopPolling();
     },
+    async loadFollowStrategy() {
+      const strategy = await this.request("/api/follow-strategy");
+      this.followStrategy = this.normalizeFollowStrategy(strategy);
+      this.strategyDirty = false;
+    },
     async refreshAfterRunnerChange() {
       await Promise.allSettled([
         this.loadHealth(),
@@ -591,18 +655,12 @@ createApp({
         this.loadFollows(),
         this.loadEvents(),
         this.loadWallets(),
+        this.loadFollowStrategy(),
       ]);
     },
     async startRunner() {
       if (this.runnerStartBlocked) {
-        const message = !this.hasFollowWallets
-          ? "需先采集目标跟单钱包"
-          : !this.runnerStakeRatioValid
-            ? "需填写跟单比例"
-            : !this.runnerMaxStakeValid
-              ? "单笔跟单限额格式不正确"
-              : "单场余额比例格式不正确";
-        this.showRunnerWarning(message);
+        this.showRunnerWarning(this.followStrategyBlockReason || "跟单策略不可用");
         return;
       }
       await this.loadRunner();
@@ -610,30 +668,17 @@ createApp({
         this.showToast("跟单脚本已经在运行");
         return;
       }
-      if (!this.runnerStakeRatioValid) {
-        this.showRunnerWarning("需填写跟单比例");
-        return;
-      }
-      if (!this.runnerMaxStakeValid) {
-        this.showRunnerWarning("单笔跟单限额格式不正确");
-        return;
-      }
-      if (!this.runnerSignalStakePercentValid) {
-        this.showRunnerWarning("单场余额比例格式不正确");
+      if (!this.followStrategyReady) {
+        this.showRunnerWarning(this.followStrategyBlockReason || "跟单策略不可用");
         return;
       }
       this.loading.runner = true;
       this.runnerActionText = "正在启动跟单脚本并刷新数据";
       try {
-        const body = { stake_ratio_percent: this.runnerStakeRatioValue };
-        if (this.runnerMaxStakeValue > 0) body.max_stake_usdc = this.runnerMaxStakeValue;
-        if (this.runnerSignalStakePercentValue > 0) {
-          body.max_signal_stake_balance_percent = this.runnerSignalStakePercentValue;
-        }
         this.runner = await this.request("/api/runner/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
+          body: JSON.stringify({}),
         });
         this.showToast("跟单脚本已启动");
         await this.refreshAfterRunnerChange();
@@ -695,6 +740,74 @@ createApp({
       const state = overview?.account_balance || {};
       const value = Number(state.balance_usdc);
       this.accountBalanceInput = state.configured && Number.isFinite(value) ? this.formatInputAmount(value) : "";
+    },
+    normalizeFollowStrategy(strategy) {
+      const source = strategy && typeof strategy === "object" ? strategy : {};
+      const sizing = source.stake_sizing || {};
+      const prefilters = source.prefilters || {};
+      const limits = source.condition_limits || {};
+      const balance = source.balance || {};
+      return {
+        configured: Boolean(source.configured),
+        schema_version: Number(source.schema_version || 1),
+        updated_at: Number(source.updated_at || 0),
+        stake_sizing: {
+          mode: sizing.mode || "proportional",
+          ratio_percent: sizing.ratio_percent ?? 10,
+          per_order_cap_enabled: Boolean(sizing.per_order_cap_enabled),
+          per_order_cap_usdc: sizing.per_order_cap_usdc || "",
+          fixed_usdc: sizing.fixed_usdc || "",
+          balance_percent: sizing.balance_percent || "",
+        },
+        prefilters: {
+          min_target_wallet_order_cash_usdc: prefilters.min_target_wallet_order_cash_usdc ?? 10,
+        },
+        condition_limits: {
+          order_count_mode: limits.order_count_mode || "none",
+          max_orders: limits.max_orders || "",
+          stake_cap_mode: limits.stake_cap_mode || "none",
+          stake_cap_usdc: limits.stake_cap_usdc || "",
+          stake_cap_balance_percent: limits.stake_cap_balance_percent || "",
+        },
+        balance: {
+          required: Boolean(balance.required),
+          usable_balance_usdc: balance.usable_balance_usdc || "",
+        },
+      };
+    },
+    markStrategyDirty() {
+      this.strategyDirty = true;
+    },
+    strategyPayload() {
+      const payload = JSON.parse(JSON.stringify(this.followStrategy || {}));
+      if (!payload.balance) payload.balance = {};
+      const balanceRaw = String(payload.balance.usable_balance_usdc ?? "").trim();
+      payload.balance.required = false;
+      payload.balance.usable_balance_usdc = balanceRaw ? Number(balanceRaw) : 0;
+      return payload;
+    },
+    async saveFollowStrategy() {
+      if (this.strategyInputsLocked) return;
+      if (!this.followStrategyValid) {
+        this.showToast("跟单策略配置不完整", "error");
+        return;
+      }
+      this.strategySaving = true;
+      try {
+        const saved = await this.request("/api/follow-strategy", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(this.strategyPayload()),
+        });
+        this.followStrategy = this.normalizeFollowStrategy(saved);
+        this.strategyDirty = false;
+        this.showToast("跟单策略已保存");
+        await Promise.allSettled([this.loadRunner(), this.loadOverview()]);
+      } catch (error) {
+        this.showToast(`策略保存失败: ${error.message}`, "error");
+      } finally {
+        this.strategySaving = false;
+      }
     },
     parseUsdcInput(value) {
       const raw = String(value || "").replace(/,/g, "").trim();
