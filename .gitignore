@@ -16,6 +16,7 @@ poly_fight/dashboard/static/team_logos/
 
 # Local review scratch files.
 review/
+sample/
 
 # Local secrets and private agent memory. Never commit.
 secret/
