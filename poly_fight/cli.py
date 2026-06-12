@@ -74,6 +74,7 @@ from .follow import (
     paper_exit_pnl,
     paper_pnl,
     process_follow_trades,
+    prune_unfollowed_signals,
     select_new_trades,
     settle_open_signals,
     summarize_wallet_fills,
@@ -6180,7 +6181,7 @@ def command_follow(
         if str(row.get("category") or "esports").lower() == "sports" and str(row.get("league") or "").strip()
     }
     wallet_trade_state = store.load_wallet_trade_state()
-    open_signals = store.load_open_signals()
+    open_signals = prune_unfollowed_signals(store.load_open_signals())
     performance = store.load_performance()
     account_balance = store.load_account_balance()
     account_balance_configured = bool(account_balance.get("configured"))

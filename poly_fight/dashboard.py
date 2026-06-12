@@ -811,8 +811,8 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
     store = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir))
     snapshot = store.load_dashboard_snapshot()
     account_balance = store.load_account_balance_readonly()
-    open_signals = snapshot.get("open_signals", [])
-    results = snapshot.get("results", [])
+    open_signals = [signal for signal in snapshot.get("open_signals", []) if _signal_has_actual_follow(signal)]
+    results = [signal for signal in snapshot.get("results", []) if _signal_has_actual_follow(signal)]
     all_signals = [*open_signals, *results]
     settled = [row for row in results if row.get("status") == "settled"]
     exited = [row for row in results if row.get("status") == "exited"]
@@ -889,6 +889,10 @@ def _signal_has_two_sided_behavior(signal: dict[str, Any]) -> bool:
         if isinstance(event, dict) and str(event.get("kind") or "") == "hedge":
             return True
     return False
+
+
+def _signal_has_actual_follow(signal: dict[str, Any]) -> bool:
+    return any(_leg_actual_stake(leg) > 0 for leg in (signal or {}).get("legs") or [])
 
 
 def _signal_quality_flags(signals: list[dict[str, Any]]) -> dict[str, bool]:
@@ -989,6 +993,8 @@ def _annotate_signal_quality(signals: list[dict[str, Any]]) -> None:
 
 
 def _overview_for_signals(open_signals: list[dict[str, Any]], results: list[dict[str, Any]]) -> dict[str, Any]:
+    open_signals = [signal for signal in open_signals if _signal_has_actual_follow(signal)]
+    results = [signal for signal in results if _signal_has_actual_follow(signal)]
     all_signals = [*open_signals, *results]
     settled = [row for row in results if row.get("status") == "settled"]
     exited = [row for row in results if row.get("status") == "exited"]
@@ -1437,7 +1443,9 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
     allowed_statuses = {"open", "settled", "insufficient_balance"}
     status_filter = status if status in allowed_statuses else ""
     category_filter = normalize_category(category)
-    groups = _follow_groups_from_signals(result.get("signals", []))
+    groups = _follow_groups_from_signals(
+        [signal for signal in result.get("signals", []) if _signal_has_actual_follow(signal)]
+    )
     rows = sorted(
         groups.values(),
         key=lambda row: (

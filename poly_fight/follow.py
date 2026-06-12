@@ -372,6 +372,14 @@ def leg_actual_stake(leg: dict[str, Any]) -> float:
     return max(0.0, to_float(leg.get("stake")))
 
 
+def signal_has_actual_follow(signal: dict[str, Any]) -> bool:
+    return any(leg_actual_stake(leg) > 0 for leg in (signal or {}).get("legs") or [])
+
+
+def prune_unfollowed_signals(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [signal for signal in signals if signal_has_actual_follow(signal)]
+
+
 def first_leg_wallet_trade_cash(signal: dict[str, Any] | None) -> float:
     for leg in (signal or {}).get("legs") or []:
         cash = to_float((leg or {}).get("wallet_trade_cash"))
@@ -482,17 +490,6 @@ def process_follow_trades(
         if side != "BUY":
             stats["ignored_trade_count"] += 1
             continue
-
-        opposite = _opposite_open_signals(
-            open_signals,
-            wallet=wallet,
-            condition_id=condition_id,
-            outcome_index=outcome_index,
-        )
-        for signal in opposite:
-            signal.setdefault("behavior_events", []).append(_behavior_event("hedge", trade))
-            signal["wallet_behavior"] = wallet_behavior_summary(signal)
-            stats["hedge_event_count"] += 1
 
         market_open_signals = _open_market_signals(open_signals, condition_id)
         opposite_market_signals = [
@@ -617,6 +614,8 @@ def process_follow_trades(
                 funding_status = "signal_cap"
                 stake_mode = "signal_cap"
                 stats["signal_cap_limited_count"] += 1
+        if not would_follow or funded_stake <= 0:
+            continue
         stats["funded_stake_usdc"] = round(to_float(stats.get("funded_stake_usdc")) + funded_stake, 8)
         leg = {
             "category": market_category,
@@ -661,6 +660,16 @@ def process_follow_trades(
             leg["follow_block_reasons"] = follow_block_reasons
         if detected_after_start:
             leg["detected_after_start"] = True
+        opposite = _opposite_open_signals(
+            open_signals,
+            wallet=wallet,
+            condition_id=condition_id,
+            outcome_index=outcome_index,
+        )
+        for signal in opposite:
+            signal.setdefault("behavior_events", []).append(_behavior_event("hedge", trade))
+            signal["wallet_behavior"] = wallet_behavior_summary(signal)
+            stats["hedge_event_count"] += 1
         if existing:
             existing.setdefault("legs", []).append(leg)
             existing.setdefault("behavior_events", []).append(_behavior_event("add", trade))

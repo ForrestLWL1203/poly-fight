@@ -147,6 +147,7 @@ from poly_fight.follow import (
     follow_signal_id,
     material_sell,
     paper_pnl,
+    prune_unfollowed_signals,
     process_follow_trades,
     follow_stake_for_signal,
     quarantine_reason,
@@ -5541,7 +5542,7 @@ class CoreTest(unittest.TestCase):
         )
         self.assertEqual((stake, tier), (50, "capped"))
 
-    def test_process_follow_trades_records_unfunded_intent_when_balance_is_too_low(self):
+    def test_process_follow_trades_skips_unfunded_buy_when_balance_is_too_low(self):
         now = 1000
         market = {
             "condition_id": "m1",
@@ -5567,17 +5568,10 @@ class CoreTest(unittest.TestCase):
         )
 
         self.assertEqual(stats["insufficient_balance_count"], 1)
-        self.assertEqual(len(signals), 1)
-        leg = signals[0]["legs"][0]
-        self.assertEqual(leg["stake"], 1)
-        self.assertEqual(leg["funded_stake"], 0)
-        self.assertEqual(leg["funding_status"], "insufficient_balance")
-        self.assertFalse(leg["would_follow"])
-        self.assertTrue(leg["would_follow_if_funded"])
-        self.assertEqual(leg["follow_block_reason"], "insufficient_balance")
+        self.assertEqual(stats["new_leg_count"], 0)
+        self.assertEqual(signals, [])
 
-    def test_settlement_keeps_unfunded_intent_out_of_actual_pnl(self):
-        now = 1000
+    def test_prune_unfollowed_signals_removes_legacy_zero_funded_open_signal(self):
         signals = [
             {
                 "signal_id": "sig-unfunded",
@@ -5597,13 +5591,9 @@ class CoreTest(unittest.TestCase):
             }
         ]
 
-        remaining, settled = settle_open_signals(signals, {"m1": 0}, now_ts=now)
+        self.assertEqual(prune_unfollowed_signals(signals), [])
 
-        self.assertEqual(remaining, [])
-        self.assertEqual(settled[0]["our_paper_pnl"], 0)
-        self.assertEqual(settled[0]["hypothetical_pnl"], 10)
-
-    def test_dashboard_overview_excludes_unfunded_intents_from_actual_totals(self):
+    def test_dashboard_overview_and_follows_hide_unfunded_intents(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             store = FollowStore(data_dir / "follow" / "follow.db")
@@ -5649,6 +5639,7 @@ class CoreTest(unittest.TestCase):
             )
 
             overview = build_overview(data_dir)
+            follows = build_follows(data_dir, size=10)
 
             self.assertEqual(overview["account_balance"]["configured"], True)
             self.assertEqual(overview["account_balance"]["balance_usdc"], 100)
@@ -5656,7 +5647,9 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(overview["resolved_stake"], 1)
             self.assertEqual(overview["open_exposure"], 0)
             self.assertEqual(overview["our_realized_pnl"], 0.8)
-            self.assertEqual(overview["hypothetical_pnl"], 8.8)
+            self.assertEqual(overview["hypothetical_pnl"], 0.8)
+            self.assertEqual(follows["total"], 1)
+            self.assertEqual(follows["follows"][0]["condition_id"], "m1")
 
     def test_process_follow_trades_applies_wallet_cash_ratio_to_signal(self):
         now = 1000
@@ -5745,12 +5738,8 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(stats["low_entry_price_blocked_count"], 1)
         self.assertEqual(stats["ignored_trade_count"], 0)
-        self.assertEqual(len(signals), 1)
-        leg = signals[0]["legs"][0]
-        self.assertFalse(leg["would_follow"])
-        self.assertEqual(leg["follow_block_reason"], "low_entry_price")
-        self.assertEqual(leg["follow_block_reasons"], ["low_entry_price"])
-        self.assertEqual(leg["min_wallet_entry_price"], 0.4)
+        self.assertEqual(stats["new_leg_count"], 0)
+        self.assertEqual(signals, [])
 
     def test_process_follow_trades_allows_ten_point_slippage(self):
         now = 1000
@@ -5811,13 +5800,8 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(stats["high_entry_price_blocked_count"], 1)
         self.assertEqual(stats["ignored_trade_count"], 0)
-        leg = signals[0]["legs"][0]
-        self.assertFalse(leg["would_follow"])
-        self.assertEqual(leg["funding_status"], "blocked")
-        self.assertEqual(leg["funded_stake"], 0)
-        self.assertEqual(leg["follow_block_reason"], "high_entry_price")
-        self.assertEqual(leg["follow_block_reasons"], ["high_entry_price"])
-        self.assertEqual(leg["max_entry_price"], 0.85)
+        self.assertEqual(stats["new_leg_count"], 0)
+        self.assertEqual(signals, [])
 
     def test_process_follow_trades_blocks_wallet_buy_under_ten_usdc(self):
         now = 1000
@@ -5846,14 +5830,8 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(stats["small_wallet_trade_blocked_count"], 1)
         self.assertEqual(stats["ignored_trade_count"], 0)
-        leg = signals[0]["legs"][0]
-        self.assertEqual(leg["wallet_trade_cash"], 9.0)
-        self.assertFalse(leg["would_follow"])
-        self.assertEqual(leg["funding_status"], "blocked")
-        self.assertEqual(leg["funded_stake"], 0)
-        self.assertEqual(leg["follow_block_reason"], "small_wallet_trade")
-        self.assertEqual(leg["follow_block_reasons"], ["small_wallet_trade"])
-        self.assertEqual(leg["min_wallet_trade_cash_usdc"], 10.0)
+        self.assertEqual(stats["new_leg_count"], 0)
+        self.assertEqual(signals, [])
 
     def test_process_follow_trades_recalculates_ratio_for_each_add(self):
         now = 1000
@@ -5894,13 +5872,10 @@ class CoreTest(unittest.TestCase):
             bankroll_usdc=1000,
         )
 
-        self.assertEqual(len(signals[0]["legs"]), 2)
+        self.assertEqual(len(signals[0]["legs"]), 1)
         self.assertTrue(signals[0]["legs"][0]["would_follow"])
-        self.assertFalse(signals[0]["legs"][1]["would_follow"])
-        self.assertEqual(signals[0]["legs"][1]["funded_stake"], 0)
-        self.assertEqual(signals[0]["legs"][1]["add_ratio_to_first"], 0.09)
-        self.assertEqual(signals[0]["legs"][1]["follow_block_reason"], "small_add")
         self.assertEqual(stats["small_add_blocked_count"], 1)
+        self.assertEqual(stats["new_leg_count"], 1)
 
     def test_process_follow_trades_caps_total_stake_per_signal(self):
         now = 1000
@@ -5922,14 +5897,13 @@ class CoreTest(unittest.TestCase):
         )
 
         legs = signals[0]["legs"]
-        self.assertEqual([leg["funded_stake"] for leg in legs], [50, 25, 0])
-        self.assertEqual([leg["funding_status"] for leg in legs], ["funded", "signal_cap", "blocked"])
+        self.assertEqual([leg["funded_stake"] for leg in legs], [50, 25])
+        self.assertEqual([leg["funding_status"] for leg in legs], ["funded", "signal_cap"])
         self.assertEqual(legs[1]["stake_mode"], "signal_cap")
-        self.assertFalse(legs[2]["would_follow"])
-        self.assertEqual(legs[2]["follow_block_reason"], "signal_cap_reached")
         self.assertEqual(stats["signal_cap_limited_count"], 1)
         self.assertEqual(stats["signal_cap_blocked_count"], 1)
         self.assertEqual(stats["funded_stake_usdc"], 75)
+        self.assertEqual(stats["new_leg_count"], 2)
 
     def test_follow_v2_buy_legs_sell_mirror_exits_by_default(self):
         now = 1000
@@ -5999,7 +5973,7 @@ class CoreTest(unittest.TestCase):
             "outcomeIndex": 0,
             "side": "BUY",
             "price": 0.40,
-            "size": 10,
+            "size": 25,
             "timestamp": start - 30,
         }
 
@@ -6037,7 +6011,7 @@ class CoreTest(unittest.TestCase):
             "outcomeIndex": 0,
             "side": "BUY",
             "price": 0.40,
-            "size": 10,
+            "size": 25,
             "timestamp": start + 30,
         }
 
@@ -6078,7 +6052,7 @@ class CoreTest(unittest.TestCase):
             "outcomeIndex": 0,
             "side": "BUY",
             "price": 0.40,
-            "size": 10,
+            "size": 25,
             "timestamp": now,
         }
 
@@ -6146,7 +6120,7 @@ class CoreTest(unittest.TestCase):
                 "outcomeIndex": 0,
                 "side": "BUY",
                 "price": 0.40,
-                "size": 10,
+                "size": 25,
                 "timestamp": now,
             },
             {
@@ -6156,7 +6130,7 @@ class CoreTest(unittest.TestCase):
                 "outcomeIndex": 0,
                 "side": "BUY",
                 "price": 0.40,
-                "size": 10,
+                "size": 25,
                 "timestamp": now,
             },
         ]
@@ -6188,7 +6162,7 @@ class CoreTest(unittest.TestCase):
             "outcomeIndex": 0,
             "side": "BUY",
             "price": 0.40,
-            "size": 10,
+            "size": 25,
             "timestamp": now,
         }
         ufc_market = {
@@ -6401,7 +6375,7 @@ class CoreTest(unittest.TestCase):
         self.assertTrue(all(signal["contested"] for signal in signals))
         self.assertTrue(all(leg["would_follow"] for signal in signals for leg in signal.get("legs") or []))
 
-    def test_follow_v2_low_price_opposite_buy_is_insurance_not_quarantine(self):
+    def test_follow_v2_low_price_opposite_buy_is_skipped_without_quarantine(self):
         now = 1000
         market = {
             "condition_id": "m1",
@@ -6412,12 +6386,13 @@ class CoreTest(unittest.TestCase):
         signals, _stats = process_follow_trades(
             [],
             wallet="0xA",
-            trades=[{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 10, "timestamp": now}],
+            trades=[{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 25, "timestamp": now}],
             markets_by_condition={"m1": market},
             now_ts=now,
             stake_usdc=1,
             max_follow_legs=10,
             max_slippage=0.5,
+            max_entry_price=1.0,
         )
 
         signals, stats = process_follow_trades(
@@ -6429,13 +6404,14 @@ class CoreTest(unittest.TestCase):
             stake_usdc=1,
             max_follow_legs=10,
             max_slippage=0.5,
+            max_entry_price=1.0,
         )
 
         self.assertEqual(stats["quarantine_events"], [])
-        self.assertEqual(stats["hedge_event_count"], 1)
+        self.assertEqual(stats["hedge_event_count"], 0)
         self.assertEqual(stats["low_entry_price_blocked_count"], 1)
-        self.assertEqual(len(signals), 2)
-        self.assertFalse(signals[1]["legs"][0]["would_follow"])
+        self.assertEqual(stats["new_leg_count"], 0)
+        self.assertEqual(len(signals), 1)
 
     def test_follow_v2_opposite_wallet_buy_opens_other_side_by_default(self):
         now = 1000
@@ -6448,7 +6424,7 @@ class CoreTest(unittest.TestCase):
         signals, _stats = process_follow_trades(
             [],
             wallet="0xA",
-            trades=[{"id": "a1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.50, "size": 10, "timestamp": now}],
+            trades=[{"id": "a1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.50, "size": 25, "timestamp": now}],
             markets_by_condition={"m1": market},
             now_ts=now,
             stake_usdc=1,
@@ -6459,7 +6435,7 @@ class CoreTest(unittest.TestCase):
         signals, stats = process_follow_trades(
             signals,
             wallet="0xB",
-            trades=[{"id": "b1", "proxyWallet": "0xB", "market": "m1", "outcomeIndex": 1, "side": "BUY", "price": 0.46, "size": 10, "timestamp": now + 1}],
+            trades=[{"id": "b1", "proxyWallet": "0xB", "market": "m1", "outcomeIndex": 1, "side": "BUY", "price": 0.46, "size": 25, "timestamp": now + 1}],
             markets_by_condition={"m1": market},
             now_ts=now + 1,
             stake_usdc=1,
@@ -6494,8 +6470,8 @@ class CoreTest(unittest.TestCase):
                         "market": "m1",
                         "outcomeIndex": 0,
                         "side": "BUY",
-                        "price": 0.45,
-                        "size": 10,
+                        "price": 0.50,
+                        "size": 25,
                         "timestamp": now,
                     }
                 ],
@@ -6509,7 +6485,7 @@ class CoreTest(unittest.TestCase):
         signals, stats = process_follow_trades(
             signals,
             wallet="0xC",
-            trades=[{"id": "c1", "proxyWallet": "0xC", "market": "m1", "outcomeIndex": 1, "side": "BUY", "price": 0.48, "size": 10, "timestamp": now + 1}],
+            trades=[{"id": "c1", "proxyWallet": "0xC", "market": "m1", "outcomeIndex": 1, "side": "BUY", "price": 0.48, "size": 25, "timestamp": now + 1}],
             markets_by_condition={"m1": market},
             now_ts=now + 1,
             stake_usdc=1,
@@ -7633,7 +7609,7 @@ class CoreTest(unittest.TestCase):
                     ]
 
                 def trades_for_user(self, _wallet, **_kwargs):
-                    return [{"id": "b1", "timestamp": 20, "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 10}]
+                    return [{"id": "b1", "timestamp": 20, "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 30}]
 
                 def positions(self, _wallet, *, limit=100):
                     raise RuntimeError("positions down")
@@ -7712,8 +7688,8 @@ class CoreTest(unittest.TestCase):
 
                 def trades_for_user(self, wallet, **_kwargs):
                     if wallet == "0xa":
-                        return [{"id": "a1", "timestamp": 20, "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 10}]
-                    return [{"id": "b1", "timestamp": 20, "market": "m1", "outcomeIndex": 1, "side": "BUY", "price": 0.45, "size": 10}]
+                        return [{"id": "a1", "timestamp": 20, "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 30}]
+                    return [{"id": "b1", "timestamp": 20, "market": "m1", "outcomeIndex": 1, "side": "BUY", "price": 0.45, "size": 30}]
 
             parser = build_parser()
             args = parser.parse_args(
@@ -7788,7 +7764,7 @@ class CoreTest(unittest.TestCase):
                     ]
 
                 def trades_for_user(self, _wallet, **_kwargs):
-                    return [{"id": "b1", "timestamp": 20, "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 10}]
+                    return [{"id": "b1", "timestamp": 20, "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.45, "size": 30}]
 
             parser = build_parser()
             args = parser.parse_args(
@@ -7813,13 +7789,10 @@ class CoreTest(unittest.TestCase):
             snapshot = store.load_dashboard_snapshot()
             run_log = read_jsonl(follow_run_log_path(data_dir))
 
-            self.assertEqual(summary["new_signal_count"], 1)
+            self.assertEqual(summary["new_signal_count"], 0)
             self.assertEqual(summary["insufficient_balance_count"], 1)
             self.assertEqual(run_log[-1]["insufficient_balance_count"], 1)
-            self.assertEqual(len(snapshot["open_signals"]), 1)
-            leg = snapshot["open_signals"][0]["legs"][0]
-            self.assertEqual(leg["funding_status"], "insufficient_balance")
-            self.assertEqual(leg["funded_stake"], 0)
+            self.assertEqual(len(snapshot["open_signals"]), 0)
 
     def test_follow_tick_debits_configured_account_balance_for_funded_buy_once(self):
         with TemporaryDirectory() as tmp:
@@ -9469,7 +9442,7 @@ class CoreTest(unittest.TestCase):
                         "status": "open",
                         "contested": True,
                         "wallet_clv": 0.12,
-                        "legs": [{"stake": 1, "would_follow": False}],
+                        "legs": [{"stake": 1, "would_follow": True}],
                     },
                     {
                         "signal_id": "m1:1",
@@ -9511,14 +9484,14 @@ class CoreTest(unittest.TestCase):
             store.save_follow_snapshot(
                 wallet_trade_state={},
                 open_signals=[
-                    {"signal_id": "m1:a", "wallet": "0xa", "condition_id": "m1", "outcome_index": 0, "status": "open", "contested": True, "legs": []},
-                    {"signal_id": "m1:b", "wallet": "0xa", "condition_id": "m1", "outcome_index": 1, "status": "open", "contested": True, "legs": []},
-                    {"signal_id": "m2:a", "wallet": "0xb", "condition_id": "m2", "outcome_index": 0, "status": "open", "contested": True, "legs": []},
-                    {"signal_id": "m2:b", "wallet": "0xc", "condition_id": "m2", "outcome_index": 1, "status": "open", "contested": True, "legs": []},
-                    {"signal_id": "m3:a", "wallet": "0xd", "condition_id": "m3", "outcome_index": 0, "status": "open", "legs": []},
-                    {"signal_id": "m4:a", "wallet": "0xe", "condition_id": "m4", "outcome_index": 0, "status": "open", "contested": True, "legs": []},
-                    {"signal_id": "m4:b", "wallet": "0xe", "condition_id": "m4", "outcome_index": 1, "status": "open", "contested": True, "legs": []},
-                    {"signal_id": "m4:c", "wallet": "0xf", "condition_id": "m4", "outcome_index": 0, "status": "open", "contested": True, "legs": []},
+                    {"signal_id": "m1:a", "wallet": "0xa", "condition_id": "m1", "outcome_index": 0, "status": "open", "contested": True, "legs": [{"stake": 1}]},
+                    {"signal_id": "m1:b", "wallet": "0xa", "condition_id": "m1", "outcome_index": 1, "status": "open", "contested": True, "legs": [{"stake": 1}]},
+                    {"signal_id": "m2:a", "wallet": "0xb", "condition_id": "m2", "outcome_index": 0, "status": "open", "contested": True, "legs": [{"stake": 1}]},
+                    {"signal_id": "m2:b", "wallet": "0xc", "condition_id": "m2", "outcome_index": 1, "status": "open", "contested": True, "legs": [{"stake": 1}]},
+                    {"signal_id": "m3:a", "wallet": "0xd", "condition_id": "m3", "outcome_index": 0, "status": "open", "legs": [{"stake": 1}]},
+                    {"signal_id": "m4:a", "wallet": "0xe", "condition_id": "m4", "outcome_index": 0, "status": "open", "contested": True, "legs": [{"stake": 1}]},
+                    {"signal_id": "m4:b", "wallet": "0xe", "condition_id": "m4", "outcome_index": 1, "status": "open", "contested": True, "legs": [{"stake": 1}]},
+                    {"signal_id": "m4:c", "wallet": "0xf", "condition_id": "m4", "outcome_index": 0, "status": "open", "contested": True, "legs": [{"stake": 1}]},
                 ],
                 result_events=[],
                 performance={},
@@ -9689,8 +9662,8 @@ class CoreTest(unittest.TestCase):
             FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
                 wallet_trade_state={},
                 open_signals=[
-                    {"signal_id": "e:m1:0", "wallet": "0xe", "condition_id": "m1", "status": "open", "category": "esports", "created_at": 100, "legs": []},
-                    {"signal_id": "s:m2:0", "wallet": "0xs", "condition_id": "m2", "status": "open", "category": "sports", "created_at": 200, "legs": []},
+                    {"signal_id": "e:m1:0", "wallet": "0xe", "condition_id": "m1", "status": "open", "category": "esports", "created_at": 100, "legs": [{"stake": 1}]},
+                    {"signal_id": "s:m2:0", "wallet": "0xs", "condition_id": "m2", "status": "open", "category": "sports", "created_at": 200, "legs": [{"stake": 1}]},
                 ],
                 result_events=[],
                 performance={},
