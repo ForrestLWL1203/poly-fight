@@ -834,24 +834,12 @@ def _latest_collection_summary(data_dir: Path) -> dict[str, Any]:
             candidates,
             key=lambda row: _parse_timestamp(row.get("published_at") or row.get("updated_at") or row.get("created_at")),
         )
-    root_summary = _read_json(data_dir / "build_summary.json", {})
-    if isinstance(root_summary, dict) and root_summary:
-        return root_summary
-    category_summaries = []
-    for _category, category_dir in category_data_dirs(data_dir).items():
-        value = _read_json(category_dir / "build_summary.json", {})
-        if isinstance(value, dict) and value:
-            category_summaries.append(value)
-    if category_summaries:
-        return max(category_summaries, key=lambda row: _parse_timestamp(row.get("created_at") or row.get("updated_at")))
     return {}
 
 
 def build_health(data_dir: Path, *, started_at: float, log_dir: Path | None = None, follow_dir: Path | None = None) -> dict[str, Any]:
     store = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir))
     rows = store.load_run_ticks(limit=100)
-    if not rows:
-        rows = _read_follow_run_logs(data_dir, log_dir=log_dir, follow_dir=follow_dir)
     db_ready = store.dashboard_db_ready()
     last_tick = rows[-1] if rows else {}
     build_summary = _latest_collection_summary(data_dir)
@@ -903,11 +891,6 @@ def read_stream_signal(
     follow_root = _follow_dir_from(data_dir, follow_dir=follow_dir)
     store = store or FollowStore(_follow_db_file(data_dir, follow_dir=follow_root))
     run_ticks_updated_at = store.read_meta_int("run_ticks_updated_at", conn=conn)
-    if not run_ticks_updated_at:
-        run_ticks_updated_at = max(
-            _file_mtime(_follow_run_log_path(data_dir, log_dir=log_dir)),
-            _file_mtime(_legacy_follow_run_log_path(data_dir, follow_dir=follow_root)),
-        )
     return StreamSignal(
         snapshot_updated_at=store.read_meta_int("follow_snapshot_updated_at", conn=conn),
         run_log_mtime=run_ticks_updated_at,
@@ -1420,27 +1403,13 @@ def _category_leaderboards(root: Path) -> list[tuple[str, Path, list[dict[str, A
     rows: list[tuple[str, Path, list[dict[str, Any]], int]] = []
     for category, data_dir in category_data_dirs(root).items():
         db_rows, db_mtimes = LeaderboardStore(data_dir / "leaderboard.db").load_leaderboard(category=category)
-        if db_rows:
-            leaderboard = [{**row, "category": category} for row in db_rows if isinstance(row, dict)]
-            rows.append((category, data_dir, leaderboard, int(db_mtimes.get(category) or 0)))
-            continue
-        path = data_dir / "smart_wallet_leaderboard.json"
-        value = _read_json(path, [])
-        leaderboard = []
-        for row in value if isinstance(value, list) else []:
-            if isinstance(row, dict):
-                leaderboard.append({**row, "category": category})
-        rows.append((category, data_dir, leaderboard, int(path.stat().st_mtime) if path.exists() else 0))
-    legacy_path = root / "smart_wallet_leaderboard.json"
+        leaderboard = [{**row, "category": category} for row in db_rows if isinstance(row, dict)]
+        rows.append((category, data_dir, leaderboard, int(db_mtimes.get(category) or 0)))
     if not any(leaderboard for _, _, leaderboard, _ in rows):
         legacy_db_rows, legacy_db_mtimes = LeaderboardStore(root / "leaderboard.db").load_leaderboard(category="esports")
         if legacy_db_rows:
             legacy_db = [{**row, "category": "esports"} for row in legacy_db_rows if isinstance(row, dict)]
             rows.append(("esports", root, legacy_db, int(legacy_db_mtimes.get("esports") or 0)))
-    if not any(leaderboard for _, _, leaderboard, _ in rows) and legacy_path.exists():
-        value = _read_json(legacy_path, [])
-        legacy = [{**row, "category": "esports"} for row in value if isinstance(row, dict)]
-        rows.append(("esports", root, legacy, int(legacy_path.stat().st_mtime)))
     return rows
 
 
@@ -2253,19 +2222,7 @@ def _active_market_cache_rows(data_dir: Path, *, follow_dir: Path | None = None)
         now_ts=now_ts,
         ttl_seconds=15 * 60,
     )
-    if markets:
-        return list(markets.values()), updated_at, fresh
-    cache_path = _follow_dir_from(data_dir, follow_dir=follow_dir) / "active_market_cache.json"
-    cached = _read_json(cache_path, {})
-    updated_at = int(cached.get("updated_at") or 0) if isinstance(cached, dict) else 0
-    markets_value = cached.get("markets") if isinstance(cached, dict) else []
-    if isinstance(markets_value, dict):
-        rows = list(markets_value.values())
-    elif isinstance(markets_value, list):
-        rows = markets_value
-    else:
-        rows = []
-    return [row for row in rows if isinstance(row, dict)], updated_at, bool(updated_at and now_ts - updated_at <= 15 * 60)
+    return list(markets.values()), updated_at, fresh
 
 
 def build_events(
@@ -2539,24 +2496,7 @@ def _normalize_logo_key(value: str) -> str:
 
 def _active_market_by_condition(data_dir: Path, condition_id: str, *, follow_dir: Path | None = None) -> dict[str, Any]:
     condition_id = str(condition_id or "").lower()
-    cached_item = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).get_market_cache_item_readonly("active", condition_id)
-    if cached_item:
-        return cached_item
-    cached = _read_json(_follow_dir_from(data_dir, follow_dir=follow_dir) / "active_market_cache.json", {})
-    markets = cached.get("markets") if isinstance(cached, dict) else []
-    if isinstance(markets, dict):
-        rows = markets.values()
-    elif isinstance(markets, list):
-        rows = markets
-    else:
-        rows = []
-    for market in rows:
-        if not isinstance(market, dict):
-            continue
-        current = str(market.get("condition_id") or market.get("conditionId") or "").lower()
-        if current == condition_id:
-            return market
-    return {}
+    return FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).get_market_cache_item_readonly("active", condition_id)
 
 
 def fetch_market_prices(data_dir: Path, client: Any, condition_id: str, *, follow_dir: Path | None = None) -> dict[str, Any]:
@@ -3327,38 +3267,6 @@ def _default_log_dir(data_dir: Path) -> Path:
 
 def _follow_log_dir(data_dir: Path, *, log_dir: Path | None = None) -> Path:
     return (Path(log_dir) if log_dir else _default_log_dir(data_dir)) / "follow"
-
-
-def _follow_run_log_path(data_dir: Path, *, log_dir: Path | None = None) -> Path:
-    return _follow_log_dir(data_dir, log_dir=log_dir) / "follow_run_log.jsonl"
-
-
-def _legacy_follow_run_log_path(data_dir: Path, *, follow_dir: Path | None = None) -> Path:
-    return _follow_dir_from(data_dir, follow_dir=follow_dir) / "follow_run_log.jsonl"
-
-
-def _read_follow_run_logs(data_dir: Path, *, log_dir: Path | None = None, follow_dir: Path | None = None) -> list[dict[str, Any]]:
-    rows = _read_jsonl(_legacy_follow_run_log_path(data_dir, follow_dir=follow_dir))
-    rows.extend(_read_jsonl(_follow_run_log_path(data_dir, log_dir=log_dir)))
-    return sorted(rows, key=lambda row: int(row.get("created_at") or 0))
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    rows = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-    for line in lines:
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(row, dict):
-            rows.append(row)
-    return rows
 
 
 def _cookie_value(raw: str, key: str) -> str:

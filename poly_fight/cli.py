@@ -507,22 +507,10 @@ def read_category_leaderboards(root: Path) -> tuple[list[dict[str, Any]], dict[s
         if db_rows:
             rows.extend({**row, "category": category} for row in db_rows if isinstance(row, dict))
             mtimes[category] = int(db_mtimes.get(category) or 0)
-            continue
-        path = data_dir / "smart_wallet_leaderboard.json"
-        leaderboard = read_json(path, [])
-        mtimes[category] = int(path.stat().st_mtime) if path.exists() else 0
-        for row in leaderboard if isinstance(leaderboard, list) else []:
-            if isinstance(row, dict):
-                rows.append({**row, "category": category})
-    legacy_path = root / "smart_wallet_leaderboard.json"
     legacy_db_rows, legacy_db_mtimes = LeaderboardStore(root / "leaderboard.db").load_leaderboard(category="esports")
     if not rows and legacy_db_rows:
         rows.extend({**row, "category": "esports"} for row in legacy_db_rows if isinstance(row, dict))
         mtimes["esports"] = int(legacy_db_mtimes.get("esports") or 0)
-    if not rows and legacy_path.exists():
-        legacy = read_json(legacy_path, [])
-        mtimes["esports"] = int(legacy_path.stat().st_mtime)
-        rows.extend({**row, "category": "esports"} for row in legacy if isinstance(row, dict))
     return rows, mtimes
 
 
@@ -5506,10 +5494,6 @@ def _command_collect_wallets(
         now_ts=now_ts,
     )
     summary["dashboard_publish"] = dashboard_publish
-    write_json(
-        resolve_data_dir(args) / "build_summary.json",
-        {**summary, "dashboard_publish": dashboard_publish},
-    )
     write_json(output_dir / f"{prefix}_build_summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
@@ -5531,7 +5515,6 @@ def publish_collector_dashboard_outputs(
     profiles = [row for row in profiles_value if isinstance(row, dict)] if isinstance(profiles_value, list) else []
 
     data_dir.mkdir(parents=True, exist_ok=True)
-    write_json(data_dir / "smart_wallet_leaderboard.json", leaderboard)
     write_json(data_dir / "wallet_profiles.json", profiles)
     publish_summary = {
         "published": True,
@@ -5560,7 +5543,6 @@ def publish_collector_dashboard_outputs(
         summary=dashboard_summary,
         updated_at=now_ts,
     )
-    write_json(data_dir / "build_summary.json", dashboard_summary)
     return publish_summary
 
 
@@ -6057,7 +6039,6 @@ def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: Polyma
         summary=summary,
         updated_at=now_ts,
     )
-    write_json(data_dir / "build_summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
     print()
     category_label = "sports" if category == "sports" else "esports"
@@ -6151,7 +6132,6 @@ def command_follow(
     open_path = follow_dir / "follow_signals_open.json"
     perf_path = follow_dir / "follow_performance.json"
     results_path = follow_dir / "follow_results.jsonl"
-    run_log_path = follow_run_log_path(data_dir, getattr(args, "log_dir", None))
     active_cache_path = follow_dir / "active_market_cache.json"
     migration_summary = migrate_category_follow_dbs(data_dir, follow_dir, now_ts=now_ts)
     store = FollowStore(follow_dir / "follow.db")
@@ -6656,10 +6636,6 @@ def command_follow(
             for category in ("esports", "sports")
         },
     }
-    run_log_rows = read_jsonl(run_log_path)
-    from .follow import prune_jsonl
-
-    run_log_rows = prune_jsonl([*run_log_rows, run_log_row], now_ts=now_ts, retention_days=args.run_log_retention_days)
     store.save_follow_snapshot(
         wallet_trade_state=wallet_trade_state,
         open_signals=open_signals,
@@ -6674,7 +6650,6 @@ def command_follow(
         "schema_version": 1,
     }
     write_json(state_path, state)
-    write_jsonl(run_log_path, run_log_rows)
 
     summary = {
         **run_log_row,

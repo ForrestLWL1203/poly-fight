@@ -181,6 +181,47 @@ def market_with_end(condition_id, end_ts):
     return datetime.fromtimestamp(end_ts, timezone.utc).isoformat()
 
 
+def _seed_leaderboard(path, rows, *, summary=None):
+    """Seed leaderboard.db from a legacy smart_wallet_leaderboard.json payload.
+
+    Dashboard/cli read the leaderboard from SQLite only; tests seed via the store
+    instead of writing the retired JSON file. Category is inferred from the path.
+    """
+    p = Path(path)
+    category = p.parent.name if p.parent.name in ("esports", "sports") else "esports"
+    storage_module.LeaderboardStore(p.parent / "leaderboard.db").publish_collection(
+        category=category,
+        leaderboard=list(rows or []),
+        profiles=[],
+        summary=summary or {},
+        updated_at=int(time.time()),
+    )
+
+
+def _seed_active_market_cache(path, payload):
+    """Seed follow.db active market cache from a legacy active_market_cache.json payload.
+
+    Dashboard reads the active market cache from SQLite only; tests seed via the store
+    instead of writing the retired JSON file.
+    """
+    db = Path(path).parent / "follow.db"
+    markets_value = payload.get("markets") if isinstance(payload, dict) else []
+    if isinstance(markets_value, dict):
+        items = list(markets_value.values())
+    elif isinstance(markets_value, list):
+        items = markets_value
+    else:
+        items = []
+    markets = {}
+    for market in items:
+        if isinstance(market, dict):
+            cid = str(market.get("condition_id") or market.get("conditionId") or "")
+            markets[cid] = market
+    FollowStore(db).save_market_cache(
+        markets, cache_kind="active", updated_at=int((payload or {}).get("updated_at") or 0)
+    )
+
+
 class CoreTest(unittest.TestCase):
     def sports_a_profile(self, wallet, *, league="nba", event_count=8, avg_market_cash=6_000, **overrides):
         profile = {
@@ -7228,7 +7269,7 @@ class CoreTest(unittest.TestCase):
             data_dir = Path(tmp)
             now = datetime.now(timezone.utc)
             start = now + timedelta(hours=2)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {
@@ -7291,26 +7332,7 @@ class CoreTest(unittest.TestCase):
             self.assertFalse((data_dir / "follow" / "follow_performance.json").exists())
             self.assertTrue((data_dir / "follow" / "follow.db").exists())
             self.assertFalse((data_dir / "follow" / "follow_run_log.jsonl").exists())
-            self.assertTrue(follow_run_log_path(data_dir).exists())
-
-    def test_dashboard_health_reads_new_and_legacy_follow_logs(self):
-        with TemporaryDirectory() as tmp:
-            data_dir = Path(tmp) / "data"
-            custom_log_dir = Path(tmp) / "local_logs"
-            write_jsonl(data_dir / "follow" / "follow_run_log.jsonl", [{"created_at": 100, "desired_next_interval_seconds": 10}])
-            write_jsonl(custom_log_dir / "follow" / "follow_run_log.jsonl", [{"created_at": 200, "desired_next_interval_seconds": 20}])
-            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
-                wallet_trade_state={},
-                open_signals=[],
-                result_events=[],
-                performance={},
-            )
-
-            health = build_health(data_dir, started_at=time.time(), log_dir=custom_log_dir)
-            signal = read_stream_signal(data_dir, log_dir=custom_log_dir)
-
-            self.assertEqual(health["last_tick_at"], 200)
-            self.assertGreater(signal.run_log_mtime, 0)
+            self.assertTrue(FollowStore(data_dir / "follow" / "follow.db").load_run_ticks())
 
     def test_dashboard_health_prefers_sqlite_collection_summary_and_run_tick(self):
         with TemporaryDirectory() as tmp:
@@ -7358,7 +7380,7 @@ class CoreTest(unittest.TestCase):
             data_dir = Path(tmp)
             now = datetime.now(timezone.utc)
             start = now + timedelta(hours=2)
-            write_json(data_dir / "smart_wallet_leaderboard.json", [])
+            _seed_leaderboard(data_dir / "smart_wallet_leaderboard.json", [])
 
             class FakeClient:
                 def list_events_paginated(self, **_kwargs):
@@ -7419,11 +7441,11 @@ class CoreTest(unittest.TestCase):
             data_dir = Path(tmp)
             now = datetime.now(timezone.utc)
             start = now + timedelta(hours=2)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "esports" / "smart_wallet_leaderboard.json",
                 [{"wallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
             )
-            write_json(
+            _seed_leaderboard(
                 data_dir / "sports" / "smart_wallet_leaderboard.json",
                 [{"wallet": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
             )
@@ -7491,7 +7513,7 @@ class CoreTest(unittest.TestCase):
             now = datetime.now(timezone.utc)
             start = now + timedelta(hours=2)
             wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {
@@ -7558,7 +7580,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {
@@ -7607,7 +7629,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             start = datetime.now(timezone.utc) + timedelta(hours=2)
-            write_json(
+            _seed_active_market_cache(
                 data_dir / "follow" / "active_market_cache.json",
                 {
                     "updated_at": int(time.time()),
@@ -7744,7 +7766,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             now = datetime.now(timezone.utc)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [{"wallet": "0xabc", "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
             )
@@ -7773,7 +7795,7 @@ class CoreTest(unittest.TestCase):
             data_dir = Path(tmp)
             now = datetime.now(timezone.utc)
             start = now + timedelta(hours=2)
-            write_json(data_dir / "smart_wallet_leaderboard.json", [])
+            _seed_leaderboard(data_dir / "smart_wallet_leaderboard.json", [])
             store = FollowStore(data_dir / "follow" / "follow.db")
             store.save_follow_snapshot(
                 wallet_trade_state={
@@ -7868,7 +7890,7 @@ class CoreTest(unittest.TestCase):
             follow_dir = data_dir / "follow"
             now = datetime.now(timezone.utc)
             start = now + timedelta(hours=2)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {
@@ -7974,7 +7996,7 @@ class CoreTest(unittest.TestCase):
             data_dir = Path(tmp)
             now = datetime.now(timezone.utc)
             start = now + timedelta(hours=2)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "sports" / "smart_wallet_leaderboard.json",
                 [
                     {
@@ -8065,7 +8087,7 @@ class CoreTest(unittest.TestCase):
             data_dir = Path(tmp)
             now = datetime.now(timezone.utc)
             start = now + timedelta(hours=2)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [{"wallet": "0xa", "category": "esports", "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
             )
@@ -8151,7 +8173,7 @@ class CoreTest(unittest.TestCase):
             data_dir = Path(tmp)
             now = datetime.now(timezone.utc)
             start = now + timedelta(hours=2)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [{"wallet": "0xa", "category": "esports", "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
             )
@@ -8225,7 +8247,7 @@ class CoreTest(unittest.TestCase):
             data_dir = Path(tmp)
             now = datetime.now(timezone.utc)
             start = now + timedelta(hours=2)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {"wallet": "0xa", "grade": "A", "last_esports_trade_at": int(now.timestamp())},
@@ -8306,7 +8328,7 @@ class CoreTest(unittest.TestCase):
             data_dir = Path(tmp)
             now = datetime.now(timezone.utc)
             start = now + timedelta(hours=2)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [{"wallet": "0xa", "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
             )
@@ -8368,7 +8390,7 @@ class CoreTest(unittest.TestCase):
 
             summary = command_follow(args, client=FakeClient(), emit=False)
             snapshot = store.load_dashboard_snapshot()
-            run_log = read_jsonl(follow_run_log_path(data_dir))
+            run_log = store.load_run_ticks(limit=100)
 
             self.assertEqual(summary["new_signal_count"], 0)
             self.assertEqual(summary["insufficient_balance_count"], 1)
@@ -8381,7 +8403,7 @@ class CoreTest(unittest.TestCase):
             now = datetime.now(timezone.utc)
             start = now + timedelta(hours=2)
             wallet = "0xa"
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [{"wallet": wallet, "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
             )
@@ -8567,7 +8589,7 @@ class CoreTest(unittest.TestCase):
             start = now + timedelta(hours=2)
             wallet = "0xa"
             signal_id = f"{wallet}:m1:0"
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [{"wallet": wallet, "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
             )
@@ -8952,7 +8974,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [{"wallet": wallet, "category": "esports", "grade": "A", "positive_market_rate": 1.0}],
             )
@@ -9010,7 +9032,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [{"wallet": wallet, "category": "esports", "grade": "A", "positive_market_rate": 1.0}],
             )
@@ -9056,7 +9078,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [{"wallet": wallet, "category": "esports", "grade": "A", "positive_market_rate": 1.0}],
             )
@@ -10636,7 +10658,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {
@@ -10838,7 +10860,7 @@ class CoreTest(unittest.TestCase):
     def test_dashboard_follows_calculates_unrealized_pnl_from_active_cache(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_json(
+            _seed_active_market_cache(
                 data_dir / "follow" / "active_market_cache.json",
                 {
                     "updated_at": 200,
@@ -10887,7 +10909,7 @@ class CoreTest(unittest.TestCase):
     def test_dashboard_follows_excludes_blocked_legs_from_unrealized_pnl(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_json(
+            _seed_active_market_cache(
                 data_dir / "follow" / "active_market_cache.json",
                 {
                     "updated_at": 200,
@@ -10942,7 +10964,7 @@ class CoreTest(unittest.TestCase):
                     }
                 },
             )
-            write_json(
+            _seed_active_market_cache(
                 data_dir / "follow" / "active_market_cache.json",
                 {
                     "updated_at": int(time.time()),
@@ -11070,7 +11092,7 @@ class CoreTest(unittest.TestCase):
     def test_dashboard_follow_detail_backfills_event_link_and_end_time(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_json(
+            _seed_active_market_cache(
                 data_dir / "follow" / "active_market_cache.json",
                 {
                     "updated_at": 100,
@@ -11194,7 +11216,7 @@ class CoreTest(unittest.TestCase):
             visible_a = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             hidden = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             visible_b = "0xcccccccccccccccccccccccccccccccccccccccc"
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {
@@ -11261,7 +11283,7 @@ class CoreTest(unittest.TestCase):
             clean_top = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             quarantined = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             target = "0xcccccccccccccccccccccccccccccccccccccccc"
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {
@@ -11322,7 +11344,7 @@ class CoreTest(unittest.TestCase):
             clean_top = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             quarantined = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             shifted = "0xcccccccccccccccccccccccccccccccccccccccc"
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {"wallet": clean_top, "grade": "A", "best_bucket_score": 90, "positive_market_rate": 1.0},
@@ -11549,7 +11571,7 @@ class CoreTest(unittest.TestCase):
     def test_dashboard_wallets_expose_quarantine_state(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {"wallet": "0xabc", "grade": "A"},
@@ -11574,7 +11596,7 @@ class CoreTest(unittest.TestCase):
     def test_dashboard_wallets_separate_active_favorite_and_quarantine_counts(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {"wallet": "0xaaa", "category": "esports", "grade": "A", "positive_market_rate": 1.0},
@@ -11611,7 +11633,7 @@ class CoreTest(unittest.TestCase):
     def test_dashboard_wallets_keep_leaderboard_favorites_active(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {"wallet": "0xaaa", "category": "esports", "grade": "A", "positive_market_rate": 1.0},
@@ -11669,7 +11691,7 @@ class CoreTest(unittest.TestCase):
     def test_dashboard_wallets_prefer_sqlite_leaderboard_over_legacy_json(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [{"wallet": "0xlegacy", "grade": "A", "positive_market_rate": 1.0}],
             )
@@ -11743,13 +11765,12 @@ class CoreTest(unittest.TestCase):
             )
 
             self.assertEqual(publish["leaderboard_wallet_count"], 1)
-            self.assertEqual(read_json(data_dir / "smart_wallet_leaderboard.json", []), leaderboard)
             self.assertEqual(read_json(data_dir / "wallet_profiles.json", []), profiles)
             rows, mtimes = read_category_leaderboards(root)
             self.assertEqual(rows[0]["wallet"], "0xcollector")
             self.assertEqual(rows[0]["lane"], "core")
             self.assertEqual(mtimes["esports"], 789)
-            dashboard_summary = read_json(data_dir / "build_summary.json", {})
+            dashboard_summary = storage_module.LeaderboardStore(data_dir / "leaderboard.db").load_latest_collection_run(category="esports")
             self.assertEqual(dashboard_summary["collector"], "wallet_collector")
             self.assertEqual(dashboard_summary["dashboard_publish"]["collector_output_dir"], str(collector_dir))
 
@@ -11816,7 +11837,7 @@ class CoreTest(unittest.TestCase):
     def test_dashboard_wallets_use_observed_follow_trade_time(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [{"wallet": "0xabc", "grade": "A", "last_esports_trade_at": 100}],
             )
@@ -11848,7 +11869,7 @@ class CoreTest(unittest.TestCase):
         # build_wallets must keep it and surface the bucket's stats, not the blended overall.
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {
@@ -11903,7 +11924,7 @@ class CoreTest(unittest.TestCase):
     def test_dashboard_wallets_expose_multiple_game_bucket_fields(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {
@@ -11973,7 +11994,7 @@ class CoreTest(unittest.TestCase):
     def test_dashboard_wallets_surface_local_follow_losses_without_changing_historical_rank(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {
@@ -12027,7 +12048,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            write_json(
+            _seed_leaderboard(
                 data_dir / "smart_wallet_leaderboard.json",
                 [
                     {
@@ -12074,7 +12095,7 @@ class CoreTest(unittest.TestCase):
             data_dir = Path(tmp)
             esports_rows = [
                 {
-                    "wallet": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee1",
+                    "wallet": f"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee{index}",
                     "category": "esports",
                     "grade": "A",
                     "esports_win_count": 8,
@@ -12105,8 +12126,8 @@ class CoreTest(unittest.TestCase):
                 }
                 for index in range(3)
             ]
-            write_json(data_dir / "esports" / "smart_wallet_leaderboard.json", esports_rows)
-            write_json(data_dir / "sports" / "smart_wallet_leaderboard.json", sports_rows)
+            _seed_leaderboard(data_dir / "esports" / "smart_wallet_leaderboard.json", esports_rows)
+            _seed_leaderboard(data_dir / "sports" / "smart_wallet_leaderboard.json", sports_rows)
             FollowStore(data_dir / "follow" / "follow.db")
 
             wallets = build_wallets(data_dir)
@@ -12132,7 +12153,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             now_ts = int(time.time())
-            write_json(
+            _seed_active_market_cache(
                 data_dir / "follow" / "active_market_cache.json",
                 {
                     "updated_at": now_ts,
@@ -12179,7 +12200,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             now_ts = int(time.time())
-            write_json(
+            _seed_active_market_cache(
                 data_dir / "follow" / "active_market_cache.json",
                 {
                     "updated_at": now_ts,
@@ -12208,7 +12229,7 @@ class CoreTest(unittest.TestCase):
             now_ts = int(time.time())
             start = datetime.fromtimestamp(now_ts + 3600, timezone.utc).isoformat()
             end = datetime.fromtimestamp(now_ts + 7200, timezone.utc).isoformat()
-            write_json(
+            _seed_active_market_cache(
                 data_dir / "follow" / "active_market_cache.json",
                 {
                     "updated_at": now_ts,
@@ -12300,7 +12321,7 @@ class CoreTest(unittest.TestCase):
             data_dir = Path(tmp)
             now_ts = int(time.time())
             start = datetime.fromtimestamp(now_ts + 3600, timezone.utc).isoformat().replace("+00:00", "+00")
-            write_json(
+            _seed_active_market_cache(
                 data_dir / "follow" / "active_market_cache.json",
                 {
                     "updated_at": now_ts,
@@ -12332,7 +12353,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             now_ts = int(time.time())
-            write_json(
+            _seed_active_market_cache(
                 data_dir / "follow" / "active_market_cache.json",
                 {
                     "updated_at": now_ts,
@@ -12393,7 +12414,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             now_ts = int(time.time())
-            write_json(
+            _seed_active_market_cache(
                 data_dir / "follow" / "active_market_cache.json",
                 {
                     "updated_at": now_ts,
@@ -12442,7 +12463,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             now_ts = int(time.time())
-            write_json(
+            _seed_active_market_cache(
                 data_dir / "follow" / "active_market_cache.json",
                 {
                     "updated_at": now_ts,
@@ -12484,7 +12505,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             now_ts = int(time.time())
-            write_json(
+            _seed_active_market_cache(
                 data_dir / "follow" / "active_market_cache.json",
                 {
                     "updated_at": now_ts,
@@ -12541,7 +12562,7 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             now_ts = int(time.time())
-            write_json(
+            _seed_active_market_cache(
                 data_dir / "follow" / "active_market_cache.json",
                 {
                     "updated_at": now_ts,
@@ -13291,7 +13312,7 @@ class CoreTest(unittest.TestCase):
             classification = read_json(Path(tmp) / "sports" / "esports_classification_set.json", [])
             self.assertEqual(len(classification), 3)
             self.assertTrue(all(row["end_date"] == "2026-06-01T03:00:00Z" for row in classification))
-            summary = read_json(Path(tmp) / "sports" / "build_summary.json", {})
+            summary = storage_module.LeaderboardStore(Path(tmp) / "sports" / "leaderboard.db").load_latest_collection_run(category="sports")
             self.assertEqual(summary["profile_fetch_plan_count"], 1)
             self.assertEqual(summary["unprofiled_profile_candidate_count"], 0)
             self.assertEqual(summary["max_profiles_per_run_effective"], 1)
@@ -14010,7 +14031,7 @@ class CoreTest(unittest.TestCase):
             ]:
                 self.assertTrue((output_dir / name).exists(), name)
             summary = read_json(output_dir / "collector_build_summary.json", {})
-            dashboard_summary = read_json(data_dir / "build_summary.json", {})
+            dashboard_summary = storage_module.LeaderboardStore(data_dir / "leaderboard.db").load_latest_collection_run(category="esports")
             self.assertEqual(summary["collector"], "wallet_collector")
             self.assertEqual(dashboard_summary["collector"], "wallet_collector")
             self.assertEqual(summary["target_market_count"], 4)
@@ -14245,7 +14266,7 @@ class CoreTest(unittest.TestCase):
 
             profiles = read_json(output_dir / "collector_wallet_profiles.json", [])
             summary = read_json(output_dir / "collector_build_summary.json", {})
-            dashboard_summary = read_json(data_dir / "build_summary.json", {})
+            dashboard_summary = storage_module.LeaderboardStore(data_dir / "leaderboard.db").load_latest_collection_run(category="esports")
 
         self.assertEqual(client.trade_calls, [])
         self.assertTrue(client.position_calls)
