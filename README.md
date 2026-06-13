@@ -28,8 +28,8 @@ python3 collect.py
 ```
 
 This discovers candidate wallets from historical closed-market trades and writes
-a strict A-grade `smart_wallet_leaderboard.json` under `data/`. The equivalent
-explicit form is `python3 -m poly_fight.cli collect`.
+a strict A-grade leaderboard into `data/{category}/leaderboard.db`. The
+equivalent explicit form is `python3 -m poly_fight.cli collect`.
 
 > Collection writes into `data/` and makes live API calls. Lower throughput with
 > `--max-requests-per-second 4` if you hit 429/503 errors.
@@ -140,11 +140,13 @@ don't stop the tick; broader errors are retried after `--error-retry-seconds`
 python3 -m poly_fight.cli --data-dir data serve --host 127.0.0.1 --port 8787
 ```
 
-The dashboard is **read-only** over `follow.db` and the JSON outputs. It never
-places trades. The only live external request it makes is the wallet-trades
-proxy. Authenticated users can trigger a background smart-wallet refresh, start/
-stop the runner, set a manual paper balance cap, manage favorites, and reset
-generated data — nothing that writes follow-signal state directly.
+The dashboard serves **every** response from SQLite (`follow.db` plus the
+per-category `leaderboard.db`) — it never parses raw JSON outputs. Access is
+**read-only** (`mode=ro`, `PRAGMA query_only=1`); it never places trades. The
+only live external request it makes is the wallet-trades proxy. Authenticated
+users can trigger a background smart-wallet refresh, start/stop the runner, set
+a manual paper balance cap, manage favorites, and reset generated data — nothing
+that writes follow-signal state directly.
 
 - **VPS / TLS:** put the service behind nginx + TLS and run with
   `--host 0.0.0.0 --cookie-secure`. Leave `--cookie-secure` off for local HTTP.
@@ -161,31 +163,37 @@ Generated data is written under `data/` (git-ignored):
 
 ```text
 data/{esports,sports}/
-  discovery_slate.json
-  candidate_wallets.json
+  leaderboard.db            # dashboard source: leaderboard + collection runs
+  discovery_slate.json      # collector intermediate products (not read by the
+  candidate_wallets.json    #   dashboard) — kept as JSON for inspection
   wallet_profiles.json
-  smart_wallet_leaderboard.json
-  build_summary.json
   raw_market_trades/  raw_user_trades/
 data/follow/
   follow.db                 # source of truth (see below)
   follow_state.json         # thin metadata/compatibility file
-  active_market_cache.json
   follow_control.json       # runner/refresh/pause control
 ```
 
+The dashboard's "product" data lives only in SQLite now: the leaderboard and
+collection summaries in each `leaderboard.db`; active/closed market caches, run
+ticks (the old `follow_run_log.jsonl`), and all follow-signal state in
+`follow.db`. The collector no longer writes `smart_wallet_leaderboard.json` /
+`build_summary.json`, and the follow loop no longer writes
+`follow_run_log.jsonl` — those products are persisted to SQLite. The remaining
+JSON files above are collector intermediates or thin compatibility stubs.
+
 `follow.db` is the long-running source of truth: wallet cursors, open/closed
 paper signals, legs, behavior events, results, quarantine, CLV/contested fields,
-performance, manual balance cap, and the configurable follow strategy.
+performance, manual balance cap, run ticks, and the configurable follow strategy.
 
-Diagnostic logs live outside `data/` under `logs/follow/` (e.g.
-`follow_run_log.jsonl`). Runtime-downloaded team logos are cached locally. Both
+Runtime-downloaded team logos are cached locally under `logs/`-adjacent dirs and
 are git-ignored — they persist locally but are never committed.
 
 ### Leaderboard strictness
 
-`smart_wallet_leaderboard.json` is intentionally strict: by default it exports
-only the top ~30 A-grade wallets that are recently active, participate in enough
+The exported leaderboard (persisted to `leaderboard.db`) is intentionally
+strict: by default it keeps only the top ~30 A-grade wallets that are recently
+active, participate in enough
 discovery-window markets, carry meaningful average market size, and have no
 same-condition two-sided or tail-entry flags. Scoring uses a Wilson lower bound
 at 80% confidence (`z=1.28`) so strong wallets with a few historical losses are

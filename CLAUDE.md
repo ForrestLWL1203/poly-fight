@@ -65,14 +65,15 @@ The pipeline has two stages plus a dashboard, all driven through one CLI:
 ```
 Stage 1 — discovery/scoring (collect / build-leaderboard):
   closed in-scope markets -> discovery slate -> trades -> candidate wallets
-  -> scoped wallet history -> smart_wallet_leaderboard.json
+  -> scoped wallet history -> leaderboard.db (per category)
 
 Stage 2 — paper follow (follow / run):
   leaderboard wallets -> upcoming watched markets -> poll trades?user=
   -> paper legs -> CLV / settlement / performance, persisted in follow.db
 
-serve: read-only dashboard reading follow.db + JSON, with a small mutation
-       allowlist for refresh/runner/balance controls.
+serve: read-only dashboard reading ONLY from SQLite (follow.db + per-category
+       leaderboard.db; no raw-JSON parsing), with a small mutation allowlist
+       for refresh/runner/balance controls.
 ```
 
 Module map (all under `poly_fight/`):
@@ -93,13 +94,18 @@ Module map (all under `poly_fight/`):
 
 - `data/follow/follow.db` — **source of truth**: wallet cursors, open/closed
   paper signals, legs, behavior events, results, quarantine, CLV/contested
-  fields, performance, manual balance cap, follow strategy.
+  fields, performance, manual balance cap, follow strategy, active/closed market
+  caches, and run ticks (the old `follow_run_log.jsonl`).
+- `data/{esports,sports}/leaderboard.db` — dashboard source for the leaderboard
+  and collection-run summaries (the old `smart_wallet_leaderboard.json` /
+  `build_summary.json` are no longer written).
 - `data/follow/follow_state.json` — thin metadata-only compatibility file.
-- `data/{esports,sports}/*.json` — collection output (`discovery_slate`,
-  `candidate_wallets`, `wallet_profiles`, `smart_wallet_leaderboard`, raw trade
-  caches). `data/`, `logs/`, `review/`, `sample/`, `secret/` are git-ignored.
-- Dashboard SQLite access is **read-only** (`mode=ro`, `PRAGMA query_only=1`).
-  Never call `FollowStore.init_db()` or write methods from a request path.
+- `data/{esports,sports}/*.json` — **collector intermediates only** (not read by
+  the dashboard): `discovery_slate`, `candidate_wallets`, `wallet_profiles`, raw
+  trade caches. `data/`, `logs/`, `review/`, `sample/`, `secret/` are git-ignored.
+- Dashboard reads **only** from SQLite — no JSON fallbacks on any read path.
+  SQLite access is **read-only** (`mode=ro`, `PRAGMA query_only=1`). Never call
+  `FollowStore.init_db()` or write methods from a request path.
 
 ## Conventions that bite if missed
 

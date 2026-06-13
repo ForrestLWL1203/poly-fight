@@ -51,7 +51,7 @@ follow / run:
   -> paper legs -> CLV / settlement / performance
 
 serve:
-  read-only dashboard + wallet refresh / runner controls
+  read-only dashboard (all data from SQLite) + wallet refresh / runner controls
 ```
 
 ## Market Scope
@@ -131,7 +131,8 @@ Win rate alone is weak. ROI can be distorted by a few large wins. For sports,
 prefer genuinely high flat win-rate wallets over “small losses, big wins”
 gamblers because follow sizing is average/proportional, not max-bet-copy.
 
-Exported `smart_wallet_leaderboard.json` is stricter than raw scoring:
+The exported leaderboard (persisted to `leaderboard.db`) is stricter than raw
+scoring:
 
 ```text
 grade == A
@@ -271,12 +272,16 @@ default 2.
 Follow files:
 
 ```text
-data/follow/follow.db              source of truth
+data/follow/follow.db              source of truth (active/closed market cache,
+                                   run ticks, signals, legs, results, strategy)
 data/follow/follow_state.json      thin metadata compatibility
-data/follow/active_market_cache.json
 data/follow/follow_control.json    runner/refresh/pause control
-logs/follow/*.jsonl and dashboard-runner-*.out
+logs/follow/*.out and dashboard-runner-*.out
 ```
+
+The active/closed market caches and run ticks (formerly
+`active_market_cache.json` / `follow_run_log.jsonl`) now live inside `follow.db`.
+Any remaining JSON of those names is a legacy import source only.
 
 ## Dashboard
 
@@ -291,10 +296,18 @@ python3 -m poly_fight.cli --data-dir data serve --host 127.0.0.1 --port 8787
 For VPS + TLS use `--host 0.0.0.0 --cookie-secure`; local HTTP should leave
 `--cookie-secure` off. Do not change dashboard password unless explicitly asked.
 
-Dashboard SQLite access must be read-only. Do not call `FollowStore.init_db()`
-or write-capable load methods from dashboard request paths. Use read-only
-SQLite (`mode=ro`, `PRAGMA query_only=1`). Missing `follow.db` should return
-empty/waiting data.
+The dashboard serves every response from SQLite (`follow.db` plus per-category
+`leaderboard.db`) and must never parse raw JSON outputs — there are no JSON
+fallbacks on read paths. SQLite access must be read-only: do not call
+`FollowStore.init_db()` or write-capable load methods from dashboard request
+paths; use read-only SQLite (`mode=ro`, `PRAGMA query_only=1`). Missing
+`follow.db` should return empty/waiting data.
+
+Mirror this on the writer side: the collector persists the leaderboard and
+collection summary to `leaderboard.db` (no `smart_wallet_leaderboard.json` /
+`build_summary.json`), and the follow loop persists run ticks to `follow.db` (no
+`follow_run_log.jsonl`). Collector intermediates (`candidate_wallets.json`,
+`wallet_profiles.json`, `discovery_slate.json`, raw trade caches) stay as JSON.
 
 Allowed dashboard mutations only:
 
@@ -381,17 +394,18 @@ older root-level files may exist for compatibility.
 Typical generated files:
 
 ```text
+leaderboard.db                  dashboard source: leaderboard + collection runs
 esports_classification_set.json
-discovery_slate.json
-candidate_wallets.json
+discovery_slate.json            collector intermediates (kept as JSON, not read
+candidate_wallets.json            by the dashboard)
 wallet_profiles.json
-smart_wallet_leaderboard.json
 leaderboard_wallet_overlap.json
-build_summary.json
 raw_market_trades/
 raw_user_trades/
 ```
 
+The leaderboard and collection summary are persisted to `leaderboard.db`; the
+collector no longer writes `smart_wallet_leaderboard.json` / `build_summary.json`.
 Follow business data lives in `data/follow/follow.db`. Avoid committing large
 live data dumps unless explicitly asked.
 
@@ -411,8 +425,9 @@ python3 -u -m poly_fight.cli --data-dir <data-dir> run \
 
 Operational notes:
 
-- `data/follow/follow.db` is the long-running paper follow source of truth.
-- `logs/follow/follow_run_log.jsonl` is diagnostic. Keep logs out of git.
+- `data/follow/follow.db` is the long-running paper follow source of truth,
+  including run ticks (query with the `run_ticks` table, not a JSONL file).
+- `logs/follow/*.out` runner stdout is diagnostic. Keep logs out of git.
 - Raw market/user-trade caches are the largest data files; add cleanup if VPS
   disk pressure becomes a problem.
 - Do not edit live code directly on the VPS unless explicitly asked. Prefer
@@ -433,7 +448,7 @@ VPS deploy/restart checklist:
 7. Update existing pid files to the new live PIDs if the manual restart path
    owns them.
 8. Verify the repo HEAD, process cwd/argv, dashboard HTTP response, and the
-   latest follow_run_log.jsonl entry before reporting success.
+   latest `run_ticks` row in `follow.db` before reporting success.
 ```
 
 When debugging follower latency on the VPS, check the latest run log for
