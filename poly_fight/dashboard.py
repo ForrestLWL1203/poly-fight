@@ -24,7 +24,16 @@ from pathlib import Path
 from typing import Any
 
 from .control import read_follow_control, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
-from .core import LEAGUE_LABELS, MIN_A_POSITIVE_MARKET_RATE, bucket_label, parse_dt, parse_jsonish, to_float
+from .core import (
+    GAME_FAMILY_LABELS,
+    LEAGUE_LABELS,
+    MARKET_TYPE_LABELS,
+    MIN_A_POSITIVE_MARKET_RATE,
+    bucket_label,
+    parse_dt,
+    parse_jsonish,
+    to_float,
+)
 from .cli import enrich_esports_bucket_scores, prepare_category_refresh_dir
 from .follow_strategy import default_follow_strategy, strategy_summary, validate_follow_strategy
 from .storage import FollowStore, LeaderboardStore
@@ -37,6 +46,7 @@ _TRADES_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _TRADES_CACHE_LOCK = threading.Lock()
 _MATCH_TITLE_RE = re.compile(r"^([^:]+):\s+(.+?)\s+vs\s+(.+?)(\s+\([^)]+\))?\s+-\s+(.+)$", re.IGNORECASE)
 _SPORTS_TITLE_RE = re.compile(r"^(.+?)\s+vs\.?\s+(.+?)(?:\s+-\s+(.+))?$", re.IGNORECASE)
+_ESPORTS_GAME_ORDER = {"dota2": 0, "cs2": 1, "lol": 2}
 
 
 @dataclass(frozen=True)
@@ -128,7 +138,7 @@ def create_server(config: DashboardConfig) -> ThreadingHTTPServer:
         raise ValueError("POLY_FIGHT_DASH_PASSWORD is required")
     if not config.cookie_secret:
         raise ValueError("POLY_FIGHT_DASH_COOKIE_SECRET is required")
-    static_dir = config.static_dir or Path(__file__).with_name("dashboard").joinpath("static")
+    static_dir = config.static_dir or Path(__file__).with_name("dashboardV2")
     resolved = DashboardConfig(
         data_dir=config.data_dir,
         follow_dir=config.follow_dir or config.data_dir / "follow",
@@ -220,6 +230,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/follow-strategy":
                 self._follow_strategy()
                 return
+            if parsed.path == "/api/follow-strategies":
+                self._follow_strategy_create()
+                return
+            action = re.match(r"^/api/follow-strategies/([^/]+)/(activate|update|delete)$", parsed.path)
+            if action:
+                self._follow_strategy_action(urllib.parse.unquote(action.group(1)), action.group(2))
+                return
             if parsed.path == "/api/runner/start":
                 self._runner_start()
                 return
@@ -258,6 +275,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 strategy = default_follow_strategy(balance_usdc=balance_value)
                 strategy["configured"] = False
             self._ok(strategy)
+            return
+        if parsed.path == "/api/follow-strategies":
+            store = FollowStore(_follow_db_path(self.dashboard_config))
+            self._ok(store.list_follow_strategies())
             return
         if parsed.path == "/api/wallets":
             self._ok(build_wallets(self.dashboard_config.data_dir, follow_dir=follow_dir))
@@ -505,6 +526,66 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         self._ok(saved)
 
+    def _follow_strategy_create(self) -> None:
+        form = self._read_request_form()
+        name = str(form.get("name") or "").strip()
+        strategy = form.get("strategy") if isinstance(form.get("strategy"), dict) else form
+        store = FollowStore(_follow_db_path(self.dashboard_config))
+        try:
+            entry = store.create_follow_strategy(name, strategy, ts=int(time.time()))
+        except ValueError as exc:
+            self._strategy_value_error(exc)
+            return
+        self._ok(entry)
+
+    def _follow_strategy_action(self, slug: str, action: str) -> None:
+        store = FollowStore(_follow_db_path(self.dashboard_config))
+        # mutations that change the *active* strategy are locked while the runner is busy
+        locks_active = action in {"activate", "delete", "update"}
+        if locks_active:
+            current = build_runner_status(self.dashboard_config)
+            if current.get("status") in {"running", "stopping"}:
+                listing = store.list_follow_strategies()
+                touches_active = action in {"activate"} or slug == listing.get("active_slug")
+                if touches_active:
+                    self._json(
+                        {"ok": False, "error": "follow_strategy_locked", "data": current},
+                        status=HTTPStatus.CONFLICT,
+                    )
+                    return
+        try:
+            if action == "activate":
+                result = store.activate_follow_strategy(slug, ts=int(time.time()))
+            elif action == "delete":
+                result = store.delete_follow_strategy_entry(slug, ts=int(time.time()))
+            else:  # update
+                form = self._read_request_form()
+                name = str(form.get("name") or "").strip()
+                strategy = form.get("strategy") if isinstance(form.get("strategy"), dict) else form
+                result = store.update_follow_strategy_entry(slug, name, strategy, ts=int(time.time()))
+        except ValueError as exc:
+            self._strategy_value_error(exc)
+            return
+        self._ok(result)
+
+    def _strategy_value_error(self, exc: ValueError) -> None:
+        msg = str(exc)
+        if msg == "strategy_not_found":
+            self._error("strategy_not_found", status=HTTPStatus.NOT_FOUND)
+        elif msg == "duplicate_name":
+            self._json({"ok": False, "error": "duplicate_name"}, status=HTTPStatus.CONFLICT)
+        elif msg == "name_required":
+            self._error("name_required", status=HTTPStatus.BAD_REQUEST)
+        elif msg.startswith("invalid_follow_strategy"):
+            _, _, detail = msg.partition(":")
+            errors = [e for e in detail.split(",") if e]
+            self._json(
+                {"ok": False, "error": "invalid_follow_strategy", "errors": errors},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        else:
+            self._error("invalid_follow_strategy", status=HTTPStatus.BAD_REQUEST, detail=msg)
+
     def _runner_stop(self) -> None:
         status = stop_runner(self.dashboard_config)
         accepted = status.get("status") in {"stopping", "stopped"}
@@ -630,7 +711,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return username == self.dashboard_config.username
 
     def _serve_static(self, path: str) -> None:
-        static_dir = self.dashboard_config.static_dir or Path(__file__).with_name("dashboard").joinpath("static")
+        static_dir = self.dashboard_config.static_dir or Path(__file__).with_name("dashboardV2")
         if path in {"", "/"} and not (static_dir / "index.html").exists():
             self._send_bytes(b"Poly Fight dashboard API", content_type="text/plain; charset=utf-8")
             return
@@ -920,7 +1001,217 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
         )
         for category in CATEGORIES
     }
+    overview.update(_overview_full_app_aggregates(open_signals, results))
     return overview
+
+
+def _overview_full_app_aggregates(open_signals: list[dict[str, Any]], results: list[dict[str, Any]]) -> dict[str, Any]:
+    esports_open = [signal for signal in open_signals if _overview_signal_game(signal)]
+    esports_results = [signal for signal in results if _overview_signal_game(signal)]
+    return {
+        "equity_points": _overview_equity_points(esports_results),
+        "win_rates_by_game": _overview_win_rates_by_game(esports_results),
+        "follow_type_distribution": _overview_follow_type_distribution(esports_results),
+        "open_by_game": _overview_open_by_game(esports_open),
+    }
+
+
+def _overview_equity_points(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cumulative = 0.0
+    points: list[dict[str, Any]] = []
+    ordered = sorted(
+        enumerate(results),
+        key=lambda item: (_signal_activity_at(item[1]) or 0, item[0]),
+    )
+    for _index, signal in ordered:
+        pnl = _round_dashboard_float(_signal_our_pnl(signal))
+        cumulative = _round_dashboard_float(cumulative + pnl)
+        points.append(
+            {
+                "timestamp": _signal_activity_at(signal) or None,
+                "pnl": pnl,
+                "cumulative_pnl": cumulative,
+            }
+        )
+    return points
+
+
+def _overview_win_rates_by_game(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for signal in results:
+        if str(signal.get("status") or "") != "settled":
+            continue
+        game = _overview_signal_game(signal)
+        if not game:
+            continue
+        row = grouped.setdefault(
+            game,
+            {
+                "game": game,
+                "game_label": GAME_FAMILY_LABELS.get(game, game.upper()),
+                "wins": 0,
+                "losses": 0,
+                "settled_count": 0,
+                "win_rate": None,
+            },
+        )
+        row["settled_count"] += 1
+        if _result_win(signal):
+            row["wins"] += 1
+        else:
+            row["losses"] += 1
+    for row in grouped.values():
+        total = int(row["settled_count"] or 0)
+        row["win_rate"] = (row["wins"] / total) if total else None
+    return sorted(grouped.values(), key=lambda row: _overview_game_sort_key(str(row.get("game") or "")))
+
+
+def _overview_follow_type_distribution(signals: list[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[str, dict[str, Any]] = {}
+    by_game: dict[str, dict[str, Any]] = {}
+    for signal in signals:
+        game = _overview_signal_game(signal)
+        if not game:
+            continue
+        follow_type, follow_label = _overview_signal_follow_type(signal)
+        stake = _round_dashboard_float(sum(_leg_actual_stake(leg) for leg in signal.get("legs") or []))
+        row = grouped.setdefault(
+            follow_type,
+            {
+                "type": follow_type,
+                "label": follow_label,
+                "count": 0,
+                "stake": 0.0,
+            },
+        )
+        row["count"] += 1
+        row["stake"] = _round_dashboard_float(row["stake"] + stake)
+        game_row = by_game.setdefault(
+            game,
+            {
+                "game": game,
+                "game_label": GAME_FAMILY_LABELS.get(game, game.upper()),
+                "types": {},
+                "total": 0,
+                "total_stake": 0.0,
+            },
+        )
+        type_row = game_row["types"].setdefault(
+            follow_type,
+            {
+                "type": follow_type,
+                "label": follow_label,
+                "count": 0,
+                "stake": 0.0,
+            },
+        )
+        type_row["count"] += 1
+        type_row["stake"] = _round_dashboard_float(type_row["stake"] + stake)
+        game_row["total"] += 1
+        game_row["total_stake"] = _round_dashboard_float(_to_float(game_row["total_stake"]) + stake)
+    segments = sorted(
+        grouped.values(),
+        key=lambda row: (0 if str(row.get("type") or "") == "main_match" else 1, str(row.get("type") or "")),
+    )
+    game_rows = []
+    for game_row in by_game.values():
+        types = [
+            game_row["types"].get(
+                follow_type,
+                {"type": follow_type, "label": follow_label, "count": 0, "stake": 0.0},
+            )
+            for follow_type, follow_label in (("main_match", "主盘"), ("sub_game", "Sub Game"))
+        ]
+        game_rows.append(
+            {
+                "game": game_row["game"],
+                "game_label": game_row["game_label"],
+                "total": game_row["total"],
+                "total_stake": _round_dashboard_float(game_row["total_stake"]),
+                "types": types,
+            }
+        )
+    return {
+        "total": sum(int(row.get("count") or 0) for row in segments),
+        "total_stake": _round_dashboard_float(sum(_to_float(row.get("stake")) for row in segments)),
+        "segments": segments,
+        "by_game": sorted(game_rows, key=lambda row: _overview_game_sort_key(str(row.get("game") or ""))),
+    }
+
+
+def _overview_open_by_game(open_signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for signal in open_signals:
+        game = _overview_signal_game(signal)
+        if not game:
+            continue
+        row = grouped.setdefault(
+            game,
+            {
+                "game": game,
+                "game_label": GAME_FAMILY_LABELS.get(game, game.upper()),
+                "count": 0,
+            },
+        )
+        row["count"] += 1
+    return sorted(grouped.values(), key=lambda row: _overview_game_sort_key(str(row.get("game") or "")))
+
+
+def _overview_signal_game(signal: dict[str, Any]) -> str:
+    if _signal_category(signal) != "esports":
+        return ""
+    raw_values: list[Any] = [
+        signal.get("game_family"),
+        signal.get("best_game_family"),
+        signal.get("game"),
+        signal.get("league"),
+    ]
+    parts = _match_parts_for_row(signal)
+    if parts:
+        raw_values.append(parts.get("game"))
+    for value in raw_values:
+        game = _normalize_esports_game(value)
+        if game:
+            return game
+    return ""
+
+
+def _normalize_esports_game(value: Any) -> str:
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    compact = text.replace(" ", "")
+    if compact in {"cs2", "counterstrike2", "counterstrike"}:
+        return "cs2"
+    if compact in {"dota2", "dota"}:
+        return "dota2"
+    if compact in {"lol", "leagueoflegends", "league"}:
+        return "lol"
+    return ""
+
+
+def _overview_signal_market_type(signal: dict[str, Any]) -> str:
+    market_type = str(signal.get("market_type") or "").strip()
+    if market_type:
+        return market_type
+    label = str(signal.get("market_type_label") or "").strip()
+    for key, value in MARKET_TYPE_LABELS.items():
+        if label == value:
+            return key
+    return "main_match"
+
+
+def _overview_signal_follow_type(signal: dict[str, Any]) -> tuple[str, str]:
+    market_type = _overview_signal_market_type(signal)
+    if market_type in {"game_winner", "map_winner"}:
+        return "sub_game", "Sub Game"
+    return "main_match", MARKET_TYPE_LABELS.get("main_match", "主盘")
+
+
+def _overview_game_sort_key(game: str) -> tuple[int, str]:
+    return (_ESPORTS_GAME_ORDER.get(game, 99), game)
+
+
+def _round_dashboard_float(value: float) -> float:
+    return round(float(value or 0.0), 10)
 
 
 def _signal_category(signal: dict[str, Any]) -> str:
@@ -1383,7 +1674,15 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
     for category in CATEGORIES:
         category_rows = [row for row in rows if row.get("category") == category]
         category_rows.sort(key=wallet_leaderboard_rank_key)
-        for index, row in enumerate(category_rows, start=1):
+        for row in category_rows:
+            row.pop("rank", None)
+        active_rows = [
+            row
+            for row in category_rows
+            if not row.get("quarantined")
+            and not row.get("favorite_snapshot_only")
+        ]
+        for index, row in enumerate(active_rows, start=1):
             row["rank"] = index
     rows.sort(key=lambda row: (CATEGORIES.index(row.get("category")) if row.get("category") in CATEGORIES else len(CATEGORIES), row.get("rank") or 999999))
     rows_by_category = {
@@ -1394,14 +1693,19 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
     return {
         "wallets": rows,
         "count": len(rows),
-        "active_count": sum(1 for row in rows if not row.get("favorite") and not row.get("quarantined")),
+        "active_count": sum(1 for row in rows if not row.get("quarantined") and not row.get("favorite_snapshot_only")),
         "favorite_count": sum(1 for row in rows if row.get("favorite")),
         "quarantined_count": sum(1 for row in rows if not row.get("favorite") and row.get("quarantined")),
         "leaderboard_updated_at": max([mtime for *_rest, mtime in leaderboard_sources] or [0]),
         "by_category": {
             category: {
                 "count": len(rows_by_category.get(category, [])),
-                "active_count": sum(1 for row in rows_by_category.get(category, []) if not row.get("favorite") and not row.get("quarantined")),
+                "active_count": sum(
+                    1
+                    for row in rows_by_category.get(category, [])
+                    if not row.get("quarantined")
+                    and not row.get("favorite_snapshot_only")
+                ),
                 "favorite_count": sum(1 for row in rows_by_category.get(category, []) if row.get("favorite")),
                 "leaderboard_updated_at": source_mtimes.get(category, 0),
                 "scoring_version": max([int(row.get("scoring_version") or 0) for row in rows_by_category.get(category, [])] or [0]) or None,
@@ -1738,6 +2042,8 @@ def _leaderboard_rank_by_wallet(data_dir: Path, *, follow_dir: Path | None = Non
                 "category": category,
                 "quarantined": quarantine_key in quarantine or wallet in quarantine,
             }
+            if merged.get("quarantined"):
+                continue
             rows_by_category.setdefault(category, []).append(merged)
     ranks: dict[str, int] = {}
     for category, rows in rows_by_category.items():
@@ -2157,7 +2463,7 @@ def build_events(
 
 
 def _load_team_logo_cache(data_dir: Path) -> dict[str, str]:
-    static_path = Path(__file__).with_name("dashboard") / "static" / "team_logos" / "team_logos.json"
+    static_path = Path(__file__).with_name("dashboardV2") / "logo" / "team_logos.json"
     raw = _read_json(static_path, {})
     if not isinstance(raw, dict):
         return {}
@@ -2964,11 +3270,6 @@ def _read_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return default
-
-
-def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _file_mtime(path: Path) -> int:

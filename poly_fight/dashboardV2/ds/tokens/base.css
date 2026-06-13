@@ -1,0 +1,86 @@
+/* ============================================================
+   Poly Sniper — Base layer
+   Reset-ish defaults + the signature mesh-gradient canvas.
+   ============================================================ */
+
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  font: var(--text-body);
+  letter-spacing: var(--ls-body);
+  color: var(--text-primary);
+  background-color: var(--bg-canvas);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* The ambient gradient field everything floats over. Put this class
+   on the app root (or body). Fixed so it doesn't scroll. */
+.ps-canvas {
+  position: relative;
+  min-height: 100vh;
+  background-color: var(--bg-app);
+}
+.ps-canvas::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background: var(--gradient-mesh);
+  pointer-events: none;
+}
+.ps-canvas > * { position: relative; z-index: 1; }
+
+/* Numbers: always tabular so columns line up */
+.ps-num,
+.font-mono { font-variant-numeric: tabular-nums; font-feature-settings: var(--num-features); }
+.font-mono { font-family: var(--font-mono); letter-spacing: 0; }
+
+/* P&L coloring helpers */
+.pnl-up { color: var(--pnl-up); }
+.pnl-down { color: var(--pnl-down); }
+.pnl-flat { color: var(--pnl-flat); }
+
+/* Selection */
+::selection { background: var(--accent-soft); color: var(--text-primary); }
+
+/* Focus visibility */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Thin custom scrollbar (webkit) */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: var(--ink-500);
+  border-radius: var(--r-pill);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--ink-400); background-clip: content-box; }
+::-webkit-scrollbar-track { background: transparent; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* Theme-switch helper: toggle this class on the root for one beat while you flip
+   [data-theme] so colors/backgrounds (driven by theme-varying custom properties)
+   swap instantly instead of freezing mid-transition. Remove it after a paint. */
+.ps-theme-switching,
+.ps-theme-switching *,
+.ps-theme-switching *::before,
+.ps-theme-switching *::after {
+  transition: none !important;
+}
+

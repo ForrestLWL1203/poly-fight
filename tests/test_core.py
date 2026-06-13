@@ -5359,6 +5359,128 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(saved["balance"]["usable_balance_usdc"], 0)
             self.assertFalse(store.load_account_balance()["configured"])
 
+    def _library_strategy(self, *, ratio=10.0):
+        strategy = default_follow_strategy()
+        strategy["configured"] = True
+        strategy["stake_sizing"]["mode"] = "proportional"
+        strategy["stake_sizing"]["ratio_percent"] = ratio
+        strategy["prefilters"]["min_target_wallet_order_cash_usdc"] = 10
+        return strategy
+
+    def test_follow_strategy_library_first_create_auto_activates(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            self.assertEqual(store.list_follow_strategies(), {"strategies": [], "active_slug": None})
+
+            entry = store.create_follow_strategy("稳健", self._library_strategy(ratio=12), ts=100)
+            self.assertTrue(entry["active"])
+            listing = store.list_follow_strategies()
+            self.assertEqual(listing["active_slug"], entry["slug"])
+            self.assertEqual(len(listing["strategies"]), 1)
+            # the runner-facing active row mirrors the first (auto-active) strategy
+            active = store.load_follow_strategy()
+            self.assertTrue(active["configured"])
+            self.assertEqual(active["stake_sizing"]["ratio_percent"], 12)
+
+    def test_follow_strategy_library_second_create_inactive(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            store.create_follow_strategy("A", self._library_strategy(ratio=10), ts=100)
+            b = store.create_follow_strategy("B", self._library_strategy(ratio=20), ts=200)
+            self.assertFalse(b["active"])
+            # active row still the first one
+            self.assertEqual(store.load_follow_strategy()["stake_sizing"]["ratio_percent"], 10)
+
+    def test_follow_strategy_library_rejects_duplicate_name(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            store.create_follow_strategy("稳健", self._library_strategy(), ts=100)
+            with self.assertRaisesRegex(ValueError, "duplicate_name"):
+                store.create_follow_strategy("稳健", self._library_strategy(), ts=200)
+            with self.assertRaisesRegex(ValueError, "duplicate_name"):
+                store.create_follow_strategy("  稳健  ", self._library_strategy(), ts=200)
+
+    def test_follow_strategy_library_requires_name(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            with self.assertRaisesRegex(ValueError, "name_required"):
+                store.create_follow_strategy("   ", self._library_strategy(), ts=100)
+
+    def test_follow_strategy_library_activate_switches_and_mirrors(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            a = store.create_follow_strategy("A", self._library_strategy(ratio=10), ts=100)
+            b = store.create_follow_strategy("B", self._library_strategy(ratio=25), ts=200)
+
+            listing = store.activate_follow_strategy(b["slug"], ts=300)
+            self.assertEqual(listing["active_slug"], b["slug"])
+            self.assertEqual(store.load_follow_strategy()["stake_sizing"]["ratio_percent"], 25)
+            actives = [e["active"] for e in listing["strategies"]]
+            self.assertEqual(actives.count(True), 1)
+
+            store.activate_follow_strategy(a["slug"], ts=400)
+            self.assertEqual(store.load_follow_strategy()["stake_sizing"]["ratio_percent"], 10)
+
+    def test_follow_strategy_library_update_active_mirrors_runner_row(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            a = store.create_follow_strategy("A", self._library_strategy(ratio=10), ts=100)
+            b = store.create_follow_strategy("B", self._library_strategy(ratio=20), ts=200)
+
+            # updating the non-active strategy must not touch the runner row
+            store.update_follow_strategy_entry(b["slug"], "B2", self._library_strategy(ratio=33), ts=300)
+            self.assertEqual(store.load_follow_strategy()["stake_sizing"]["ratio_percent"], 10)
+
+            # updating the active strategy mirrors into the runner row
+            store.update_follow_strategy_entry(a["slug"], "A2", self._library_strategy(ratio=44), ts=400)
+            self.assertEqual(store.load_follow_strategy()["stake_sizing"]["ratio_percent"], 44)
+            names = sorted(e["name"] for e in store.list_follow_strategies()["strategies"])
+            self.assertEqual(names, ["A2", "B2"])
+
+    def test_follow_strategy_library_update_rejects_duplicate_and_missing(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            store.create_follow_strategy("A", self._library_strategy(), ts=100)
+            b = store.create_follow_strategy("B", self._library_strategy(), ts=200)
+            with self.assertRaisesRegex(ValueError, "duplicate_name"):
+                store.update_follow_strategy_entry(b["slug"], "A", self._library_strategy(), ts=300)
+            with self.assertRaisesRegex(ValueError, "strategy_not_found"):
+                store.update_follow_strategy_entry("nope", "X", self._library_strategy(), ts=300)
+
+    def test_follow_strategy_library_delete_active_promotes_last_remaining(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            a = store.create_follow_strategy("A", self._library_strategy(ratio=10), ts=100)
+            b = store.create_follow_strategy("B", self._library_strategy(ratio=20), ts=200)
+
+            listing = store.delete_follow_strategy_entry(a["slug"], ts=300)
+            # exactly one remains → it is auto-promoted to active and mirrored
+            self.assertEqual(listing["active_slug"], b["slug"])
+            self.assertEqual(store.load_follow_strategy()["stake_sizing"]["ratio_percent"], 20)
+
+    def test_follow_strategy_library_delete_active_leaves_none_when_many(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            a = store.create_follow_strategy("A", self._library_strategy(), ts=100)
+            store.create_follow_strategy("B", self._library_strategy(), ts=200)
+            store.create_follow_strategy("C", self._library_strategy(), ts=300)
+
+            listing = store.delete_follow_strategy_entry(a["slug"], ts=400)
+            # two remain, neither auto-activated → runner sees no configured strategy
+            self.assertIsNone(listing["active_slug"])
+            self.assertEqual(len(listing["strategies"]), 2)
+            self.assertFalse(store.load_follow_strategy()["configured"])
+
+    def test_follow_strategy_library_delete_inactive_keeps_active(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            a = store.create_follow_strategy("A", self._library_strategy(ratio=10), ts=100)
+            b = store.create_follow_strategy("B", self._library_strategy(ratio=20), ts=200)
+
+            listing = store.delete_follow_strategy_entry(b["slug"], ts=300)
+            self.assertEqual(listing["active_slug"], a["slug"])
+            self.assertEqual(store.load_follow_strategy()["stake_sizing"]["ratio_percent"], 10)
+
     def test_follow_store_clears_legacy_quarantine_reasons(self):
         with TemporaryDirectory() as tmp:
             store = FollowStore(Path(tmp) / "follow.db")
@@ -7508,8 +7630,8 @@ class CoreTest(unittest.TestCase):
                 dashboard_module,
                 "_load_team_logo_cache",
                 return_value={
-                    "nba los angeles dodgers": "/team_logos/dodgers.png",
-                    "nba san diego padres": "/team_logos/padres.png",
+                    "nba los angeles dodgers": "/logo/dodgers.png",
+                    "nba san diego padres": "/logo/padres.png",
                 },
             ):
                 events = build_events(data_dir)
@@ -7524,8 +7646,8 @@ class CoreTest(unittest.TestCase):
                     "meta": "Moneyline",
                 },
             )
-            self.assertEqual(events["events"][0]["team_logos"]["teamA"], "/team_logos/dodgers.png")
-            self.assertEqual(events["events"][0]["team_logos"]["teamB"], "/team_logos/padres.png")
+            self.assertEqual(events["events"][0]["team_logos"]["teamA"], "/logo/dodgers.png")
+            self.assertEqual(events["events"][0]["team_logos"]["teamB"], "/logo/padres.png")
 
     def test_dashboard_events_read_active_markets_from_follow_db(self):
         with TemporaryDirectory() as tmp:
@@ -7559,7 +7681,7 @@ class CoreTest(unittest.TestCase):
     def test_sports_watched_events_missing_logos_trigger_refresh_scan(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            logo_dir = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "team_logos"
+            logo_dir = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboardV2" / "logo"
             logo_path = logo_dir / "team_logos.json"
             before_json = logo_path.read_bytes() if logo_path.exists() else None
             before_files = set(logo_dir.glob("*")) if logo_dir.exists() else set()
@@ -7608,7 +7730,7 @@ class CoreTest(unittest.TestCase):
 
                 self.assertEqual(summary["watched_event_count"], 1)
                 self.assertEqual(calls, ["pytest-bears-kings-2026-06-08"])
-                self.assertTrue(logo_cache["teams"]["pytest sample kings"].startswith("/team_logos/"))
+                self.assertTrue(logo_cache["teams"]["pytest sample kings"].startswith("/logo/"))
                 self.assertNotIn("nba", logo_cache["teams"])
             finally:
                 if before_json is None:
@@ -8618,6 +8740,87 @@ class CoreTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_dashboard_follow_strategy_library_endpoints(self):
+        with TemporaryDirectory() as tmp:
+            server = create_server(
+                DashboardConfig(
+                    data_dir=Path(tmp),
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+
+                def call(method, path, body=None, cookie=None):
+                    conn = http.client.HTTPConnection(host, port, timeout=5)
+                    headers = {"Content-Type": "application/json"}
+                    if cookie:
+                        headers["Cookie"] = cookie
+                    conn.request(method, path, body=json.dumps(body) if body is not None else None, headers=headers)
+                    resp = conn.getresponse()
+                    raw = resp.read().decode()
+                    conn.close()
+                    return resp.status, (json.loads(raw) if raw else None), resp.getheader("Set-Cookie") or ""
+
+                _, _, cookie = call("POST", "/api/login", {"username": "admin", "password": "pw"})
+
+                valid = {
+                    "configured": True,
+                    "stake_sizing": {"mode": "proportional", "ratio_percent": 12, "per_order_cap_enabled": False,
+                                     "per_order_cap_usdc": 0, "fixed_usdc": 0, "balance_percent": 0},
+                    "prefilters": {"min_target_wallet_order_cash_usdc": 10},
+                    "condition_limits": {"order_count_mode": "none", "max_orders": 0, "stake_cap_mode": "none",
+                                          "stake_cap_usdc": 0, "stake_cap_balance_percent": 0},
+                    "balance": {"required": False, "usable_balance_usdc": 0},
+                }
+
+                status, payload, _ = call("GET", "/api/follow-strategies", cookie=cookie)
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["data"], {"strategies": [], "active_slug": None})
+
+                status, payload, _ = call("POST", "/api/follow-strategies", {"name": "稳健", "strategy": valid}, cookie=cookie)
+                self.assertEqual(status, 200)
+                self.assertTrue(payload["data"]["active"])
+                slug_a = payload["data"]["slug"]
+
+                # the runner-facing strategy endpoint reflects the active strategy
+                status, payload, _ = call("GET", "/api/follow-strategy", cookie=cookie)
+                self.assertTrue(payload["data"]["configured"])
+                self.assertEqual(payload["data"]["stake_sizing"]["ratio_percent"], 12)
+
+                # duplicate name → 409
+                status, payload, _ = call("POST", "/api/follow-strategies", {"name": "稳健", "strategy": valid}, cookie=cookie)
+                self.assertEqual(status, 409)
+                self.assertEqual(payload["error"], "duplicate_name")
+
+                # second strategy, then activate it
+                status, payload, _ = call("POST", "/api/follow-strategies", {"name": "激进", "strategy": valid}, cookie=cookie)
+                slug_b = payload["data"]["slug"]
+                self.assertFalse(payload["data"]["active"])
+
+                status, payload, _ = call("POST", f"/api/follow-strategies/{slug_b}/activate", {}, cookie=cookie)
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["data"]["active_slug"], slug_b)
+
+                # update a missing slug → 404
+                status, payload, _ = call("POST", "/api/follow-strategies/nope/update", {"name": "X", "strategy": valid}, cookie=cookie)
+                self.assertEqual(status, 404)
+
+                # delete active (slug_b) — slug_a remains and is auto-promoted
+                status, payload, _ = call("POST", f"/api/follow-strategies/{slug_b}/delete", {}, cookie=cookie)
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["data"]["active_slug"], slug_a)
+                self.assertEqual(len(payload["data"]["strategies"]), 1)
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_dashboard_serves_bundled_index_html(self):
         with TemporaryDirectory() as tmp:
             server = create_server(
@@ -8641,8 +8844,10 @@ class CoreTest(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertIn("text/html", response.getheader("Content-Type") or "")
                 self.assertIn("Polymarket Sniper", body)
-                self.assertIn("/app.js", body)
-                self.assertIn("/vendor/vue-3.5.13.global.prod.js", body)
+                self.assertIn("/app.jsx", body)
+                self.assertIn("/ds/_ds_bundle.js", body)
+                self.assertIn("/vendor/react-18.3.1.production.min.js", body)
+                self.assertNotIn("vue-3", body)
                 self.assertNotIn("cdn.jsdelivr.net", body)
                 conn.close()
             finally:
@@ -10084,6 +10289,144 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(overview["wallet_basis_realized_roi"], 1.0)
             self.assertAlmostEqual(overview["delay_cost"], 0.2)
 
+    def test_dashboard_overview_exposes_full_app_esports_aggregates(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "open-cs2",
+                        "wallet": "0xabc",
+                        "condition_id": "m-open-cs2",
+                        "status": "open",
+                        "category": "esports",
+                        "game_family": "cs2",
+                        "market_type": "main_match",
+                        "legs": [{"stake": 2, "would_follow": True}],
+                    },
+                    {
+                        "signal_id": "open-dota",
+                        "wallet": "0xabc",
+                        "condition_id": "m-open-dota",
+                        "status": "open",
+                        "category": "esports",
+                        "game_family": "dota2",
+                        "market_type": "game_winner",
+                        "legs": [{"stake": 3, "would_follow": True}],
+                    },
+                    {
+                        "signal_id": "open-sports",
+                        "wallet": "0xabc",
+                        "condition_id": "m-open-sports",
+                        "status": "open",
+                        "category": "sports",
+                        "league": "nba",
+                        "market_type": "main_match",
+                        "legs": [{"stake": 9, "would_follow": True}],
+                    },
+                ],
+                result_events=[
+                    {
+                        "signal_id": "win-cs2",
+                        "wallet": "0xabc",
+                        "condition_id": "m-win-cs2",
+                        "status": "settled",
+                        "category": "esports",
+                        "game_family": "cs2",
+                        "market_type": "main_match",
+                        "outcome_won": True,
+                        "our_paper_pnl": 0.5,
+                        "legs": [{"stake": 1, "would_follow": True}],
+                        "settled_at": 110,
+                    },
+                    {
+                        "signal_id": "loss-cs2",
+                        "wallet": "0xabc",
+                        "condition_id": "m-loss-cs2",
+                        "status": "settled",
+                        "category": "esports",
+                        "game_family": "cs2",
+                        "market_type": "main_match",
+                        "outcome_won": False,
+                        "our_paper_pnl": -1.0,
+                        "legs": [{"stake": 1, "would_follow": True}],
+                        "settled_at": 120,
+                    },
+                    {
+                        "signal_id": "win-dota",
+                        "wallet": "0xabc",
+                        "condition_id": "m-win-dota",
+                        "status": "settled",
+                        "category": "esports",
+                        "game_family": "dota2",
+                        "market_type": "game_winner",
+                        "outcome_won": True,
+                        "our_paper_pnl": 2.0,
+                        "legs": [{"stake": 4, "would_follow": True}],
+                        "settled_at": 130,
+                    },
+                    {
+                        "signal_id": "win-nba",
+                        "wallet": "0xabc",
+                        "condition_id": "m-win-nba",
+                        "status": "settled",
+                        "category": "sports",
+                        "league": "nba",
+                        "market_type": "main_match",
+                        "outcome_won": True,
+                        "our_paper_pnl": 8.0,
+                        "legs": [{"stake": 9, "would_follow": True}],
+                        "settled_at": 140,
+                    },
+                ],
+                performance={"wallets": {}, "total": {}},
+            )
+
+            overview = build_overview(data_dir)
+
+            self.assertEqual(
+                [
+                    {"timestamp": 110, "pnl": 0.5, "cumulative_pnl": 0.5},
+                    {"timestamp": 120, "pnl": -1.0, "cumulative_pnl": -0.5},
+                    {"timestamp": 130, "pnl": 2.0, "cumulative_pnl": 1.5},
+                ],
+                overview["equity_points"],
+            )
+            win_rates = {row["game"]: row for row in overview["win_rates_by_game"]}
+            self.assertEqual(win_rates["cs2"]["game_label"], "CS2")
+            self.assertEqual(win_rates["cs2"]["wins"], 1)
+            self.assertEqual(win_rates["cs2"]["losses"], 1)
+            self.assertEqual(win_rates["cs2"]["settled_count"], 2)
+            self.assertEqual(win_rates["cs2"]["win_rate"], 0.5)
+            self.assertEqual(win_rates["dota2"]["wins"], 1)
+            self.assertNotIn("nba", win_rates)
+
+            open_by_game = {row["game"]: row["count"] for row in overview["open_by_game"]}
+            self.assertEqual({"cs2": 1, "dota2": 1}, open_by_game)
+
+            distribution = {
+                row["type"]: row
+                for row in overview["follow_type_distribution"]["segments"]
+            }
+            self.assertEqual(distribution["main_match"]["label"], "主盘")
+            self.assertEqual(distribution["main_match"]["count"], 2)
+            self.assertEqual(distribution["main_match"]["stake"], 2.0)
+            self.assertEqual(distribution["sub_game"]["label"], "Sub Game")
+            self.assertEqual(distribution["sub_game"]["count"], 1)
+            self.assertEqual(distribution["sub_game"]["stake"], 4.0)
+            self.assertEqual(overview["follow_type_distribution"]["total"], 3)
+            self.assertEqual(overview["follow_type_distribution"]["total_stake"], 6.0)
+            by_game = {
+                row["game"]: {item["type"]: item for item in row["types"]}
+                for row in overview["follow_type_distribution"]["by_game"]
+            }
+            self.assertEqual(by_game["cs2"]["main_match"]["count"], 2)
+            self.assertEqual(by_game["cs2"]["sub_game"]["count"], 0)
+            self.assertEqual(by_game["dota2"]["main_match"]["count"], 0)
+            self.assertEqual(by_game["dota2"]["sub_game"]["count"], 1)
+
     def test_dashboard_overview_exposes_total_tracking_duration(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -10587,7 +10930,7 @@ class CoreTest(unittest.TestCase):
     def test_dashboard_rows_include_cached_team_logos(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            static_logo_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "team_logos" / "team_logos.json"
+            static_logo_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboardV2" / "logo" / "team_logos.json"
             old_static_logos = read_json(static_logo_path, None) if static_logo_path.exists() else None
             self.addCleanup(lambda: write_json(static_logo_path, old_static_logos) if old_static_logos is not None else static_logo_path.unlink(missing_ok=True))
             write_json(
@@ -10642,7 +10985,7 @@ class CoreTest(unittest.TestCase):
     def test_refresh_team_logo_cache_scans_watched_event_slugs(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            static_logo_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboard" / "static" / "team_logos" / "team_logos.json"
+            static_logo_path = Path(__file__).resolve().parents[1] / "poly_fight" / "dashboardV2" / "logo" / "team_logos.json"
             static_logo_dir = static_logo_path.parent
             old_static_logos = read_json(static_logo_path, None) if static_logo_path.exists() else None
             old_static_files = {path.name: path.read_bytes() for path in static_logo_dir.glob("*") if path.is_file()} if static_logo_dir.exists() else {}
@@ -10710,8 +11053,8 @@ class CoreTest(unittest.TestCase):
 
             self.assertEqual(summary["watched_event_count"], 1)
             self.assertEqual(len(fetched_urls), 2)
-            self.assertTrue(logos["teams"]["legacy"].startswith("/team_logos/"))
-            self.assertTrue(logos["teams"]["mibr"].startswith("/team_logos/"))
+            self.assertTrue(logos["teams"]["legacy"].startswith("/logo/"))
+            self.assertTrue(logos["teams"]["mibr"].startswith("/logo/"))
             self.assertTrue((static_logo_dir / logos["teams"]["legacy"].rsplit("/", 1)[-1]).exists())
             self.assertTrue((static_logo_dir / logos["teams"]["mibr"].rsplit("/", 1)[-1]).exists())
 
@@ -10970,8 +11313,35 @@ class CoreTest(unittest.TestCase):
             detail = build_follow_detail(data_dir, "m1")
 
             self.assertEqual([row["wallet"] for row in wallets], [clean_top, target, quarantined])
-            self.assertEqual([row["rank"] for row in wallets], [1, 2, 3])
+            self.assertEqual([row.get("rank") for row in wallets], [1, 2, None])
             self.assertEqual(detail["wallets"][0]["leaderboard_rank"], 2)
+
+    def test_dashboard_wallet_ranks_compact_after_quarantine(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            clean_top = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            quarantined = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            shifted = "0xcccccccccccccccccccccccccccccccccccccccc"
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [
+                    {"wallet": clean_top, "grade": "A", "best_bucket_score": 90, "positive_market_rate": 1.0},
+                    {"wallet": quarantined, "grade": "A", "best_bucket_score": 89, "positive_market_rate": 1.0},
+                    {"wallet": shifted, "grade": "A", "best_bucket_score": 88, "positive_market_rate": 1.0},
+                ],
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.upsert_wallet_quarantine(quarantined, reason="material_sell", ts=100)
+
+            wallets = build_wallets(data_dir)
+
+            by_wallet = {row["wallet"]: row for row in wallets["wallets"]}
+            self.assertEqual([row["wallet"] for row in wallets["wallets"]], [clean_top, shifted, quarantined])
+            self.assertEqual(by_wallet[clean_top]["rank"], 1)
+            self.assertEqual(by_wallet[shifted]["rank"], 2)
+            self.assertNotIn("rank", by_wallet[quarantined])
+            self.assertEqual(wallets["active_count"], 2)
+            self.assertEqual(wallets["quarantined_count"], 1)
 
     def test_dashboard_follow_detail_does_not_mix_wallet_avg_across_outcomes(self):
         with TemporaryDirectory() as tmp:
@@ -11237,6 +11607,36 @@ class CoreTest(unittest.TestCase):
             self.assertFalse(by_wallet["0xbbb"]["favorite"])
             self.assertTrue(by_wallet["0xbbb"]["quarantined"])
             self.assertTrue(by_wallet["0xccc"]["quarantined"])
+
+    def test_dashboard_wallets_keep_leaderboard_favorites_active(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_json(
+                data_dir / "smart_wallet_leaderboard.json",
+                [
+                    {"wallet": "0xaaa", "category": "esports", "grade": "A", "positive_market_rate": 1.0},
+                    {"wallet": "0xbbb", "category": "esports", "grade": "A", "positive_market_rate": 1.0},
+                    {"wallet": "0xccc", "category": "esports", "grade": "A", "positive_market_rate": 1.0},
+                ],
+            )
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            store.upsert_wallet_favorite(
+                "0xbbb",
+                category="esports",
+                favorite=True,
+                ts=200,
+                snapshot={"wallet": "0xbbb", "grade": "A", "eligible_market_types": ["main_match"]},
+            )
+
+            wallets = build_wallets(data_dir)
+
+            self.assertEqual(wallets["active_count"], 3)
+            self.assertEqual(wallets["favorite_count"], 1)
+            self.assertEqual(wallets["by_category"]["esports"]["active_count"], 3)
+            self.assertEqual(wallets["by_category"]["esports"]["favorite_count"], 1)
+            by_wallet = {row["wallet"]: row for row in wallets["wallets"]}
+            self.assertTrue(by_wallet["0xbbb"]["favorite"])
+            self.assertFalse(by_wallet["0xbbb"]["favorite_snapshot_only"])
 
     def test_dashboard_wallets_append_snapshot_only_favorites(self):
         with TemporaryDirectory() as tmp:

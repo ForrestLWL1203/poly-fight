@@ -20,3 +20,6 @@ sample/
 
 # Local secrets and private agent memory. Never commit.
 secret/
+
+# Local Claude Code / IDE tooling config (may contain local dev credentials).
+.claude/

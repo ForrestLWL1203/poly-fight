@@ -1,0 +1,45 @@
+/* ============================================================
+   Poly Sniper — Spacing, radii, sizing
+   8pt-ish base with a few half-steps. Generous whitespace.
+   ============================================================ */
+
+:root {
+  /* ---- Spacing scale ---- */
+  --sp-0: 0; /* @kind spacing */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-7: 32px;
+  --sp-8: 40px;
+  --sp-9: 48px;
+  --sp-10: 64px;
+  --sp-11: 80px;
+  --sp-12: 96px;
+
+  /* Layout rhythm */
+  --gutter: var(--sp-6);          /* gap between cards */
+  --page-pad: var(--sp-8);        /* content padding from edges */
+  --sidebar-w: 264px;
+  --topbar-h: 68px;
+
+  /* ---- Radii — everything rounded, capsules for buttons/pills ---- */
+  --r-xs: 8px;
+  --r-sm: 12px;
+  --r-md: 16px;       /* chips, inputs */
+  --r-lg: 20px;       /* cards */
+  --r-xl: 28px;       /* large panels */
+  --r-2xl: 36px;
+  --r-pill: 999px;    /* buttons, status pills, tags */
+
+  /* ---- Control heights (hit targets ≥ 44px for primary) ---- */
+  --control-sm: 32px;
+  --control-md: 40px;
+  --control-lg: 48px;
+  --icon-btn: 40px;
+
+  /* ---- Content widths ---- */
+  --maxw-content: 1200px;
+}

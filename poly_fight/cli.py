@@ -44,7 +44,6 @@ from .core import (
     bucket_label,
     classify_market_type,
     ESPORTS_DISCOVERY_GAME_MARKET_TYPE_LIMITS,
-    classify_wallet,
     event_to_market_record,
     event_to_market_records,
     split_bucket_key,
@@ -54,7 +53,6 @@ from .core import (
     parse_dt,
     parse_jsonish,
     profile_candidate_wallet,
-    summarize_closed_positions,
     summarize_trade_reconstructed_positions,
     to_float,
     to_int,
@@ -67,17 +65,13 @@ from .follow import (
     contested_markets,
     desired_tick_interval,
     eligible_follow_wallets,
-    esports_match_imminent,
-    evaluate_slippage,
     leg_actual_stake,
-    market_current_price,
     paper_exit_pnl,
     paper_pnl,
     process_follow_trades,
     prune_unfollowed_signals,
     select_new_trades,
     settle_open_signals,
-    summarize_wallet_fills,
     trade_condition_id,
     trade_timestamp,
     winner_outcome_index,
@@ -1715,7 +1709,7 @@ def refresh_team_logo_cache_from_active_markets(
         slug = str(market.get("event_slug") or "").strip()
         if slug:
             by_slug.setdefault(slug, market)
-    logo_dir = Path(__file__).with_name("dashboard") / "static" / "team_logos"
+    logo_dir = Path(__file__).with_name("dashboardV2") / "logo"
     logo_path = logo_dir / "team_logos.json"
     cache = read_json(logo_path, {})
     if not isinstance(cache, dict):
@@ -1725,7 +1719,7 @@ def refresh_team_logo_cache_from_active_markets(
 
     def cached_logo_exists(value: str) -> bool:
         url = str(value or "")
-        if not url.startswith("/team_logos/"):
+        if not url.startswith("/logo/"):
             return False
         return (logo_dir / url.rsplit("/", 1)[-1]).exists()
 
@@ -1758,7 +1752,7 @@ def refresh_team_logo_cache_from_active_markets(
         if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
             suffix = ".png"
         digest = hashlib.sha1(remote_url.encode("utf-8")).hexdigest()[:20]
-        return f"/team_logos/{digest}{suffix}"
+        return f"/logo/{digest}{suffix}"
 
     def worker(slug: str) -> tuple[int, list[tuple[str, str, str, bytes]]]:
         market = by_slug[slug]
@@ -4988,37 +4982,6 @@ def momentum_recent_ok(row: dict[str, Any]) -> bool:
     return recent_7d_ok or recent_14d_ok
 
 
-def momentum_quality_ok(row: dict[str, Any]) -> bool:
-    if not momentum_recent_ok(row):
-        return False
-    metrics = leaderboard_rank_metrics(row)
-    best_bucket = str(row.get("best_bucket") or "")
-    candidate_metrics = _candidate_bucket_metrics(row, best_bucket) if best_bucket else {}
-    if to_float(row.get("esports_roi")) < MOMENTUM_MIN_OVERALL_ROI:
-        return False
-    if to_float(metrics.get("capital_weighted_edge") or metrics.get("entry_edge")) < MOMENTUM_MIN_CAPITAL_WEIGHTED_EDGE:
-        return False
-    median_entry = to_float(metrics.get("median_entry_price") or row.get("median_entry_price"))
-    if median_entry <= 0 or median_entry > MOMENTUM_MAX_MEDIAN_ENTRY_PRICE:
-        return False
-    if to_float(row.get("actual_minus_hold_pnl_rate")) > SWING_DEPENDENT_RATE:
-        return False
-    behavior_market_count = int(row.get("historical_trade_behavior_market_count") or 0)
-    two_sided_rate = to_float(row.get("two_sided_trade_market_rate"))
-    if behavior_market_count >= TRADE_BEHAVIOR_MIN_MARKETS and two_sided_rate > MOMENTUM_MAX_TWO_SIDED_RATE:
-        return False
-    if not copyable_two_sided_behavior_ok(candidate_metrics, metrics):
-        return False
-    participated = int(candidate_metrics.get("participated_market_count") or 0)
-    if participated > 0:
-        tail_rate = int(candidate_metrics.get("tail_entry_market_count") or 0) / participated
-        if tail_rate > 0.34:
-            return False
-    if not row.get("eligible_buckets") and not row.get("eligible_market_types"):
-        return False
-    return True
-
-
 def momentum_score(row: dict[str, Any]) -> float:
     metrics = leaderboard_rank_metrics(row)
     recent_7d_score = 0.0
@@ -6869,6 +6832,11 @@ def command_serve(args: argparse.Namespace) -> int:
         data_dir=resolve_dashboard_root(args),
         follow_dir=resolve_follow_dir(args, resolve_dashboard_root(args)),
         log_dir=Path(args.log_dir) if args.log_dir else None,
+        static_dir=(
+            Path(args.static_dir).expanduser().resolve()
+            if getattr(args, "static_dir", None)
+            else Path(__file__).resolve().with_name("dashboardV2")
+        ),
         host=args.host,
         port=args.port,
         username=args.user,
@@ -7108,6 +7076,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--stream-poll-seconds", type=float, default=2.0)
     serve.add_argument("--stream-heartbeat-seconds", type=float, default=15.0)
     serve.add_argument("--max-stream-clients", type=int, default=8)
+    serve.add_argument("--static-dir", help="override the directory of static dashboard assets (e.g. the dashboardV2 build)")
     serve.add_argument("--follow-dir")
     serve.set_defaults(func=command_serve)
     return parser

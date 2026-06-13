@@ -1,0 +1,54 @@
+/* ============================================================
+   Poly Sniper — Effects: blur, shadow, motion
+   The frosted-glass + soft-shadow system that defines the look.
+   ============================================================ */
+
+:root {
+  /* ---- Backdrop blur (frosted glass) ---- */
+  --blur-thin: blur(12px) saturate(160%); /* @kind other */
+  --blur-regular: blur(24px) saturate(175%); /* @kind other */
+  --blur-thick: blur(40px) saturate(185%); /* @kind other */
+
+  /* ---- Shadows — soft, diffuse, theme-aware (warm on light) ---- */
+  --shadow-xs: 0 1px 2px var(--shadow-c-1);
+  --shadow-sm: 0 4px 14px var(--shadow-c-2);
+  --shadow-md: 0 14px 34px var(--shadow-c-3);
+  --shadow-lg: 0 26px 60px var(--shadow-c-4);
+  --shadow-pop: 0 30px 80px var(--shadow-c-4);    /* dialogs */
+  --shadow-accent: 0 10px 28px var(--shadow-accent-c);  /* coral CTA lift */
+
+  /* Inner top-highlight that sells the glass material */
+  --inner-highlight: inset 0 1px 0 var(--highlight-c); /* @kind shadow */
+  --inner-highlight-strong: inset 0 1px 0 var(--highlight-c); /* @kind shadow */
+
+  /* ---- Motion — Apple spring/ease, quick & calm ---- */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1); /* @kind other */
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1); /* @kind other */
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1); /* @kind other */
+  --dur-fast: 0.16s; /* @kind other */
+  --dur-base: 0.24s; /* @kind other */
+  --dur-slow: 0.4s; /* @kind other */
+
+  /* Standard transitions. NOTE: `color` and `background` are intentionally NOT
+     transitioned anywhere in this system. Both are driven by theme-varying custom
+     properties, and browsers FREEZE a var()-based color/background at its stale
+     value when the var changes (on hover OR theme switch) instead of interpolating.
+     Hover affordances therefore use border-color / box-shadow / transform / filter,
+     which interpolate cleanly and never break on a theme flip. */
+  --t-press: transform var(--dur-fast) var(--ease-out); /* @kind other */
+  --t-hover: border-color var(--dur-base) var(--ease-out),
+             box-shadow var(--dur-base) var(--ease-out); /* @kind other */
+}
+
+/* Reusable glass surface helper — apply to any panel/card.
+   Falls back to a solid surface when backdrop-filter is unsupported. */
+.ps-glass {
+  background: var(--surface-card);
+  border: 1px solid var(--border-hairline);
+  box-shadow: var(--shadow-md), var(--inner-highlight);
+  -webkit-backdrop-filter: var(--blur-regular);
+  backdrop-filter: var(--blur-regular);
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .ps-glass { background: var(--surface-solid); }
+}

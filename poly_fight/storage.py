@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import time
 import hashlib
@@ -760,6 +761,15 @@ class FollowStore:
                     updated_at INTEGER NOT NULL,
                     raw_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS follow_strategy_library (
+                    slug TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    is_active INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_follow_strategy_library_name
+                    ON follow_strategy_library(name COLLATE NOCASE);
                 CREATE INDEX IF NOT EXISTS idx_follow_signals_status ON follow_signals(status);
                 CREATE INDEX IF NOT EXISTS idx_follow_signals_wallet ON follow_signals(wallet);
                 CREATE INDEX IF NOT EXISTS idx_follow_signals_condition_id ON follow_signals(condition_id);
@@ -1011,6 +1021,173 @@ class FollowStore:
             return self.load_follow_strategy(readonly)
         finally:
             readonly.close()
+
+    # ---- named strategy library (multiple saved strategies, one active) ----
+
+    @staticmethod
+    def _strategy_entry(slug: str, name: str, *, active: bool, updated_at: int, strategy: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "slug": str(slug),
+            "name": str(name),
+            "active": bool(active),
+            "updated_at": int(updated_at),
+            "strategy": strategy,
+        }
+
+    @staticmethod
+    def _normalize_library_strategy(payload: Any, *, updated_at: int | None = None) -> dict[str, Any]:
+        normalized = normalize_follow_strategy(payload if isinstance(payload, dict) else None, updated_at=updated_at)
+        normalized["configured"] = True
+        return normalized
+
+    def _new_strategy_slug(self, conn: sqlite3.Connection) -> str:
+        for _ in range(32):
+            slug = "s" + secrets.token_hex(5)
+            hit = conn.execute("SELECT 1 FROM follow_strategy_library WHERE slug = ?", (slug,)).fetchone()
+            if not hit:
+                return slug
+        raise ValueError("slug_generation_failed")
+
+    def list_follow_strategies(self) -> dict[str, Any]:
+        self.init_db()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT slug, name, is_active, updated_at, raw_json FROM follow_strategy_library "
+                "ORDER BY updated_at ASC, slug ASC"
+            ).fetchall()
+        strategies: list[dict[str, Any]] = []
+        active_slug: str | None = None
+        for row in rows:
+            payload = _loads(row["raw_json"], {})
+            strategy = self._normalize_library_strategy(payload)
+            active = bool(row["is_active"])
+            if active:
+                active_slug = str(row["slug"])
+            strategies.append(
+                self._strategy_entry(
+                    str(row["slug"]),
+                    str(row["name"]),
+                    active=active,
+                    updated_at=int(row["updated_at"]),
+                    strategy=strategy,
+                )
+            )
+        return {"strategies": strategies, "active_slug": active_slug}
+
+    def create_follow_strategy(self, name: str, strategy: dict[str, Any], *, ts: int | None = None) -> dict[str, Any]:
+        self.init_db()
+        updated_at = int(ts or time.time())
+        name = str(name or "").strip()
+        if not name:
+            raise ValueError("name_required")
+        normalized = self._normalize_library_strategy(strategy, updated_at=updated_at)
+        valid, errors = validate_follow_strategy(normalized)
+        if not valid:
+            raise ValueError("invalid_follow_strategy:" + ",".join(errors))
+        make_active = False
+        with self.connect() as conn:
+            dup = conn.execute(
+                "SELECT 1 FROM follow_strategy_library WHERE name = ? COLLATE NOCASE", (name,)
+            ).fetchone()
+            if dup:
+                raise ValueError("duplicate_name")
+            count_row = conn.execute("SELECT COUNT(*) AS n FROM follow_strategy_library").fetchone()
+            make_active = int(count_row["n"]) == 0 if count_row else True
+            slug = self._new_strategy_slug(conn)
+            if make_active:
+                conn.execute("UPDATE follow_strategy_library SET is_active = 0")
+            conn.execute(
+                "INSERT INTO follow_strategy_library(slug, name, is_active, updated_at, raw_json) VALUES (?, ?, ?, ?, ?)",
+                (slug, name, 1 if make_active else 0, updated_at, _dumps(normalized)),
+            )
+        if make_active:
+            self.save_follow_strategy(normalized, ts=updated_at)
+        return self._strategy_entry(slug, name, active=make_active, updated_at=updated_at, strategy=normalized)
+
+    def update_follow_strategy_entry(
+        self, slug: str, name: str, strategy: dict[str, Any], *, ts: int | None = None
+    ) -> dict[str, Any]:
+        self.init_db()
+        updated_at = int(ts or time.time())
+        name = str(name or "").strip()
+        if not name:
+            raise ValueError("name_required")
+        normalized = self._normalize_library_strategy(strategy, updated_at=updated_at)
+        valid, errors = validate_follow_strategy(normalized)
+        if not valid:
+            raise ValueError("invalid_follow_strategy:" + ",".join(errors))
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT is_active FROM follow_strategy_library WHERE slug = ?", (slug,)
+            ).fetchone()
+            if not row:
+                raise ValueError("strategy_not_found")
+            dup = conn.execute(
+                "SELECT 1 FROM follow_strategy_library WHERE name = ? COLLATE NOCASE AND slug != ?",
+                (name, slug),
+            ).fetchone()
+            if dup:
+                raise ValueError("duplicate_name")
+            was_active = bool(row["is_active"])
+            conn.execute(
+                "UPDATE follow_strategy_library SET name = ?, updated_at = ?, raw_json = ? WHERE slug = ?",
+                (name, updated_at, _dumps(normalized), slug),
+            )
+        if was_active:
+            self.save_follow_strategy(normalized, ts=updated_at)
+        return self._strategy_entry(slug, name, active=was_active, updated_at=updated_at, strategy=normalized)
+
+    def activate_follow_strategy(self, slug: str, *, ts: int | None = None) -> dict[str, Any]:
+        self.init_db()
+        updated_at = int(ts or time.time())
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT raw_json FROM follow_strategy_library WHERE slug = ?", (slug,)
+            ).fetchone()
+            if not row:
+                raise ValueError("strategy_not_found")
+            conn.execute("UPDATE follow_strategy_library SET is_active = 0")
+            conn.execute("UPDATE follow_strategy_library SET is_active = 1 WHERE slug = ?", (slug,))
+            payload = _loads(row["raw_json"], {})
+        normalized = self._normalize_library_strategy(payload, updated_at=updated_at)
+        self.save_follow_strategy(normalized, ts=updated_at)
+        return self.list_follow_strategies()
+
+    def delete_follow_strategy_entry(self, slug: str, *, ts: int | None = None) -> dict[str, Any]:
+        self.init_db()
+        updated_at = int(ts or time.time())
+        promote: sqlite3.Row | None = None
+        was_active = False
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT is_active FROM follow_strategy_library WHERE slug = ?", (slug,)
+            ).fetchone()
+            if not row:
+                raise ValueError("strategy_not_found")
+            was_active = bool(row["is_active"])
+            conn.execute("DELETE FROM follow_strategy_library WHERE slug = ?", (slug,))
+            if was_active:
+                remaining = conn.execute(
+                    "SELECT slug, raw_json FROM follow_strategy_library ORDER BY updated_at ASC, slug ASC"
+                ).fetchall()
+                if len(remaining) == 1:
+                    promote = remaining[0]
+                    conn.execute(
+                        "UPDATE follow_strategy_library SET is_active = 1 WHERE slug = ?",
+                        (promote["slug"],),
+                    )
+        if was_active:
+            if promote is not None:
+                normalized = self._normalize_library_strategy(_loads(promote["raw_json"], {}), updated_at=updated_at)
+                self.save_follow_strategy(normalized, ts=updated_at)
+            else:
+                self.clear_active_follow_strategy()
+        return self.list_follow_strategies()
+
+    def clear_active_follow_strategy(self) -> None:
+        self.init_db()
+        with self.connect() as conn:
+            conn.execute("DELETE FROM follow_strategy WHERE id = ?", (ACTIVE_FOLLOW_STRATEGY_ID,))
 
     def set_account_balance(self, balance_usdc: float, *, ts: int | None = None, source: str = "manual") -> dict[str, Any]:
         self.init_db()

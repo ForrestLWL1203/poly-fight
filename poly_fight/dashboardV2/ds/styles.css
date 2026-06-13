@@ -1,0 +1,10 @@
+/* ============================================================
+   Poly Sniper Design System — global entry point.
+   Consumers link THIS file only. Imports-only by contract.
+   ============================================================ */
+
+@import "tokens/colors.css";
+@import "tokens/typography.css";
+@import "tokens/spacing.css";
+@import "tokens/effects.css";
+@import "tokens/base.css";

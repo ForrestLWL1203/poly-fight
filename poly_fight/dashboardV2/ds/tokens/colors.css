@@ -1,0 +1,169 @@
+/* ============================================================
+   Poly Sniper — Color tokens
+   LIGHT-FIRST, warm editorial. Cream canvas + coral accent
+   (Fireart-style). Dark is a switchable secondary theme.
+   Green/red reserved strictly for P&L semantics.
+   Token NAMES are stable; only values changed.
+   ============================================================ */
+
+:root {
+  /* ---- Brand / accent (warm coral) ---- */
+  --coral: #ff6b4a;
+  --coral-strong: #e8502f;       /* hover / pressed darken */
+  --brand-blue: #ff6b4a;         /* legacy name → coral */
+  --brand-indigo: #ff8a5f;       /* legacy name → peach */
+  --brand-violet: #2c8c84;       /* legacy name → teal (categorical "分歧") */
+  --brand-cyan: #2c8c84;
+  --accent: var(--coral);
+  --accent-strong: var(--coral-strong);
+  --accent-soft: rgba(255, 107, 74, 0.14);
+  --accent-ring: rgba(255, 107, 74, 0.42);
+
+  /* Signature gradient — soft coral, used sparingly on CTAs / hero */
+  --gradient-brand: linear-gradient(135deg, #ff8a5f 0%, #ff6b4a 55%, #f0512f 100%); /* @kind color */
+  --gradient-brand-soft: linear-gradient(135deg, rgba(255,138,95,0.16), rgba(240,81,47,0.10)); /* @kind color */
+  --gradient-mesh: radial-gradient(120% 120% at 0% 0%, rgba(255,107,74,0.10) 0%, rgba(255,107,74,0) 46%),
+                   radial-gradient(120% 120% at 100% 0%, rgba(255,176,120,0.12) 0%, rgba(255,176,120,0) 50%),
+                   radial-gradient(140% 140% at 100% 100%, rgba(44,140,132,0.07) 0%, rgba(44,140,132,0) 55%); /* @kind color */
+
+  /* ---- Warm cream surface ladder (light) ---- */
+  --ink-base: #f0eadf;           /* canvas */
+  --ink-900: #f6f1e8;            /* app background */
+  --ink-800: #fbf7f0;            /* base panels */
+  --ink-700: #ffffff;            /* raised cards (solid) */
+  --ink-600: #f0eadd;            /* inputs, chips, inset */
+  --ink-500: #e4dccb;            /* strong borders */
+  --ink-400: #d6ccb7;
+
+  /* Glass surfaces (translucent, sit over the warm mesh) */
+  --glass-1: rgba(255, 253, 248, 0.74);
+  --glass-2: rgba(255, 255, 255, 0.82);
+  --glass-3: rgba(244, 238, 227, 0.72);
+  --glass-hairline: rgba(58, 46, 32, 0.10);
+  --glass-hairline-strong: rgba(58, 46, 32, 0.15);
+
+  /* ---- Text (warm charcoal) ---- */
+  --text-primary: rgba(33, 28, 21, 0.94);
+  --text-secondary: rgba(33, 28, 21, 0.58);
+  --text-tertiary: rgba(33, 28, 21, 0.40);
+  --text-quaternary: rgba(33, 28, 21, 0.24);
+  --text-on-accent: #ffffff;
+
+  /* ---- P&L / financial semantics (the ONLY green/red) ---- */
+  --pnl-up: #1f9d57;
+  --pnl-up-soft: rgba(31, 157, 87, 0.14);
+  --pnl-down: #e5484d;
+  --pnl-down-soft: rgba(229, 72, 77, 0.12);
+  --pnl-flat: var(--text-secondary);
+
+  /* ---- Status / utility ---- */
+  --status-live: #1f9d57;
+  --status-warn: #e08a1e;        /* warm amber */
+  --status-warn-soft: rgba(224, 138, 30, 0.16);
+  --status-idle: #a89a82;
+  --status-info: var(--brand-cyan);
+
+  /* Team / outcome sides (neutral categorical, not P&L) */
+  --side-a: var(--coral);
+  --side-b: #2c8c84;
+
+  /* ---- Soft warm shadow colors (referenced by effects.css) ---- */
+  --shadow-c-1: rgba(74, 56, 36, 0.05); /* @kind shadow */
+  --shadow-c-2: rgba(74, 56, 36, 0.09); /* @kind shadow */
+  --shadow-c-3: rgba(74, 56, 36, 0.12); /* @kind shadow */
+  --shadow-c-4: rgba(74, 56, 36, 0.16); /* @kind shadow */
+  --shadow-accent-c: rgba(255, 107, 74, 0.30); /* @kind shadow */
+  --highlight-c: rgba(255, 255, 255, 0.72); /* @kind shadow */
+
+  /* ---- Semantic aliases (use these in components) ---- */
+  --bg-canvas: var(--ink-base);
+  --bg-app: var(--ink-900);
+  --surface-sidebar: rgba(251, 247, 240, 0.80);
+  --surface-panel: var(--glass-1);
+  --surface-card: var(--glass-2);
+  --surface-inset: var(--glass-3);
+  --surface-solid: var(--ink-700);
+  --border-hairline: var(--glass-hairline);
+  --border-strong: var(--glass-hairline-strong);
+
+  --focus-ring: var(--accent-ring);
+  color-scheme: light;
+}
+
+/* ============================================================
+   Dark theme — warm charcoal (NOT pure black-blue), coral accent.
+   Apply on a container with [data-theme="dark"].
+   ============================================================ */
+[data-theme="dark"] {
+  --coral: #ff7a5c;
+  --coral-strong: #ff6b4a;
+  --brand-blue: #ff7a5c;
+  --brand-indigo: #ff9a72;
+  --brand-violet: #38b3a6;
+  --brand-cyan: #38b3a6;
+  --accent: var(--coral);
+  --accent-strong: var(--coral-strong);
+  --accent-soft: rgba(255, 122, 92, 0.18);
+  --accent-ring: rgba(255, 122, 92, 0.48);
+
+  --gradient-brand: linear-gradient(135deg, #ff9a72 0%, #ff7a5c 55%, #f0512f 100%); /* @kind color */
+  --gradient-brand-soft: linear-gradient(135deg, rgba(255,154,114,0.20), rgba(240,81,47,0.14)); /* @kind color */
+  --gradient-mesh: radial-gradient(120% 120% at 0% 0%, rgba(255,122,92,0.16) 0%, rgba(255,122,92,0) 46%),
+                   radial-gradient(120% 120% at 100% 0%, rgba(255,154,114,0.12) 0%, rgba(255,154,114,0) 50%),
+                   radial-gradient(140% 140% at 100% 100%, rgba(56,179,166,0.10) 0%, rgba(56,179,166,0) 55%); /* @kind color */
+
+  /* Warm charcoal ladder */
+  --ink-base: #16120d;
+  --ink-900: #1b1610;
+  --ink-800: #221c15;
+  --ink-700: #2b241c;
+  --ink-600: #342c22;
+  --ink-500: #41382c;
+  --ink-400: #4f4537;
+
+  --glass-1: rgba(34, 28, 21, 0.58);
+  --glass-2: rgba(43, 36, 28, 0.64);
+  --glass-3: rgba(52, 44, 34, 0.56);
+  --glass-hairline: rgba(255, 244, 230, 0.09);
+  --glass-hairline-strong: rgba(255, 244, 230, 0.15);
+
+  --text-primary: rgba(250, 246, 240, 0.96);
+  --text-secondary: rgba(245, 238, 228, 0.60);
+  /* tertiary/quaternary lifted from 0.38/0.22 — the originals were nearly
+     illegible on the dark surfaces (faint labels & captions). */
+  --text-tertiary: rgba(245, 238, 228, 0.50);
+  --text-quaternary: rgba(245, 238, 228, 0.38);
+
+  --pnl-up: #34c46d;
+  --pnl-up-soft: rgba(52, 196, 109, 0.16);
+  --pnl-down: #ff5a5f;
+  --pnl-down-soft: rgba(255, 90, 95, 0.16);
+
+  --status-live: #34c46d;
+  --status-warn: #f0a73a;
+  --status-warn-soft: rgba(240, 167, 58, 0.18);
+  --status-idle: #8a7f6c;
+  --status-info: var(--brand-cyan);
+  --pnl-flat: var(--text-secondary);
+  --side-a: var(--coral);
+  --side-b: #38b3a6;
+  --focus-ring: var(--accent-ring);
+
+  --shadow-c-1: rgba(0, 0, 0, 0.32);
+  --shadow-c-2: rgba(0, 0, 0, 0.40);
+  --shadow-c-3: rgba(0, 0, 0, 0.50);
+  --shadow-c-4: rgba(0, 0, 0, 0.58);
+  --shadow-accent-c: rgba(255, 107, 74, 0.40);
+  --highlight-c: rgba(255, 255, 255, 0.08);
+
+  --bg-canvas: var(--ink-base);
+  --bg-app: var(--ink-900);
+  --surface-sidebar: rgba(27, 22, 16, 0.74);
+  --surface-panel: rgba(34, 28, 21, 0.58);
+  --surface-card: rgba(43, 36, 28, 0.64);
+  --surface-inset: rgba(52, 44, 34, 0.56);
+  --surface-solid: var(--ink-700);
+  --border-hairline: rgba(255, 244, 230, 0.09);
+  --border-strong: rgba(255, 244, 230, 0.15);
+  color-scheme: dark;
+}

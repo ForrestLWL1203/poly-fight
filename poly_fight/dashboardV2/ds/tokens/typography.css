@@ -1,0 +1,58 @@
+/* ============================================================
+   Poly Sniper — Typography tokens
+   Uses the genuine San Francisco system stack (-apple-system).
+   On macOS/iOS this renders SF Pro exactly; on Windows it falls
+   to Segoe UI, elsewhere to system-ui. No webfonts shipped — this
+   is the authentic Apple approach and avoids the "Inter" trope.
+   Wallet addresses / numerics use SF Mono via ui-monospace.
+   ============================================================ */
+
+:root {
+  /* ---- Families ---- */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-text: var(--font-sans);
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  /* Tabular figures for all data/numbers — keeps columns aligned */
+  --num-features: "tnum" 1, "cv01" 1; /* @kind other */
+
+  /* ---- Type scale (Apple-ish, tight display tracking) ---- */
+  --fs-display: 56px;   /* hero P&L number */
+  --fs-h1: 34px;        /* large title */
+  --fs-h2: 28px;        /* title 1 */
+  --fs-h3: 22px;        /* title 2 / section head */
+  --fs-h4: 17px;        /* headline (semibold body) */
+  --fs-body: 15px;      /* body */
+  --fs-callout: 14px;
+  --fs-subhead: 13px;   /* subheadline */
+  --fs-footnote: 12px;
+  --fs-caption: 11px;   /* caption / table micro-labels */
+
+  /* ---- Weights ---- */
+  --fw-regular: 400; /* @kind font */
+  --fw-medium: 500; /* @kind font */
+  --fw-semibold: 600; /* @kind font */
+  --fw-bold: 700; /* @kind font */
+
+  /* ---- Line heights ---- */
+  --lh-tight: 1.05; /* @kind font */
+  --lh-snug: 1.2; /* @kind font */
+  --lh-normal: 1.4; /* @kind font */
+  --lh-relaxed: 1.55; /* @kind font */
+
+  /* ---- Letter spacing (SF tightens at display sizes) ---- */
+  --ls-display: -0.022em; /* @kind font */
+  --ls-title: -0.018em; /* @kind font */
+  --ls-body: -0.01em; /* @kind font */
+  --ls-label: 0.06em; /* @kind font */
+
+  /* ---- Semantic roles ---- */
+  --text-hero: var(--fw-bold) var(--fs-display) / var(--lh-tight) var(--font-sans); /* @kind font */
+  --text-title: var(--fw-bold) var(--fs-h2) / var(--lh-snug) var(--font-sans); /* @kind font */
+  --text-section: var(--fw-semibold) var(--fs-h3) / var(--lh-snug) var(--font-sans); /* @kind font */
+  --text-headline: var(--fw-semibold) var(--fs-h4) / var(--lh-normal) var(--font-sans); /* @kind font */
+  --text-body: var(--fw-regular) var(--fs-body) / var(--lh-relaxed) var(--font-sans); /* @kind font */
+  --text-label: var(--fw-semibold) var(--fs-caption) / var(--lh-normal) var(--font-sans); /* @kind font */
+}
