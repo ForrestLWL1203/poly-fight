@@ -234,11 +234,6 @@ def build_client(args: argparse.Namespace) -> PolymarketClient:
 DATA_DIR = Path("data")
 CATEGORY_TAG_SLUGS = {
     "esports": ("counter-strike-2", "league-of-legends", "dota-2"),
-    "sports": ("nba", "ufc"),
-}
-CATEGORY_MARKET_SCOPES = {
-    "esports": "cs-dota-lol-main-game-map-v1",
-    "sports": "nba-ufc-moneyline-v1",
 }
 FOLLOW_SIGNAL_CATEGORIES = ("esports",)
 COLLECTOR_NAME = "wallet_collector"
@@ -356,9 +351,6 @@ SPORTS_DEFAULT_SUBMARKET_MAX_MARKETS_PER_RUN = 60
 ESPORTS_DEFAULT_MAX_PROFILES_PER_RUN = 300
 ESPORTS_DEFAULT_MAX_ESPORTS_CLOSED_POSITIONS_PER_WALLET = 100
 ESPORTS_DEFAULT_USER_HISTORY_TRADES_MAX_PAGES = 3
-SPORTS_DEFAULT_MAX_PROFILES_PER_RUN = 200
-SPORTS_DEFAULT_MAX_ESPORTS_CLOSED_POSITIONS_PER_WALLET = 150
-SPORTS_DEFAULT_USER_HISTORY_TRADES_MAX_PAGES = 8
 
 
 def effective_build_defaults(args: argparse.Namespace) -> dict[str, int]:
@@ -485,34 +477,6 @@ def effective_discovery_defaults(args: argparse.Namespace) -> dict[str, int]:
     }
 
 
-def effective_build_limits(args: argparse.Namespace) -> dict[str, int]:
-    if getattr(args, "category", "esports") != "sports":
-        return {}
-    limits = {
-        "sports_nba_target_markets": int(getattr(args, "sports_nba_target_markets", 80) or 80),
-        "sports_ufc_target_markets": int(getattr(args, "sports_ufc_target_markets", 80) or 80),
-        "max_profiles_per_run": int(getattr(args, "max_profiles_per_run", SPORTS_DEFAULT_MAX_PROFILES_PER_RUN) or 0),
-        "user_history_trades_max_pages": int(
-            getattr(args, "user_history_trades_max_pages", SPORTS_DEFAULT_USER_HISTORY_TRADES_MAX_PAGES) or 0
-        ),
-        "max_esports_closed_positions_per_wallet": int(
-            getattr(
-                args,
-                "max_esports_closed_positions_per_wallet",
-                SPORTS_DEFAULT_MAX_ESPORTS_CLOSED_POSITIONS_PER_WALLET,
-            )
-            or 0
-        ),
-    }
-    if limits["max_profiles_per_run"] == ESPORTS_DEFAULT_MAX_PROFILES_PER_RUN:
-        limits["max_profiles_per_run"] = SPORTS_DEFAULT_MAX_PROFILES_PER_RUN
-    if limits["user_history_trades_max_pages"] == ESPORTS_DEFAULT_USER_HISTORY_TRADES_MAX_PAGES:
-        limits["user_history_trades_max_pages"] = SPORTS_DEFAULT_USER_HISTORY_TRADES_MAX_PAGES
-    if limits["max_esports_closed_positions_per_wallet"] == ESPORTS_DEFAULT_MAX_ESPORTS_CLOSED_POSITIONS_PER_WALLET:
-        limits["max_esports_closed_positions_per_wallet"] = SPORTS_DEFAULT_MAX_ESPORTS_CLOSED_POSITIONS_PER_WALLET
-    return limits
-
-
 def resolve_data_dir(args: argparse.Namespace) -> Path:
     # Each category lives under its own subdir (data/esports, data/sports) so the two
     # lines can be integrated later without colliding. Explicit --data-dir always wins.
@@ -538,7 +502,7 @@ def resolve_follow_dir(args: argparse.Namespace, root: Path | None = None) -> Pa
 
 def category_data_dirs(root: Path) -> dict[str, Path]:
     root = Path(root)
-    return {"esports": root / "esports", "sports": root / "sports"}
+    return {"esports": root / "esports"}
 
 
 def leaderboard_db_path(data_dir: Path) -> Path:
@@ -4169,88 +4133,6 @@ def evaluate_seed_bucket_qualification(
     }
 
 
-def filter_profile_seed_wallets(
-    seed_wallets: dict[str, dict[str, Any]],
-    *,
-    max_wallets: int = 500,
-    min_seed_win_count: int = 2,
-    min_seed_cost_total: float = 0,
-    max_median_avg_price: float = SEED_MAX_MEDIAN_AVG_PRICE,
-    seed_bucket_min_wins: dict[str, int] | None = None,
-    seed_bucket_min_avg_cash: dict[str, float] | None = None,
-    seed_min_weighted_roi: float = SEED_MIN_WEIGHTED_ROI,
-    seed_max_median_avg_price: float | None = None,
-    seed_single_bucket_min_wins: int = SEED_SINGLE_BUCKET_MIN_WINS,
-    seed_multi_bucket_min_wins: int = SEED_MULTI_BUCKET_MIN_WINS,
-) -> list[dict[str, Any]]:
-    rows = []
-    bucket_thresholds = effective_seed_bucket_min_wins(
-        seed_bucket_min_wins,
-        seed_single_bucket_min_wins=seed_single_bucket_min_wins,
-    )
-    max_avg_price = float(seed_max_median_avg_price if seed_max_median_avg_price is not None else max_median_avg_price)
-    for row in seed_wallets.values():
-        qualification = {}
-        if bucket_thresholds:
-            qualification = evaluate_seed_bucket_qualification(
-                row,
-                seed_bucket_min_wins=seed_bucket_min_wins,
-                seed_single_bucket_min_wins=seed_single_bucket_min_wins,
-                seed_multi_bucket_min_wins=seed_multi_bucket_min_wins,
-                seed_bucket_min_avg_cash=seed_bucket_min_avg_cash,
-                seed_min_weighted_roi=seed_min_weighted_roi,
-                seed_max_median_avg_price=max_avg_price,
-            )
-            if not qualification.get("qualified_seed_buckets"):
-                continue
-        elif to_int(row.get("seed_win_count")) < min_seed_win_count:
-            continue
-        if not bucket_thresholds:
-            if to_float(row.get("seed_cost_total")) < min_seed_cost_total:
-                continue
-            if to_float(row.get("seed_weighted_roi")) < seed_min_weighted_roi:
-                continue
-            if to_float(row.get("median_avg_price")) > max_avg_price:
-                continue
-        updated = dict(row)
-        if bucket_thresholds:
-            qualified_seed_buckets = list(qualification["qualified_seed_buckets"])
-            updated["qualified_seed_buckets"] = qualified_seed_buckets
-            updated["qualified_seed_bucket_labels"] = [bucket_label(bucket) for bucket in qualified_seed_buckets]
-            updated["qualified_seed_bucket_stats"] = dict(qualification["qualified_seed_bucket_stats"])
-            updated["seed_bucket_min_wins"] = dict(qualification["seed_bucket_min_wins"])
-            updated["seed_multi_bucket_min_wins"] = qualification["seed_multi_bucket_min_wins"]
-            updated["multi_bucket_seed_win_count"] = qualification["multi_bucket_seed_win_count"]
-            updated["seed_qualification_mode"] = qualification["seed_qualification_mode"]
-            updated["seed_bucket_min_avg_cash"] = dict(seed_bucket_min_avg_cash or default_seed_bucket_min_avg_cash())
-            updated["seed_min_weighted_roi"] = float(seed_min_weighted_roi)
-            updated["seed_max_median_avg_price"] = max_avg_price
-            updated["seed_bucket_reject_reasons"] = qualification["seed_bucket_reject_reasons"]
-            candidate = dict(updated.get("candidate") or {})
-            candidate["qualified_seed_buckets"] = qualified_seed_buckets
-            candidate["qualified_seed_bucket_labels"] = updated["qualified_seed_bucket_labels"]
-            candidate["qualified_seed_bucket_stats"] = updated["qualified_seed_bucket_stats"]
-            candidate["seed_bucket_min_wins"] = updated["seed_bucket_min_wins"]
-            candidate["seed_multi_bucket_min_wins"] = updated["seed_multi_bucket_min_wins"]
-            candidate["multi_bucket_seed_win_count"] = updated["multi_bucket_seed_win_count"]
-            candidate["seed_qualification_mode"] = updated["seed_qualification_mode"]
-            candidate["seed_bucket_min_avg_cash"] = updated["seed_bucket_min_avg_cash"]
-            candidate["seed_min_weighted_roi"] = float(seed_min_weighted_roi)
-            candidate["seed_max_median_avg_price"] = max_avg_price
-            updated["candidate"] = candidate
-        updated["seed_score"] = round(seed_wallet_score(updated), 8)
-        rows.append(updated)
-    rows.sort(
-        key=lambda row: (
-            to_float(row.get("seed_score")),
-            to_int(row.get("seed_win_count")),
-            to_float(row.get("seed_pnl_total")),
-            -to_float(row.get("median_avg_price")),
-            normalize_wallet(row.get("wallet")),
-        ),
-        reverse=True,
-    )
-    return rows[: max(0, int(max_wallets))]
 
 
 def filter_profile_seed_wallets_v2(
@@ -4934,37 +4816,6 @@ def recent_health_ok(row: dict[str, Any]) -> bool:
     return True
 
 
-def core_quality_ok(row: dict[str, Any]) -> bool:
-    return strict_final_quality_ok(row) and recent_health_ok(row)
-
-
-def activity_fresh_ok(row: dict[str, Any], *, now_ts: int) -> bool:
-    last_trade_at = int(row.get("best_bucket_last_trade_at") or row.get("last_esports_trade_at") or 0)
-    if last_trade_at <= 0:
-        return False
-    return int(now_ts) - last_trade_at <= COLLECTOR_MAX_INACTIVE_SECONDS
-
-
-def copyable_final_gate_ok(row: dict[str, Any]) -> bool:
-    metrics = leaderboard_rank_metrics(row)
-    if to_float(metrics.get("esports_roi")) < MIN_COPYABLE_BUCKET_ROI:
-        return False
-    bucket_key = str(row.get("best_bucket") or "")
-    if not bucket_key:
-        return False
-    candidate_metrics = _candidate_bucket_metrics(row, bucket_key)
-    if not copyable_two_sided_behavior_ok(candidate_metrics, metrics):
-        return False
-    participated = int(candidate_metrics.get("participated_market_count") or 0)
-    if _eligible_bucket_mode(row, bucket_key) == "emerging" and participated > 0:
-        high_churn_rate = int(candidate_metrics.get("high_churn_market_count") or 0) / participated
-        if high_churn_rate > MAX_HIGH_CHURN_MARKET_RATE:
-            return False
-    if participated > 0:
-        tail_rate = int(candidate_metrics.get("tail_entry_market_count") or 0) / participated
-        if tail_rate > MAX_COPYABLE_TAIL_ENTRY_RATE:
-            return False
-    return True
 
 
 def _copyable_reject_reasons(row: dict[str, Any]) -> list[str]:
@@ -5007,168 +4858,6 @@ def _eligible_bucket_mode(row: dict[str, Any], bucket_key: str) -> str:
     return ""
 
 
-def momentum_recent_ok(row: dict[str, Any]) -> bool:
-    recent_7d_ok = (
-        int(row.get("recent_7d_market_count") or 0) >= MOMENTUM_MIN_7D_MARKETS
-        and to_float(row.get("recent_7d_positive_rate")) >= MOMENTUM_MIN_7D_POSITIVE_RATE
-        and to_float(row.get("recent_7d_roi")) >= MOMENTUM_MIN_7D_ROI
-    )
-    recent_14d_ok = (
-        int(row.get("recent_14d_market_count") or 0) >= MOMENTUM_MIN_14D_MARKETS
-        and to_float(row.get("recent_14d_positive_rate")) >= MOMENTUM_MIN_14D_POSITIVE_RATE
-        and to_float(row.get("recent_14d_roi")) >= MOMENTUM_MIN_14D_ROI
-    )
-    return recent_7d_ok or recent_14d_ok
-
-
-def momentum_score(row: dict[str, Any]) -> float:
-    metrics = leaderboard_rank_metrics(row)
-    recent_7d_score = 0.0
-    if int(row.get("recent_7d_market_count") or 0) > 0:
-        recent_7d_score = (
-            45.0 * _clamp_float(to_float(row.get("recent_7d_positive_rate")))
-            + 30.0 * _clamp_float(to_float(row.get("recent_7d_roi")) / 0.75)
-            + 10.0 * _clamp_float(int(row.get("recent_7d_market_count") or 0) / 50)
-        )
-    recent_14d_score = (
-        35.0 * _clamp_float(to_float(row.get("recent_14d_positive_rate")))
-        + 25.0 * _clamp_float(to_float(row.get("recent_14d_roi")) / 0.60)
-        + 10.0 * _clamp_float(int(row.get("recent_14d_market_count") or 0) / 100)
-    )
-    score = max(recent_7d_score, recent_14d_score)
-    score += 10.0 * _clamp_float(to_float(row.get("esports_roi")) / 0.30)
-    score += 10.0 * _clamp_float(to_float(metrics.get("capital_weighted_edge") or metrics.get("entry_edge")) / 0.20)
-    score += 5.0 * _clamp_float((0.75 - to_float(metrics.get("median_entry_price") or row.get("median_entry_price"))) / 0.35)
-    return round(score, 6)
-
-
-def _prepare_followable_profile(row: dict[str, Any], *, now_ts: int) -> dict[str, Any] | None:
-    if str(row.get("category") or "esports").lower() != "esports":
-        return None
-    if int(row.get("scoring_version") or 0) != SCORING_VERSION:
-        return None
-    profile = _with_esports_followable_market_types(dict(row))
-    if profile is None:
-        return None
-    return enrich_esports_bucket_scores(profile, now_ts=now_ts)
-
-
-def _watch_reasons(row: dict[str, Any]) -> list[str]:
-    reasons: list[str] = []
-    metrics = leaderboard_rank_metrics(row)
-    if not momentum_recent_ok(row):
-        reasons.append("not_recent_momentum")
-    if to_float(row.get("esports_roi")) < MOMENTUM_MIN_OVERALL_ROI:
-        reasons.append("low_overall_roi")
-    if to_float(metrics.get("capital_weighted_edge") or metrics.get("entry_edge")) < MOMENTUM_MIN_CAPITAL_WEIGHTED_EDGE:
-        reasons.append("weak_capital_edge")
-    median_entry = to_float(metrics.get("median_entry_price") or row.get("median_entry_price"))
-    if median_entry <= 0 or median_entry > MOMENTUM_MAX_MEDIAN_ENTRY_PRICE:
-        reasons.append("high_entry_price")
-    if to_float(row.get("actual_minus_hold_pnl_rate")) > SWING_DEPENDENT_RATE:
-        reasons.append("swing_dependent")
-    behavior_market_count = int(row.get("historical_trade_behavior_market_count") or 0)
-    if behavior_market_count >= TRADE_BEHAVIOR_MIN_MARKETS and to_float(row.get("two_sided_trade_market_rate")) > MOMENTUM_MAX_TWO_SIDED_RATE:
-        reasons.append("two_sided_behavior")
-    if not row.get("eligible_buckets") and not row.get("eligible_market_types"):
-        reasons.append("no_followable_scope")
-    if not reasons and not recent_health_ok(row):
-        reasons.append("core_recent_health_gate")
-    return sorted(set(reasons))
-
-
-def build_collector_leaderboard(
-    profiles_by_wallet: dict[str, dict[str, Any]],
-    *,
-    now_ts: int,
-    max_leaderboard_wallets: int = 60,
-    max_core_wallets: int = 20,
-    max_momentum_wallets: int = 10,
-    max_watchlist_wallets: int = 50,
-) -> dict[str, Any]:
-    core_candidates = [
-        {**row, "collector": COLLECTOR_NAME, "lane": "core"}
-        for row in build_seeded_leaderboard(
-            profiles_by_wallet,
-            now_ts=now_ts,
-            max_leaderboard_wallets=0,
-            require_strict_quality_gate=True,
-            max_two_sided_market_count=COPYABLE_TWO_SIDED_PREFILTER_MAX_COUNT,
-            max_two_sided_market_rate=COPYABLE_TWO_SIDED_MAX_RATE,
-        )
-        if core_quality_ok(row)
-        and activity_fresh_ok(row, now_ts=now_ts)
-        and copyable_final_gate_ok(row)
-    ]
-    core_limit = max(0, int(max_leaderboard_wallets)) if max_leaderboard_wallets > 0 else len(core_candidates)
-    core = sorted(core_candidates, key=leaderboard_rank_key)[:core_limit]
-    core_wallets = {normalize_wallet(row.get("wallet")) for row in core}
-
-    watch_candidates: list[dict[str, Any]] = []
-    for profile in profiles_by_wallet.values():
-        wallet = normalize_wallet(profile.get("wallet"))
-        if not wallet or wallet in core_wallets:
-            continue
-        prepared = _prepare_followable_profile(profile, now_ts=now_ts)
-        if prepared is None:
-            continue
-        prepared = {**prepared, "collector": COLLECTOR_NAME}
-        if not activity_fresh_ok(prepared, now_ts=now_ts):
-            watch_candidates.append(
-                {
-                    **prepared,
-                    "lane": "watch",
-                    "watch_reasons": sorted(set(_watch_reasons(prepared)) | {"inactive_gt5d"}),
-                    "momentum_score": momentum_score(prepared),
-                }
-            )
-            continue
-        if not copyable_final_gate_ok(prepared):
-            watch_candidates.append(
-                {
-                    **prepared,
-                    "lane": "watch",
-                    "watch_reasons": sorted(set(_watch_reasons(prepared)) | {"copyability_gate"}),
-                    "momentum_score": momentum_score(prepared),
-                }
-            )
-            continue
-        if not core_quality_ok(prepared):
-            watch_candidates.append(
-                {
-                    **prepared,
-                    "lane": "watch",
-                    "watch_reasons": sorted(set(_watch_reasons(prepared)) | {"strict_quality_gate"}),
-                    "momentum_score": momentum_score(prepared),
-                }
-            )
-    watch_candidates.sort(
-        key=lambda row: (
-            -to_float(row.get("momentum_score")),
-            -to_float(row.get("recent_7d_positive_rate")),
-            -to_float(row.get("recent_14d_positive_rate")),
-            normalize_wallet(row.get("wallet")),
-        )
-    )
-    family_supplements: list[dict[str, Any]] = []
-    momentum: list[dict[str, Any]] = []
-    leaderboard = core
-    if max_leaderboard_wallets > 0:
-        leaderboard = leaderboard[:max_leaderboard_wallets]
-    watch = watch_candidates[: max(0, int(max_watchlist_wallets))]
-    return {
-        "leaderboard": leaderboard,
-        "core": core,
-        "momentum": momentum,
-        "family_supplements": family_supplements,
-        "watch": watch,
-        "lane_counts": {
-            "core": len(core),
-            "momentum": len(momentum),
-            "family_supplement": len(family_supplements),
-            "watch": len(watch),
-        },
-    }
 
 
 def _v2_candidate_metric(profile: dict[str, Any], key: str) -> Any:
@@ -5449,19 +5138,16 @@ def _command_collect_wallets(
     args: argparse.Namespace,
     client: PolymarketClient | None = None,
     *,
-    variant: str = "v1",
+    variant: str = "v2",
 ) -> int:
-    # variant="v2": collect-v2 全新管线 —— 双侧发现 + actual 口径打分 + V2 导出门 + 每游戏配额,
-    # 产出完全隔离到 collector_v2_* / leaderboard_v2.db,不触碰 V1 任何产物。
-    is_v2 = variant == "v2"
-    scoring_basis = "actual" if is_v2 else "hold"
-    include_losing_side = is_v2
+    # collect-v2 是唯一管线 —— 双侧发现 + actual 口径打分 + V2 导出门 + 每游戏配额,
+    # 产出隔离到 collector_v2_* / leaderboard_v2.db。
+    scoring_basis = "actual"
+    include_losing_side = True
     client = client or build_client(args)
-    output_dir = resolve_collector_output_dir(args)
-    if is_v2:
-        output_dir = output_dir / "collector_v2"
+    output_dir = resolve_collector_output_dir(args) / "collector_v2"
     output_dir.mkdir(parents=True, exist_ok=True)
-    prefix = "collector_v2" if is_v2 else "collector"
+    prefix = "collector_v2"
     now_dt = datetime.now(timezone.utc)
     now_ts = int(now_dt.timestamp())
     lookback_days = int(getattr(args, "lookback_days", 30) or 30)
@@ -5562,25 +5248,13 @@ def _command_collect_wallets(
     seed_wallets = aggregate_seed_wallets(seed_positions)
     write_json(output_dir / f"{prefix}_seed_wallets.json", list(seed_wallets.values()))
     max_profile_wallets = resolve_collector_profile_wallet_limit(args)
-    if is_v2:
-        # v2:廉价召回 + per-game round-robin 填满 profiling 预算(破 v1 严格种子门的 411 天花板)。
-        profile_wallets = filter_profile_seed_wallets_v2(
-            seed_wallets,
-            max_wallets=max_profile_wallets,
-            min_seed_markets=getattr(args, "v2_min_seed_markets", 1),
-            min_avg_seed_cash=getattr(args, "v2_min_seed_avg_cash", 150.0),
-        )
-    else:
-        profile_wallets = filter_profile_seed_wallets(
-            seed_wallets,
-            max_wallets=max_profile_wallets,
-            seed_bucket_min_wins=seed_bucket_min_wins,
-            seed_bucket_min_avg_cash=seed_bucket_min_avg_cash,
-            seed_min_weighted_roi=seed_min_weighted_roi,
-            seed_max_median_avg_price=seed_max_median_avg_price,
-            seed_single_bucket_min_wins=seed_single_bucket_min_wins,
-            seed_multi_bucket_min_wins=seed_multi_bucket_min_wins,
-        )
+    # v2:廉价召回 + per-game round-robin 填满 profiling 预算(破 v1 严格种子门的 411 天花板)。
+    profile_wallets = filter_profile_seed_wallets_v2(
+        seed_wallets,
+        max_wallets=max_profile_wallets,
+        min_seed_markets=getattr(args, "v2_min_seed_markets", 1),
+        min_avg_seed_cash=getattr(args, "v2_min_seed_avg_cash", 150.0),
+    )
     write_json(output_dir / f"{prefix}_profile_wallets.json", profile_wallets)
     mark_stage("seed_wallet_filter")
 
@@ -5709,43 +5383,27 @@ def _command_collect_wallets(
         for row in [*reused_profiles_by_wallet.values(), *refreshed_profiles]
         if normalize_wallet(row.get("wallet"))
     }
-    if is_v2:
-        # 协调:保留 observe-v2(M4)累积发现的钱包,避免被全量重建丢掉;按打分窗口剪枝防膨胀。
-        prune_cutoff = now_ts - max(1, profile_lookback_days) * 86400
-        for wallet_key, cached in existing_profiles.items():
-            wallet_key = normalize_wallet(wallet_key or cached.get("wallet"))
-            if not wallet_key or wallet_key in profiles_by_wallet:
-                continue
-            last_trade = to_int(cached.get("last_esports_trade_at"))
-            if last_trade and last_trade >= prune_cutoff:
-                profiles_by_wallet[wallet_key] = cached
+    # 协调:保留 observe-v2(M4)累积发现的钱包,避免被全量重建丢掉;按打分窗口剪枝防膨胀。
+    prune_cutoff = now_ts - max(1, profile_lookback_days) * 86400
+    for wallet_key, cached in existing_profiles.items():
+        wallet_key = normalize_wallet(wallet_key or cached.get("wallet"))
+        if not wallet_key or wallet_key in profiles_by_wallet:
+            continue
+        last_trade = to_int(cached.get("last_esports_trade_at"))
+        if last_trade and last_trade >= prune_cutoff:
+            profiles_by_wallet[wallet_key] = cached
     write_json(output_dir / f"{prefix}_wallet_profiles.json", list(profiles_by_wallet.values()))
     mark_stage("wallet_profiles")
 
-    if is_v2:
-        collector_result = build_collector_leaderboard_v2(
-            profiles_by_wallet,
-            now_ts=now_ts,
-            per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
-            max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
-            include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
-            gate_kwargs=_v2_gate_kwargs_from_args(args),
-        )
-    else:
-        collector_result = build_collector_leaderboard(
-            profiles_by_wallet,
-            now_ts=now_ts,
-            max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", 60),
-            max_core_wallets=getattr(args, "max_core_wallets", 20),
-            max_momentum_wallets=getattr(args, "max_momentum_wallets", 10),
-            max_watchlist_wallets=getattr(args, "max_watchlist_wallets", 50),
-        )
+    collector_result = build_collector_leaderboard_v2(
+        profiles_by_wallet,
+        now_ts=now_ts,
+        per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
+        max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
+        include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
+        gate_kwargs=_v2_gate_kwargs_from_args(args),
+    )
     leaderboard = collector_result["leaderboard"]
-    if not is_v2:
-        write_json(output_dir / "collector_core_leaderboard.json", collector_result["core"])
-        write_json(output_dir / "collector_momentum_leaderboard.json", collector_result["momentum"])
-        write_json(output_dir / "collector_family_leaderboard.json", collector_result["family_supplements"])
-        write_json(output_dir / "collector_watchlist.json", collector_result["watch"])
     write_json(output_dir / f"{prefix}_leaderboard.json", leaderboard)
     mark_stage("leaderboard")
 
@@ -5800,59 +5458,30 @@ def _command_collect_wallets(
         "stage_timings": {key: round(float(value), 6) for key, value in sorted(stage_timings.items())},
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    if is_v2:
-        summary["collector"] = V2_COLLECTOR_NAME
-        summary.update(
-            {
-                "scoring_basis": scoring_basis,
-                "include_losing_side": include_losing_side,
-                "v2_include_technical": bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
-                "v2_qualified_count": collector_result.get("qualified_count", 0),
-                "v2_per_game_counts": collector_result.get("per_game_counts", {}),
-                "v2_edge_type_counts": collector_result.get("edge_type_counts", {}),
-                "v2_rejected_counts": collector_result.get("rejected_counts", {}),
-                "v2_gates": _v2_gate_kwargs_from_args(args),
-                "v2_per_game_quota": getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
-            }
-        )
-    else:
-        summary.update(
-            {
-                "lane_counts": collector_result["lane_counts"],
-                "core_leaderboard_wallet_count": len(collector_result["core"]),
-                "momentum_leaderboard_wallet_count": len(collector_result["momentum"]),
-                "family_leaderboard_wallet_count": len(collector_result["family_supplements"]),
-                "watchlist_wallet_count": len(collector_result["watch"]),
-                "max_inactive_hours": round(COLLECTOR_MAX_INACTIVE_SECONDS / 3600, 2),
-                "min_copyable_bucket_roi": MIN_COPYABLE_BUCKET_ROI,
-                "max_copyable_two_sided_market_count": MAX_COPYABLE_TWO_SIDED_COUNT,
-                "max_copyable_two_sided_market_rate": MAX_COPYABLE_TWO_SIDED_RATE,
-                "copyable_two_sided_max_rate": COPYABLE_TWO_SIDED_MAX_RATE,
-                "copyable_two_sided_min_bucket_roi": COPYABLE_TWO_SIDED_MIN_BUCKET_ROI,
-                "copyable_two_sided_min_first_direction_win_rate": COPYABLE_TWO_SIDED_MIN_FIRST_DIRECTION_WIN_RATE,
-                "copyable_two_sided_min_closed_count": COPYABLE_TWO_SIDED_MIN_CLOSED_COUNT,
-                "max_copyable_tail_entry_rate": MAX_COPYABLE_TAIL_ENTRY_RATE,
-                "high_churn_hard_excluded": False,
-            }
-        )
-    if is_v2:
-        dashboard_publish = publish_collector_dashboard_outputs(
-            output_dir,
-            resolve_data_dir(args),
-            summary=summary,
-            now_ts=now_ts,
-            prefix=prefix,
-            db_filename="leaderboard_v2.db",
-            profiles_publish_name="wallet_profiles_v2.json",
-            collector_name=V2_COLLECTOR_NAME,
-        )
-    else:
-        dashboard_publish = publish_collector_dashboard_outputs(
-            output_dir,
-            resolve_data_dir(args),
-            summary=summary,
-            now_ts=now_ts,
-        )
+    summary["collector"] = V2_COLLECTOR_NAME
+    summary.update(
+        {
+            "scoring_basis": scoring_basis,
+            "include_losing_side": include_losing_side,
+            "v2_include_technical": bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
+            "v2_qualified_count": collector_result.get("qualified_count", 0),
+            "v2_per_game_counts": collector_result.get("per_game_counts", {}),
+            "v2_edge_type_counts": collector_result.get("edge_type_counts", {}),
+            "v2_rejected_counts": collector_result.get("rejected_counts", {}),
+            "v2_gates": _v2_gate_kwargs_from_args(args),
+            "v2_per_game_quota": getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
+        }
+    )
+    dashboard_publish = publish_collector_dashboard_outputs(
+        output_dir,
+        resolve_data_dir(args),
+        summary=summary,
+        now_ts=now_ts,
+        prefix=prefix,
+        db_filename="leaderboard_v2.db",
+        profiles_publish_name="wallet_profiles_v2.json",
+        collector_name=V2_COLLECTOR_NAME,
+    )
     summary["dashboard_publish"] = dashboard_publish
     write_json(output_dir / f"{prefix}_build_summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
@@ -5919,10 +5548,6 @@ def command_analyze_collector_snapshot(args: argparse.Namespace) -> int:
     write_json(output_file, diagnostics)
     print(json.dumps(diagnostics, indent=2, sort_keys=True))
     return 0
-
-
-def command_collect_wallets(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
-    return _command_collect_wallets(args, client=client)
 
 
 def run_collect_v2_loop(
@@ -6242,497 +5867,8 @@ def command_observe_v2(args: argparse.Namespace, client: PolymarketClient | None
 
 
 def command_collect(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
-    category = str(getattr(args, "category", "esports") or "esports").lower()
-    if category == "esports":
-        if client is None:
-            return command_collect_wallets(args)
-        return command_collect_wallets(args, client=client)
-    if client is None:
-        return command_build_leaderboard(args)
-    return command_build_leaderboard(args, client=client)
-
-
-def command_build_leaderboard(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
-    data_dir = resolve_data_dir(args)
-    with acquire_build_lock(data_dir):
-        return _command_build_leaderboard_unlocked(args, client=client)
-
-
-def _command_build_leaderboard_unlocked(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
-    client = client or build_client(args)
-    data_dir = resolve_data_dir(args)
-    now_ts = int(datetime.now(timezone.utc).timestamp())
-    stage_timings: dict[str, float] = {}
-    stage_started_at = time.monotonic()
-
-    def mark_stage(name: str) -> None:
-        nonlocal stage_started_at
-        now = time.monotonic()
-        stage_timings[f"{name}_seconds"] = round(now - stage_started_at, 6)
-        stage_started_at = now
-
-    category = getattr(args, "category", "esports")
-    effective_limits = effective_build_limits(args)
-    effective_defaults = effective_build_defaults(args)
-    classification_lookback_days = effective_defaults["classification_lookback_days"]
-    lookback_steps = (classification_lookback_days,) if classification_lookback_days else (7, 14, 30)
-    classification_path = data_dir / "esports_classification_set.json"
-    classification_meta_path = data_dir / "esports_classification_set.meta.json"
-    tag_slugs = CATEGORY_TAG_SLUGS.get(category, CATEGORY_TAG_SLUGS["esports"])
-    market_scope = CATEGORY_MARKET_SCOPES.get(category, CATEGORY_MARKET_SCOPES["esports"])
-    classification_meta = {
-        "category": category,
-        "gamma_pages": args.gamma_pages,
-        "classification_lookback_days": classification_lookback_days,
-        "market_scope": market_scope,
-        "tag_slugs": list(tag_slugs),
-        "sports_event_min_volume": getattr(args, "sports_event_min_volume", 0.0) if category == "sports" else 0.0,
-    }
-    classification_source = "api"
-    if (
-        classification_path.exists()
-        and read_json(classification_meta_path, None) == classification_meta
-        and not should_refresh_file_cache(
-            classification_path.stat().st_mtime,
-            now_ts=now_ts,
-            ttl_hours=args.classification_cache_ttl_hours,
-            force_refresh=args.refresh_classification,
-        )
-    ):
-        classification_set = read_json(classification_path, [])
-        classification_source = "cache"
-    else:
-        now_dt = datetime.fromtimestamp(now_ts, timezone.utc)
-        min_end_date = (
-            now_dt - timedelta(days=classification_lookback_days)
-            if classification_lookback_days and classification_lookback_days > 0
-            else None
-        )
-        closed_events = client.list_events_paginated(
-            closed=True,
-            active=None,
-            max_pages=args.gamma_pages,
-            min_end_date=min_end_date,
-            max_end_date=None if category == "sports" else now_dt,
-            tag_slugs=tag_slugs,
-        )
-        classification_set = build_classification_set(
-            closed_events,
-            now=now_dt,
-            lookback_days=classification_lookback_days if classification_lookback_days > 0 else None,
-            sports_event_min_volume=getattr(args, "sports_event_min_volume", 0.0) if category == "sports" else 0.0,
-        )
-        write_json(classification_path, classification_set)
-        write_json(classification_meta_path, classification_meta)
-    league_event_counts = league_event_counts_from_classification_set(classification_set)
-    mark_stage("classification")
-
-    effective_discovery = effective_discovery_defaults(args)
-    market_batch_size = args.market_batch_size or 50
-    market_count = effective_discovery["max_markets_per_run"]
-    market_offset = args.market_offset
-    if args.market_batch_index is not None:
-        market_offset = args.market_batch_index * market_batch_size
-        market_count = market_batch_size
-    discovery_slate, slate_meta = build_discovery_slate(
-        classification_set,
-        lookback_steps=lookback_steps,
-        min_market_volume=args.min_market_volume,
-        fallback_min_market_volume=args.fallback_min_market_volume,
-        submarket_min_market_volume=args.submarket_min_market_volume,
-        submarket_fallback_min_market_volume=args.submarket_fallback_min_market_volume,
-        target_markets=effective_discovery["target_markets"],
-        submarket_target_markets=effective_discovery["submarket_target_markets"],
-        game_winner_target_markets=effective_discovery["game_winner_target_markets"],
-        map_winner_target_markets=effective_discovery["map_winner_target_markets"],
-        max_markets_per_run=market_count,
-        submarket_max_markets_per_run=effective_discovery["submarket_max_markets_per_run"],
-        game_winner_max_markets_per_run=effective_discovery["game_winner_max_markets_per_run"],
-        map_winner_max_markets_per_run=effective_discovery["map_winner_max_markets_per_run"],
-        market_offset=market_offset,
-        league_target_markets=(
-            {
-                "nba": effective_limits.get("sports_nba_target_markets", args.sports_nba_target_markets),
-                "ufc": effective_limits.get("sports_ufc_target_markets", args.sports_ufc_target_markets),
-            }
-            if category == "sports"
-            else None
-        ),
-        league_min_market_volumes=(
-            {"nba": args.sports_nba_min_market_volume, "ufc": args.sports_ufc_min_market_volume}
-            if category == "sports"
-            else None
-        ),
-        league_fallback_min_market_volumes=(
-            {"nba": args.sports_nba_fallback_min_market_volume, "ufc": args.sports_ufc_fallback_min_market_volume}
-            if category == "sports"
-            else None
-        ),
-    )
-    write_json(data_dir / "discovery_slate.json", discovery_slate)
-    mark_stage("discovery_slate")
-
-    trades_by_market: dict[str, list[dict]] = {}
-    partial_markets = []
-    market_trades_cache_hits = 0
-    market_trades_api_fetches = 0
-    def fetch_trades_for_market(market: dict[str, Any]) -> tuple[str, list[dict], bool, str]:
-        condition_id = market["condition_id"]
-        try:
-            trades, partial, trades_source = fetch_market_trades_cached(
-                client,
-                condition_id,
-                data_dir=data_dir,
-                now_ts=now_ts,
-                page_limit=args.trades_page_limit,
-                max_pages=args.max_pages_per_market,
-                min_trade_cash=args.min_trade_cash,
-                cache_ttl_days=args.market_trades_cache_ttl_days,
-                force_refresh=args.refresh_market_trades,
-                use_cache=not args.no_market_trades_cache,
-            )
-            return condition_id, trades, partial, trades_source
-        except Exception:
-            return condition_id, [], True, "error"
-
-    trade_results = run_ordered_io_tasks(
-        discovery_slate,
-        fetch_trades_for_market,
-        max_workers=args.max_workers,
-    )
-    for result in trade_results:
-        if isinstance(result, Exception):
-            continue
-        condition_id, trades, partial, trades_source = result
-        trades_by_market[condition_id] = trades
-        if partial:
-            partial_markets.append(condition_id)
-        if trades_source == "cache":
-            market_trades_cache_hits += 1
-        else:
-            market_trades_api_fetches += 1
-    market_end_times = {}
-    market_start_times = {}
-    for market in discovery_slate:
-        end_dt = parse_dt(market.get("end_date"))
-        if end_dt:
-            market_end_times[market["condition_id"]] = int(end_dt.timestamp())
-        start_dt = parse_dt(market.get("match_start_time") or market.get("market_start_time"))
-        if start_dt:
-            market_start_times[market["condition_id"]] = int(start_dt.timestamp())
-    candidates = build_candidate_wallets(
-        trades_by_market,
-        market_type_by_id={
-            str(market.get("condition_id") or "").lower(): str(market.get("market_type") or "main_match")
-            for market in discovery_slate
-            if market.get("condition_id")
-        },
-        market_game_family_by_id={
-            str(market.get("condition_id") or "").lower(): str(market.get("game_family") or "")
-            for market in discovery_slate
-            if market.get("condition_id") and market.get("game_family")
-        },
-        market_end_times=market_end_times,
-        market_start_times=market_start_times,
-        min_trade_cash=args.min_trade_cash,
-        participation_threshold=args.participation_threshold,
-        top_participation_count=args.top_participation_count,
-        total_cash_threshold=args.total_cash_threshold,
-        single_market_cash_threshold=args.single_market_cash_threshold,
-        max_candidate_wallets=args.max_candidate_wallets,
-        candidate_wallets_per_market_type=(
-            ESPORTS_DEFAULT_CANDIDATE_WALLETS_PER_MARKET_TYPE if category == "esports" else None
-        ),
-        candidate_wallets_per_game_family=(
-            ESPORTS_DEFAULT_CANDIDATE_WALLETS_PER_MARKET_TYPE if category == "esports" else None
-        ),
-        candidate_game_family_thresholds=(
-            ESPORTS_CANDIDATE_GAME_FAMILY_THRESHOLDS if category == "esports" else None
-        ),
-    )
-    mark_stage("market_trades_fetch")
-    profile_candidates = filter_profile_candidates(
-        candidates,
-        min_participated_markets=effective_defaults["min_profile_participated_markets"],
-        min_avg_market_cash=args.min_profile_avg_market_cash,
-        require_clean_discovery=True,
-        market_type_thresholds=ESPORTS_CANDIDATE_MARKET_TYPE_THRESHOLDS if category == "esports" else None,
-        game_family_thresholds=ESPORTS_CANDIDATE_GAME_FAMILY_THRESHOLDS if category == "esports" else None,
-    )
-    favorite_rows = load_favorite_wallet_rows_for_category(data_dir, category)
-    favorite_wallets = set(favorite_rows)
-    if favorite_rows:
-        seen_profile_candidates = {normalize_wallet(row.get("wallet")) for row in profile_candidates}
-        profile_candidates.extend(
-            row
-            for row in favorite_profile_candidates(favorite_rows, category=category)
-            if normalize_wallet(row.get("wallet")) not in seen_profile_candidates
-        )
-    write_json(data_dir / "candidate_wallets.json", candidates)
-    write_json(data_dir / "profile_candidate_wallets.json", profile_candidates)
-    mark_stage("candidate_filtering")
-
-    existing_profiles = {
-        normalize_wallet(row.get("wallet")): row for row in read_json(data_dir / "wallet_profiles.json", [])
-    }
-    condition_ids = {row["condition_id"] for row in classification_set}
-    market_records_by_id = {
-        str(row.get("condition_id") or "").lower(): row
-        for row in classification_set
-        if row.get("condition_id")
-    }
-    condition_type_by_id = {
-        str(row.get("condition_id") or "").lower(): str(row.get("market_type") or "main_match")
-        for row in classification_set
-        if row.get("condition_id")
-    }
-    condition_game_family_by_id = {
-        str(row.get("condition_id") or "").lower(): str(row.get("game_family") or "unknown")
-        for row in classification_set
-        if row.get("condition_id")
-    }
-    max_profiles_per_run_effective = effective_limits.get("max_profiles_per_run", args.max_profiles_per_run)
-    profile_fetch_plan = build_profile_fetch_plan(
-        profile_candidates,
-        existing_profiles,
-        now_ts=now_ts,
-        ttl_seconds=args.profile_refresh_ttl_days * 86400,
-        max_profiles=max_profiles_per_run_effective,
-        force_refresh_wallets=favorite_wallets,
-    )
-
-    def fetch_raw_user_trades_for_candidate(candidate: dict[str, Any]) -> tuple[str, list[dict]]:
-        wallet = normalize_wallet(candidate.get("wallet"))
-        trades = fetch_recent_user_trades_for_wallet(
-            client,
-            wallet,
-            page_limit=args.user_history_trades_limit,
-            max_pages=effective_limits.get("user_history_trades_max_pages", args.user_history_trades_max_pages),
-            data_dir=data_dir,
-            now_ts=now_ts,
-            cache_ttl_days=args.market_trades_cache_ttl_days,
-            force_refresh=args.refresh_market_trades or wallet in favorite_wallets,
-            use_cache=not args.no_market_trades_cache,
-        )
-        return wallet, trades
-
-    raw_user_trade_results = run_ordered_io_tasks(
-        profile_fetch_plan,
-        fetch_raw_user_trades_for_candidate,
-        max_workers=args.max_workers,
-    )
-    raw_user_trades_by_wallet: dict[str, list[dict]] = {}
-    for index, result in enumerate(raw_user_trade_results):
-        fallback_wallet = normalize_wallet(profile_fetch_plan[index].get("wallet"))
-        if isinstance(result, Exception):
-            raw_user_trades_by_wallet[fallback_wallet] = []
-            continue
-        wallet, trades = result
-        raw_user_trades_by_wallet[normalize_wallet(wallet)] = trades
-    mark_stage("raw_user_trades_fetch")
-
-    if category == "esports":
-        backfilled_market_records, backfill_summary = backfill_user_trade_submarkets(
-            client,
-            raw_user_trades_by_wallet,
-            market_records_by_id,
-            data_dir=data_dir,
-            now_ts=now_ts,
-            cache_ttl_days=args.market_trades_cache_ttl_days,
-            force_refresh=args.refresh_market_trades,
-            use_cache=not args.no_market_trades_cache,
-            max_workers=args.max_workers,
-        )
-    else:
-        backfilled_market_records = {}
-        backfill_summary = empty_user_trade_backfill_summary()
-    if backfilled_market_records:
-        market_records_by_id = {**market_records_by_id, **backfilled_market_records}
-        condition_type_by_id = {
-            **condition_type_by_id,
-            **{
-                condition_id: str(record.get("market_type") or "main_match")
-                for condition_id, record in backfilled_market_records.items()
-            },
-        }
-        condition_game_family_by_id = {
-            **condition_game_family_by_id,
-            **{
-                condition_id: str(record.get("game_family") or "unknown")
-                for condition_id, record in backfilled_market_records.items()
-            },
-        }
-        condition_ids = set(market_records_by_id)
-    mark_stage("submarket_backfill")
-
-    def load_user_trades(wallet: str) -> list[dict]:
-        # Per-user history is the accurate source: a per-market pool over the discovery
-        # slate only covers markets we fetched and is taker-side only, which materially
-        # undercounts a wallet's resolved markets (verified: 0xe16 80→39 markets, A→B).
-        return _filter_esports_user_trades(
-            raw_user_trades_by_wallet.get(normalize_wallet(wallet), []),
-            condition_ids,
-            max_esports_markets=effective_limits.get(
-                "max_esports_closed_positions_per_wallet",
-                args.max_esports_closed_positions_per_wallet,
-            ),
-        )
-
-    def load_closed_positions(wallet: str) -> list[dict]:
-        return fetch_recent_esports_closed_positions_for_wallet(
-            client,
-            wallet,
-            condition_ids,
-            max_esports_closed_positions=effective_limits.get(
-                "max_esports_closed_positions_per_wallet",
-                args.max_esports_closed_positions_per_wallet,
-            ),
-            market_chunk_size=args.closed_position_market_chunk_size,
-        )
-
-    def profile_one_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
-        try:
-            return profile_candidate_wallet(
-                candidate,
-                condition_ids,
-                market_records_by_id=market_records_by_id,
-                condition_type_by_id=condition_type_by_id,
-                condition_game_family_by_id=condition_game_family_by_id,
-                user_trades_loader=load_user_trades,
-                closed_positions_loader=load_closed_positions,
-                current_positions_loader=lambda _wallet: [],
-                now_ts=now_ts,
-            )
-        except Exception as exc:
-            return make_retryable_profile(candidate, exc, now_ts=now_ts)
-
-    profile_results = run_ordered_io_tasks(
-        profile_fetch_plan,
-        profile_one_candidate,
-        max_workers=args.max_workers,
-    )
-    profiles = [
-        make_retryable_profile(profile_fetch_plan[index], result, now_ts=now_ts)
-        if isinstance(result, Exception)
-        else result
-        for index, result in enumerate(profile_results)
-    ]
-    profiled_count = len(profile_fetch_plan)
-    mark_stage("wallet_profiling")
-
-    profiles_by_wallet = {
-        normalize_wallet(row.get("wallet")): row
-        for row in [*existing_profiles.values(), *profiles]
-        if normalize_wallet(row.get("wallet"))
-    }
-    if category == "sports":
-        profiles_by_wallet = {
-            wallet: augment_profile_sports_league_fields(profile, market_records_by_id)
-            for wallet, profile in profiles_by_wallet.items()
-        }
-    profiles_by_wallet = merge_profiles_with_candidates(profiles_by_wallet, profile_candidates)
-    profiles_by_wallet = apply_favorite_profile_defaults(profiles_by_wallet, favorite_rows, category=category)
-    if category == "esports":
-        refreshed_profiles: dict[str, dict[str, Any]] = {}
-        for wallet, profile in profiles_by_wallet.items():
-            raw_trades = raw_user_trades_by_wallet.get(wallet)
-            if raw_trades is None:
-                cached = read_json(user_trades_cache_path(data_dir, wallet), {})
-                raw_trades = cached.get("trades") if isinstance(cached, dict) else []
-            refreshed_profiles[wallet] = merge_recent_trade_metrics_into_profile(
-                profile,
-                raw_trades or [],
-                market_records_by_id,
-                now_ts=now_ts,
-            )
-        profiles_by_wallet = refreshed_profiles
-        profiles_by_wallet = apply_favorite_profile_defaults(profiles_by_wallet, favorite_rows, category=category)
-    leaderboard = build_leaderboard_from_profiles(
-        profiles_by_wallet,
-        now_ts=now_ts,
-        min_participated_markets=effective_defaults["leaderboard_min_participated_markets"],
-        min_avg_market_cash=args.leaderboard_min_avg_market_cash,
-        require_tail_entry_field=True,
-        require_current_scoring_version=True,
-        max_leaderboard_wallets=args.max_leaderboard_wallets,
-        min_pre_match_entry_rate=0.0,
-        league_event_counts=league_event_counts if category == "sports" else None,
-    )
-    leaderboard = merge_favorites_into_leaderboard(
-        leaderboard,
-        profiles_by_wallet,
-        favorite_rows,
-        category=category,
-    )
-    overlap_report = build_wallet_overlap_report(leaderboard)
-    diagnostics = build_collection_diagnostics(
-        discovery_slate=discovery_slate,
-        candidates=candidates,
-        profile_candidates=profile_candidates,
-        profiles_by_wallet=profiles_by_wallet,
-        leaderboard=leaderboard,
-        now_ts=now_ts,
-        stage_timings=stage_timings,
-    )
-    mark_stage("leaderboard_build")
-    diagnostics["stage_timings"] = {
-        key: round(float(value), 6)
-        for key, value in sorted(stage_timings.items())
-    }
-    profiles_by_wallet = prune_profile_store(
-        profiles_by_wallet,
-        now_ts=now_ts,
-        max_age_days=args.profile_store_max_age_days,
-    )
-    write_json(data_dir / "wallet_profiles.json", list(profiles_by_wallet.values()))
-    write_json(data_dir / "leaderboard_wallet_overlap.json", overlap_report)
-
-    summary = {
-        "category": category,
-        "market_scope": market_scope,
-        "classification_market_count": len(classification_set),
-        "eligible_event_count_by_league": league_event_counts if category == "sports" else {},
-        "classification_source": classification_source,
-        "discovery_market_count": len(discovery_slate),
-        "candidate_wallet_count": len(candidates),
-        "profile_candidate_wallet_count": len(profile_candidates),
-        "profiled_wallet_count": profiled_count,
-        **build_profile_budget_summary(
-            profile_candidate_wallet_count=len(profile_candidates),
-            profile_fetch_plan_count=len(profile_fetch_plan),
-            max_profiles_per_run_effective=max_profiles_per_run_effective,
-        ),
-        **backfill_summary,
-        "leaderboard_wallet_count": len(leaderboard),
-        "leaderboard_union_market_count": overlap_report["union_market_count"],
-        "leaderboard_pair_overlap_count": len(overlap_report["pair_overlaps"]),
-        "market_trades_cache_hits": market_trades_cache_hits,
-        "market_trades_api_fetches": market_trades_api_fetches,
-        "partial_market_trades": partial_markets,
-        "discovery_source": "trades",
-        "slate": slate_meta,
-        "diagnostics": diagnostics,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    LeaderboardStore(data_dir / "leaderboard.db").publish_collection(
-        category=category,
-        leaderboard=leaderboard,
-        profiles=list(profiles_by_wallet.values()),
-        summary=summary,
-        updated_at=now_ts,
-    )
-    print(json.dumps(summary, indent=2, sort_keys=True))
-    print()
-    category_label = "sports" if category == "sports" else "esports"
-    print("搜集完成")
-    print(f"- 历史 {category_label} 胜负市场: {summary['classification_market_count']}")
-    print(f"- 本轮发现市场: {summary['discovery_market_count']}")
-    print(f"- 候选钱包: {summary['candidate_wallet_count']}")
-    print(f"- 通过快速过滤的钱包: {summary['profile_candidate_wallet_count']}")
-    print(f"- 本轮深度分析钱包: {summary['profiled_wallet_count']}")
-    print(f"- A/B 优质钱包: {summary['leaderboard_wallet_count']}")
-    print(f"- 输出目录: {data_dir}")
-    return 0
+    # v2 是唯一管线;collect 走 collect-v2(esports-only)。
+    return _command_collect_wallets(args, client=client, variant="v2")
 
 
 def find_active_market(client: PolymarketClient, args: argparse.Namespace) -> dict[str, Any] | None:
@@ -7509,7 +6645,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_build_arguments(subparser: argparse.ArgumentParser, *, include_category: bool = False) -> None:
         if include_category:
-            subparser.add_argument("--category", choices=["esports", "sports"], default="esports")
+            subparser.add_argument("--category", choices=["esports"], default="esports")
         subparser.add_argument("--gamma-pages", type=int, default=10)
         subparser.add_argument("--refresh-classification", action="store_true")
         subparser.add_argument("--classification-cache-ttl-hours", type=int, default=24)
@@ -7519,13 +6655,6 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--request-burst", type=int, default=5)
         subparser.add_argument("--max-retry-after-seconds", type=float, default=60)
         subparser.add_argument("--min-market-volume", type=float, default=25_000)
-        subparser.add_argument("--sports-event-min-volume", type=float, default=50_000)
-        subparser.add_argument("--sports-nba-target-markets", type=int, default=80)
-        subparser.add_argument("--sports-ufc-target-markets", type=int, default=80)
-        subparser.add_argument("--sports-nba-min-market-volume", type=float, default=250_000)
-        subparser.add_argument("--sports-nba-fallback-min-market-volume", type=float, default=100_000)
-        subparser.add_argument("--sports-ufc-min-market-volume", type=float, default=25_000)
-        subparser.add_argument("--sports-ufc-fallback-min-market-volume", type=float, default=10_000)
         subparser.add_argument("--fallback-min-market-volume", type=float, default=10_000)
         subparser.add_argument("--submarket-min-market-volume", type=float, default=5_000)
         subparser.add_argument("--submarket-fallback-min-market-volume", type=float, default=1_000)
@@ -7566,7 +6695,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--max-leaderboard-wallets", type=int, default=60)
         subparser.add_argument("--profile-refresh-ttl-days", type=int, default=7)
         subparser.add_argument("--profile-store-max-age-days", type=int, default=180)
-        subparser.set_defaults(func=command_build_leaderboard)
+        subparser.set_defaults(func=command_collect)
 
     def add_follow_arguments(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--follow-dir")
@@ -7625,11 +6754,6 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--max-esports-markets-per-wallet", type=int, default=100)
         subparser.add_argument("--collector-profile-cache-ttl-hours", type=float, default=24)
         subparser.add_argument("--user-trades-cache-ttl-days", type=int, default=1)
-
-    build = subparsers.add_parser("build-leaderboard")
-    add_build_arguments(build, include_category=True)
-    add_collector_arguments(build)
-    build.set_defaults(func=command_collect)
 
     collect = subparsers.add_parser("collect", help="one-shot wallet collection and leaderboard build")
     add_build_arguments(collect, include_category=True)

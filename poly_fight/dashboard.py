@@ -2574,7 +2574,7 @@ def _update_active_market_price_cache(data_dir: Path, condition_id: str, record:
     )
 
 
-CATEGORIES = ("esports", "sports")
+CATEGORIES = ("esports",)   # sports 已退役;esports 是唯一类目
 
 
 def normalize_category(category: str | None) -> str:
@@ -2594,7 +2594,7 @@ def league_label(value: Any) -> str:
 
 def category_data_dirs(root: Path) -> dict[str, Path]:
     root = Path(root)
-    return {"esports": root / "esports", "sports": root / "sports"}
+    return {"esports": root / "esports"}
 
 
 def _follow_dir(config_or_data_dir: DashboardConfig | Path) -> Path:
@@ -3127,20 +3127,13 @@ def start_wallet_refresh(
 
     follow_dir.mkdir(parents=True, exist_ok=True)
     log_path = follow_dir / f"wallet-refresh-{category}-{now_ts}.out"
+    # v2 是唯一管线:刷新走 collect-v2(esports;sports 已退役)。可透传胜率/买入价阈值。
     base = [sys.executable, "-u", "-m", "poly_fight.cli", "--data-dir", str(category_dir)]
-    if category == "esports":
-        # esports 走 collect-v2(dashboard 读 leaderboard_v2.db);可透传胜率/买入价阈值。
-        command = [
-            *base, "collect-v2", "--category", category,
-            "--refresh-classification", "--max-profile-wallets", "1000",
-            *(extra_args or []),
-        ]
-    else:
-        # sports 暂无 v2 管线,保持 v1 collect。
-        command = [
-            *base, "collect", "--category", category,
-            "--refresh-classification", "--max-profiles-per-run", "1000",
-        ]
+    command = [
+        *base, "collect-v2", "--category", category,
+        "--refresh-classification", "--max-profile-wallets", "1000",
+        *(extra_args or []),
+    ]
     status = {
         "status": "running",
         "category": category,
