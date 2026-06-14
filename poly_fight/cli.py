@@ -895,6 +895,90 @@ def fetch_recent_esports_closed_positions_for_wallet(
     return positions[:max_esports_closed_positions]
 
 
+USER_TRADES_CACHE_SCHEMA = 2
+
+
+def _user_trade_dedup_key(trade: dict[str, Any]) -> tuple[Any, ...]:
+    tid = trade.get("id") or trade.get("transactionHash")
+    if tid:
+        return ("id", str(tid))
+    return (
+        "composite",
+        str(trade.get("conditionId") or trade.get("condition_id") or "").lower(),
+        int(trade.get("timestamp") or 0),
+        str(trade.get("side") or ""),
+        str(trade.get("size") or ""),
+        str(trade.get("price") or ""),
+        str(trade.get("outcomeIndex") if trade.get("outcomeIndex") is not None else trade.get("outcome") or ""),
+    )
+
+
+def _sort_user_trades_desc(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(trades, key=lambda trade: int(trade.get("timestamp") or 0), reverse=True)
+
+
+def _load_raw_user_trade_cache(cache_path: Path) -> tuple[list[dict[str, Any]], bool]:
+    """载入 schema=2 的原始交易缓存;旧格式/缺失返回 ([], False) → 当首采处理。"""
+    data = read_json(cache_path, {})
+    if not isinstance(data, dict) or int(data.get("schema") or 0) != USER_TRADES_CACHE_SCHEMA:
+        return [], False
+    trades = data.get("trades")
+    if not isinstance(trades, list):
+        return [], False
+    return trades, True
+
+
+def _fetch_user_trade_pages(
+    client: PolymarketClient,
+    wallet: str,
+    *,
+    page_limit: int,
+    max_pages: int,
+    stop_cursor: dict[str, Any] | None = None,
+    scope_condition_ids: set[str] | None = None,
+    max_scoped_markets: int = 0,
+) -> list[dict[str, Any]]:
+    """从 offset 0 翻页拉取钱包交易。
+    - stop_cursor 给定(增量):遇到 ≤cursor 的交易即停(通常 1 页)。
+    - 否则(首采):翻至短页 / max_pages / 深度命中 max_scoped_markets 个 scoped 市场。
+    深翻 400 容错沿用旧逻辑。"""
+    collected: list[dict[str, Any]] = []
+    limit = max(1, int(page_limit))
+    cursor_ts = int((stop_cursor or {}).get("timestamp") or 0) if stop_cursor else None
+    cursor_id = str((stop_cursor or {}).get("id") or "") if stop_cursor else ""
+    seen_scoped: set[str] = set()
+    for page in range(max(1, int(max_pages))):
+        offset = page * limit
+        try:
+            batch = client.trades_for_user(wallet, limit=limit, offset=offset)
+        except RuntimeError as exc:
+            if offset > 0 and "HTTP Error 400" in str(exc):
+                break
+            raise
+        if not batch:
+            break
+        reached_cursor = False
+        for trade in batch:
+            if cursor_ts is not None:
+                ts = int(trade.get("timestamp") or 0)
+                tid = str(trade.get("id") or trade.get("transactionHash") or "")
+                if ts < cursor_ts or (ts == cursor_ts and (not cursor_id or tid == cursor_id)):
+                    reached_cursor = True
+                    break
+            collected.append(trade)
+            if scope_condition_ids is not None and max_scoped_markets:
+                cid = str(trade.get("conditionId") or trade.get("condition_id") or "").lower()
+                if cid in scope_condition_ids:
+                    seen_scoped.add(cid)
+        if reached_cursor:
+            break
+        if scope_condition_ids is not None and max_scoped_markets and len(seen_scoped) >= max_scoped_markets:
+            break
+        if len(batch) < limit:
+            break
+    return collected
+
+
 def fetch_recent_esports_user_trades_for_wallet(
     client: PolymarketClient,
     wallet: str,
@@ -909,72 +993,70 @@ def fetch_recent_esports_user_trades_for_wallet(
     force_refresh: bool = False,
     use_cache: bool = True,
     include_source: bool = False,
+    retention_days: int | None = None,
 ) -> list[dict] | tuple[list[dict], str]:
+    """逐钱包**原始**交易缓存 + 增量拉取。缓存按钱包做键、存原始近期交易(不按 scope 过滤);
+    已拉过的历史不重复拉,只增量拉游标之后的新交易;打分时再按当前 scope 过滤(窗口裁剪正确)。"""
     condition_ids = {str(value).lower() for value in esports_condition_ids if value}
     if not condition_ids:
         return ([], "empty") if include_source else []
     wallet = normalize_wallet(wallet)
-    condition_ids_hash = hashlib.sha256("\n".join(sorted(condition_ids)).encode("utf-8")).hexdigest()
-    expected_meta = {
-        "wallet": wallet,
-        "page_limit": int(page_limit),
-        "max_pages": int(max_pages),
-        "max_esports_markets": int(max_esports_markets),
-        "condition_id_count": len(condition_ids),
-        "condition_ids_hash": condition_ids_hash,
-    }
+    now_ts = int(now_ts if now_ts is not None else time.time())
     cache_path = user_trades_cache_path(data_dir, wallet) if data_dir else None
-    if (
-        use_cache
-        and cache_path
-        and cache_path.exists()
-        and not should_refresh_file_cache(
+
+    cached_trades: list[dict[str, Any]] = []
+    cache_ok = False
+    fetch_needed = True
+    if use_cache and cache_path and cache_path.exists():
+        cached_trades, cache_ok = _load_raw_user_trade_cache(cache_path)
+        if cache_ok and not should_refresh_file_cache(
             cache_path.stat().st_mtime,
-            now_ts=now_ts or int(time.time()),
+            now_ts=now_ts,
             ttl_hours=cache_ttl_days * 24,
             force_refresh=force_refresh,
-        )
-    ):
-        cached = read_json(cache_path, {})
-        if cached.get("meta") == expected_meta:
-            raw_trades = cached.get("trades") or []
-            filtered = _filter_esports_user_trades(raw_trades, condition_ids, max_esports_markets=max_esports_markets)
-            return (filtered, "cache") if include_source else filtered
+        ):
+            fetch_needed = False
 
-    trades = []
-    limit = max(1, int(page_limit))
-    for page in range(max(1, int(max_pages))):
-        offset = page * limit
-        try:
-            batch = client.trades_for_user(wallet, limit=limit, offset=offset)
-        except RuntimeError as exc:
-            if offset > 0 and "HTTP Error 400" in str(exc):
-                break
-            raise
-        if not batch:
-            break
-        trades.extend(batch)
-        filtered = _filter_esports_user_trades(trades, condition_ids, max_esports_markets=max_esports_markets)
-        seen_markets = {
-            str(trade.get("conditionId") or trade.get("condition_id") or "").lower()
-            for trade in filtered
-        }
-        if len(seen_markets) >= max_esports_markets:
-            break
-        if len(batch) < limit:
-            break
-    if use_cache and cache_path:
-        filtered_trades = _filter_esports_user_trades(trades, condition_ids, max_esports_markets=max_esports_markets)
-        write_json(
-            cache_path,
-            {
-                "meta": expected_meta,
-                "trades": filtered_trades,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-    filtered = _filter_esports_user_trades(trades, condition_ids, max_esports_markets=max_esports_markets)
-    return (filtered, "api") if include_source else filtered
+    source = "cache"
+    if fetch_needed:
+        if cache_ok and cached_trades and not force_refresh:
+            # 增量:仅拉最新缓存交易之后的新交易。
+            newest = _sort_user_trades_desc(cached_trades)[0]
+            stop_cursor = {
+                "timestamp": int(newest.get("timestamp") or 0),
+                "id": str(newest.get("id") or newest.get("transactionHash") or ""),
+            }
+            new_trades = _fetch_user_trade_pages(
+                client, wallet, page_limit=page_limit, max_pages=max_pages, stop_cursor=stop_cursor
+            )
+        else:
+            # 首采(或 force):全采,深度沿用旧界(scoped-market 上限)。
+            new_trades = _fetch_user_trade_pages(
+                client, wallet, page_limit=page_limit, max_pages=max_pages,
+                scope_condition_ids=condition_ids, max_scoped_markets=max_esports_markets,
+            )
+            cached_trades = []
+        merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for trade in [*new_trades, *cached_trades]:   # 新交易优先覆盖
+            merged.setdefault(_user_trade_dedup_key(trade), trade)
+        cached_trades = _sort_user_trades_desc(list(merged.values()))
+        if retention_days is not None and int(retention_days) > 0:
+            cutoff = now_ts - int(retention_days) * 86400
+            cached_trades = [t for t in cached_trades if int(t.get("timestamp") or 0) >= cutoff]
+        source = "api"
+        if use_cache and cache_path:
+            write_json(
+                cache_path,
+                {
+                    "schema": USER_TRADES_CACHE_SCHEMA,
+                    "wallet": wallet,
+                    "trades": cached_trades,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
+    filtered = _filter_esports_user_trades(cached_trades, condition_ids, max_esports_markets=max_esports_markets)
+    return (filtered, source) if include_source else filtered
 
 
 def _filter_esports_user_trades(
@@ -5677,6 +5759,7 @@ def _command_collect_wallets(
             force_refresh=False,
             use_cache=True,
             include_source=True,
+            retention_days=profile_lookback_days,
         )
         return wallet, trades, source
 
@@ -6112,6 +6195,7 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
             data_dir=output_dir, now_ts=now_ts,
             cache_ttl_days=getattr(args, "user_trades_cache_ttl_days", 1),
             force_refresh=False, use_cache=True, include_source=True,
+            retention_days=profile_lookback_days,
         )
         seed_candidate = build_profile_candidate_from_trades(collector_seed_candidate(seed_wallet), trades, market_records_by_id)
         profile = profile_candidate_wallet(

@@ -2949,7 +2949,8 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(client.calls, 1)
 
-    def test_recent_esports_user_trades_cache_stores_only_scoped_trades(self):
+    def test_recent_esports_user_trades_cache_stores_raw_returns_scoped(self):
+        # 缓存存原始交易(含非 scoped 的 other,供跨 scope/窗口复用);返回仍按 scope 过滤。
         class FakeClient:
             def trades_for_user(self, wallet, *, limit, offset):
                 return [
@@ -2970,8 +2971,50 @@ class CoreTest(unittest.TestCase):
             )
             cached = read_json(data_dir / "raw_user_trades" / "0xabc.json", {})
 
-        self.assertEqual([row["conditionId"] for row in trades], ["m1"])
-        self.assertEqual([row["conditionId"] for row in cached["trades"]], ["m1"])
+        self.assertEqual([row["conditionId"] for row in trades], ["m1"])          # 返回 scope 过滤
+        self.assertEqual(cached["schema"], 2)
+        self.assertEqual(sorted(row["conditionId"] for row in cached["trades"]), ["m1", "other"])  # 缓存存 raw
+
+    def test_recent_esports_user_trades_incremental_fetch_only_pulls_new(self):
+        # 第二次只增量拉游标之后的新交易,不重拉历史;合并后返回 scope 过滤的全部。
+        class FakeClient:
+            def __init__(self):
+                self.offsets = []
+                self.newest_ts = 100
+
+            def trades_for_user(self, wallet, *, limit, offset):
+                self.offsets.append(offset)
+                if offset > 0:
+                    return []
+                # 始终返回当前最新交易(含历史 m1@100);增量时遇到 ≤cursor 即停。
+                trades = []
+                if self.newest_ts > 100:
+                    trades.append({"id": "new", "conditionId": "m1", "timestamp": self.newest_ts})
+                trades.append({"id": "old", "conditionId": "m1", "timestamp": 100})
+                return trades
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            client = FakeClient()
+            fetch_recent_esports_user_trades_for_wallet(
+                client, "0xABC", {"m1"}, data_dir=data_dir, now_ts=100,
+                page_limit=10, max_pages=3, cache_ttl_days=0,
+            )
+            # 把缓存 mtime 压成 0,使 now_ts(200) 触发刷新(否则真实 mtime 远大于 now_ts → 判新鲜)
+            os.utime(data_dir / "raw_user_trades" / "0xabc.json", (0, 0))
+            client.offsets.clear()
+            client.newest_ts = 300   # 来了一笔新交易
+            trades = fetch_recent_esports_user_trades_for_wallet(
+                client, "0xABC", {"m1"}, data_dir=data_dir, now_ts=200,
+                page_limit=10, max_pages=3, cache_ttl_days=0,
+            )
+            cached = read_json(data_dir / "raw_user_trades" / "0xabc.json", {})
+
+        # 增量第二次:offset 0 一页即停(遇到 old@100=cursor),不深翻
+        self.assertEqual(client.offsets, [0])
+        # 合并后缓存含新旧两笔(去重,不重复)
+        self.assertEqual(sorted(t["id"] for t in cached["trades"]), ["new", "old"])
+        self.assertEqual(sorted(t["timestamp"] for t in trades), [100, 300])
 
     def test_write_json_uses_target_unique_atomic_temp_files(self):
         from poly_fight.cli import write_json
