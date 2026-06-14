@@ -16685,8 +16685,8 @@ class CoreTest(unittest.TestCase):
                 return {"desired_next_interval_seconds": 900}
 
             with patch("poly_fight.cli.datetime", FakeDateTime), patch("poly_fight.cli.build_client", return_value=object()), patch(
-                "poly_fight.cli.command_collect", side_effect=fake_build
-            ) as collect, patch("poly_fight.cli.command_build_leaderboard") as old_build, patch(
+                "poly_fight.cli._command_collect_wallets", side_effect=fake_build
+            ) as collect, patch(
                 "poly_fight.cli.command_follow", side_effect=fake_follow
             ):
                 from poly_fight.cli import command_run
@@ -16695,7 +16695,6 @@ class CoreTest(unittest.TestCase):
                     self.assertEqual(command_run(args), 0)
 
             self.assertEqual(collect.call_count, 1)
-            old_build.assert_not_called()
             self.assertEqual(set(paused_categories), {"esports"})
 
     def test_run_loop_stops_after_consecutive_error_window(self):

@@ -7372,7 +7372,8 @@ def command_run(args: argparse.Namespace) -> int:
                         now_ts=now_ts,
                         cache_retention_days_by_dir=category_refresh_cache_retention_days_by_dir(args),
                     )
-                    command_collect(category_args(category), client=client)
+                    # v2 是唯一管线:run 的周期性榜单刷新走 collect-v2(esports)。
+                    _command_collect_wallets(category_args(category), client=client, variant="v2")
                 finally:
                     set_pause_new_signals(follow_dir, category, None)
             now_done = int(datetime.now(timezone.utc).timestamp())
