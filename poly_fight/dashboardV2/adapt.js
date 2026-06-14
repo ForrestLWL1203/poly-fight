@@ -16,6 +16,7 @@
     two_sided: "同盘双边下注",
     revalidation_required: "需重新评估",
     observed_paper_underperformance: "跟单表现不佳",
+    rescore_below_grade_a: "重评跌出A级",
   };
   // [main_match, sub_game] accent colors per game, for the distribution donut.
   const GAME_COLORS = {

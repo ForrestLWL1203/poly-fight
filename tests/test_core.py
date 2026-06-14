@@ -13911,6 +13911,50 @@ class CoreTest(unittest.TestCase):
             # 不存在的 db → 空(不抛)
             self.assertEqual(storage_module.LeaderboardStore(Path(d) / "nope.db").load_observe_analyzed(now_ts=now), {})
 
+    def test_observe_v2_rescore_targets_demotion_and_recovery(self):
+        from poly_fight.cli import _observe_v2_rescore_targets, RESCORE_QUARANTINE_REASON
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            now = 1_700_000_000
+            store.save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[{"signal_id": "wa:m:0", "wallet": "0xWA", "category": "esports",
+                               "condition_id": "m", "outcome_index": 0, "status": "open",
+                               "created_at": now, "updated_at": now}],
+                result_events=[
+                    {"signal_id": "wb:m:0", "wallet": "0xWB", "category": "esports", "condition_id": "m",
+                     "outcome_index": 0, "status": "settled", "settled_at": now - 3 * 86400,
+                     "created_at": now - 3 * 86400, "updated_at": now - 3 * 86400},
+                    {"signal_id": "wc:m:0", "wallet": "0xWC", "category": "esports", "condition_id": "m",
+                     "outcome_index": 0, "status": "settled", "settled_at": now - 40 * 86400,
+                     "created_at": now - 40 * 86400, "updated_at": now - 40 * 86400},
+                ],
+                performance={},
+            )
+            store.upsert_wallet_quarantine("0xWD", reason=RESCORE_QUARANTINE_REASON, ts=now - 10 * 86400, category="esports")
+            store.upsert_wallet_quarantine("0xWE", reason="manual_dashboard_quarantine", ts=now - 10 * 86400, category="esports")
+            store.upsert_wallet_quarantine("0xWF", reason=RESCORE_QUARANTINE_REASON, ts=now - 1 * 86400, category="esports")
+            board = {"0xwa", "0xwb", "0xwd", "0xwf"}
+            demotion, recovery = _observe_v2_rescore_targets(
+                store, board, now_ts=now, recent_window_days=15, cooldown_days=7,
+            )
+            self.assertEqual(demotion, {"0xwa", "0xwb"})   # 在榜∩近期跟单 − 已隔离;wc 旧窗不算
+            self.assertEqual(recovery, {"0xwd"})           # auto 满冷却;manual 排除、冷却内排除
+
+    def test_clear_revalidated_quarantine_protects_sticky_reasons(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            now = 1_700_000_000
+            store.upsert_wallet_quarantine("0xA", reason="rescore_below_grade_a", ts=now - 100, category="esports")
+            store.upsert_wallet_quarantine("0xB", reason="revalidation_required", ts=now - 100, category="esports")
+            store.clear_revalidated_quarantine(
+                {"0xa", "0xb"}, validated_at=now,
+                protected_reasons={"rescore_below_grade_a", "manual_dashboard_quarantine"},
+            )
+            q = store.load_wallet_quarantine(category="esports")
+            self.assertIn("0xa", q)       # sticky 原因保留
+            self.assertNotIn("0xb", q)    # 可复审原因被清除
+
     def test_detect_newly_settled_markets(self):
         from unittest.mock import patch
         from poly_fight.cli import detect_newly_settled_markets

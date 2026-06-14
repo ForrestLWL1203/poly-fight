@@ -1428,24 +1428,29 @@ class FollowStore:
         with self.connect() as conn:
             conn.execute(f"DELETE FROM wallet_quarantine WHERE wallet IN ({placeholders})", tuple(sorted(expanded)))
 
-    def clear_revalidated_quarantine(self, wallets: set[str], *, validated_at: int) -> None:
+    def clear_revalidated_quarantine(
+        self,
+        wallets: set[str],
+        *,
+        validated_at: int,
+        protected_reasons: set[str] | None = None,
+    ) -> None:
+        """历史复审清隔离;protected_reasons 里的原因(手动 + M5 实跟/重评类)不自动清除。"""
         self.init_db()
         wallets = {str(wallet).lower() for wallet in wallets if wallet}
         if not wallets or validated_at <= 0:
             return
+        protected = {str(r).lower() for r in (protected_reasons or {"manual_dashboard_quarantine"}) if r}
         expanded_wallets = set(wallets)
         expanded_wallets.update(f"esports:{wallet}" for wallet in wallets)
-        placeholders = ",".join("?" for _ in expanded_wallets)
+        wallet_ph = ",".join("?" for _ in expanded_wallets)
+        sql = f"DELETE FROM wallet_quarantine WHERE wallet IN ({wallet_ph}) AND quarantined_at < ?"
+        params: list[Any] = [*sorted(expanded_wallets), int(validated_at)]
+        if protected:
+            sql += f" AND reason NOT IN ({','.join('?' for _ in protected)})"
+            params.extend(sorted(protected))
         with self.connect() as conn:
-            conn.execute(
-                f"""
-                DELETE FROM wallet_quarantine
-                WHERE wallet IN ({placeholders})
-                  AND quarantined_at < ?
-                  AND reason != ?
-                """,
-                    (*tuple(sorted(expanded_wallets)), int(validated_at), "manual_dashboard_quarantine"),
-            )
+            conn.execute(sql, tuple(params))
 
     def upsert_wallet_favorite(
         self,
