@@ -9657,6 +9657,48 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(read_follow_control(follow_dir)["runner"]["pid"], 4321)
             self.assertTrue(status["strategy_configured"])
 
+    def test_dashboard_runner_start_realtime_refresh_spawns_observe(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            follow_dir = data_dir / "follow"
+            calls = []
+
+            class FakeProcess:
+                pid = 4321
+                pgid = 4321
+
+            def fake_starter(command, log_path):
+                calls.append(command)
+                return FakeProcess()
+
+            config = DashboardConfig(
+                data_dir=data_dir, follow_dir=follow_dir, username="admin",
+                password="pw", cookie_secret="secret",
+                runner_process_lister=lambda: [],
+                runner_process_starter=fake_starter,
+            )
+            FollowStore(follow_dir / "follow.db").save_follow_strategy(default_follow_strategy(balance_usdc=100), ts=100)
+
+            # 不勾选 → 只起 runner,无 observe
+            off = start_runner(config, realtime_refresh=False)
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(off["realtime_refresh"])
+            self.assertIsNone(off["observe_pid"])
+
+            # lister 返回 [] → 状态判定永远非 running,可直接再次 start(无需真停进程)
+            calls.clear()
+
+            # 勾选 → runner + observe-v2 两个进程
+            on = start_runner(config, realtime_refresh=True)
+            self.assertEqual(len(calls), 2)
+            observe_cmd = calls[1]
+            self.assertIn("observe-v2", observe_cmd)
+            self.assertEqual(observe_cmd[observe_cmd.index("--loop-hours") + 1], "2")
+            self.assertEqual(observe_cmd[observe_cmd.index("--observe-lookback-hours") + 1], "4")
+            self.assertIn(str(data_dir / "esports"), observe_cmd)   # 与 collect-v2 同一 data 目录
+            self.assertTrue(on["realtime_refresh"])
+            self.assertEqual(on["observe_pid"], 4321)
+
     def test_dashboard_runner_start_requires_saved_follow_strategy(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)

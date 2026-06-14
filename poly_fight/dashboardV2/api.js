@@ -103,7 +103,7 @@
     post("/api/follow-strategies/" + encodeURIComponent(slug) + "/update", { name, strategy });
   const activateStrategy = (slug) => post("/api/follow-strategies/" + encodeURIComponent(slug) + "/activate", {});
   const deleteStrategy = (slug) => post("/api/follow-strategies/" + encodeURIComponent(slug) + "/delete", {});
-  const runnerStart = () => post("/api/runner/start", {});
+  const runnerStart = (body) => post("/api/runner/start", body || {});
   const runnerStop = () => post("/api/runner/stop", {});
   const resetData = () => post("/api/reset-data", {});
   const walletRefresh = (category, body) =>

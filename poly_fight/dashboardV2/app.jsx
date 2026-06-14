@@ -1229,6 +1229,8 @@ function Dashboard({ onLogout, toast }) {
     }
   }, [merge]);
 
+  const [realtimeRefresh, setRealtimeRefresh] = React.useState(false);
+
   const runStop = React.useCallback(async () => {
     maskCancel.current = false;
     setMask({ kind: "stop", done: false, error: false, label: "正在停止跟单", hint: "等待跟单进程安全退出…" });
@@ -1248,14 +1250,14 @@ function Dashboard({ onLogout, toast }) {
 
   const runStart = React.useCallback(async () => {
     try {
-      await Api.runnerStart();
+      await Api.runnerStart({ realtime_refresh: realtimeRefresh });
       const [rn, hh] = await Promise.all([Api.runner().catch(() => null), Api.health().catch(() => null)]);
       merge({ ...(rn ? { runner: rn } : {}), ...(hh ? { health: hh } : {}) });
-      toast("跟单已启动", "success");
+      toast(realtimeRefresh ? "跟单已启动 · 实时刷新开启" : "跟单已启动", "success");
     } catch (e) {
       toast(e && e.error === "runner_already_running" ? "已在运行中" : (e && e.detail) || "启动失败，请先完成并保存跟单策略", "error");
     }
-  }, [merge, toast]);
+  }, [merge, toast, realtimeRefresh]);
 
   /* initial load */
   React.useEffect(() => {
@@ -1349,9 +1351,15 @@ function Dashboard({ onLogout, toast }) {
           <div className="topbar-actions">
             {runnerLive || runnerStatus === "stopping"
               ? <Button variant="danger" size="sm" className="tb-runbtn" disabled={runnerStatus === "stopping"} iconLeft={<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2.5" /></svg>} onClick={() => runStop()}>停止跟单</Button>
-              : <span className={"tb-tip" + (strategyReady ? "" : " disabled")} data-tip={startTip}>
-                  <Button variant="primary" size="sm" className="tb-runbtn" disabled={!strategyReady} iconLeft={<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M7 4.5v15a1 1 0 0 0 1.5.87l13-7.5a1 1 0 0 0 0-1.74l-13-7.5A1 1 0 0 0 7 4.5z" /></svg>} onClick={() => runStart()}>启动跟单</Button>
-                </span>}
+              : <React.Fragment>
+                  <label className="tb-realtime" data-tip="勾选后随跟单起一个 observer，每 2 小时动态发现新钱包并更新 Leaderboard">
+                    <input type="checkbox" checked={realtimeRefresh} onChange={(e) => setRealtimeRefresh(e.target.checked)} />
+                    <span>实时刷新</span>
+                  </label>
+                  <span className={"tb-tip" + (strategyReady ? "" : " disabled")} data-tip={startTip}>
+                    <Button variant="primary" size="sm" className="tb-runbtn" disabled={!strategyReady} iconLeft={<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M7 4.5v15a1 1 0 0 0 1.5.87l13-7.5a1 1 0 0 0 0-1.74l-13-7.5A1 1 0 0 0 7 4.5z" /></svg>} onClick={() => runStart()}>启动跟单</Button>
+                  </span>
+                </React.Fragment>}
             <StatusPill status={runnerLive ? "live" : "idle"} label={runnerLive ? "运行中" : runnerStatus === "stopping" ? "停止中" : "已停止"} extra={runnerLive ? hms(data.health && data.health.uptime_seconds) : undefined} />
             <Button variant="ghost" size="sm" iconLeft={ico("log-out")} onClick={onLogout}>退出</Button>
           </div>

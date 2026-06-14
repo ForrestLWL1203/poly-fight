@@ -480,8 +480,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if current.get("status") == "running":
             self._json({"ok": False, "error": "runner_already_running", "data": current}, status=HTTPStatus.CONFLICT)
             return
+        form = self._read_request_form()
+        raw_realtime = form.get("realtime_refresh")
+        realtime = raw_realtime is True or str(raw_realtime).strip().lower() in {"1", "true", "yes", "on"}
         try:
-            status = start_runner(self.dashboard_config)
+            status = start_runner(self.dashboard_config, realtime_refresh=realtime)
         except RunnerAlreadyRunning as exc:
             self._json({"ok": False, "error": "runner_already_running", "data": exc.status}, status=HTTPStatus.CONFLICT)
             return
@@ -2669,6 +2672,10 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
             "strategy_updated_at": recorded.get("strategy_updated_at", defaults.get("strategy_updated_at")),
             "strategy_summary": recorded.get("strategy_summary", defaults.get("strategy_summary")),
             "log_path": recorded.get("log_path") if source == "dashboard" else None,
+            "realtime_refresh": bool(recorded.get("realtime_refresh")) if source == "dashboard" else False,
+            "observe_pid": recorded.get("observe_pid") if source == "dashboard" else None,
+            "observe_pgid": recorded.get("observe_pgid") if source == "dashboard" else None,
+            "observe_log_path": recorded.get("observe_log_path") if source == "dashboard" else None,
             "data_dir": str(config.data_dir),
             "follow_dir": str(follow_dir),
         }
@@ -2701,12 +2708,32 @@ def _runner_default_params(config: DashboardConfig) -> dict[str, Any]:
     }
 
 
+def _spawn_detached_process(command: list[str], log_path: Path, starter: Any) -> tuple[int, int]:
+    """起一个分离的子进程,返回 (pid, pgid)。starter 给定时走注入(便于测试)。"""
+    if starter is not None:
+        process = starter(command, log_path)
+        pid = int(getattr(process, "pid", process if isinstance(process, int) else 0) or 0)
+        pgid = int(getattr(process, "pgid", 0) or 0)
+        return pid, pgid
+    with log_path.open("ab") as log_file:
+        process = subprocess.Popen(
+            command,
+            cwd=Path(__file__).resolve().parents[1],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    pid = int(process.pid)
+    return pid, _process_group_id(pid) or pid
+
+
 def start_runner(
     config: DashboardConfig,
     *,
     stake_ratio_percent: float | None = None,
     max_stake_usdc: float | None = None,
     max_signal_stake_balance_percent: float | None = None,
+    realtime_refresh: bool = False,
 ) -> dict[str, Any]:
     current = build_runner_status(config)
     if current.get("status") == "running":
@@ -2757,11 +2784,34 @@ def start_runner(
             )
         pid = int(process.pid)
         pgid = _process_group_id(pid) or pid
+    # 实时刷新:勾选则随 runner 起一个独立的 observe-v2 --loop-hours 2 进程(2h 一轮、
+    # 回看 4h 去重维护 delta),发布到 dashboard 读的同一个 esports/leaderboard_v2.db。
+    observe_pid = 0
+    observe_pgid = 0
+    observe_log_path = ""
+    if realtime_refresh:
+        observe_data_dir = category_data_dirs(config.data_dir)["esports"]
+        observe_command = [
+            sys.executable, "-u", "-m", "poly_fight.cli",
+            "--data-dir", str(observe_data_dir),
+            "observe-v2", "--category", "esports",
+            "--loop-hours", "2", "--observe-lookback-hours", "4",
+            "--follow-dir", str(follow_dir),
+        ]
+        observe_log = log_dir / f"dashboard-observe-{now_ts}.out"
+        observe_pid, observe_pgid = _spawn_detached_process(
+            observe_command, observe_log, config.runner_process_starter
+        )
+        observe_log_path = str(observe_log)
     status = {
         "status": "running",
         "source": "dashboard",
         "pid": pid,
         "pgid": pgid,
+        "realtime_refresh": bool(realtime_refresh),
+        "observe_pid": observe_pid or None,
+        "observe_pgid": observe_pgid or None,
+        "observe_log_path": observe_log_path or None,
         "started_at": now_ts,
         "command": command,
         "stake_usdc": min_stake,
@@ -2788,6 +2838,7 @@ def stop_runner(config: DashboardConfig) -> dict[str, Any]:
         config.runner_process_stopper(current)
     else:
         _terminate_runner_process(current)
+        _terminate_observe_process(current)   # 一并停掉实时刷新的 observe-v2 进程
     status = {
         **current,
         "status": "stopping",
@@ -2959,6 +3010,25 @@ def _terminate_runner_process(status: dict[str, Any]) -> None:
     pgid = int(status.get("pgid") or 0)
     source = status.get("source")
     if source == "dashboard" and pgid:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+
+
+def _terminate_observe_process(status: dict[str, Any]) -> None:
+    """停掉实时刷新挂的 observe-v2 子进程(best-effort,进程不在直接忽略)。"""
+    pgid = int(status.get("observe_pgid") or 0)
+    pid = int(status.get("observe_pid") or 0)
+    if pgid:
         try:
             os.killpg(pgid, signal.SIGTERM)
             return
