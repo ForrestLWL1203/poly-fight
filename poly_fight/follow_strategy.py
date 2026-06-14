@@ -9,6 +9,7 @@ from .core import to_float, to_int
 
 DEFAULT_FOLLOW_STRATEGY_SCHEMA_VERSION = 1
 ACTIVE_FOLLOW_STRATEGY_ID = "active"
+DEFAULT_MAX_FOLLOW_ENTRY_PRICE = 0.85   # 现价上限默认(0 = 不限)
 
 
 def _finite_positive(value: Any) -> bool:
@@ -38,6 +39,9 @@ def default_follow_strategy(*, balance_usdc: float | None = None) -> dict[str, A
         },
         "prefilters": {
             "min_target_wallet_order_cash_usdc": 10.0,
+            # 现价(我们检测时)上限:跟单有延迟,钱包 0.75 买、我们发现已 0.9 就别跟。
+            # current_price > 此值 → would_follow=False → 不建 leg/不进列表。0 = 不限。
+            "max_follow_entry_price": DEFAULT_MAX_FOLLOW_ENTRY_PRICE,
         },
         "condition_limits": {
             "order_count_mode": "none",
@@ -85,6 +89,11 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
         to_float(prefilters.get("min_target_wallet_order_cash_usdc")),
         8,
     )
+    if "max_follow_entry_price" not in prefilters:
+        prefilters["max_follow_entry_price"] = DEFAULT_MAX_FOLLOW_ENTRY_PRICE
+    prefilters["max_follow_entry_price"] = round(
+        min(1.0, max(0.0, to_float(prefilters.get("max_follow_entry_price")))), 8
+    )
 
     limits["order_count_mode"] = str(limits.get("order_count_mode") or "none").strip().lower()
     limits["max_orders"] = max(0, to_int(limits.get("max_orders")))
@@ -124,6 +133,7 @@ def validate_follow_strategy(strategy: dict[str, Any] | None) -> tuple[bool, lis
         errors.append("stake_sizing.balance_percent")
     if not _finite_non_negative(prefilters.get("min_target_wallet_order_cash_usdc")):
         errors.append("prefilters.min_target_wallet_order_cash_usdc")
+    # max_follow_entry_price 由 normalize clamp 到 [0,1],无需额外校验。
 
     if limits["order_count_mode"] not in {"none", "condition", "wallet"}:
         errors.append("condition_limits.order_count_mode")
@@ -285,6 +295,9 @@ def strategy_summary(strategy: dict[str, Any] | None) -> str:
         parts.append(f"condition cap {to_float(limits.get('stake_cap_usdc')):g}")
     elif limits.get("stake_cap_mode") == "balance_percent":
         parts.append(f"condition cap 余额 {to_float(limits.get('stake_cap_balance_percent')):g}%")
+    max_entry = to_float(normalized["prefilters"].get("max_follow_entry_price"))
+    if 0 < max_entry < 1:
+        parts.append(f"现价上限 {max_entry:g}")
     balance = normalized["balance"]
     if to_float(balance.get("usable_balance_usdc")) > 0:
         parts.append(f"可用余额 {to_float(balance.get('usable_balance_usdc')):g}")

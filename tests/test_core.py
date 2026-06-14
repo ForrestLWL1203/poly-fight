@@ -163,6 +163,7 @@ from poly_fight.follow import (
 from poly_fight.follow_strategy import (
     default_follow_strategy,
     evaluate_follow_candidate,
+    normalize_follow_strategy,
     strategy_from_legacy_args,
     validate_follow_strategy,
 )
@@ -5432,6 +5433,23 @@ class CoreTest(unittest.TestCase):
 
             self.assertFalse(store.load_follow_strategy()["configured"])
 
+    def test_follow_strategy_max_entry_price_default_and_clamp(self):
+        # 默认 0.85;缺字段补默认;clamp 到 [0,1];0 = 不限(均 normalize 处理,校验通过)。
+        self.assertEqual(default_follow_strategy()["prefilters"]["max_follow_entry_price"], 0.85)
+        miss = normalize_follow_strategy({"prefilters": {"min_target_wallet_order_cash_usdc": 10}})
+        self.assertEqual(miss["prefilters"]["max_follow_entry_price"], 0.85)
+        self.assertEqual(
+            normalize_follow_strategy({"prefilters": {"max_follow_entry_price": 1.5}})["prefilters"]["max_follow_entry_price"],
+            1.0,
+        )
+        self.assertEqual(
+            normalize_follow_strategy({"prefilters": {"max_follow_entry_price": -0.2}})["prefilters"]["max_follow_entry_price"],
+            0.0,
+        )
+        s = default_follow_strategy(balance_usdc=100)
+        s["prefilters"]["max_follow_entry_price"] = 0.7
+        self.assertTrue(validate_follow_strategy(s)[0])
+
     def test_follow_store_allows_strategy_without_balance_limit(self):
         with TemporaryDirectory() as tmp:
             store = FollowStore(Path(tmp) / "follow.db")
@@ -9699,8 +9717,8 @@ class CoreTest(unittest.TestCase):
             )
 
             self.assertIn("--strategy-source", calls[0][0])
-            self.assertEqual(status["strategy_summary"], "固定 25 USDC，可用余额 250")
-            self.assertEqual(read_follow_control(follow_dir)["runner"]["strategy_summary"], "固定 25 USDC，可用余额 250")
+            self.assertEqual(status["strategy_summary"], "固定 25 USDC，现价上限 0.85，可用余额 250")
+            self.assertEqual(read_follow_control(follow_dir)["runner"]["strategy_summary"], "固定 25 USDC，现价上限 0.85，可用余额 250")
 
     def test_dashboard_runner_start_allows_strategy_without_balance_limit(self):
         with TemporaryDirectory() as tmp:

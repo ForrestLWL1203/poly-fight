@@ -7056,6 +7056,14 @@ def command_follow(
             balance_usdc=account_balance.get("balance_usdc") if account_balance_configured else None,
         )
 
+    # 现价上限:策略里显式配了 max_follow_entry_price 就用它(含 0=不限),否则回退 CLI 默认
+    # (--max-entry-price 0.85)。老策略没这字段 → 保持 CLI 默认不变。
+    effective_max_entry_price = args.max_entry_price
+    if follow_strategy and follow_strategy.get("configured"):
+        strat_max_entry = (follow_strategy.get("prefilters") or {}).get("max_follow_entry_price")
+        if strat_max_entry is not None:
+            effective_max_entry_price = to_float(strat_max_entry)
+
     tracked_condition_ids = {str(condition_id).lower() for condition_id in watched}
     tracked_condition_ids.update(str(signal.get("condition_id") or "").lower() for signal in open_signals)
     if gate_open and follow_wallets:
@@ -7162,7 +7170,7 @@ def command_follow(
                 max_follow_legs=args.max_follow_legs,
                 max_slippage=args.max_slippage_over_entry,
                 min_wallet_entry_price=args.min_wallet_entry_price,
-                max_entry_price=args.max_entry_price,
+                max_entry_price=effective_max_entry_price,
                 stake_ratio_percent=args.stake_ratio_percent,
                 require_pre_match=args.require_pre_match,
                 post_start_grace_seconds=args.post_start_trade_grace_seconds,

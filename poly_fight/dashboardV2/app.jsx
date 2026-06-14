@@ -769,6 +769,7 @@ function WalletFollowsModal({ wallet, onClose }) {
 const STRATEGY_DEFAULTS = {
   usableMode: "all", usableCap: "5000",
   minSignalOn: true, minSignal: "10",
+  maxEntryOn: true, maxEntry: "0.85",
   sizing: "ratio", ratio: "10", ratioCapOn: false, ratioCap: "100",
   fixed: "50", balancePct: "1",
   countOn: false, countMode: "event", count: "10",
@@ -782,9 +783,10 @@ function strategyDigest(s) {
     ? `比例 ${s.ratio || 0}%${s.ratioCapOn ? `（封顶 ${usdInt(n(s.ratioCap))}）` : ""}`
     : s.sizing === "fixed" ? `固定 ${usdInt(n(s.fixed))}` : `余额 ${s.balancePct || 0}%`;
   const filter = `门槛 ${usdInt(n(s.minSignal))}`;
+  const maxEntry = s.maxEntryOn ? `现价 ≤ ${s.maxEntry}` : null;
   const count = s.countOn ? (s.countMode === "event" ? `单场 ${s.count} 笔` : `每钱包 ${s.count} 笔`) : null;
   const spend = s.spendOn ? (s.spendMode === "fixed" ? `单场 ≤ ${usdInt(n(s.spendFixed))}` : `单场 ≤ 余额 ${s.spendPct}%`) : null;
-  return { sizing, chips: [filter, count, spend].filter(Boolean) };
+  return { sizing, chips: [filter, maxEntry, count, spend].filter(Boolean) };
 }
 
 function NumField({ value, onChange, unit, width = 76, lead, disabled }) {
@@ -853,6 +855,7 @@ function strategyNodes(s) {
   return [
     { k: "资金池", v: s.usableMode === "all" ? "全部余额" : `上限 ${usdInt(n(s.usableCap))}` },
     { k: "信号门槛", v: s.minSignalOn ? `忽略 < ${usdInt(n(s.minSignal))}` : "不限" },
+    { k: "现价上限", v: s.maxEntryOn ? `现价 ≤ ${s.maxEntry}` : "不限" },
     { k: "单笔金额", v: dg.sizing, key: true },
     { k: "单场笔数", v: s.countOn ? (s.countMode === "event" ? `整场 ${s.count} 笔` : `每钱包 ${s.count} 笔`) : "不限" },
     { k: "单场投入", v: s.spendOn ? (s.spendMode === "fixed" ? `≤ ${usdInt(n(s.spendFixed))}` : `≤ 余额 ${s.spendPct}%`) : "不限" },
@@ -912,6 +915,16 @@ function StrategyEditor({ s, up, wallet, locked }) {
               <input type="checkbox" checked={s.minSignalOn} onChange={(e) => up("minSignalOn")(e.target.checked)} /><span className="cr-label">启用</span>
             </label>
             <NumField value={s.minSignal} onChange={up("minSignal")} unit="USDC" lead="忽略目标买入 <" width={64} disabled={!s.minSignalOn} />
+          </div>
+        </div>
+        <div className="cfg-mini">
+          <div className="cm-head"><Ico n="filter" /><span>现价上限</span></div>
+          <div className="cm-body">
+            <label className="check-row" onClick={(e) => e.stopPropagation()}>
+              <input type="checkbox" checked={s.maxEntryOn} onChange={(e) => up("maxEntryOn")(e.target.checked)} /><span className="cr-label">启用</span>
+            </label>
+            <NumField value={s.maxEntry} onChange={up("maxEntry")} lead="现价 >" unit="不跟" width={56} disabled={!s.maxEntryOn} />
+            <p className="cfg-sub">跟单有延迟:发现时现价已高于此值则不跟,避免追高(0–1)</p>
           </div>
         </div>
         <div className="cfg-head"><h3>单场风控上限</h3></div>
