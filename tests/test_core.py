@@ -94,8 +94,6 @@ from poly_fight.cli import (
     merge_cached_profile_with_candidate,
     merge_profiles_with_candidates,
     migrate_category_follow_dbs,
-    observed_performance_quarantine_events,
-    recent_chop_loss_quarantine_events,
     publish_collector_dashboard_outputs,
     prune_profile_store,
     read_category_leaderboards,
@@ -5600,83 +5598,6 @@ class CoreTest(unittest.TestCase):
             self.assertNotIn("0xa", quarantined)
             self.assertNotIn("0xb", quarantined)
             self.assertIn("0xc", quarantined)
-
-    def test_observed_performance_quarantine_events_require_enough_bad_samples(self):
-        performance = {
-            "wallets": {
-                "0xBad": {"signals": 10, "wins": 4, "our_pnl": -1.2},
-                "0xThin": {"signals": 9, "wins": 0, "our_pnl": -2.0},
-                "0xGood": {"signals": 10, "wins": 10, "our_pnl": 1.0},
-            }
-        }
-
-        events = observed_performance_quarantine_events(performance, now_ts=500)
-
-        self.assertEqual(events, [{"wallet": "0xbad", "reason": "observed_paper_underperformance", "timestamp": 500}])
-
-    def test_recent_chop_loss_quarantine_events_detect_repeated_alternating_losses(self):
-        now = 10 * 86400
-
-        def exited(outcome_index, exit_at):
-            return {
-                "signal_id": f"m1-{outcome_index}-{exit_at}",
-                "wallet": "0xA",
-                "category": "esports",
-                "condition_id": "m1",
-                "outcome_index": outcome_index,
-                "status": "exited",
-                "exit_at": exit_at,
-                "exit_price": 0.4,
-                "legs": [{"wallet_fill_price": 0.55, "wallet_trade_size": 10, "stake": 1}],
-            }
-
-        events = recent_chop_loss_quarantine_events(
-            [
-                exited(0, now - 4 * 86400),
-                exited(1, now - 3 * 86400),
-                exited(0, now - 2 * 86400),
-                exited(1, now - 1 * 86400),
-            ],
-            now_ts=now,
-        )
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["wallet"], "0xa")
-        self.assertEqual(events[0]["category"], "esports")
-        self.assertEqual(events[0]["reason"], "recent_chop_loss")
-        self.assertEqual(events[0]["timestamp"], now - 1 * 86400)
-        self.assertEqual(events[0]["details"]["window_days"], 7)
-        self.assertEqual(events[0]["details"]["cut_loss_count"], 4)
-        self.assertEqual(events[0]["details"]["condition_ids"], ["m1"])
-
-    def test_recent_chop_loss_quarantine_ignores_single_stop_and_old_losses(self):
-        now = 10 * 86400
-
-        def exited(outcome_index, exit_at, *, exit_price=0.4):
-            return {
-                "signal_id": f"m1-{outcome_index}-{exit_at}",
-                "wallet": "0xA",
-                "category": "esports",
-                "condition_id": "m1",
-                "outcome_index": outcome_index,
-                "status": "exited",
-                "exit_at": exit_at,
-                "exit_price": exit_price,
-                "legs": [{"wallet_fill_price": 0.55, "wallet_trade_size": 10, "stake": 1}],
-            }
-
-        events = recent_chop_loss_quarantine_events(
-            [
-                exited(0, now - 8 * 86400),
-                exited(1, now - 3 * 86400),
-                exited(0, now - 2 * 86400),
-                exited(1, now - 1 * 86400),
-                exited(1, now - 100, exit_price=0.7),
-            ],
-            now_ts=now,
-        )
-
-        self.assertEqual(events, [])
 
     def test_follow_store_clears_only_revalidated_quarantine(self):
         with TemporaryDirectory() as tmp:

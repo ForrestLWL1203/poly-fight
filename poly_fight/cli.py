@@ -124,25 +124,17 @@ DEFAULT_REFRESH_CACHE_RETENTION_DAYS = {
     "clob_market_metadata": 30,
 }
 LEGACY_TRADE_QUARANTINE_REASONS = {"material_sell", "two_sided_switch"}
-RECENT_CHOP_LOSS_QUARANTINE_REASON = "recent_chop_loss"
-OBSERVED_UNDERPERFORMANCE_QUARANTINE_REASON = "observed_paper_underperformance"
 # M5 动态淘汰:observe-v2 重评在榜钱包近期交易,跌出 grade-A 即隔离。
 RESCORE_QUARANTINE_REASON = "rescore_below_grade_a"
 RESCORE_COOLDOWN_DAYS = 7
-# 实跟/重评类隔离 + 手动:历史复审不自动清除(恢复只走 observe-v2 重评满冷却,或人工)。
+# 隔离入口收束为两个:人工按钮 + M5 重评。两者都不被历史复审自动清除。
 STICKY_QUARANTINE_REASONS = {
     "manual_dashboard_quarantine",
     "manual_quarantine",
-    OBSERVED_UNDERPERFORMANCE_QUARANTINE_REASON,
-    RECENT_CHOP_LOSS_QUARANTINE_REASON,
     RESCORE_QUARANTINE_REASON,
 }
-# 自动隔离(非手动):满冷却后由重评决定恢复/留隔离。
-AUTO_RECOVERABLE_QUARANTINE_REASONS = {
-    OBSERVED_UNDERPERFORMANCE_QUARANTINE_REASON,
-    RECENT_CHOP_LOSS_QUARANTINE_REASON,
-    RESCORE_QUARANTINE_REASON,
-}
+# 自动隔离(非手动):满冷却后由重评决定恢复/留隔离。当前仅 M5 重评一种。
+AUTO_RECOVERABLE_QUARANTINE_REASONS = {RESCORE_QUARANTINE_REASON}
 
 @contextmanager
 def acquire_build_lock(data_dir: Path, *, blocking: bool = True):
@@ -1439,134 +1431,8 @@ def empty_user_trade_backfill_summary() -> dict[str, Any]:
     }
 
 
-def observed_performance_quarantine_events(
-    performance: dict[str, Any],
-    *,
-    now_ts: int,
-    min_signals: int = 10,
-) -> list[dict[str, Any]]:
-    events = []
-    for wallet, row in sorted((performance.get("wallets") or {}).items()):
-        wallet = normalize_wallet(wallet)
-        if not wallet:
-            continue
-        signals = int(row.get("signals") or 0)
-        wins = int(row.get("wins") or 0)
-        if signals < min_signals:
-            continue
-        win_rate = wins / signals if signals else 0.0
-        if win_rate < 0.5 or to_float(row.get("our_pnl")) < 0:
-            events.append(
-                {
-                    "wallet": wallet,
-                    "reason": "observed_paper_underperformance",
-                    "timestamp": now_ts,
-                }
-            )
-    return events
-
-
 def _signal_result_at(signal: dict[str, Any]) -> int:
     return to_int(signal.get("exit_at") or signal.get("settled_at") or signal.get("updated_at") or signal.get("created_at"))
-
-
-def _weighted_wallet_entry_price(signal: dict[str, Any]) -> float:
-    legs = [leg for leg in signal.get("legs") or [] if isinstance(leg, dict)]
-    size_weighted = [
-        (to_float(leg.get("wallet_fill_price")), to_float(leg.get("wallet_trade_size")))
-        for leg in legs
-        if to_float(leg.get("wallet_fill_price")) > 0 and to_float(leg.get("wallet_trade_size")) > 0
-    ]
-    total_size = sum(size for _price, size in size_weighted)
-    if total_size > 0:
-        return sum(price * size for price, size in size_weighted) / total_size
-    stake_weighted = [
-        (to_float(leg.get("wallet_fill_price")), to_float(leg.get("stake")))
-        for leg in legs
-        if to_float(leg.get("wallet_fill_price")) > 0 and to_float(leg.get("stake")) > 0
-    ]
-    total_stake = sum(stake for _price, stake in stake_weighted)
-    if total_stake > 0:
-        return sum(price * stake for price, stake in stake_weighted) / total_stake
-    return to_float(signal.get("wallet_avg_price") or signal.get("wallet_entry_price"))
-
-
-def recent_chop_loss_quarantine_events(
-    result_events: list[dict[str, Any]],
-    *,
-    now_ts: int,
-    window_days: int = 7,
-    loss_epsilon: float = 0.005,
-    min_cut_loss_count: int = 4,
-) -> list[dict[str, Any]]:
-    cutoff = now_ts - max(1, int(window_days)) * SECONDS_PER_DAY
-    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-    for signal in result_events:
-        if not isinstance(signal, dict) or str(signal.get("status") or "").lower() != "exited":
-            continue
-        event_at = _signal_result_at(signal)
-        if event_at < cutoff or event_at > now_ts:
-            continue
-        wallet = normalize_wallet(signal.get("wallet"))
-        category = str(signal.get("category") or "esports").lower()
-        condition_id = str(signal.get("condition_id") or "").lower()
-        outcome_index = to_int(signal.get("outcome_index"), -1)
-        exit_price = to_float(signal.get("exit_price"))
-        entry_price = _weighted_wallet_entry_price(signal)
-        if not wallet or not condition_id or outcome_index < 0 or exit_price <= 0 or entry_price <= 0:
-            continue
-        if exit_price + loss_epsilon >= entry_price:
-            continue
-        grouped.setdefault((wallet, category, condition_id), []).append(
-            {
-                "wallet": wallet,
-                "category": category,
-                "condition_id": condition_id,
-                "outcome_index": outcome_index,
-                "timestamp": event_at,
-                "entry_price": round(entry_price, 8),
-                "exit_price": round(exit_price, 8),
-                "signal_id": str(signal.get("signal_id") or ""),
-            }
-        )
-
-    triggered_by_wallet: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for (wallet, category, condition_id), rows in grouped.items():
-        alternating: list[dict[str, Any]] = []
-        for row in sorted(rows, key=lambda item: (item["timestamp"], item["signal_id"])):
-            if alternating and row["outcome_index"] == alternating[-1]["outcome_index"]:
-                alternating[-1] = row
-            else:
-                alternating.append(row)
-        if len(alternating) < min_cut_loss_count:
-            continue
-        triggered_by_wallet.setdefault((wallet, category), []).append(
-            {
-                "condition_id": condition_id,
-                "cut_loss_count": len(alternating),
-                "last_event_at": max(row["timestamp"] for row in alternating),
-            }
-        )
-
-    events = []
-    for (wallet, category), triggers in sorted(triggered_by_wallet.items()):
-        last_event_at = max(to_int(row.get("last_event_at")) for row in triggers)
-        condition_ids = sorted({str(row.get("condition_id") or "") for row in triggers if row.get("condition_id")})
-        events.append(
-            {
-                "wallet": wallet,
-                "category": category,
-                "reason": RECENT_CHOP_LOSS_QUARANTINE_REASON,
-                "timestamp": last_event_at,
-                "details": {
-                    "window_days": max(1, int(window_days)),
-                    "cut_loss_count": sum(to_int(row.get("cut_loss_count")) for row in triggers),
-                    "condition_ids": condition_ids,
-                    "last_event_at": last_event_at,
-                },
-            }
-        )
-    return events
 
 
 def market_records_from_events(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -7307,13 +7173,6 @@ def command_follow(
             exited_signal_count += stats.get("exited_signal_count", 0)
             hedge_event_count += stats.get("hedge_event_count", 0)
             opposite_blocked_count += stats.get("opposite_blocked_count", 0)
-            for event in stats.get("quarantine_events") or []:
-                event_category = str(event.get("category") or category).lower()
-                event_wallet = normalize_wallet(event.get("wallet"))
-                if f"{event_category}:{event_wallet}" in favorite_wallets or event_wallet in favorite_wallets:
-                    continue
-                store.upsert_wallet_quarantine(event.get("wallet"), reason=str(event.get("reason") or ""), ts=int(event.get("timestamp") or now_ts), category=str(event.get("category") or category))
-                quarantine_event_count += 1
             next_wallet_state.update({
                 "last_trade_cursor": next_cursor,
                 "last_seen_at": now_ts,
@@ -7353,35 +7212,8 @@ def command_follow(
         performance = aggregate_follow_performance(performance, result_events)
     else:
         performance = aggregate_follow_performance(performance, [])
-    existing_quarantine = set(store.load_wallet_quarantine())
-    for event in observed_performance_quarantine_events(performance, now_ts=now_ts):
-        category = str(event.get("category") or "esports").lower()
-        key = f"{category}:{event['wallet']}"
-        if key in favorite_wallets or event["wallet"] in favorite_wallets:
-            continue
-        if key in existing_quarantine:
-            continue
-        store.upsert_wallet_quarantine(event["wallet"], reason=event["reason"], ts=int(event["timestamp"]), category=category)
-        existing_quarantine.add(key)
-        quarantine_event_count += 1
-    historical_results = store.load_results()
-    for event in recent_chop_loss_quarantine_events([*historical_results, *result_events], now_ts=now_ts):
-        category = str(event.get("category") or "esports").lower()
-        wallet = normalize_wallet(event.get("wallet"))
-        key = f"{category}:{wallet}"
-        if key in favorite_wallets or wallet in favorite_wallets:
-            continue
-        if key in existing_quarantine:
-            continue
-        store.upsert_wallet_quarantine(
-            wallet,
-            reason=str(event.get("reason") or ""),
-            ts=int(event.get("timestamp") or now_ts),
-            category=category,
-            details=event.get("details") if isinstance(event.get("details"), dict) else None,
-        )
-        existing_quarantine.add(key)
-        quarantine_event_count += 1
+    # 自动降级/隔离统一由 observe-v2 重评负责(M5:重跑近期交易跌出 grade-A 即隔离)。
+    # follow tick 不再写隔离 —— 隔离入口收束为两个:人工按钮 + M5 重评。
     stage_seconds["settlement_and_quarantine"] = round(time.monotonic() - settlement_started_mono, 3)
     balance_ledger_result = {"configured": account_balance_configured, "applied_count": 0, "applied_amount_usdc": 0.0}
     if account_balance_configured:
