@@ -13665,7 +13665,7 @@ class CoreTest(unittest.TestCase):
 
     def _v2_profile(self, wallet, game, *, roi=0.25, pnl=2000.0, wilson=0.62,
                     positive=0.78, two_sided=0.02, edge_type="directional",
-                    now=1_700_000_000, market_type="main_match"):
+                    now=1_700_000_000, market_type="main_match", grade="A"):
         hold = pnl if edge_type != "technical" else -abs(pnl)
         rate = 0.0 if edge_type != "technical" else None
         metrics = {
@@ -13686,6 +13686,7 @@ class CoreTest(unittest.TestCase):
         bucket = {**metrics, "game_family": game, "market_type": market_type}
         return {
             "wallet": wallet,
+            "grade": grade,   # 钱包级等级(榜单只发 grade-A)
             **metrics,  # 顶层冗余存一份(builder 实际读 per_game_type 桶)
             "two_sided_trade_market_rate": two_sided,
             "bot_like_score": 10,
@@ -13770,7 +13771,7 @@ class CoreTest(unittest.TestCase):
                 "wilson_win_rate_lower_bound": 0.30, "esports_total_cost": 6 * 1200.0,
                 "last_esports_trade_at": now - 86400, "recent_14d_market_count": 0,
                 "hold_pnl": 50.0, "actual_pnl": 50.0, "actual_minus_hold_pnl_rate": 0.0}
-        profile = {"wallet": "0xspec", "two_sided_trade_market_rate": 0.05, "bot_like_score": 10,
+        profile = {"wallet": "0xspec", "grade": "A", "two_sided_trade_market_rate": 0.05, "bot_like_score": 10,
                    "candidate": {"tail_entry_market_count": 0, "participated_market_count": 11},
                    "per_game_type": {"cs2:map_winner": strong, "lol:main_match": weak}}
         out = build_collector_leaderboard_v2({"0xspec": profile}, now_ts=now)
@@ -13779,6 +13780,21 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(row["eligible_buckets"], ["cs2:map_winner"])  # 只在专精盘口够格
         self.assertEqual(row["primary_game"], "cs2")
         self.assertEqual(row["best_market_type"], "map_winner")
+
+    def test_v2_leaderboard_publishes_grade_a_only(self):
+        # 榜单只发 grade-A:B 档即使有合格桶也不上榜(但不影响 profiles 池留存)。
+        now = 1_700_000_000
+        profiles = {
+            "0xA": self._v2_profile("0xA", "lol", wilson=0.70, now=now, grade="A"),
+            "0xB": self._v2_profile("0xB", "cs2", wilson=0.70, now=now, grade="B"),
+        }
+        out = build_collector_leaderboard_v2(profiles, now_ts=now)
+        kept = {row["wallet"] for row in out["leaderboard"]}
+        self.assertEqual(kept, {"0xa"})                                  # 只 A 上榜
+        self.assertEqual(out["rejected_counts"].get("grade_below_floor"), 1)
+        # min_grade 可放宽:显式允许 B 时,两者都上榜
+        out_b = build_collector_leaderboard_v2(profiles, now_ts=now, min_grade="B")
+        self.assertEqual({row["wallet"] for row in out_b["leaderboard"]}, {"0xa", "0xb"})
 
     def test_observe_analyzed_sqlite_store_and_prune(self):
         with TemporaryDirectory() as d:
