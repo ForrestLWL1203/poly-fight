@@ -322,9 +322,13 @@ function OverviewPage({ data, onNav, onOpenFollow }) {
    ============================================================ */
 function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
   const [view, setView] = React.useState("active");
+  const [gameFilter, setGameFilter] = React.useState("all");
   const [pg, setPg] = React.useState(1);
   const [busy, setBusy] = React.useState({});
-  React.useEffect(() => { setPg(1); }, [view]);
+  const [samplePanel, setSamplePanel] = React.useState(false);
+  const [wrInput, setWrInput] = React.useState("75");
+  const [entryInput, setEntryInput] = React.useState("0.65");
+  React.useEffect(() => { setPg(1); }, [view, gameFilter]);
   React.useEffect(() => { window.lucide && window.lucide.createIcons(); });
 
   if (!data.wallets) return <CenterLoad />;
@@ -333,9 +337,10 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
   const activeWallets = all.filter((w) => !w.quarantined);
   const favRows = activeWallets.filter((w) => w.fav);
   const quarantinedRows = all.filter((w) => w.quarantined);
-  const rows = view === "quarantined" ? quarantinedRows : view === "favorite" ? favRows : activeWallets;
+  const viewRows = view === "quarantined" ? quarantinedRows : view === "favorite" ? favRows : activeWallets;
+  const rows = gameFilter === "all" ? viewRows : viewRows.filter((w) => w.game === gameFilter);
   const q = view === "quarantined";
-  const PAGE = 5;
+  const PAGE = 20;
   const pages = Math.max(1, Math.ceil(rows.length / PAGE));
   const cur = Math.min(pg, pages);
   const pageRows = rows.slice((cur - 1) * PAGE, cur * PAGE);
@@ -363,6 +368,12 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
   };
   const refreshing = JSON.stringify(data.refresh || {}).includes('"running"');
   const updatedLabel = lb.updatedAt ? Adapt.timeAgo(lb.updatedAt) : "—";
+  const startSample = () => {
+    const pr = Math.max(50, Math.min(99, parseFloat(wrInput) || 75)) / 100;
+    const me = Math.max(0.30, Math.min(0.95, parseFloat(entryInput) || 0.65));
+    setSamplePanel(false);
+    onSample && onSample("esports", { min_positive_rate: pr, max_median_entry: me });
+  };
 
   return (
     <div className="page-inner">
@@ -375,15 +386,33 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
               { value: "quarantined", label: "隔离", count: lb.quarantinedCount },
             ]} />
             <div className="sec-actions">
-              <span className="sec-sub" style={{ marginRight: 4 }}>更新 {updatedLabel} · {lb.activeCount} 个活跃</span>
-              <Button variant="primary" disabled={refreshing} iconLeft={refreshing ? <Spinner sm /> : <i data-lucide="radar" style={{ width: 16, height: 16 }} />} onClick={() => onSample && onSample("esports")}>采样钱包</Button>
+              <select className="ps-select" value={gameFilter} onChange={(e) => setGameFilter(e.target.value)} aria-label="按游戏过滤">
+                <option value="all">全部游戏</option>
+                <option value="dota2">Dota 2</option>
+                <option value="cs2">CS2</option>
+                <option value="lol">LoL</option>
+              </select>
+              <span className="lb-updated" style={{ marginRight: 4 }}>最后更新 {updatedLabel} · {lb.activeCount} 个活跃</span>
+              <div className="sample-trigger">
+                <Button variant="primary" disabled={refreshing} iconLeft={refreshing ? <Spinner sm /> : <i data-lucide="radar" style={{ width: 16, height: 16 }} />} onClick={() => setSamplePanel((v) => !v)}>采样钱包</Button>
+                {samplePanel && <>
+                  <div className="sample-backdrop" onClick={() => setSamplePanel(false)} />
+                  <div className="sample-pop" role="dialog" aria-label="采集门槛设置">
+                    <div className="sample-pop-title">采集门槛</div>
+                    <Input label="胜率门槛" type="number" min="50" max="99" step="1" suffix="%" value={wrInput} onChange={(e) => setWrInput(e.target.value)} block />
+                    <Input label="买入价上限" type="number" min="0.3" max="0.95" step="0.01" value={entryInput} onChange={(e) => setEntryInput(e.target.value)} block />
+                    <div className="sample-pop-hint">仅采集专精盘口胜率 ≥ 门槛、买入价 ≤ 上限的钱包</div>
+                    <Button variant="primary" disabled={refreshing} iconLeft={<i data-lucide="radar" style={{ width: 15, height: 15 }} />} onClick={startSample}>开始采样</Button>
+                  </div>
+                </>}
+              </div>
             </div>
           </div>
         </div>
         <div className="tbl-wrap">
           <table className="ps-table">
             <thead><tr>
-              {!q && <th></th>}<th>Rank</th><th>钱包</th>{q && <th>隔离原因</th>}<th>评分</th><th>专精 ROI</th><th>场均交易额</th><th>近期</th><th>专精</th>{!q && <th>跟单胜负</th>}{!q && <th>跟单 PnL</th>}<th>最后交易</th><th></th>
+              {!q && <th></th>}<th>Rank</th><th>钱包</th>{q && <th>隔离原因</th>}<th>专精 ROI</th><th>胜率</th><th>场均交易额</th><th>专精</th>{!q && <th>跟单胜负</th>}{!q && <th>跟单 PnL</th>}<th>最后交易</th><th></th>
             </tr></thead>
             <tbody key={view + cur} className="tbl-fade">
               {pageRows.map((w) => (
@@ -392,10 +421,9 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                   <td>{w.rank != null ? <RankBadge rank={w.rank} /> : <span className="muted">—</span>}</td>
                   <td><WalletAddress address={w.addr} copyable /></td>
                   {q && <td><div className="cell-stack"><span className="strong" style={{ color: "var(--status-warn)" }}>{w.reason}</span><span className="muted">{w.reasonTime}</span></div></td>}
-                  <td className="strong">{w.score || "—"}</td>
                   <td><div className="cell-stack"><span className={pnlClass(w.roi) + " strong"}>{w.roi > 0 ? "+" : ""}{w.roi}%</span>{w.overallRoi != null && <span className="muted">全部 {w.overallRoi > 0 ? "+" : ""}{w.overallRoi}%</span>}</div></td>
+                  <td><div className="cell-stack"><span className="strong">{w.winRate != null ? w.winRate + "%" : "—"}</span>{w.closedCount > 0 && <span className="muted">{w.closedCount} 场</span>}</div></td>
                   <td className="num" title={money(w.avgCash)}>{compactMoney(w.avgCash)}</td>
-                  <td>{w.recent != null ? <TrendValue value={w.recent} percent /> : <span className="muted">–</span>}</td>
                   <td><div className="scope-list">{w.scope.map((s, j) => <span key={j} className="scope-item"><GameIcon game={s.game} base={ASSET_BASE} size="sm" /><span>{s.market}</span></span>)}{!w.scope.length && <span className="muted">–</span>}</div></td>
                   {!q && <td className="strong">{w.followRec}</td>}
                   {!q && <td className={pnlClass(w.followPnl) + " num strong"}>{w.settled ? signedMoney(w.followPnl) : "—"}</td>}
@@ -406,7 +434,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                   </td>
                 </tr>
               ))}
-              {!rows.length && <tr><td colSpan="12" className="empty-cell">暂无{view === "favorite" ? "收藏" : view === "quarantined" ? "隔离" : "活跃"}钱包</td></tr>}
+              {!rows.length && <tr><td colSpan="11" className="empty-cell">暂无{view === "favorite" ? "收藏" : view === "quarantined" ? "隔离" : "活跃"}钱包</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1163,14 +1191,14 @@ function Dashboard({ onLogout, toast }) {
   const closeMask = React.useCallback(() => { maskCancel.current = true; setMask(null); }, []);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  const runSample = React.useCallback(async (category) => {
+  const runSample = React.useCallback(async (category, thresholds) => {
     category = category || "esports";
     maskCancel.current = false;
     setMask({ kind: "sample", done: false, error: false, label: "正在采集聪明钱包", hint: "分析链上交易并重建榜单，请稍候…" });
     const catOf = (st) => (st && st.status && st.status[category]) || {};
     let prevStarted = 0;
     try { prevStarted = Adapt.num(catOf(await Api.walletRefreshStatus()).started_at); } catch (e) {}
-    try { await Api.walletRefresh(category); }
+    try { await Api.walletRefresh(category, thresholds); }
     catch (e) { if (!(e && e.error === "wallet_refresh_running")) { setMask({ kind: "sample", done: true, error: true, label: "采样启动失败", hint: "请稍后重试" }); return; } }
     const start = Date.now();
     while (!maskCancel.current) {

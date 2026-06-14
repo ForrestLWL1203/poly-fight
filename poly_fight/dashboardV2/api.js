@@ -106,8 +106,8 @@
   const runnerStart = () => post("/api/runner/start", {});
   const runnerStop = () => post("/api/runner/stop", {});
   const resetData = () => post("/api/reset-data", {});
-  const walletRefresh = (category) =>
-    post("/api/wallet-refresh?category=" + encodeURIComponent(category), {});
+  const walletRefresh = (category, body) =>
+    post("/api/wallet-refresh?category=" + encodeURIComponent(category), body || {});
 
   /* ---- live stream (SSE) with polling fallback ---- */
   function openStream(onFrame, onStatus) {

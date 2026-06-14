@@ -1971,7 +1971,7 @@ if (typeof document !== "undefined" && !document.getElementById("ps-rankbadge-cs
     color: var(--text-secondary); background: var(--surface-inset);
     border: 1px solid var(--border-hairline); flex: none;
   }
-  .ps-rank.medal { color: #1a1205; border-color: transparent; box-shadow: var(--shadow-sm), var(--inner-highlight-strong); }
+  .ps-rank.medal { color: #1a1205; border: 0; background-clip: border-box; box-shadow: var(--shadow-sm), var(--inner-highlight-strong); }
   .ps-rank.gold   { background: linear-gradient(150deg, #ffe79a 0%, #f5c451 45%, #c8932a 100%); }
   .ps-rank.silver { background: linear-gradient(150deg, #f4f6fb 0%, #cfd6e2 45%, #9aa3b4 100%); }
   .ps-rank.bronze { background: linear-gradient(150deg, #f0c39a 0%, #d59760 45%, #a36a37 100%); }

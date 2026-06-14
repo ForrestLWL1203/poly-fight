@@ -150,6 +150,32 @@
 .sec-head h2 { font: var(--text-section); margin: 0; letter-spacing: var(--ls-title); }
 .sec-head .sec-sub { font-size: var(--fs-subhead); color: var(--text-tertiary); margin-top: 2px; }
 .sec-actions { display: flex; align-items: center; gap: var(--sp-3); }
+/* 榜单"最后更新"药丸:柔珊瑚底 + 新鲜小圆点,契合暖色调,替代白底黑字 */
+.lb-updated {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 4px 11px; border-radius: 999px;
+  background: var(--accent-soft); border: 1px solid var(--border-hairline);
+  color: var(--text-secondary); font-size: var(--fs-subhead); font-weight: 500;
+  white-space: nowrap; letter-spacing: 0.01em;
+}
+.lb-updated::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
+  flex: none;
+}
+/* 采集门槛 popover:点采样按钮弹出,内含胜率/买入价输入 */
+.sample-trigger { position: relative; display: inline-flex; }
+.sample-backdrop { position: fixed; inset: 0; z-index: 40; }
+.sample-pop {
+  position: absolute; top: calc(100% + 8px); right: 0; z-index: 50;
+  width: 248px; padding: var(--sp-4);
+  display: flex; flex-direction: column; gap: var(--sp-3);
+  background: var(--surface-card); border: 1px solid var(--border-hairline);
+  border-radius: 14px; box-shadow: 0 14px 36px rgba(74, 56, 36, 0.18);
+}
+.sample-pop-title { font-size: var(--fs-subhead); font-weight: 700; color: var(--text-primary); }
+.sample-pop-hint { font-size: 11px; color: var(--text-tertiary); line-height: 1.45; }
+.sample-pop .ps-btn { width: 100%; justify-content: center; }
 
 /* ---- Overview grid ---- */
 .ov-grid { display: grid; grid-template-columns: 1.5fr 1fr; gap: var(--gutter); align-items: stretch; }

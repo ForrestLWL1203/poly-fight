@@ -374,6 +374,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not category:
             self._error("invalid_category", status=HTTPStatus.BAD_REQUEST)
             return
+        extra_args = v2_refresh_extra_args(self._read_request_form()) if category == "esports" else None
         try:
             status = start_wallet_refresh(
                 self.dashboard_config.data_dir,
@@ -381,6 +382,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 follow_dir=_follow_dir(self.dashboard_config),
                 runner=self.dashboard_config.wallet_refresh_runner,
                 timeout_seconds=self.dashboard_config.wallet_refresh_timeout_seconds,
+                extra_args=extra_args,
             )
         except WalletRefreshAlreadyRunning as exc:
             self._json({"ok": False, "error": "wallet_refresh_running", "data": exc.status}, status=HTTPStatus.CONFLICT)
@@ -823,10 +825,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 def _latest_collection_summary(data_dir: Path) -> dict[str, Any]:
     candidates: list[dict[str, Any]] = []
     for category, category_dir in category_data_dirs(data_dir).items():
-        row = LeaderboardStore(category_dir / "leaderboard.db").load_latest_collection_run(category=category)
+        row = LeaderboardStore(_leaderboard_db_file(category_dir)).load_latest_collection_run(category=category)
         if row:
             candidates.append(row)
-    legacy_row = LeaderboardStore(data_dir / "leaderboard.db").load_latest_collection_run(category="esports")
+    legacy_row = LeaderboardStore(_leaderboard_db_file(data_dir)).load_latest_collection_run(category="esports")
     if legacy_row:
         candidates.append(legacy_row)
     if candidates:
@@ -1402,11 +1404,11 @@ def _observed_buckets(row: dict[str, Any]) -> list[str]:
 def _category_leaderboards(root: Path) -> list[tuple[str, Path, list[dict[str, Any]], int]]:
     rows: list[tuple[str, Path, list[dict[str, Any]], int]] = []
     for category, data_dir in category_data_dirs(root).items():
-        db_rows, db_mtimes = LeaderboardStore(data_dir / "leaderboard.db").load_leaderboard(category=category)
+        db_rows, db_mtimes = LeaderboardStore(_leaderboard_db_file(data_dir)).load_leaderboard(category=category)
         leaderboard = [{**row, "category": category} for row in db_rows if isinstance(row, dict)]
         rows.append((category, data_dir, leaderboard, int(db_mtimes.get(category) or 0)))
     if not any(leaderboard for _, _, leaderboard, _ in rows):
-        legacy_db_rows, legacy_db_mtimes = LeaderboardStore(root / "leaderboard.db").load_leaderboard(category="esports")
+        legacy_db_rows, legacy_db_mtimes = LeaderboardStore(_leaderboard_db_file(root)).load_leaderboard(category="esports")
         if legacy_db_rows:
             legacy_db = [{**row, "category": "esports"} for row in legacy_db_rows if isinstance(row, dict)]
             rows.append(("esports", root, legacy_db, int(legacy_db_mtimes.get("esports") or 0)))
@@ -1578,6 +1580,8 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
                 "game_label": row_league_label if category == "sports" else "",
                 "short_addr": short_addr(wallet),
                 "grade": row.get("grade"),
+                "edge_type": row.get("edge_type"),
+                "primary_game": row.get("primary_game"),
                 "last_esports_trade_at": last_trade_at or row.get("last_esports_trade_at"),
                 "best_market_type": row.get("best_market_type"),
                 "best_market_type_label": row.get("best_market_type_label"),
@@ -2595,6 +2599,12 @@ def _follow_db_file(data_dir: Path, *, follow_dir: Path | None = None) -> Path:
     return _follow_dir_from(data_dir, follow_dir=follow_dir) / "follow.db"
 
 
+def _leaderboard_db_file(data_dir: Path) -> Path:
+    """优先读 collect-v2 的 leaderboard_v2.db;不存在则回退 v1 的 leaderboard.db。"""
+    v2 = Path(data_dir) / "leaderboard_v2.db"
+    return v2 if v2.exists() else Path(data_dir) / "leaderboard.db"
+
+
 class WalletRefreshAlreadyRunning(RuntimeError):
     def __init__(self, status: dict[str, Any]) -> None:
         super().__init__("wallet refresh already running")
@@ -2982,6 +2992,31 @@ def build_wallet_refresh_status(data_dir: Path, *, follow_dir: Path | None = Non
     }
 
 
+def _clamp_optional_float(value: Any, *, lo: float, hi: float) -> float | None:
+    """把表单值解析为 float 并夹到 [lo,hi];无效/缺失返回 None(用 collect-v2 默认)。"""
+    if value is None or value == "":
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f:  # NaN
+        return None
+    return max(lo, min(hi, f))
+
+
+def v2_refresh_extra_args(form: dict[str, Any]) -> list[str]:
+    """从采样表单构造 collect-v2 阈值参数(仅 esports)。值经 float 解析+夹紧+格式化,防注入。"""
+    args: list[str] = []
+    pr = _clamp_optional_float(form.get("min_positive_rate"), lo=0.50, hi=0.99)
+    if pr is not None:
+        args += ["--v2-min-positive-rate", f"{pr:.4f}"]
+    me = _clamp_optional_float(form.get("max_median_entry"), lo=0.30, hi=0.95)
+    if me is not None:
+        args += ["--v2-max-median-entry", f"{me:.4f}"]
+    return args
+
+
 def start_wallet_refresh(
     data_dir: Path,
     *,
@@ -2989,6 +3024,7 @@ def start_wallet_refresh(
     follow_dir: Path | None = None,
     runner: Any = None,
     timeout_seconds: int = 7200,
+    extra_args: list[str] | None = None,
 ) -> dict[str, Any]:
     category = normalize_category(category)
     if not category:
@@ -3007,20 +3043,20 @@ def start_wallet_refresh(
 
     follow_dir.mkdir(parents=True, exist_ok=True)
     log_path = follow_dir / f"wallet-refresh-{category}-{now_ts}.out"
-    command = [
-        sys.executable,
-        "-u",
-        "-m",
-        "poly_fight.cli",
-        "--data-dir",
-        str(category_dir),
-        "collect",
-        "--category",
-        category,
-        "--refresh-classification",
-        "--max-profiles-per-run",
-        "1000",
-    ]
+    base = [sys.executable, "-u", "-m", "poly_fight.cli", "--data-dir", str(category_dir)]
+    if category == "esports":
+        # esports 走 collect-v2(dashboard 读 leaderboard_v2.db);可透传胜率/买入价阈值。
+        command = [
+            *base, "collect-v2", "--category", category,
+            "--refresh-classification", "--max-profile-wallets", "1000",
+            *(extra_args or []),
+        ]
+    else:
+        # sports 暂无 v2 管线,保持 v1 collect。
+        command = [
+            *base, "collect", "--category", category,
+            "--refresh-classification", "--max-profiles-per-run", "1000",
+        ]
     status = {
         "status": "running",
         "category": category,
@@ -3222,10 +3258,10 @@ def _file_mtime(path: Path) -> int:
 def _latest_scoring_version(data_dir: Path) -> int | None:
     versions: list[int] = []
     for category, category_dir in category_data_dirs(data_dir).items():
-        version = LeaderboardStore(category_dir / "leaderboard.db").latest_scoring_version(category=category)
+        version = LeaderboardStore(_leaderboard_db_file(category_dir)).latest_scoring_version(category=category)
         if version:
             versions.append(int(version))
-    legacy_version = LeaderboardStore(data_dir / "leaderboard.db").latest_scoring_version(category="esports")
+    legacy_version = LeaderboardStore(_leaderboard_db_file(data_dir)).latest_scoring_version(category="esports")
     if legacy_version:
         versions.append(int(legacy_version))
     if versions:
