@@ -7390,6 +7390,105 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(summary["watched_market_count"], 1)
             self.assertEqual(requested_wallets, ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
 
+    def test_follow_tick_opens_signal_from_onchain_collector_without_data_api(self):
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now = datetime.now(timezone.utc)
+            start = now + timedelta(hours=2)
+            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            _seed_leaderboard(
+                data_dir / "esports" / "smart_wallet_leaderboard.json",
+                [{"wallet": wallet, "grade": "A", "last_esports_trade_at": int(now.timestamp())}],
+            )
+            write_json(
+                data_dir / "follow" / "active_market_cache.json",
+                {
+                    "updated_at": int(now.timestamp()),
+                    "categories": ["esports"],
+                    "markets": [
+                        {
+                            "condition_id": "esports_m1",
+                            "category": "esports",
+                            "market_type": "main_match",
+                            "match_start_time": start.isoformat(),
+                            "outcomes": ["A", "B"],
+                            "outcome_prices": [0.5, 0.5],
+                            "clob_token_ids": ["tok_yes", "tok_no"],
+                        },
+                    ],
+                },
+            )
+
+            # data-api must NOT be consulted on the on-chain path.
+            requested_wallets = []
+
+            class FakeClient:
+                def trades_for_user(self, w, *_args, **_kwargs):
+                    requested_wallets.append(w)
+                    return []
+
+                def positions(self, *_args, **_kwargs):
+                    return []
+
+            onchain_fill = {
+                "wallet": wallet,
+                "conditionId": "esports_m1",
+                "outcomeIndex": 0,
+                "tokenId": "tok_yes",
+                "side": "BUY",
+                "size": 50.0,
+                "transactionHash": "0xfeed",
+                "logIndex": 0,
+                "blockNumber": 100,
+                "blockTs": int(now.timestamp()),
+            }
+
+            class FakeCollector:
+                healthy = True
+
+                def __init__(self):
+                    self.asset_map_updates = 0
+                    self.wallet_updates = []
+                    self._emitted = False
+
+                def update_asset_map(self, amap):
+                    self.asset_map_updates += 1
+                    self._last_asset_map = amap
+
+                def update_wallets(self, wallets):
+                    self.wallet_updates.append(set(wallets))
+
+                def drain(self):
+                    if self._emitted:
+                        return {}
+                    self._emitted = True
+                    return {wallet: [dict(onchain_fill)]}
+
+            parser = build_parser()
+            args = parser.parse_args(
+                ["--data-dir", str(data_dir), "follow", "--stake-usdc", "1",
+                 "--user-trades-max-pages", "1", "--max-workers", "1"]
+            )
+
+            fake_collector = FakeCollector()
+            with patch("poly_fight.cli.clob_price", return_value=0.55):
+                summary = command_follow(args, client=FakeClient(), emit=False, collector=fake_collector)
+
+            # build_asset_map wired the watched market's token ids into the collector.
+            self.assertEqual(fake_collector.asset_map_updates, 1)
+            self.assertEqual(fake_collector._last_asset_map.get("tok_yes"),
+                             {"conditionId": "esports_m1", "outcomeIndex": 0})
+            self.assertIn(wallet, fake_collector.wallet_updates[-1])
+            # a paper signal opened from the WS fill, and data-api was never polled.
+            self.assertEqual(summary["new_signal_count"], 1)
+            self.assertEqual(requested_wallets, [])
+            open_signals = FollowStore(data_dir / "follow" / "follow.db").load_open_signals()
+            self.assertEqual(len(open_signals), 1)
+            leg = (open_signals[0].get("legs") or [open_signals[0]])[0]
+            self.assertAlmostEqual(float(leg.get("our_entry_price")), 0.55, places=4)
+
     def test_follow_tick_quarantine_takes_precedence_over_favorite(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)

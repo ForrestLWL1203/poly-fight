@@ -67,6 +67,7 @@ from .follow import (
     desired_tick_interval,
     eligible_follow_wallets,
     leg_actual_stake,
+    market_current_price,
     paper_exit_pnl,
     paper_pnl,
     process_follow_trades,
@@ -74,10 +75,18 @@ from .follow import (
     select_new_trades,
     settle_open_signals,
     trade_condition_id,
+    trade_id,
     trade_timestamp,
     winner_outcome_index,
 )
 from .follow_strategy import strategy_from_legacy_args, strategy_summary, validate_follow_strategy
+from .onchain import (
+    WSFollowCollector,
+    build_asset_map,
+    clob_price,
+    fill_to_trade,
+    load_rpc_endpoints,
+)
 from .storage import FollowStore, LeaderboardStore
 from .control import read_follow_control, set_pause_new_signals
 
@@ -5658,6 +5667,7 @@ def command_follow(
     client: PolymarketClient | None = None,
     *,
     emit: bool = True,
+    collector: "WSFollowCollector | None" = None,
 ) -> dict[str, Any]:
     client = client or build_client(args)
     data_dir = resolve_dashboard_root(args)
@@ -5808,6 +5818,15 @@ def command_follow(
         post_start_grace_seconds=args.post_start_trade_grace_seconds,
     )
     gate_open = bool(watched or open_signals)
+    # On-chain detection: keep the WS collector's subscription tracking the
+    # current watched-market token ids + follow wallet set. Detection then comes
+    # from the collector buffer (drained below) instead of data-api polling.
+    onchain_asset_map: dict[str, dict] = {}
+    if collector is not None:
+        onchain_asset_map = build_asset_map(watched)
+        collector.update_asset_map(onchain_asset_map)
+        collector.update_wallets({normalize_wallet(row.get("wallet")) for row in follow_wallets})
+    detection_source = "onchain" if (collector is not None and collector.healthy) else "data_api"
     next_interval = desired_tick_interval(
         list(watched.values()),
         open_signals,
@@ -5919,13 +5938,62 @@ def command_follow(
             return scope_key, trades, meta
 
         wallet_fetch_started_mono = time.monotonic()
-        trade_results = run_ordered_io_tasks(
-            follow_wallets,
-            fetch_trades_for_wallet,
-            max_workers=args.max_workers,
-        )
+        if detection_source == "onchain":
+            # Near-real-time path: drain on-chain fills the collector already
+            # decoded (deduped, filtered to watched tokens + follow wallets).
+            # Each fill -> a trade dict in the shape process_follow_trades expects;
+            # entry price from the live CLOB ask, falling back to the market
+            # snapshot if the quote is unavailable. Idle wallets are skipped.
+            drained = collector.drain()
+            entry_price_cache: dict[str, float] = {}
+
+            def _onchain_entry_price(fill: dict[str, Any]) -> float:
+                token_id = fill["tokenId"]
+                if token_id not in entry_price_cache:
+                    market = active_markets_for_follow.get(fill["conditionId"]) or watched.get(fill["conditionId"]) or {}
+                    price = clob_price(token_id, "buy")
+                    if price is None:
+                        price = market_current_price(market, fill["outcomeIndex"])
+                    price = to_float(price)
+                    # Refresh the market's current-price snapshot so this fresh CLOB
+                    # quote becomes our entry (process_follow_trades reads it via
+                    # market_current_price, which prefers outcome_prices over the trade).
+                    if market and price > 0:
+                        prices = list(market.get("outcome_prices") or [])
+                        idx = fill["outcomeIndex"]
+                        while len(prices) <= idx:
+                            prices.append(0.0)
+                        prices[idx] = price
+                        market["outcome_prices"] = prices
+                    entry_price_cache[token_id] = price
+                return entry_price_cache[token_id]
+
+            trade_results = []
+            for row in follow_wallets:
+                wallet = normalize_wallet(row.get("wallet"))
+                scope_key = str(row.get("scope_key") or f"{str(row.get('category') or 'esports').lower()}:{wallet}")
+                fills = drained.get(wallet) or []
+                if not fills:
+                    continue
+                previous_state = wallet_trade_state.get(scope_key) or wallet_trade_state.get(wallet) or {}
+                trades = [fill_to_trade(fill, price=_onchain_entry_price(fill)) for fill in fills]
+                meta = {
+                    "fetch_started_at": now_ts,
+                    "fetch_completed_at": now_ts,
+                    "previous_poll_at": to_int(previous_state.get("last_seen_at")),
+                    "fetch_seconds": 0.0,
+                    "source": "onchain",
+                }
+                trade_results.append((scope_key, trades, meta))
+            trade_request_count = len(trade_results)
+        else:
+            trade_results = run_ordered_io_tasks(
+                follow_wallets,
+                fetch_trades_for_wallet,
+                max_workers=args.max_workers,
+            )
+            trade_request_count = len(follow_wallets)
         stage_seconds["wallet_trade_fetch"] = round(time.monotonic() - wallet_fetch_started_mono, 3)
-        trade_request_count = len(follow_wallets)
         wallet_process_started_mono = time.monotonic()
 
         def record_observed_delay(trades: list[dict[str, Any]], *, observed_at: int, previous_poll_at: int) -> None:
@@ -5966,7 +6034,19 @@ def command_follow(
                 wallet_tracked_condition_ids = current_tracked_condition_ids
             else:
                 wallet_tracked_condition_ids = open_condition_ids_by_wallet.get(scope_key, set())
-            new_trades, next_cursor, cold_start = select_new_trades(trades, previous_cursor)
+            if detection_source == "onchain":
+                # The collector only emits fills observed AFTER subscribing and
+                # dedups them, so every drained trade is genuinely new — no
+                # cold-start swallow (that's a data-api "diff full history" notion).
+                new_trades = sorted(trades, key=lambda row: (trade_timestamp(row), trade_id(row)))
+                cold_start = False
+                if new_trades:
+                    last = new_trades[-1]
+                    next_cursor = {"timestamp": trade_timestamp(last), "id": trade_id(last)}
+                else:
+                    next_cursor = previous_cursor
+            else:
+                new_trades, next_cursor, cold_start = select_new_trades(trades, previous_cursor)
             if cold_start:
                 cold_start_wallet_count += 1
                 next_wallet_state.update({
@@ -6206,6 +6286,25 @@ def command_run(args: argparse.Namespace) -> int:
     except (AttributeError, ValueError):
         previous_sigterm = None
 
+    # On-chain follow detection: start a WS collector if an RPC is configured.
+    # command_follow drains it (when healthy) instead of polling data-api; if the
+    # WS is unavailable it automatically falls back to data-api. No RPC -> data-api.
+    collector: WSFollowCollector | None = None
+    https_url, wss_url = load_rpc_endpoints()
+    if https_url and wss_url:
+        collector = WSFollowCollector(
+            wss_url=wss_url,
+            https_url=https_url,
+            on_event=lambda kind, data: print(
+                json.dumps({"status": "onchain", "event": kind, **{k: v for k, v in data.items() if k in ("error", "wallets", "from", "to", "count")}}, ensure_ascii=False),
+                flush=True,
+            ),
+        )
+        collector.start()
+        print(json.dumps({"status": "onchain_collector_started", "rpc": wss_url.split("/v2/")[0] + "/v2/***"}, ensure_ascii=False), flush=True)
+    else:
+        print(json.dumps({"status": "onchain_disabled", "reason": "no secret/rpc; using data-api polling"}, ensure_ascii=False), flush=True)
+
     def sleep_or_stop(seconds: int) -> None:
         if not stop_requested["value"] and int(seconds) > 0:
             time.sleep(int(seconds))
@@ -6259,7 +6358,7 @@ def command_run(args: argparse.Namespace) -> int:
             iteration_started_mono = time.monotonic()
             try:
                 maybe_build(force=False)
-                summary = command_follow(args, client=client, emit=True)
+                summary = command_follow(args, client=client, emit=True, collector=collector)
             except Exception as exc:
                 now = time.time()
                 if first_error_at is None:
@@ -6297,13 +6396,21 @@ def command_run(args: argparse.Namespace) -> int:
             tick_count += 1
             if args.max_run_ticks and tick_count >= args.max_run_ticks:
                 break
-            target_interval = int(summary.get("desired_next_interval_seconds") or args.max_tick_seconds)
+            # WS healthy -> drain on the short cadence (fills were already detected
+            # sub-second; this bounds how soon we act). Otherwise (no RPC / WS down,
+            # i.e. the data-api fallback) use the adaptive tick interval.
+            if collector is not None and collector.healthy:
+                target_interval = max(1, int(getattr(args, "ws_drain_seconds", 5)))
+            else:
+                target_interval = int(summary.get("desired_next_interval_seconds") or args.max_tick_seconds)
             iteration_seconds = time.monotonic() - iteration_started_mono
             sleep_seconds = max(0, int(round(target_interval - iteration_seconds)))
             sleep_or_stop(sleep_seconds)
     except KeyboardInterrupt:
         print(json.dumps({"status": "stopped", "reason": "keyboard_interrupt", "ticks": tick_count}, ensure_ascii=False))
     finally:
+        if collector is not None:
+            collector.stop()
         if stop_requested["value"]:
             print(json.dumps({"status": "stopped", "reason": stop_requested["reason"], "ticks": tick_count}, ensure_ascii=False))
         if previous_sigterm is not None:
@@ -6447,6 +6554,10 @@ def build_parser() -> argparse.ArgumentParser:
         # Fixed polling cadence (seconds). >0 overrides the adaptive min/max curve so every
         # wallet is checked on one steady interval; 0 restores the start-time-aware backoff.
         subparser.add_argument("--tick-seconds", type=int, default=60)
+        # When the on-chain WS collector is healthy, drain it on this short cadence
+        # instead of the slow data-api tick (the WS already detected fills sub-second;
+        # this bounds how soon we act on them). Ignored when WS is unavailable.
+        subparser.add_argument("--ws-drain-seconds", type=int, default=5)
         subparser.add_argument("--quarantine-sell-frac", type=float, default=0.2)
         subparser.add_argument("--max-workers", type=int, default=8)
         subparser.add_argument("--max-requests-per-second", type=float, default=10)
@@ -6592,6 +6703,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-tick-seconds", type=int, default=900)
     # Fixed polling cadence (seconds). >0 overrides the adaptive min/max curve; 0 = adaptive.
     run.add_argument("--tick-seconds", type=int, default=60)
+    run.add_argument("--ws-drain-seconds", type=int, default=5)
     run.add_argument("--quarantine-sell-frac", type=float, default=0.2)
     run.add_argument("--error-retry-seconds", type=int, default=180)
     run.add_argument("--max-consecutive-error-seconds", type=int, default=600)

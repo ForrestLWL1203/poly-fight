@@ -433,6 +433,9 @@ def event_to_market_records(
             "question": market.get("question"),
             "outcomes": parse_jsonish(market.get("outcomes"), []),
             "outcome_prices": [to_float(v) for v in parse_jsonish(market.get("outcomePrices"), [])],
+            # ERC1155 token ids per outcome — drives on-chain follow detection
+            # (build_asset_map maps tokenId -> conditionId/outcomeIndex).
+            "clob_token_ids": [str(v) for v in parse_jsonish(market.get("clobTokenIds"), []) if v],
             "end_date": end_date,
             "match_start_time": match_start_time,
             "market_start_time": market_start_time,
