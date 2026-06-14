@@ -5956,9 +5956,52 @@ def command_collect_wallets(args: argparse.Namespace, client: PolymarketClient |
     return _command_collect_wallets(args, client=client)
 
 
+def run_collect_v2_loop(
+    args: argparse.Namespace,
+    *,
+    client: PolymarketClient,
+    sleeper=time.sleep,
+) -> int:
+    """定时自动重采:每 --loop-hours 跑一次 collect-v2 刷新 leaderboard_v2.db。
+
+    不依赖 follow 循环(M3 的 L2 单独形态)。单次失败不崩溃,退避后继续。
+    --loop-max-iterations>0 时跑够即停(测试/有限轮用)。
+    """
+    interval = max(60, int(float(getattr(args, "loop_hours", 0) or 0) * 3600))
+    retry = max(30, int(getattr(args, "loop_error_retry_seconds", 300) or 300))
+    max_iter = int(getattr(args, "loop_max_iterations", 0) or 0)
+    # 暂停门写到 follow 循环读的同一个 follow_dir;采集期间 follow 不开新单,DB 落库后恢复。
+    follow_dir = resolve_follow_dir(args, resolve_data_dir(args))
+    iterations = 0
+    while True:
+        now_ts = int(time.time())
+        for category in FOLLOW_SIGNAL_CATEGORIES:
+            set_pause_new_signals(follow_dir, category, {"status": "paused", "reason": "auto_refresh", "started_at": now_ts})
+        try:
+            _command_collect_wallets(args, client=client, variant="v2")
+            wait = interval
+        except KeyboardInterrupt:
+            for category in FOLLOW_SIGNAL_CATEGORIES:
+                set_pause_new_signals(follow_dir, category, None)
+            return 0
+        except Exception as exc:
+            print(json.dumps({"event": "collect_v2_loop_error", "error": str(exc)}))
+            wait = min(interval, retry)
+        finally:
+            # DB 已落库(或失败保持旧榜)→ 解除暂停,follow 在新榜上继续。
+            for category in FOLLOW_SIGNAL_CATEGORIES:
+                set_pause_new_signals(follow_dir, category, None)
+        iterations += 1
+        if max_iter and iterations >= max_iter:
+            return 0
+        sleeper(wait)
+
+
 def command_collect_v2(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
     # collect-v2:全新 actual 口径管线,esports-only(与现有新信号 esports-only 政策一致)。
-    return _command_collect_wallets(args, client=client, variant="v2")
+    if float(getattr(args, "loop_hours", 0) or 0) <= 0:
+        return _command_collect_wallets(args, client=client, variant="v2")
+    return run_collect_v2_loop(args, client=client or build_client(args))
 
 
 def command_collect(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
@@ -7396,6 +7439,12 @@ def build_parser() -> argparse.ArgumentParser:
         # 技术型(低买高卖)默认不纳入;加此 flag 一键开回。
         subparser.add_argument("--v2-include-technical", dest="v2_include_technical",
                                action="store_true", default=V2_INCLUDE_TECHNICAL)
+        # 定时自动重采(长驻进程):>0 时每 N 小时跑一次刷新 leaderboard_v2.db(0=一次性)。
+        # 循环期间会暂停 follow 开新单;--follow-dir 须指向 follow 循环的同一个 follow 目录。
+        subparser.add_argument("--loop-hours", type=float, default=0)
+        subparser.add_argument("--loop-error-retry-seconds", type=int, default=300)
+        subparser.add_argument("--loop-max-iterations", type=int, default=0)
+        subparser.add_argument("--follow-dir")
         # v2 种子预筛(廉价召回;质量在导出门把控)
         subparser.add_argument("--v2-min-seed-markets", type=int, default=1)
         subparser.add_argument("--v2-min-seed-avg-cash", type=float, default=150.0)

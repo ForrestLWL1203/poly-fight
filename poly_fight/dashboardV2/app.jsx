@@ -551,7 +551,7 @@ function FollowsPage({ data, goStrategy, onOpenFollow }) {
               {pageRows.map((f) => (
                 <tr key={f.cid} className="clickable" onClick={() => onOpenFollow(f.cid)}>
                   <td><MatchCell ev={f} /></td>
-                  <td>{f.status === "open" ? <StatusPill status="live" label="进行中" /> : <Badge tone="neutral">已结算</Badge>}</td>
+                  <td><div className="evt-status">{f.status === "open" ? <StatusPill status="live" label="进行中" /> : <Badge tone="neutral">已结算</Badge>}{f.sourceOffLeaderboard && <Badge tone="warn" title="源钱包已不在最新榜单 — 此跟单继续跟至结算，但不再新开仓">源已脱榜</Badge>}</div></td>
                   <td>{f.settlement === "盈利" ? <span className="pnl-up strong">盈利</span> : f.settlement === "亏损" ? <span className="pnl-down strong">亏损</span> : <span className="muted">未结算</span>}</td>
                   <td className="strong">{f.wallets}</td>
                   <td className="num">{f.legs}</td>

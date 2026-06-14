@@ -13800,6 +13800,42 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(row["primary_game"], "cs2")
         self.assertEqual(row["best_market_type"], "map_winner")
 
+    def test_collect_v2_loop_iterations_and_backoff(self):
+        import argparse
+        from unittest.mock import patch
+        from poly_fight.cli import run_collect_v2_loop
+        # 正常:3 轮,轮间按 interval(12h=43200s)sleep 2 次
+        waits = []
+        state = {"n": 0, "fail_on": None}
+
+        def fake_collect(args, client=None, variant=None):
+            state["n"] += 1
+            if state["fail_on"] == state["n"]:
+                raise RuntimeError("boom")
+            return 0
+
+        pauses = []
+        args = argparse.Namespace(loop_hours=12, loop_error_retry_seconds=300, loop_max_iterations=3,
+                                  data_dir=None, follow_dir="/tmp/_t_follow", category="esports")
+        with patch("poly_fight.cli._command_collect_wallets", side_effect=fake_collect), \
+             patch("poly_fight.cli.set_pause_new_signals", side_effect=lambda d, c, s: pauses.append(bool(s))):
+            run_collect_v2_loop(args, client=object(), sleeper=lambda w: waits.append(w))
+        self.assertEqual(state["n"], 3)
+        self.assertEqual(waits, [43200, 43200])
+        # 每轮:采集前暂停(True)→ 采集后恢复(None=False),共 3 轮
+        self.assertEqual(pauses, [True, False, True, False, True, False])
+
+        # 退避:第 1 轮抛错 → 用 retry(300)而非 interval;循环不崩,继续到第 2 轮
+        waits2 = []
+        state = {"n": 0, "fail_on": 1}
+        args2 = argparse.Namespace(loop_hours=12, loop_error_retry_seconds=300, loop_max_iterations=2,
+                                   data_dir=None, follow_dir="/tmp/_t_follow", category="esports")
+        with patch("poly_fight.cli._command_collect_wallets", side_effect=fake_collect), \
+             patch("poly_fight.cli.set_pause_new_signals"):
+            run_collect_v2_loop(args2, client=object(), sleeper=lambda w: waits2.append(w))
+        self.assertEqual(state["n"], 2)
+        self.assertEqual(waits2, [300])
+
     def test_v2_bucket_gate_risk_controls(self):
         now = 1_700_000_000
         base = {"esports_closed_count": 8, "median_market_roi": 0.30, "esports_roi": 0.30,

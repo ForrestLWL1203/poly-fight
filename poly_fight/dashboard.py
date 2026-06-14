@@ -1797,7 +1797,20 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
     size = max(1, int(size or 25))
     start = (page - 1) * size
     rows = rows[start : start + size]
+    # 脱榜标记:源钱包已不在当前 leaderboard(被刷新排除)。跟单仍跟至结算,但需清晰标出。
+    active_leaderboard = {
+        str(lb_row.get("wallet") or "").lower()
+        for _cat, _dir, lb_rows, _mt in _category_leaderboards(data_dir)
+        for lb_row in lb_rows
+        if lb_row.get("wallet")
+    }
     for row in rows:
+        sources = [str(w).lower() for w in (row.get("wallets") or []) if w]
+        off = [w for w in sources if w not in active_leaderboard]
+        row["off_leaderboard_wallets"] = off
+        row["off_leaderboard_wallet_count"] = len(off)
+        # 全部源钱包都脱榜 → 这条跟单整体"源已脱榜";部分脱榜的多源跟单仍有在榜源,不标。
+        row["source_off_leaderboard"] = bool(sources) and len(off) == len(sources)
         market = _active_market_by_condition(data_dir, str(row.get("condition_id") or ""), follow_dir=follow_dir)
         row["match_start_time"] = row.get("match_start_time") or market.get("match_start_time") or market.get("market_start_time")
         row["end_date"] = row.get("end_date") or market.get("end_date")

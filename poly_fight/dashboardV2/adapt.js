@@ -339,6 +339,7 @@
       pnl,
       pnlKind: row.display_pnl_kind === "unrealized" ? "unrealized" : "realized",
       quality: followQuality(row),
+      sourceOffLeaderboard: !!row.source_off_leaderboard,
       start: fmtClock(row.match_start_time, nowMs),
       end: fmtClock(row.end_date, nowMs),
     };
