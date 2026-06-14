@@ -226,6 +226,8 @@
       grade: row.grade || "",
       category: row.category || "esports",
       game: normalizeGame(row.primary_game || row.best_game_family),
+      // M4 动态观测发现并入榜 < 2h → 显示 "NEW";超过 2h 不再显示
+      isNew: row.observed_at ? (nowMs - num(row.observed_at) * 1000 < 2 * 3600 * 1000) : false,
       score: Math.round(num(row.best_bucket_score)),
       roi: Math.round(pct(row.esports_roi) * 10) / 10,
       overallRoi: row.overall_esports_roi != null ? Math.round(pct(row.overall_esports_roi) * 10) / 10 : null,

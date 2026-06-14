@@ -419,7 +419,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                 <tr key={w.addr} className="clickable" onClick={() => onOpenWallet && onOpenWallet(w.addr)}>
                   {!q && <td><button className={"fav-btn" + (w.fav ? " on" : "")} disabled={busy[w.addr]} onClick={(e) => { e.stopPropagation(); toggleFav(w); }} aria-label="收藏">{w.fav ? "★" : "☆"}</button></td>}
                   <td>{w.rank != null ? <RankBadge rank={w.rank} /> : <span className="muted">—</span>}</td>
-                  <td><WalletAddress address={w.addr} copyable /></td>
+                  <td><div className="wallet-cell"><WalletAddress address={w.addr} copyable />{w.isNew && <span className="new-badge" title="动态观测刚发现并入榜（2 小时内）">NEW</span>}</div></td>
                   {q && <td><div className="cell-stack"><span className="strong" style={{ color: "var(--status-warn)" }}>{w.reason}</span><span className="muted">{w.reasonTime}</span></div></td>}
                   <td><div className="cell-stack"><span className={pnlClass(w.roi) + " strong"}>{w.roi > 0 ? "+" : ""}{w.roi}%</span>{w.overallRoi != null && <span className="muted">全部 {w.overallRoi > 0 ? "+" : ""}{w.overallRoi}%</span>}</div></td>
                   <td><div className="cell-stack"><span className="strong">{w.winRate != null ? w.winRate + "%" : "—"}</span>{w.closedCount > 0 && <span className="muted">{w.closedCount} 场</span>}</div></td>

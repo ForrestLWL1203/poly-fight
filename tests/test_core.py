@@ -7200,39 +7200,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(resolutions, {})
         self.assertEqual(client.calls, 0)
 
-    def test_follow_resolution_lookup_uses_sqlite_closed_cache(self):
-        class FakeClient:
-            def __init__(self):
-                self.calls = 0
-
-            def list_events_paginated(self, **_kwargs):
-                self.calls += 1
-                return []
-
-        with TemporaryDirectory() as tmp:
-            store = FollowStore(Path(tmp) / "follow.db")
-            store.save_market_cache(
-                {"m1": {"condition_id": "m1", "outcome_prices": [1, 0]}},
-                cache_kind="closed",
-                updated_at=900,
-            )
-            signal = {"condition_id": "m1", "match_start_time": datetime.fromtimestamp(500, timezone.utc).isoformat()}
-            client = FakeClient()
-
-            resolutions = fetch_resolutions_for_open_signals(
-                client,
-                [signal],
-                state={},
-                store=store,
-                now_ts=1000,
-                gamma_pages=3,
-                ttl_seconds=900,
-            )
-
-            self.assertEqual(resolutions, {"m1": 0})
-            self.assertEqual(client.calls, 0)
-
     def test_follow_resolution_lookup_queries_open_condition_ids_directly(self):
+        # Option A: resolution is a targeted batch query over the started open
+        # signals' condition_ids — no broad closed-events pull, no scratch cache.
         class FakeClient:
             def __init__(self):
                 self.event_calls = 0
@@ -7265,7 +7235,7 @@ class CoreTest(unittest.TestCase):
         )
 
         self.assertEqual(resolutions, {"m1": 1})
-        self.assertEqual(client.event_calls, 1)
+        self.assertEqual(client.event_calls, 0)  # no broad closed-events pull
         self.assertEqual(client.market_calls, [["m1"]])
 
     def test_follow_tick_does_not_write_performance_json(self):
@@ -8557,6 +8527,16 @@ class CoreTest(unittest.TestCase):
 
                 def trades_for_user(self, _wallet, **_kwargs):
                     return []
+
+                def markets_by_condition_ids(self, condition_ids, *, limit=500):
+                    return [
+                        {
+                            "conditionId": "m1",
+                            "outcomes": ["Team A", "Team B"],
+                            "outcomePrices": ["1", "0"],
+                            "closed": True,
+                        }
+                    ]
 
             parser = build_parser()
             args = parser.parse_args(
@@ -13800,6 +13780,35 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(row["primary_game"], "cs2")
         self.assertEqual(row["best_market_type"], "map_winner")
 
+    def test_observe_analyzed_sqlite_store_and_prune(self):
+        with TemporaryDirectory() as d:
+            store = storage_module.LeaderboardStore(Path(d) / "leaderboard_v2.db")
+            now = 1_700_000_000
+            store.record_observe_analyzed(["0xAA", "0xBB"], now_ts=now)
+            store.record_observe_analyzed(["0xCC"], now_ts=now - 10 * 86400)  # 10天前 → 剪枝
+            got = store.load_observe_analyzed(now_ts=now, retain_days=7)
+            self.assertEqual(set(got), {"0xaa", "0xbb"})   # 去重小写 + 过期剪掉
+            self.assertNotIn("0xcc", got)
+            # 不存在的 db → 空(不抛)
+            self.assertEqual(storage_module.LeaderboardStore(Path(d) / "nope.db").load_observe_analyzed(now_ts=now), {})
+
+    def test_detect_newly_settled_markets(self):
+        from unittest.mock import patch
+        from poly_fight.cli import detect_newly_settled_markets
+        now = datetime(2026, 6, 14, tzinfo=timezone.utc)
+        recent = (now - timedelta(hours=2)).isoformat()
+        old = (now - timedelta(hours=20)).isoformat()
+        markets = [
+            {"condition_id": "0xNEW", "outcome_prices": [1.0, 0.0], "end_date": recent},        # 新结算 → 取
+            {"condition_id": "0xSEEN", "outcome_prices": [1.0, 0.0], "end_date": recent},       # 已分析 → 跳
+            {"condition_id": "0xUNRESOLVED", "outcome_prices": None, "end_date": recent},       # 未结算 → 跳
+            {"condition_id": "0xOLD", "outcome_prices": [1.0, 0.0], "end_date": old},           # 超窗口 → 跳
+        ]
+        client = type("C", (), {"list_events_paginated": lambda self, **k: []})()
+        with patch("poly_fight.cli.build_classification_set", return_value=markets):
+            out = detect_newly_settled_markets(client, analyzed_ids={"0xseen"}, now=now, lookback_hours=6)
+        self.assertEqual([str(m["condition_id"]).lower() for m in out], ["0xnew"])
+
     def test_collect_v2_loop_iterations_and_backoff(self):
         import argparse
         from unittest.mock import patch
@@ -16381,7 +16390,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.run_log_retention_days, 7)
         self.assertEqual(args.resolution_cache_ttl_seconds, 60)
         self.assertEqual(args.resolution_gamma_pages, 2)
-        self.assertEqual(args.event_cache_ttl_minutes, 10)
+        self.assertEqual(args.event_cache_ttl_minutes, 60)
         self.assertEqual(args.user_trades_limit, 50)
         self.assertEqual(args.user_trades_max_pages, 1)
         self.assertFalse(hasattr(args, "bootstrap_current_positions"))
@@ -16427,7 +16436,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.max_slippage_over_entry, 0.10)
         self.assertEqual(args.max_entry_price, 0.85)
         self.assertEqual(args.min_wallet_entry_price, 0.4)
-        self.assertEqual(args.event_cache_ttl_minutes, 10)
+        self.assertEqual(args.event_cache_ttl_minutes, 60)
         self.assertEqual(args.resolution_cache_ttl_seconds, 60)
         self.assertEqual(args.resolution_gamma_pages, 2)
         self.assertEqual(args.tick_seconds, 60)

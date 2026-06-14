@@ -176,6 +176,20 @@
 .sample-pop-title { font-size: var(--fs-subhead); font-weight: 700; color: var(--text-primary); }
 .sample-pop-hint { font-size: 11px; color: var(--text-tertiary); line-height: 1.45; }
 .sample-pop .ps-btn { width: 100%; justify-content: center; }
+/* M4 动态观测新入榜钱包:亮闪 NEW 标记(2h 内显示) */
+.wallet-cell { display: inline-flex; align-items: center; gap: 8px; }
+.new-badge {
+  display: inline-flex; align-items: center;
+  padding: 1px 7px; border-radius: 999px;
+  font-size: 10px; font-weight: 800; letter-spacing: 0.06em;
+  color: #fff; background: var(--accent); flex: none;
+  animation: new-pulse 1.8s ease-out infinite;
+}
+@keyframes new-pulse {
+  0%   { box-shadow: 0 0 0 0 var(--accent-ring); }
+  70%  { box-shadow: 0 0 0 6px rgba(255, 107, 74, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(255, 107, 74, 0); }
+}
 
 /* ---- Overview grid ---- */
 .ov-grid { display: grid; grid-template-columns: 1.5fr 1fr; gap: var(--gutter); align-items: stretch; }

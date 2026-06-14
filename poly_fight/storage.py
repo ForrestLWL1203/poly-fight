@@ -278,6 +278,12 @@ class LeaderboardStore:
                     leaderboard_wallet_count INTEGER,
                     raw_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS observe_analyzed (
+                    condition_id TEXT PRIMARY KEY,
+                    analyzed_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_observe_analyzed_at
+                    ON observe_analyzed(analyzed_at);
                 CREATE INDEX IF NOT EXISTS idx_leaderboard_wallets_category_rank
                     ON leaderboard_wallets(category, rank);
                 CREATE INDEX IF NOT EXISTS idx_wallet_profiles_category_wallet
@@ -469,6 +475,39 @@ class LeaderboardStore:
             )
             conn.execute("COMMIT")
         return summary_payload
+
+    def load_observe_analyzed(self, *, now_ts: int, retain_days: int = 7) -> dict[str, int]:
+        """M4 已分析结算盘 condition_id → analyzed_at(只返回 retain_days 内的;只读)。"""
+        conn = self.connect_readonly()
+        if conn is None:
+            return {}
+        try:
+            cutoff = int(now_ts) - max(1, int(retain_days)) * 86400
+            rows = conn.execute(
+                "SELECT condition_id, analyzed_at FROM observe_analyzed WHERE analyzed_at >= ?",
+                (cutoff,),
+            ).fetchall()
+            return {str(row["condition_id"]).lower(): int(row["analyzed_at"]) for row in rows}
+        except sqlite3.Error:
+            return {}
+        finally:
+            conn.close()
+
+    def record_observe_analyzed(self, condition_ids, *, now_ts: int, retain_days: int = 7) -> None:
+        """记录这批已分析结算盘 + 顺手剪枝超 retain_days 的旧项(防膨胀)。"""
+        self.init_db()
+        cutoff = int(now_ts) - max(1, int(retain_days)) * 86400
+        with self.connect() as conn:
+            conn.execute("BEGIN")
+            for cid in condition_ids:
+                cid = str(cid or "").lower()
+                if cid:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO observe_analyzed(condition_id, analyzed_at) VALUES(?, ?)",
+                        (cid, int(now_ts)),
+                    )
+            conn.execute("DELETE FROM observe_analyzed WHERE analyzed_at < ?", (cutoff,))
+            conn.execute("COMMIT")
 
     def load_leaderboard(self, *, category: str | None = None) -> tuple[list[dict[str, Any]], dict[str, int]]:
         conn = self.connect_readonly()

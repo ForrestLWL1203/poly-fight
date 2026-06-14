@@ -528,15 +528,21 @@ def category_data_dirs(root: Path) -> dict[str, Path]:
     return {"esports": root / "esports", "sports": root / "sports"}
 
 
+def leaderboard_db_path(data_dir: Path) -> Path:
+    """优先 collect-v2 的 leaderboard_v2.db;不存在则回退 v1 leaderboard.db。"""
+    v2 = Path(data_dir) / "leaderboard_v2.db"
+    return v2 if v2.exists() else Path(data_dir) / "leaderboard.db"
+
+
 def read_category_leaderboards(root: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
     rows: list[dict[str, Any]] = []
     mtimes: dict[str, int] = {}
     for category, data_dir in category_data_dirs(root).items():
-        db_rows, db_mtimes = LeaderboardStore(data_dir / "leaderboard.db").load_leaderboard(category=category)
+        db_rows, db_mtimes = LeaderboardStore(leaderboard_db_path(data_dir)).load_leaderboard(category=category)
         if db_rows:
             rows.extend({**row, "category": category} for row in db_rows if isinstance(row, dict))
             mtimes[category] = int(db_mtimes.get(category) or 0)
-    legacy_db_rows, legacy_db_mtimes = LeaderboardStore(root / "leaderboard.db").load_leaderboard(category="esports")
+    legacy_db_rows, legacy_db_mtimes = LeaderboardStore(leaderboard_db_path(root)).load_leaderboard(category="esports")
     if not rows and legacy_db_rows:
         rows.extend({**row, "category": "esports"} for row in legacy_db_rows if isinstance(row, dict))
         mtimes["esports"] = int(legacy_db_mtimes.get("esports") or 0)
@@ -1971,62 +1977,30 @@ def fetch_resolutions_for_open_signals(
         eligible_signals.append(signal)
     if not eligible_signals:
         return {}
-    needed = {str(signal.get("condition_id") or "").lower() for signal in eligible_signals}
-    cached = state.pop("closed_market_cache", None) or {}
-    if store:
-        closed_markets, _updated_at, fresh = store.load_market_cache(
-            cache_kind="closed",
-            now_ts=now_ts,
-            ttl_seconds=ttl_seconds,
-        )
-        if fresh:
-            cached = {}
-        elif cached:
-            store.save_market_cache(
-                {row["condition_id"]: row for row in cached.get("markets") or []},
-                cache_kind="closed",
-                updated_at=int(cached.get("updated_at") or 0),
-            )
-    if not store and cached and now_ts - int(cached.get("updated_at") or 0) < ttl_seconds:
-        closed_markets = {row["condition_id"]: row for row in cached.get("markets") or []}
-    elif store and closed_markets and fresh:
-        pass
-    else:
-        events = client.list_events_paginated(closed=True, active=None, max_pages=gamma_pages, order="endDate")
-        closed_markets = market_records_from_events(events)
-        if store:
-            store.save_market_cache(closed_markets, cache_kind="closed", updated_at=now_ts)
-        else:
-            state["closed_market_cache"] = {
-                "updated_at": now_ts,
-                "markets": list(closed_markets.values()),
-            }
-    resolutions = {}
-    for condition_id, market in closed_markets.items():
-        if condition_id in needed:
-            winner = winner_outcome_index(market)
-            if winner is not None:
-                resolutions[condition_id] = winner
-    missing = sorted(needed - set(resolutions))
-    if missing:
-        direct_markets = client.markets_by_condition_ids(missing, limit=len(missing))
-        direct_records = resolution_market_records_from_markets(direct_markets)
-        if direct_records:
-            closed_markets.update(direct_records)
-            if store:
-                store.save_market_cache(closed_markets, cache_kind="closed", updated_at=now_ts)
-            else:
-                state["closed_market_cache"] = {
-                    "updated_at": now_ts,
-                    "markets": list(closed_markets.values()),
-                }
-            for condition_id in missing:
-                market = direct_records.get(condition_id)
-                if not market:
-                    continue
-                winner = winner_outcome_index(market)
-                if winner is not None:
-                    resolutions[condition_id] = winner
+    needed = sorted(
+        {
+            str(signal.get("condition_id") or "").lower()
+            for signal in eligible_signals
+            if signal.get("condition_id")
+        }
+    )
+    if not needed:
+        return {}
+    # Resolve exactly the started open signals' markets via a targeted batch query.
+    # No broad closed-events pull and no scratch cache: winners are persisted into
+    # signals/results by the caller, so there is nothing here worth retaining. With a
+    # min tick interval of 180s, a per-tick targeted lookup is strictly cheaper than
+    # the old 60s-TTL broad pull (which expired every tick anyway).
+    direct_markets = client.markets_by_condition_ids(needed, limit=len(needed))
+    direct_records = resolution_market_records_from_markets(direct_markets)
+    resolutions: dict[str, int] = {}
+    for condition_id in needed:
+        market = direct_records.get(condition_id)
+        if not market:
+            continue
+        winner = winner_outcome_index(market)
+        if winner is not None:
+            resolutions[condition_id] = winner
     return resolutions
 
 
@@ -5400,6 +5374,9 @@ def build_collector_leaderboard_v2(
                 "best_market_type": best["market_type"],
                 "edge_type": best["edge_type"],
                 "eligible_buckets": [item["bucket_key"] for item in eligible],
+                # follow 循环按 eligible_market_types 判定可跟盘口;从够格桶派生,否则 v2 钱包会被跳过。
+                "eligible_market_types": sorted({item["market_type"] for item in eligible}),
+                "eligible_game_families": sorted({item["game_family"] for item in eligible}),
                 "eligible_bucket_details": [
                     {key: value for key, value in item.items() if key != "rank_score"} for item in eligible
                 ],
@@ -5750,6 +5727,16 @@ def _command_collect_wallets(
         for row in [*reused_profiles_by_wallet.values(), *refreshed_profiles]
         if normalize_wallet(row.get("wallet"))
     }
+    if is_v2:
+        # 协调:保留 observe-v2(M4)累积发现的钱包,避免被全量重建丢掉;按打分窗口剪枝防膨胀。
+        prune_cutoff = now_ts - max(1, profile_lookback_days) * 86400
+        for wallet_key, cached in existing_profiles.items():
+            wallet_key = normalize_wallet(wallet_key or cached.get("wallet"))
+            if not wallet_key or wallet_key in profiles_by_wallet:
+                continue
+            last_trade = to_int(cached.get("last_esports_trade_at"))
+            if last_trade and last_trade >= prune_cutoff:
+                profiles_by_wallet[wallet_key] = cached
     write_json(output_dir / f"{prefix}_wallet_profiles.json", list(profiles_by_wallet.values()))
     mark_stage("wallet_profiles")
 
@@ -6002,6 +5989,195 @@ def command_collect_v2(args: argparse.Namespace, client: PolymarketClient | None
     if float(getattr(args, "loop_hours", 0) or 0) <= 0:
         return _command_collect_wallets(args, client=client, variant="v2")
     return run_collect_v2_loop(args, client=client or build_client(args))
+
+
+# ============================================================
+# M4 observe-v2 —— 事件驱动增量发现(从新结算赛事;见 review/m4-observe-design.md)
+# ============================================================
+def detect_newly_settled_markets(
+    client: PolymarketClient,
+    *,
+    analyzed_ids: set[str],
+    now: datetime | None = None,
+    lookback_hours: float = 4.0,
+    gamma_pages: int = 2,
+) -> list[dict[str, Any]]:
+    """检测最近结算的 in-scope esports 盘口(已分析的除外)。
+
+    窗口 lookback_hours = tick 间隔 + buffer(默认 4h 配 2h tick = 2 倍覆盖,靠去重维护 delta;
+    buffer 兼顾 closed→UMA 解析延迟与 tick 抖动)。只返回已结算
+    (winning_outcome 非空)、end_date 在窗口内、且未分析过的盘口。
+    """
+    now = now or datetime.now(timezone.utc)
+    min_end = now - timedelta(hours=max(1.0, float(lookback_hours)))
+    events = client.list_events_paginated(
+        closed=True,
+        active=None,
+        max_pages=gamma_pages,
+        min_end_date=min_end,
+        max_end_date=now,
+        tag_slugs=CATEGORY_TAG_SLUGS["esports"],
+    )
+    classification = build_classification_set(events, now=now, lookback_days=1)
+    new_markets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for market in classification:
+        cid = str(market.get("condition_id") or "").lower()
+        if not cid or cid in analyzed_ids or cid in seen:
+            continue
+        if winning_outcome_index(market) is None:  # 未结算
+            continue
+        end_dt = parse_dt(market.get("end_date"))
+        if not end_dt or end_dt < min_end or end_dt > now:
+            continue
+        seen.add(cid)
+        new_markets.append(market)
+    return new_markets
+
+
+def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
+    """M4 一次 tick:新结算盘 → top-20 双侧持仓者 → profile 新候选 → 合并重建 → 发布。"""
+    client = client or build_client(args)
+    output_dir = resolve_collector_output_dir(args) / "collector_v2"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    now_dt = datetime.now(timezone.utc)
+    now_ts = int(now_dt.timestamp())
+    follow_dir = resolve_follow_dir(args, resolve_data_dir(args))
+    positions_per_market = getattr(args, "positions_per_market", 20)
+    observe_store = LeaderboardStore(resolve_data_dir(args) / "leaderboard_v2.db")
+
+    new_markets = detect_newly_settled_markets(
+        client,
+        analyzed_ids=set(observe_store.load_observe_analyzed(now_ts=now_ts)),
+        now=now_dt,
+        lookback_hours=float(getattr(args, "observe_lookback_hours", 4.0)),
+        gamma_pages=int(getattr(args, "observe_gamma_pages", 2)),
+    )
+    if not new_markets:
+        print(json.dumps({"event": "observe_v2_tick", "new_settled_markets": 0}))
+        return 0
+
+    # 1) 发现:新结算盘 top-20 双侧持仓者(只盈利)
+    seed_positions: list[dict[str, Any]] = []
+    for market in new_markets:
+        condition_id = str(market.get("condition_id") or "").lower()
+        try:
+            response = client.market_positions(condition_id, limit=positions_per_market, sort_by="TOTAL_PNL", sort_direction="DESC")
+        except Exception:
+            continue
+        seed_positions.extend(collect_seed_positions(market, response, positions_per_market=positions_per_market, include_losing_side=True))
+    seed_wallets = aggregate_seed_wallets(seed_positions)
+
+    # 2) 分类集(15 天)给 profiling 提供 scope
+    lookback_days = int(getattr(args, "lookback_days", 15) or 15)
+    closed_events = client.list_events_paginated(
+        closed=True, active=None, max_pages=getattr(args, "gamma_pages", 10),
+        min_end_date=now_dt - timedelta(days=lookback_days), max_end_date=now_dt,
+        tag_slugs=CATEGORY_TAG_SLUGS["esports"],
+    )
+    classification_set = build_classification_set(closed_events, now=now_dt, lookback_days=lookback_days)
+    profile_lookback_days = int(getattr(args, "profile_lookback_days", COLLECTOR_PROFILE_LOOKBACK_DAYS) or 0)
+    profile_classification_set = filter_classification_set_by_lookback(classification_set, now=now_dt, lookback_days=profile_lookback_days)
+    condition_ids = {str(row.get("condition_id") or "").lower() for row in profile_classification_set if row.get("condition_id")}
+    market_records_by_id = {str(row.get("condition_id") or "").lower(): row for row in profile_classification_set if row.get("condition_id")}
+    condition_type_by_id = {cid: str(row.get("market_type") or MAIN_MATCH) for cid, row in market_records_by_id.items()}
+    condition_game_family_by_id = {cid: str(row.get("game_family") or "unknown") for cid, row in market_records_by_id.items()}
+
+    # 3) 合并累积 profiles;只 profile "新" 候选(已有的保留,含其 observed_at)
+    existing = load_collector_existing_profiles(output_dir, resolve_data_dir(args), prefix="collector_v2")
+    new_seed_wallets = [sw for wallet, sw in seed_wallets.items() if wallet not in existing]
+
+    def profile_one(seed_wallet: dict[str, Any]) -> dict[str, Any]:
+        wallet = normalize_wallet(seed_wallet.get("wallet"))
+        trades, _source = fetch_recent_esports_user_trades_for_wallet(
+            client, wallet, condition_ids,
+            page_limit=getattr(args, "user_history_trades_limit", 500),
+            max_pages=getattr(args, "user_history_trades_max_pages", 3),
+            max_esports_markets=getattr(args, "max_esports_markets_per_wallet", 100),
+            data_dir=output_dir, now_ts=now_ts,
+            cache_ttl_days=getattr(args, "user_trades_cache_ttl_days", 1),
+            force_refresh=False, use_cache=True, include_source=True,
+        )
+        seed_candidate = build_profile_candidate_from_trades(collector_seed_candidate(seed_wallet), trades, market_records_by_id)
+        profile = profile_candidate_wallet(
+            seed_candidate, condition_ids,
+            market_records_by_id=market_records_by_id,
+            condition_type_by_id=condition_type_by_id,
+            condition_game_family_by_id=condition_game_family_by_id,
+            user_trades_loader=lambda _w: trades,
+            current_positions_loader=lambda _w: [],
+            now_ts=now_ts, scoring_basis="actual",
+        )
+        # observed_at:M4 发现并打分的时间 → dashboard 据此显示 2h "new" 标记
+        return {**profile, "profile_lookback_days": profile_lookback_days, "seed": collector_seed_payload(seed_wallet), "observed_at": now_ts}
+
+    new_profiles = [r for r in run_ordered_io_tasks(new_seed_wallets, profile_one, max_workers=getattr(args, "max_workers", 8)) if not isinstance(r, Exception)]
+
+    profiles_by_wallet = dict(existing)
+    for profile in new_profiles:
+        wallet = normalize_wallet(profile.get("wallet"))
+        if wallet:
+            profiles_by_wallet[wallet] = profile
+    write_json(output_dir / "collector_v2_wallet_profiles.json", list(profiles_by_wallet.values()))
+
+    # 4) 整体重建 + 发布(发布期间暂停 follow)
+    collector_result = build_collector_leaderboard_v2(
+        profiles_by_wallet, now_ts=now_ts,
+        per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
+        max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
+        include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
+        gate_kwargs=_v2_gate_kwargs_from_args(args),
+    )
+    leaderboard = collector_result["leaderboard"]
+    write_json(output_dir / "collector_v2_leaderboard.json", leaderboard)
+    for category in FOLLOW_SIGNAL_CATEGORIES:
+        set_pause_new_signals(follow_dir, category, {"status": "paused", "reason": "observe_v2", "started_at": now_ts})
+    try:
+        publish_collector_dashboard_outputs(
+            output_dir, resolve_data_dir(args),
+            summary={"collector": V2_COLLECTOR_NAME, "category": "esports", "source": "observe_v2"},
+            now_ts=now_ts, prefix="collector_v2", db_filename="leaderboard_v2.db",
+            profiles_publish_name="wallet_profiles_v2.json", collector_name=V2_COLLECTOR_NAME,
+        )
+    finally:
+        for category in FOLLOW_SIGNAL_CATEGORIES:
+            set_pause_new_signals(follow_dir, category, None)
+
+    observe_store.record_observe_analyzed(
+        [str(market.get("condition_id") or "").lower() for market in new_markets],
+        now_ts=now_ts,
+    )
+
+    new_on_board = sum(1 for row in leaderboard if to_int(row.get("observed_at")) and now_ts - to_int(row.get("observed_at")) < 7200)
+    print(json.dumps({
+        "event": "observe_v2_tick", "new_settled_markets": len(new_markets),
+        "new_candidates": len(new_seed_wallets), "profiled": len(new_profiles),
+        "leaderboard": len(leaderboard), "new_on_board_2h": new_on_board,
+    }))
+    return 0
+
+
+def command_observe_v2(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
+    if float(getattr(args, "loop_hours", 0) or 0) <= 0:
+        return _command_observe_v2(args, client=client)
+    cli_client = client or build_client(args)
+    interval = max(60, int(float(getattr(args, "loop_hours", 0) or 0) * 3600))
+    retry = max(30, int(getattr(args, "loop_error_retry_seconds", 300) or 300))
+    max_iter = int(getattr(args, "loop_max_iterations", 0) or 0)
+    iterations = 0
+    while True:
+        try:
+            _command_observe_v2(args, client=cli_client)
+            wait = interval
+        except KeyboardInterrupt:
+            return 0
+        except Exception as exc:
+            print(json.dumps({"event": "observe_v2_loop_error", "error": str(exc)}))
+            wait = min(interval, retry)
+        iterations += 1
+        if max_iter and iterations >= max_iter:
+            return 0
+        time.sleep(wait)
 
 
 def command_collect(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
@@ -7364,7 +7540,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--bankroll-usdc", type=float, default=0.0, help="optional paper bankroll cap for total open exposure; 0 disables the cap")
         subparser.add_argument("--follow-recency-days", type=int, default=30)
         subparser.add_argument("--observe-window-hours", type=float, default=24)
-        subparser.add_argument("--event-cache-ttl-minutes", type=int, default=10)
+        subparser.add_argument("--event-cache-ttl-minutes", type=int, default=60)
         subparser.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
         subparser.add_argument("--resolution-gamma-pages", type=int, default=2)
         subparser.add_argument("--max-slippage-over-entry", type=float, default=0.10)
@@ -7448,6 +7624,9 @@ def build_parser() -> argparse.ArgumentParser:
         # v2 种子预筛(廉价召回;质量在导出门把控)
         subparser.add_argument("--v2-min-seed-markets", type=int, default=1)
         subparser.add_argument("--v2-min-seed-avg-cash", type=float, default=150.0)
+        # M4 observe-v2:结算检测窗口(应 ≥ tick 间隔 + buffer)
+        subparser.add_argument("--observe-lookback-hours", type=float, default=4.0)
+        subparser.add_argument("--observe-gamma-pages", type=int, default=2)
 
     collect_v2 = subparsers.add_parser(
         "collect-v2",
@@ -7459,6 +7638,20 @@ def build_parser() -> argparse.ArgumentParser:
     # v2 默认更宽的发现/打分窗口(仍可用 --lookback-days / --profile-lookback-days 覆盖);v1 collect 不受影响。
     collect_v2.set_defaults(
         func=command_collect_v2,
+        max_leaderboard_wallets=V2_MAX_LEADERBOARD_WALLETS,
+        lookback_days=V2_DEFAULT_LOOKBACK_DAYS,
+        profile_lookback_days=V2_DEFAULT_PROFILE_LOOKBACK_DAYS,
+    )
+
+    observe_v2 = subparsers.add_parser(
+        "observe-v2",
+        help="M4: event-driven incremental discovery from newly-settled matches (loop: --loop-hours 2)",
+    )
+    add_build_arguments(observe_v2, include_category=True)
+    add_collector_arguments(observe_v2)
+    add_collector_v2_arguments(observe_v2)
+    observe_v2.set_defaults(
+        func=command_observe_v2,
         max_leaderboard_wallets=V2_MAX_LEADERBOARD_WALLETS,
         lookback_days=V2_DEFAULT_LOOKBACK_DAYS,
         profile_lookback_days=V2_DEFAULT_PROFILE_LOOKBACK_DAYS,
@@ -7499,7 +7692,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--bankroll-usdc", type=float, default=0.0, help="optional paper bankroll cap for total open exposure; 0 disables the cap")
     run.add_argument("--follow-recency-days", type=int, default=30)
     run.add_argument("--observe-window-hours", type=float, default=24)
-    run.add_argument("--event-cache-ttl-minutes", type=int, default=10)
+    run.add_argument("--event-cache-ttl-minutes", type=int, default=60)
     run.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
     run.add_argument("--resolution-gamma-pages", type=int, default=2)
     run.add_argument("--max-slippage-over-entry", type=float, default=0.10)

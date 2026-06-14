@@ -1582,6 +1582,7 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
                 "grade": row.get("grade"),
                 "edge_type": row.get("edge_type"),
                 "primary_game": row.get("primary_game"),
+                "observed_at": row.get("observed_at"),  # M4 动态观测发现并入榜的时间(供 2h "new" 标记)
                 "last_esports_trade_at": last_trade_at or row.get("last_esports_trade_at"),
                 "best_market_type": row.get("best_market_type"),
                 "best_market_type_label": row.get("best_market_type_label"),
