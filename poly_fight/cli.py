@@ -42,6 +42,7 @@ from .core import (
     build_discovery_slate,
     bucket_key,
     bucket_label,
+    classify_edge_type,
     classify_market_type,
     ESPORTS_DISCOVERY_GAME_MARKET_TYPE_LIMITS,
     event_to_market_record,
@@ -258,6 +259,34 @@ MOMENTUM_MIN_OVERALL_ROI = 0.02
 MOMENTUM_MIN_CAPITAL_WEIGHTED_EDGE = 0.04
 MOMENTUM_MAX_MEDIAN_ENTRY_PRICE = 0.75
 MOMENTUM_MAX_TWO_SIDED_RATE = 0.05
+# --- collect-v2 全新 actual 口径选择门(不继承 V1 老门;见 review/collector-v2-plan.md 附录 C/D)---
+# V2 跟两类钱包:单向(押对+持有到结算)与技术型(低买弱势方、盘中短涨清仓),两类都要求场均 ROI 足够高。
+# 评分基准为 actual(实际进出场),故这些阈值读到的 pnl/roi/胜率均为 actual 口径。
+# 风控门(短跟单窗口下,高胜率=低方差,优先于长期 EV;二元市场买入价=盈亏平衡胜率)。
+V2_MIN_DIRECTIONAL_ROI = 0.10      # 单向型 aggregate actual ROI(总盈亏/总成本)≥ 0.10;真实 +EV(magnitude-aware)
+V2_MIN_TECHNICAL_ROI = 0.15        # 技术型 aggregate actual ROI ≥ 0.15;出场难复制,留跟单滑点余地
+V2_MIN_ACTUAL_PNL = 100.0          # 总 actual PnL ≥ $100;补杀"赚几十刀"的残渣
+V2_MIN_AVG_MARKET_CASH = 300.0     # 单场均额 ≥ $300;温和挡微注,保留"小而精"
+V2_MIN_POSITIVE_RATE = 0.75        # actual 盈利市场率 ≥ 0.75;短窗口最大化胜率(网格回测后定,~56个钱包)
+V2_MAX_MEDIAN_ENTRY = 0.65         # 买入价上限 ≤ 0.65;防"买热门胜率虚高但一亏全损"的负EV,强制低价买赢家
+V2_MIN_WILSON = 0.50               # actual 胜率 Wilson 下界 ≥ 0.50;小样本防运气
+V2_MIN_RECENT_MARKETS = 3          # 近14天达此样本数才复检近期战绩(否则只靠 inactive 门)
+V2_MAX_TWO_SIDED_RATE = 0.20       # 双边市场率 ≤ 0.20(实证空谷,降噪;edge 无关)
+V2_MAX_BOT_SCORE = 70              # bot 评分硬排除阈
+V2_MAX_TAIL_ENTRY_RATE = 0.25      # 尾盘追高市场占比 ≤ 0.25
+V2_MAX_INACTIVE_DAYS = 14          # 近 14 天内有 scoped 交易
+V2_PER_GAME_QUOTA = 0              # 0 = 不设每游戏上限(榜单=全部够格);>0 时才强制每游戏封顶
+V2_MAX_LEADERBOARD_WALLETS = 200   # 仅作安全上限(质量门已把关,大小不重要)
+# 技术型(低买高卖/靠出场)默认不纳入:占比极低 + 我们 follow 延迟高跟不准卖点,风险大。
+# 路径保留(--v2-include-technical 可一键开回),scoring_basis 仍用 actual(单向卖0.99回收也算得准)。
+V2_INCLUDE_TECHNICAL = False
+# 统一单一 15 天窗口:发现=打分=近期,全部用最近 15 天。esports 比赛密集,实测 15 天
+# 即可把 6 个桶全部装满 100 场(瓶颈是 bucket_market_limit,不是窗口),故发现层无损;
+# 而窗口短 → 赛事新鲜 → 捞出的钱包原生活跃。近期复检自然内建(整个打分窗口就是 15 天)。
+V2_DEFAULT_LOOKBACK_DAYS = 15          # 历史赛事发现范围(--lookback-days)
+V2_DEFAULT_PROFILE_LOOKBACK_DAYS = 15  # 打分窗口(--profile-lookback-days)
+V2_COLLECTOR_NAME = "wallet_collector_v2"
+
 SEED_BUCKET_MIN_HIT_RATE = 0.10
 SEED_BUCKET_MIN_WIN_RATE = SEED_BUCKET_MIN_HIT_RATE
 SEED_BUCKET_MIN_WINS_FLOOR = 0
@@ -3862,15 +3891,24 @@ def collect_seed_positions(
     market_positions_response: list[dict[str, Any]],
     *,
     positions_per_market: int = 20,
+    include_losing_side: bool = False,
 ) -> list[dict[str, Any]]:
+    """从 market-positions 抽取盈利持仓作为种子。
+
+    v1(默认)只取最终胜方持仓 —— 但实证(review/collector-v2-plan.md 附录 A)显示负方
+    也有大量盈利钱包,它们靠"低价买入 + 结算前卖出"赚钱(technical 型),winners-only 会
+    把这些高水平钱包全部丢掉。`include_losing_side=True`(collect-v2)同时采集双侧盈利持仓,
+    把"押对/押错"留给钱包级 profiling 用真实历史判定,降噪下沉到钱包级。
+    """
     winner_index = winning_outcome_index(market)
     if winner_index is None:
         return []
-    winning_positions: list[dict[str, Any]] = []
+    seed_rows: list[dict[str, Any]] = []
     for token_index, token_block in enumerate(market_positions_response or []):
         for position in token_block.get("positions") or []:
             outcome_index = to_int(position.get("outcomeIndex"), token_index)
-            if outcome_index != winner_index:
+            outcome_won = outcome_index == winner_index
+            if not include_losing_side and not outcome_won:
                 continue
             wallet = normalize_wallet(position.get("proxyWallet") or position.get("wallet"))
             if not wallet:
@@ -3881,9 +3919,10 @@ def collect_seed_positions(
             if seed_pnl == 0:
                 seed_pnl = to_float(position.get("realizedPnl"))
             seed_cost = total_bought * avg_price
+            # 仍只保留盈利持仓(质量信号);负方盈利者必然已在结算前卖出 → technical 型。
             if seed_pnl <= 0 or total_bought <= 0 or avg_price <= 0 or seed_cost <= 0:
                 continue
-            winning_positions.append(
+            seed_rows.append(
                 {
                     "wallet": wallet,
                     "condition_id": str(market.get("condition_id") or "").lower(),
@@ -3893,6 +3932,7 @@ def collect_seed_positions(
                     "bucket_key": str(market.get("bucket_key") or bucket_key(market.get("game_family"), market.get("market_type"))),
                     "outcome_index": outcome_index,
                     "outcome": position.get("outcome"),
+                    "seed_outcome_won": outcome_won,
                     "avg_price": round(avg_price, 8),
                     "total_bought": round(total_bought, 8),
                     "seed_cost": round(seed_cost, 8),
@@ -3903,9 +3943,19 @@ def collect_seed_positions(
                     "timestamp": int(parse_dt(market.get("end_date")).timestamp()) if parse_dt(market.get("end_date")) else 0,
                 }
             )
-    rows = winning_positions[: max(0, int(positions_per_market))]
-    for rank, row in enumerate(rows, start=1):
-        row["seed_rank"] = rank
+    cap = max(0, int(positions_per_market))
+    if not include_losing_side:
+        rows = seed_rows[:cap]
+        for rank, row in enumerate(rows, start=1):
+            row["seed_rank"] = rank
+        return rows
+    # 双侧:按每一侧分别截断并各自排名,避免胜方占满名额把负方整段挤掉。
+    rows: list[dict[str, Any]] = []
+    for won in (True, False):
+        side_rows = [row for row in seed_rows if bool(row.get("seed_outcome_won")) is won][:cap]
+        for rank, row in enumerate(side_rows, start=1):
+            row["seed_rank"] = rank
+        rows.extend(side_rows)
     return rows
 
 
@@ -4260,6 +4310,62 @@ def filter_profile_seed_wallets(
     return rows[: max(0, int(max_wallets))]
 
 
+def filter_profile_seed_wallets_v2(
+    seed_wallets: dict[str, dict[str, Any]],
+    *,
+    max_wallets: int,
+    min_seed_markets: int = 1,
+    min_avg_seed_cash: float = 150.0,
+) -> list[dict[str, Any]]:
+    """v2 种子预筛:廉价召回 + per-game round-robin 分配 profiling 预算。
+
+    不套 v1 严格桶门(min_wins/weighted_roi/median_price)——质量决策已下沉到 v2 导出门
+    (actual ROI + 降噪)。这里只:① 去 dust(至少 1 个种子市场、均额 ≥ 低底);
+    ② 按 seed_score 在每个 game_family 内排序后 round-robin 取,保证低交易游戏的候选也能
+    拿到 profiling 名额(从源头解决偏科),高交易游戏用剩余预算补足。
+    """
+    candidates: list[dict[str, Any]] = []
+    for row in seed_wallets.values():
+        market_count = to_int(row.get("seed_market_count"))
+        if market_count < min_seed_markets:
+            continue
+        avg_cash = to_float(row.get("seed_cost_total")) / market_count if market_count else 0.0
+        if avg_cash < min_avg_seed_cash:
+            continue
+        game_counts = row.get("seed_game_family_counts") if isinstance(row.get("seed_game_family_counts"), dict) else {}
+        primary_game = max(game_counts, key=lambda g: game_counts[g]) if game_counts else "unknown"
+        updated = dict(row)
+        updated["seed_primary_game"] = primary_game
+        updated["seed_avg_cash"] = round(avg_cash, 4)
+        candidates.append(updated)
+    by_game: dict[str, list[dict[str, Any]]] = {}
+    for row in candidates:
+        by_game.setdefault(row["seed_primary_game"], []).append(row)
+    for rows in by_game.values():
+        rows.sort(
+            key=lambda row: (
+                to_float(row.get("seed_score")),
+                to_int(row.get("seed_win_count")),
+                to_float(row.get("seed_pnl_total")),
+                normalize_wallet(row.get("wallet")),
+            ),
+            reverse=True,
+        )
+    budget = max(0, int(max_wallets))
+    games = sorted(by_game)
+    pointers = {game: 0 for game in games}
+    selected: list[dict[str, Any]] = []
+    # round-robin:每轮各游戏取 1 个(按各自 seed_score 序),低交易游戏先取尽,高交易游戏补足预算。
+    while len(selected) < budget and any(pointers[game] < len(by_game[game]) for game in games):
+        for game in games:
+            if pointers[game] < len(by_game[game]):
+                selected.append(by_game[game][pointers[game]])
+                pointers[game] += 1
+                if len(selected) >= budget:
+                    break
+    return selected
+
+
 def seed_filter_reject_reasons(
     seed_wallets: dict[str, dict[str, Any]],
     profile_wallets: list[dict[str, Any]],
@@ -4591,10 +4697,12 @@ def build_collector_profile_refresh_plan(
     }
 
 
-def load_collector_existing_profiles(output_dir: Path, data_dir: Path | None = None) -> dict[str, dict[str, Any]]:
+def load_collector_existing_profiles(
+    output_dir: Path, data_dir: Path | None = None, *, prefix: str = "collector"
+) -> dict[str, dict[str, Any]]:
     del data_dir
     paths = [
-        Path(output_dir) / "collector_wallet_profiles.json",
+        Path(output_dir) / f"{prefix}_wallet_profiles.json",
         Path(output_dir) / "wallet_profiles.json",
     ]
     for path in paths:
@@ -5120,6 +5228,230 @@ def build_collector_leaderboard(
     }
 
 
+def _v2_candidate_metric(profile: dict[str, Any], key: str) -> Any:
+    """读取在 profile 顶层或嵌套 candidate 里的发现层指标(avg_market_cash/tail/participated)。"""
+    if key in profile:
+        return profile.get(key)
+    candidate = profile.get("candidate") if isinstance(profile.get("candidate"), dict) else {}
+    return candidate.get(key)
+
+
+def v2_bucket_gate(
+    metrics: dict[str, Any],
+    market_type: str,
+    *,
+    now_ts: int,
+    wallet_tail_rate: float = 0.0,
+    min_directional_roi: float = V2_MIN_DIRECTIONAL_ROI,
+    min_technical_roi: float = V2_MIN_TECHNICAL_ROI,
+    min_actual_pnl: float = V2_MIN_ACTUAL_PNL,
+    min_avg_market_cash: float = V2_MIN_AVG_MARKET_CASH,
+    min_positive_rate: float = V2_MIN_POSITIVE_RATE,
+    max_median_entry: float = V2_MAX_MEDIAN_ENTRY,
+    min_wilson: float = V2_MIN_WILSON,
+    min_recent_markets: int = V2_MIN_RECENT_MARKETS,
+    max_tail_entry_rate: float = V2_MAX_TAIL_ENTRY_RATE,
+    max_inactive_days: int = V2_MAX_INACTIVE_DAYS,
+) -> list[str]:
+    """V2 逐 game×market_type 桶的 actual 口径风控门。专精评估:钱包在某盘口够格即合格。
+
+    风控原则(短跟单窗口,方差优先于长期 EV):
+      - 高胜率(盈利市场率 ≥ 0.75,两类通用;技术型=盈利出场率)→ 短窗口少踩连败
+      - 买入价上限(median ≤ 0.65)→ 防"买热门胜率虚高但负EV",强制低价买赢家
+      - aggregate ROI(总盈亏/总成本)→ 真实 +EV,堵临界负EV(中位ROI会被热门骗过);技术型更高
+      - 近 14 天用同样的胜率+ROI 标准复检 → 近期手冷不跟
+    样本下限按盘口:主赛 6 / 子盘 3。
+    """
+    reasons: list[str] = []
+    closed = to_int(metrics.get("esports_closed_count"))
+    min_closed = 6 if str(market_type) == MAIN_MATCH else 3
+    if closed < min_closed:
+        reasons.append("thin_sample")
+    is_technical = classify_edge_type(metrics) == "technical"
+    min_aggregate_roi = min_technical_roi if is_technical else min_directional_roi
+    # 胜率(方差安全,两类通用)
+    if to_float(metrics.get("positive_market_rate")) < min_positive_rate:
+        reasons.append("low_positive_rate")
+    # 买入价上限(防热门负EV;技术型买冷门自动过)
+    median_entry = to_float(metrics.get("median_entry_price"))
+    if median_entry <= 0 or median_entry > max_median_entry:
+        reasons.append("entry_too_high")
+    # aggregate ROI(总盈亏/总成本):真实 +EV,magnitude-aware(中位ROI在高胜率门下从不触发,故已删)
+    if to_float(metrics.get("esports_roi")) < min_aggregate_roi:
+        reasons.append("low_aggregate_roi")
+    if to_float(metrics.get("wilson_win_rate_lower_bound")) < min_wilson:
+        reasons.append("low_wilson")
+    if to_float(metrics.get("esports_realized_pnl")) < min_actual_pnl:
+        reasons.append("low_actual_pnl")
+    bucket_avg_cash = to_float(metrics.get("esports_total_cost")) / closed if closed else 0.0
+    if bucket_avg_cash < min_avg_market_cash:
+        reasons.append("low_avg_market_cash")
+    if wallet_tail_rate > max_tail_entry_rate:
+        reasons.append("tail_entry_over_limit")
+    # 活跃 + 近 14 天同标准复检(样本足够时)
+    last_trade = to_int(metrics.get("last_esports_trade_at"))
+    if last_trade <= 0 or (now_ts - last_trade) > max_inactive_days * 86400:
+        reasons.append("inactive")
+    if to_int(metrics.get("recent_14d_market_count")) >= min_recent_markets:
+        if to_float(metrics.get("recent_14d_positive_rate")) < min_positive_rate:
+            reasons.append("recent_low_positive_rate")
+        if to_float(metrics.get("recent_14d_roi")) < min_aggregate_roi:
+            reasons.append("recent_low_roi")
+    return reasons
+
+
+def v2_rank_score(profile: dict[str, Any]) -> tuple[Any, ...]:
+    """V2 排序键(降序优先):actual 胜率 Wilson → 场均 ROI → actual PnL。"""
+    return (
+        to_float(profile.get("wilson_win_rate_lower_bound")),
+        to_float(profile.get("median_market_roi")),
+        to_float(profile.get("esports_realized_pnl")),
+    )
+
+
+def build_collector_leaderboard_v2(
+    profiles_by_wallet: dict[str, dict[str, Any]],
+    *,
+    now_ts: int,
+    per_game_quota: int = V2_PER_GAME_QUOTA,
+    max_leaderboard_wallets: int = V2_MAX_LEADERBOARD_WALLETS,
+    include_technical: bool = V2_INCLUDE_TECHNICAL,
+    gate_kwargs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """V2 导出:逐 game×market_type 桶的专精评估 + edge_type 标签 +(可选)每游戏配额。
+
+    钱包在任一盘口桶够格即入榜(eligible_buckets 记录够格的盘口),不被它在别处的平庸表现
+    拖累。bot/系统性双边是钱包级硬排除。不走 V1 的 classify_wallet 等级门 / strict_final /
+    copyable / recent_health。
+    """
+    gate_kwargs = gate_kwargs or {}
+    # bot / 系统性双边是钱包级硬排除(bot 处处是 bot);其余是逐桶质量门。
+    max_two_sided_rate = float(gate_kwargs.get("max_two_sided_rate", V2_MAX_TWO_SIDED_RATE))
+    max_bot_score = int(gate_kwargs.get("max_bot_score", V2_MAX_BOT_SCORE))
+    bucket_gate_kwargs = {
+        key: value
+        for key, value in gate_kwargs.items()
+        if key not in ("max_two_sided_rate", "max_bot_score", "min_closed")
+    }
+    qualified: list[dict[str, Any]] = []
+    rejected_counts: dict[str, int] = {}
+    for wallet, profile in profiles_by_wallet.items():
+        wallet = normalize_wallet(wallet or profile.get("wallet"))
+        if not wallet:
+            continue
+        # wallet 级硬排除
+        if to_float(profile.get("two_sided_trade_market_rate")) > max_two_sided_rate:
+            rejected_counts["two_sided_over_limit"] = rejected_counts.get("two_sided_over_limit", 0) + 1
+            continue
+        if to_int(profile.get("bot_like_score")) >= max_bot_score:
+            rejected_counts["bot_like"] = rejected_counts.get("bot_like", 0) + 1
+            continue
+        participated = to_int(_v2_candidate_metric(profile, "participated_market_count")) or to_int(profile.get("esports_closed_count"))
+        wallet_tail_rate = (
+            to_int(_v2_candidate_metric(profile, "tail_entry_market_count")) / participated if participated > 0 else 0.0
+        )
+        # 逐 game×market_type 桶评估专精方向
+        per_game_type = profile.get("per_game_type") if isinstance(profile.get("per_game_type"), dict) else {}
+        eligible: list[dict[str, Any]] = []
+        for bucket_key, metrics in per_game_type.items():
+            if not isinstance(metrics, dict):
+                continue
+            game_family, market_type = split_bucket_key(bucket_key)
+            bucket_edge = classify_edge_type(metrics)
+            # 技术型默认不纳入(占比低 + follow 延迟跟不准卖点风险大);路径保留可一键开回。
+            if not include_technical and bucket_edge == "technical":
+                rejected_counts["technical_excluded"] = rejected_counts.get("technical_excluded", 0) + 1
+                continue
+            reasons = v2_bucket_gate(
+                metrics, market_type, now_ts=now_ts, wallet_tail_rate=wallet_tail_rate, **bucket_gate_kwargs
+            )
+            if reasons:
+                for reason in reasons:
+                    rejected_counts[reason] = rejected_counts.get(reason, 0) + 1
+                continue
+            eligible.append(
+                {
+                    "bucket_key": bucket_key,
+                    "game_family": str(game_family or "unknown"),
+                    "market_type": str(market_type),
+                    "edge_type": bucket_edge,
+                    "median_market_roi": round(to_float(metrics.get("median_market_roi")), 6),
+                    "positive_market_rate": round(to_float(metrics.get("positive_market_rate")), 6),
+                    "wilson_win_rate_lower_bound": round(to_float(metrics.get("wilson_win_rate_lower_bound")), 6),
+                    "esports_realized_pnl": round(to_float(metrics.get("esports_realized_pnl")), 4),
+                    "esports_closed_count": to_int(metrics.get("esports_closed_count")),
+                    "rank_score": (
+                        to_float(metrics.get("wilson_win_rate_lower_bound")),
+                        to_float(metrics.get("median_market_roi")),
+                        to_float(metrics.get("esports_realized_pnl")),
+                    ),
+                }
+            )
+        if not eligible:
+            continue
+        best = max(eligible, key=lambda item: item["rank_score"])
+        qualified.append(
+            {
+                **profile,
+                "wallet": wallet,
+                "collector": V2_COLLECTOR_NAME,
+                "primary_game": best["game_family"],
+                "best_bucket": best["bucket_key"],
+                "best_market_type": best["market_type"],
+                "edge_type": best["edge_type"],
+                "eligible_buckets": [item["bucket_key"] for item in eligible],
+                "eligible_bucket_details": [
+                    {key: value for key, value in item.items() if key != "rank_score"} for item in eligible
+                ],
+                "v2_rank_score": best["rank_score"],
+            }
+        )
+    # 默认不设每游戏上限(per_game_quota<=0):榜单 = 全部够格钱包,不砍。质量由门把控,
+    # 偏科由"全部纳入"自然化解(少数游戏的够格钱包也全在);需要强均衡时才设 quota>0。
+    by_game: dict[str, list[dict[str, Any]]] = {}
+    for row in qualified:
+        by_game.setdefault(row["primary_game"], []).append(row)
+    cap_per_game = int(per_game_quota) if per_game_quota and int(per_game_quota) > 0 else None
+    selected: list[dict[str, Any]] = []
+    game_counts: dict[str, int] = {}
+    for game, rows in by_game.items():
+        rows.sort(key=lambda r: r["v2_rank_score"], reverse=True)
+        kept = rows[:cap_per_game] if cap_per_game is not None else rows
+        game_counts[game] = len(kept)
+        selected.extend(kept)
+    selected.sort(key=lambda r: r["v2_rank_score"], reverse=True)
+    leaderboard = selected[: max(0, int(max_leaderboard_wallets))] if max_leaderboard_wallets and max_leaderboard_wallets > 0 else selected
+    for row in leaderboard:
+        row.pop("v2_rank_score", None)
+    edge_counts: dict[str, int] = {}
+    for row in leaderboard:
+        edge_counts[row.get("edge_type", "unknown")] = edge_counts.get(row.get("edge_type", "unknown"), 0) + 1
+    return {
+        "leaderboard": leaderboard,
+        "qualified_count": len(qualified),
+        "per_game_counts": game_counts,
+        "edge_type_counts": edge_counts,
+        "rejected_counts": rejected_counts,
+    }
+
+
+def _v2_gate_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "min_directional_roi": float(getattr(args, "v2_min_directional_roi", V2_MIN_DIRECTIONAL_ROI)),
+        "min_technical_roi": float(getattr(args, "v2_min_technical_roi", V2_MIN_TECHNICAL_ROI)),
+        "min_actual_pnl": float(getattr(args, "v2_min_actual_pnl", V2_MIN_ACTUAL_PNL)),
+        "min_avg_market_cash": float(getattr(args, "v2_min_avg_market_cash", V2_MIN_AVG_MARKET_CASH)),
+        "min_positive_rate": float(getattr(args, "v2_min_positive_rate", V2_MIN_POSITIVE_RATE)),
+        "max_median_entry": float(getattr(args, "v2_max_median_entry", V2_MAX_MEDIAN_ENTRY)),
+        "min_wilson": float(getattr(args, "v2_min_wilson", V2_MIN_WILSON)),
+        "min_recent_markets": int(getattr(args, "v2_min_recent_markets", V2_MIN_RECENT_MARKETS)),
+        "max_tail_entry_rate": float(getattr(args, "v2_max_tail_entry_rate", V2_MAX_TAIL_ENTRY_RATE)),
+        "max_inactive_days": int(getattr(args, "v2_max_inactive_days", V2_MAX_INACTIVE_DAYS)),
+        "max_two_sided_rate": float(getattr(args, "v2_max_two_sided_rate", V2_MAX_TWO_SIDED_RATE)),
+        "max_bot_score": int(getattr(args, "v2_max_bot_score", V2_MAX_BOT_SCORE)),
+    }
+
+
 def run_ordered_io_tasks(items: list[Any], worker, *, max_workers: int) -> list[Any]:
     if len(items) <= 1 or max_workers <= 1:
         results = []
@@ -5158,11 +5490,20 @@ def make_retryable_profile(candidate: dict[str, Any], exc: Exception, *, now_ts:
 def _command_collect_wallets(
     args: argparse.Namespace,
     client: PolymarketClient | None = None,
+    *,
+    variant: str = "v1",
 ) -> int:
+    # variant="v2": collect-v2 全新管线 —— 双侧发现 + actual 口径打分 + V2 导出门 + 每游戏配额,
+    # 产出完全隔离到 collector_v2_* / leaderboard_v2.db,不触碰 V1 任何产物。
+    is_v2 = variant == "v2"
+    scoring_basis = "actual" if is_v2 else "hold"
+    include_losing_side = is_v2
     client = client or build_client(args)
     output_dir = resolve_collector_output_dir(args)
+    if is_v2:
+        output_dir = output_dir / "collector_v2"
     output_dir.mkdir(parents=True, exist_ok=True)
-    prefix = "collector"
+    prefix = "collector_v2" if is_v2 else "collector"
     now_dt = datetime.now(timezone.utc)
     now_ts = int(now_dt.timestamp())
     lookback_days = int(getattr(args, "lookback_days", 30) or 30)
@@ -5254,6 +5595,7 @@ def _command_collect_wallets(
                 market_by_id.get(condition_id) or {"condition_id": condition_id},
                 response,
                 positions_per_market=getattr(args, "positions_per_market", 20),
+                include_losing_side=include_losing_side,
             )
         )
     write_json(output_dir / f"{prefix}_seed_positions.json", seed_positions)
@@ -5262,16 +5604,25 @@ def _command_collect_wallets(
     seed_wallets = aggregate_seed_wallets(seed_positions)
     write_json(output_dir / f"{prefix}_seed_wallets.json", list(seed_wallets.values()))
     max_profile_wallets = resolve_collector_profile_wallet_limit(args)
-    profile_wallets = filter_profile_seed_wallets(
-        seed_wallets,
-        max_wallets=max_profile_wallets,
-        seed_bucket_min_wins=seed_bucket_min_wins,
-        seed_bucket_min_avg_cash=seed_bucket_min_avg_cash,
-        seed_min_weighted_roi=seed_min_weighted_roi,
-        seed_max_median_avg_price=seed_max_median_avg_price,
-        seed_single_bucket_min_wins=seed_single_bucket_min_wins,
-        seed_multi_bucket_min_wins=seed_multi_bucket_min_wins,
-    )
+    if is_v2:
+        # v2:廉价召回 + per-game round-robin 填满 profiling 预算(破 v1 严格种子门的 411 天花板)。
+        profile_wallets = filter_profile_seed_wallets_v2(
+            seed_wallets,
+            max_wallets=max_profile_wallets,
+            min_seed_markets=getattr(args, "v2_min_seed_markets", 1),
+            min_avg_seed_cash=getattr(args, "v2_min_seed_avg_cash", 150.0),
+        )
+    else:
+        profile_wallets = filter_profile_seed_wallets(
+            seed_wallets,
+            max_wallets=max_profile_wallets,
+            seed_bucket_min_wins=seed_bucket_min_wins,
+            seed_bucket_min_avg_cash=seed_bucket_min_avg_cash,
+            seed_min_weighted_roi=seed_min_weighted_roi,
+            seed_max_median_avg_price=seed_max_median_avg_price,
+            seed_single_bucket_min_wins=seed_single_bucket_min_wins,
+            seed_multi_bucket_min_wins=seed_multi_bucket_min_wins,
+        )
     write_json(output_dir / f"{prefix}_profile_wallets.json", profile_wallets)
     mark_stage("seed_wallet_filter")
 
@@ -5304,7 +5655,7 @@ def _command_collect_wallets(
         condition_id: str(row.get("game_family") or "unknown")
         for condition_id, row in market_records_by_id.items()
     }
-    existing_profiles = load_collector_existing_profiles(output_dir, resolve_data_dir(args))
+    existing_profiles = load_collector_existing_profiles(output_dir, resolve_data_dir(args), prefix=prefix)
     profile_cache_ttl_hours = float(getattr(args, "collector_profile_cache_ttl_hours", 24) or 0)
     profile_refresh = build_collector_profile_refresh_plan(
         profile_wallets,
@@ -5378,6 +5729,7 @@ def _command_collect_wallets(
             user_trades_loader=lambda _wallet: raw_user_trades_by_wallet.get(wallet, []),
             current_positions_loader=lambda _wallet: [],
             now_ts=now_ts,
+            scoring_basis=scoring_basis,
         )
         return {
             **profile,
@@ -5401,19 +5753,30 @@ def _command_collect_wallets(
     write_json(output_dir / f"{prefix}_wallet_profiles.json", list(profiles_by_wallet.values()))
     mark_stage("wallet_profiles")
 
-    collector_result = build_collector_leaderboard(
-        profiles_by_wallet,
-        now_ts=now_ts,
-        max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", 60),
-        max_core_wallets=getattr(args, "max_core_wallets", 20),
-        max_momentum_wallets=getattr(args, "max_momentum_wallets", 10),
-        max_watchlist_wallets=getattr(args, "max_watchlist_wallets", 50),
-    )
+    if is_v2:
+        collector_result = build_collector_leaderboard_v2(
+            profiles_by_wallet,
+            now_ts=now_ts,
+            per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
+            max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
+            include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
+            gate_kwargs=_v2_gate_kwargs_from_args(args),
+        )
+    else:
+        collector_result = build_collector_leaderboard(
+            profiles_by_wallet,
+            now_ts=now_ts,
+            max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", 60),
+            max_core_wallets=getattr(args, "max_core_wallets", 20),
+            max_momentum_wallets=getattr(args, "max_momentum_wallets", 10),
+            max_watchlist_wallets=getattr(args, "max_watchlist_wallets", 50),
+        )
     leaderboard = collector_result["leaderboard"]
-    write_json(output_dir / "collector_core_leaderboard.json", collector_result["core"])
-    write_json(output_dir / "collector_momentum_leaderboard.json", collector_result["momentum"])
-    write_json(output_dir / "collector_family_leaderboard.json", collector_result["family_supplements"])
-    write_json(output_dir / "collector_watchlist.json", collector_result["watch"])
+    if not is_v2:
+        write_json(output_dir / "collector_core_leaderboard.json", collector_result["core"])
+        write_json(output_dir / "collector_momentum_leaderboard.json", collector_result["momentum"])
+        write_json(output_dir / "collector_family_leaderboard.json", collector_result["family_supplements"])
+        write_json(output_dir / "collector_watchlist.json", collector_result["watch"])
     write_json(output_dir / f"{prefix}_leaderboard.json", leaderboard)
     mark_stage("leaderboard")
 
@@ -5468,31 +5831,59 @@ def _command_collect_wallets(
         "stage_timings": {key: round(float(value), 6) for key, value in sorted(stage_timings.items())},
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    summary.update(
-        {
-            "lane_counts": collector_result["lane_counts"],
-            "core_leaderboard_wallet_count": len(collector_result["core"]),
-            "momentum_leaderboard_wallet_count": len(collector_result["momentum"]),
-            "family_leaderboard_wallet_count": len(collector_result["family_supplements"]),
-            "watchlist_wallet_count": len(collector_result["watch"]),
-            "max_inactive_hours": round(COLLECTOR_MAX_INACTIVE_SECONDS / 3600, 2),
-            "min_copyable_bucket_roi": MIN_COPYABLE_BUCKET_ROI,
-            "max_copyable_two_sided_market_count": MAX_COPYABLE_TWO_SIDED_COUNT,
-            "max_copyable_two_sided_market_rate": MAX_COPYABLE_TWO_SIDED_RATE,
-            "copyable_two_sided_max_rate": COPYABLE_TWO_SIDED_MAX_RATE,
-            "copyable_two_sided_min_bucket_roi": COPYABLE_TWO_SIDED_MIN_BUCKET_ROI,
-            "copyable_two_sided_min_first_direction_win_rate": COPYABLE_TWO_SIDED_MIN_FIRST_DIRECTION_WIN_RATE,
-            "copyable_two_sided_min_closed_count": COPYABLE_TWO_SIDED_MIN_CLOSED_COUNT,
-            "max_copyable_tail_entry_rate": MAX_COPYABLE_TAIL_ENTRY_RATE,
-            "high_churn_hard_excluded": False,
-        }
-    )
-    dashboard_publish = publish_collector_dashboard_outputs(
-        output_dir,
-        resolve_data_dir(args),
-        summary=summary,
-        now_ts=now_ts,
-    )
+    if is_v2:
+        summary["collector"] = V2_COLLECTOR_NAME
+        summary.update(
+            {
+                "scoring_basis": scoring_basis,
+                "include_losing_side": include_losing_side,
+                "v2_include_technical": bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
+                "v2_qualified_count": collector_result.get("qualified_count", 0),
+                "v2_per_game_counts": collector_result.get("per_game_counts", {}),
+                "v2_edge_type_counts": collector_result.get("edge_type_counts", {}),
+                "v2_rejected_counts": collector_result.get("rejected_counts", {}),
+                "v2_gates": _v2_gate_kwargs_from_args(args),
+                "v2_per_game_quota": getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
+            }
+        )
+    else:
+        summary.update(
+            {
+                "lane_counts": collector_result["lane_counts"],
+                "core_leaderboard_wallet_count": len(collector_result["core"]),
+                "momentum_leaderboard_wallet_count": len(collector_result["momentum"]),
+                "family_leaderboard_wallet_count": len(collector_result["family_supplements"]),
+                "watchlist_wallet_count": len(collector_result["watch"]),
+                "max_inactive_hours": round(COLLECTOR_MAX_INACTIVE_SECONDS / 3600, 2),
+                "min_copyable_bucket_roi": MIN_COPYABLE_BUCKET_ROI,
+                "max_copyable_two_sided_market_count": MAX_COPYABLE_TWO_SIDED_COUNT,
+                "max_copyable_two_sided_market_rate": MAX_COPYABLE_TWO_SIDED_RATE,
+                "copyable_two_sided_max_rate": COPYABLE_TWO_SIDED_MAX_RATE,
+                "copyable_two_sided_min_bucket_roi": COPYABLE_TWO_SIDED_MIN_BUCKET_ROI,
+                "copyable_two_sided_min_first_direction_win_rate": COPYABLE_TWO_SIDED_MIN_FIRST_DIRECTION_WIN_RATE,
+                "copyable_two_sided_min_closed_count": COPYABLE_TWO_SIDED_MIN_CLOSED_COUNT,
+                "max_copyable_tail_entry_rate": MAX_COPYABLE_TAIL_ENTRY_RATE,
+                "high_churn_hard_excluded": False,
+            }
+        )
+    if is_v2:
+        dashboard_publish = publish_collector_dashboard_outputs(
+            output_dir,
+            resolve_data_dir(args),
+            summary=summary,
+            now_ts=now_ts,
+            prefix=prefix,
+            db_filename="leaderboard_v2.db",
+            profiles_publish_name="wallet_profiles_v2.json",
+            collector_name=V2_COLLECTOR_NAME,
+        )
+    else:
+        dashboard_publish = publish_collector_dashboard_outputs(
+            output_dir,
+            resolve_data_dir(args),
+            summary=summary,
+            now_ts=now_ts,
+        )
     summary["dashboard_publish"] = dashboard_publish
     write_json(output_dir / f"{prefix}_build_summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
@@ -5505,23 +5896,29 @@ def publish_collector_dashboard_outputs(
     *,
     summary: dict[str, Any] | None = None,
     now_ts: int | None = None,
+    prefix: str = "collector",
+    db_filename: str = "leaderboard.db",
+    profiles_publish_name: str = "wallet_profiles.json",
+    collector_name: str = COLLECTOR_NAME,
 ) -> dict[str, Any]:
     collector_output_dir = Path(collector_output_dir)
     data_dir = Path(data_dir)
     now_ts = int(now_ts or time.time())
-    leaderboard_value = read_json(collector_output_dir / "collector_leaderboard.json", [])
-    profiles_value = read_json(collector_output_dir / "collector_wallet_profiles.json", [])
+    leaderboard_value = read_json(collector_output_dir / f"{prefix}_leaderboard.json", [])
+    profiles_value = read_json(collector_output_dir / f"{prefix}_wallet_profiles.json", [])
     leaderboard = [row for row in leaderboard_value if isinstance(row, dict)] if isinstance(leaderboard_value, list) else []
     profiles = [row for row in profiles_value if isinstance(row, dict)] if isinstance(profiles_value, list) else []
 
     data_dir.mkdir(parents=True, exist_ok=True)
-    write_json(data_dir / "wallet_profiles.json", profiles)
+    # v2 用独立的 profiles 落地名(wallet_profiles_v2.json),不覆盖 v1 dashboard 源。
+    write_json(data_dir / profiles_publish_name, profiles)
     publish_summary = {
         "published": True,
-        "collector": COLLECTOR_NAME,
+        "collector": collector_name,
         "category": "esports",
         "collector_output_dir": str(collector_output_dir),
         "data_dir": str(data_dir),
+        "leaderboard_db": db_filename,
         "leaderboard_wallet_count": len(leaderboard),
         "profile_wallet_count": len(profiles),
         "updated_at": now_ts,
@@ -5529,14 +5926,14 @@ def publish_collector_dashboard_outputs(
     dashboard_summary = dict(summary) if isinstance(summary, dict) else {}
     dashboard_summary.update(
         {
-            "collector": COLLECTOR_NAME,
+            "collector": collector_name,
             "category": "esports",
             "leaderboard_wallet_count": len(leaderboard),
             "profiled_wallet_count": len(profiles),
             "dashboard_publish": publish_summary,
         }
     )
-    LeaderboardStore(data_dir / "leaderboard.db").publish_collection(
+    LeaderboardStore(data_dir / db_filename).publish_collection(
         category="esports",
         leaderboard=leaderboard,
         profiles=profiles,
@@ -5557,6 +5954,11 @@ def command_analyze_collector_snapshot(args: argparse.Namespace) -> int:
 
 def command_collect_wallets(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
     return _command_collect_wallets(args, client=client)
+
+
+def command_collect_v2(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
+    # collect-v2:全新 actual 口径管线,esports-only(与现有新信号 esports-only 政策一致)。
+    return _command_collect_wallets(args, client=client, variant="v2")
 
 
 def command_collect(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
@@ -6975,6 +7377,43 @@ def build_parser() -> argparse.ArgumentParser:
     add_build_arguments(collect, include_category=True)
     add_collector_arguments(collect)
     collect.set_defaults(func=command_collect)
+
+    def add_collector_v2_arguments(subparser: argparse.ArgumentParser) -> None:
+        # V2 actual 口径选择门(都可调;默认见 cli 顶部 V2_* 常量)。
+        subparser.add_argument("--v2-min-directional-roi", type=float, default=V2_MIN_DIRECTIONAL_ROI)
+        subparser.add_argument("--v2-min-technical-roi", type=float, default=V2_MIN_TECHNICAL_ROI)
+        subparser.add_argument("--v2-min-actual-pnl", type=float, default=V2_MIN_ACTUAL_PNL)
+        subparser.add_argument("--v2-min-avg-market-cash", type=float, default=V2_MIN_AVG_MARKET_CASH)
+        subparser.add_argument("--v2-min-positive-rate", type=float, default=V2_MIN_POSITIVE_RATE)
+        subparser.add_argument("--v2-max-median-entry", type=float, default=V2_MAX_MEDIAN_ENTRY)
+        subparser.add_argument("--v2-min-wilson", type=float, default=V2_MIN_WILSON)
+        subparser.add_argument("--v2-min-recent-markets", type=int, default=V2_MIN_RECENT_MARKETS)
+        subparser.add_argument("--v2-max-two-sided-rate", type=float, default=V2_MAX_TWO_SIDED_RATE)
+        subparser.add_argument("--v2-max-bot-score", type=int, default=V2_MAX_BOT_SCORE)
+        subparser.add_argument("--v2-max-tail-entry-rate", type=float, default=V2_MAX_TAIL_ENTRY_RATE)
+        subparser.add_argument("--v2-max-inactive-days", type=int, default=V2_MAX_INACTIVE_DAYS)
+        subparser.add_argument("--v2-per-game-quota", type=int, default=V2_PER_GAME_QUOTA)
+        # 技术型(低买高卖)默认不纳入;加此 flag 一键开回。
+        subparser.add_argument("--v2-include-technical", dest="v2_include_technical",
+                               action="store_true", default=V2_INCLUDE_TECHNICAL)
+        # v2 种子预筛(廉价召回;质量在导出门把控)
+        subparser.add_argument("--v2-min-seed-markets", type=int, default=1)
+        subparser.add_argument("--v2-min-seed-avg-cash", type=float, default=150.0)
+
+    collect_v2 = subparsers.add_parser(
+        "collect-v2",
+        help="collect-v2: dual-side discovery + actual-PnL scoring + per-game quota (isolated leaderboard_v2.db)",
+    )
+    add_build_arguments(collect_v2, include_category=True)
+    add_collector_arguments(collect_v2)
+    add_collector_v2_arguments(collect_v2)
+    # v2 默认更宽的发现/打分窗口(仍可用 --lookback-days / --profile-lookback-days 覆盖);v1 collect 不受影响。
+    collect_v2.set_defaults(
+        func=command_collect_v2,
+        max_leaderboard_wallets=V2_MAX_LEADERBOARD_WALLETS,
+        lookback_days=V2_DEFAULT_LOOKBACK_DAYS,
+        profile_lookback_days=V2_DEFAULT_PROFILE_LOOKBACK_DAYS,
+    )
 
     snapshot = subparsers.add_parser("analyze-collector-snapshot", help="summarize a local collector data snapshot")
     snapshot.add_argument("--snapshot-dir", default="data_vps/esports")

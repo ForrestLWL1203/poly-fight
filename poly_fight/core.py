@@ -1179,6 +1179,7 @@ def summarize_closed_positions(
     condition_game_family_by_id: dict[str, str] | None = None,
     now_ts: int | None = None,
     bot_like_score: int = 0,
+    scoring_basis: str = "hold",
 ) -> dict[str, Any]:
     condition_type_by_id = {str(key).lower(): value for key, value in (condition_type_by_id or {}).items()}
     condition_game_family_by_id = {
@@ -1197,17 +1198,21 @@ def summarize_closed_positions(
         game_family = condition_game_family_by_id.get(condition_id, "unknown")
         game_type_key = bucket_key(game_family, market_type)
         total_bought = to_float(position.get("totalBought") or position.get("total_bought"))
-        realized_pnl = to_float(position.get("realizedPnl") or position.get("realized_pnl"))
+        hold_realized = to_float(position.get("realizedPnl") or position.get("realized_pnl"))
         if total_bought <= 0:
-            continue
-        if realized_pnl == 0:
-            neutral_market_count_by_type[market_type] = neutral_market_count_by_type.get(market_type, 0) + 1
-            neutral_market_count_by_game_type[game_type_key] = neutral_market_count_by_game_type.get(game_type_key, 0) + 1
             continue
         avg_price = to_float(position.get("avgPrice") or position.get("avg_price"))
         cost_basis = total_bought * avg_price if avg_price > 0 else total_bought
-        actual_pnl = to_float(position.get("actualPnl"), realized_pnl)
-        hold_pnl = to_float(position.get("holdPnl"), realized_pnl)
+        actual_pnl = to_float(position.get("actualPnl"), hold_realized)
+        hold_pnl = to_float(position.get("holdPnl"), hold_realized)
+        # scoring_basis 决定 win/pnl/roi 的口径:
+        #   hold   = 押对结果、持有到结算(v1 默认,只奖励单向钱包)
+        #   actual = 实际进出场盈亏(v2,容纳低买高卖的 technical 钱包)
+        scoring_pnl = actual_pnl if scoring_basis == "actual" else hold_realized
+        if scoring_pnl == 0:
+            neutral_market_count_by_type[market_type] = neutral_market_count_by_type.get(market_type, 0) + 1
+            neutral_market_count_by_game_type[game_type_key] = neutral_market_count_by_game_type.get(game_type_key, 0) + 1
+            continue
         rows.append(
             {
                 "condition_id": condition_id,
@@ -1217,11 +1222,11 @@ def summarize_closed_positions(
                 "pre_match_entry": position.get("preMatchEntry"),
                 "total_bought": total_bought,
                 "cost_basis": cost_basis,
-                "realized_pnl": realized_pnl,
+                "realized_pnl": scoring_pnl,
                 "actual_pnl": actual_pnl,
                 "hold_pnl": hold_pnl,
-                "profit_per_share": realized_pnl / total_bought,
-                "roi": realized_pnl / cost_basis if cost_basis > 0 else 0.0,
+                "profit_per_share": scoring_pnl / total_bought,
+                "roi": scoring_pnl / cost_basis if cost_basis > 0 else 0.0,
                 "avg_price": avg_price,
                 "timestamp": to_int(position.get("timestamp")),
                 "first_buy_won": position.get("firstBuyWon") if "firstBuyWon" in position else None,
@@ -1566,6 +1571,7 @@ def summarize_trade_reconstructed_positions(
     now_ts: int | None = None,
     bot_like_score: int = 0,
     material_sell_frac: float = 0.2,
+    scoring_basis: str = "hold",
 ) -> dict[str, Any]:
     markets = {str(key).lower(): value for key, value in market_records_by_id.items()}
     categories = {str(record.get("category") or "") for record in markets.values() if record.get("category")}
@@ -1591,6 +1597,7 @@ def summarize_trade_reconstructed_positions(
         condition_game_family_by_id=condition_game_family_by_id,
         now_ts=now_ts,
         bot_like_score=bot_like_score,
+        scoring_basis=scoring_basis,
     )
     behavior_market_count = len(behavior_by_market)
     sold_before_resolution_market_count = sum(1 for row in behavior_by_market.values() if row.get("sold_before_resolution"))
@@ -2172,6 +2179,36 @@ def bot_like_score_from_candidate(candidate: dict[str, Any]) -> int:
     return 0
 
 
+# --- edge_type 标签 ---------------------------------------------------------
+# 区分钱包盈利来源,决定我们能不能、以及怎么跟单(见 review/collector-v2-plan.md §4.4)。
+#   directional = 持有到结算也盈利,edge 在"押对结果"。跟单买入持有即可,执行风险低。
+#   technical   = 盈利依赖"低价买入 + 结算前精准卖出"(swing/出场)。持有到结算可能是亏的,
+#                 跟单需要快速镜像出场,延迟/执行风险高。后期若跟不上可按此标签剔除。
+EDGE_TYPE_DIRECTIONAL = "directional"
+EDGE_TYPE_TECHNICAL = "technical"
+EDGE_TYPE_UNKNOWN = "unknown"
+
+
+def classify_edge_type(profile: dict[str, Any], *, swing_rate: float = SWING_DEPENDENT_RATE) -> str:
+    """根据 hold-to-resolution PnL 与实际 PnL 之差给钱包打 edge_type 标签。
+
+    复用 core 已计算的 actual_pnl / hold_pnl / actual_minus_hold_pnl_rate,
+    不引入新的 API 或重算。无可用样本时返回 unknown。
+    """
+    actual_pnl = to_float(profile.get("actual_pnl"))
+    hold_pnl = to_float(profile.get("hold_pnl"))
+    closed = to_int(profile.get("esports_closed_count"))
+    rate = profile.get("actual_minus_hold_pnl_rate")
+    if closed <= 0 and actual_pnl == 0 and hold_pnl == 0:
+        return EDGE_TYPE_UNKNOWN
+    # 持有到结算会亏(或不赚),却实际盈利 → 利润纯靠出场时机。
+    if hold_pnl <= 0 < actual_pnl:
+        return EDGE_TYPE_TECHNICAL
+    if rate is not None and to_float(rate) > swing_rate:
+        return EDGE_TYPE_TECHNICAL
+    return EDGE_TYPE_DIRECTIONAL
+
+
 def profile_candidate_wallet(
     candidate: dict[str, Any],
     esports_condition_ids: set[str],
@@ -2184,6 +2221,7 @@ def profile_candidate_wallet(
     current_positions_loader,
     historical_trades_loader=None,
     now_ts: int | None = None,
+    scoring_basis: str = "hold",
 ) -> dict[str, Any]:
     wallet = normalize_wallet(candidate.get("wallet"))
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
@@ -2196,6 +2234,7 @@ def profile_candidate_wallet(
                 market_records_by_id,
                 now_ts=now_ts,
                 bot_like_score=bot_score,
+                scoring_basis=scoring_basis,
             )
         else:
             if not closed_positions_loader:
@@ -2208,6 +2247,7 @@ def profile_candidate_wallet(
                 condition_game_family_by_id=condition_game_family_by_id,
                 now_ts=now_ts,
                 bot_like_score=bot_score,
+                scoring_basis=scoring_basis,
             )
         if historical_trades_loader and not user_trades_loader:
             trade_behavior = summarize_historical_trade_behavior(
@@ -2221,7 +2261,11 @@ def profile_candidate_wallet(
             for market_type, behavior in per_type_behavior.items():
                 per_type[market_type] = {**(per_type.get(market_type) or {}), **behavior}
             summary["per_type"] = per_type
-        return classify_wallet({**summary, "wallet": wallet, "candidate": candidate}, now_ts=now_ts)
+        result = classify_wallet({**summary, "wallet": wallet, "candidate": candidate}, now_ts=now_ts)
+        # edge_type 标签恒在 profile 上(directional/technical/unknown),供 v2 导出/follow 按标签过滤。
+        result["edge_type"] = classify_edge_type(result)
+        result["scoring_basis"] = scoring_basis
+        return result
     except Exception as exc:
         return {
             "wallet": wallet,

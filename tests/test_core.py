@@ -60,10 +60,13 @@ from poly_fight.cli import (
     command_collect_wallets,
     command_analyze_collector_snapshot,
     aggregate_seed_wallets,
+    build_collector_leaderboard_v2,
     build_seeded_leaderboard,
     calculate_seed_bucket_min_wins,
     collect_seed_positions,
     command_collect,
+    filter_profile_seed_wallets_v2,
+    v2_bucket_gate,
     ESPORTS_CANDIDATE_MARKET_TYPE_THRESHOLDS,
     ESPORTS_CANDIDATE_GAME_FAMILY_THRESHOLDS,
     filter_profile_seed_wallets,
@@ -120,6 +123,7 @@ from poly_fight.core import (
     build_candidate_wallets_from_holders,
     build_classification_set,
     build_discovery_slate,
+    classify_edge_type,
     classify_market_type,
     classify_wallet,
     event_category,
@@ -13588,6 +13592,263 @@ class CoreTest(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["seed_roi"], 40 / 60)
         self.assertEqual(rows[0]["seed_edge"], 0.4)
         self.assertEqual(rows[0]["seed_rank"], 1)
+        self.assertTrue(rows[0]["seed_outcome_won"])
+
+    def test_seed_positions_dual_side_captures_profitable_loser(self):
+        # v2 collect-v2: include_losing_side 同时采集负方盈利钱包(technical 型),
+        # 但仍只保留盈利持仓(0xBBB pnl=0 被排除),且双侧各自排名。
+        market = {
+            "condition_id": "m1",
+            "category": "esports",
+            "game_family": "lol",
+            "market_type": "main_match",
+            "bucket_key": "lol:main_match",
+            "outcome_prices": [1.0, 0.0],  # index 0 wins
+            "end_date": "2026-06-08T00:00:00Z",
+        }
+        response = [
+            {
+                "positions": [
+                    {"proxyWallet": "0xAAA", "outcomeIndex": 0, "avgPrice": 0.6,
+                     "totalBought": 100, "realizedPnl": 40, "totalPnl": 40},
+                    {"proxyWallet": "0xBBB", "outcomeIndex": 0, "avgPrice": 0.9,
+                     "totalBought": 100, "realizedPnl": 0, "totalPnl": 0},
+                ]
+            },
+            {
+                "positions": [
+                    {"proxyWallet": "0xLOSER", "outcomeIndex": 1, "avgPrice": 0.2,
+                     "totalBought": 100, "realizedPnl": 200, "totalPnl": 200},
+                ]
+            },
+        ]
+
+        rows = collect_seed_positions(market, response, positions_per_market=20, include_losing_side=True)
+        by_wallet = {row["wallet"]: row for row in rows}
+
+        self.assertEqual(set(by_wallet), {"0xaaa", "0xloser"})
+        self.assertTrue(by_wallet["0xaaa"]["seed_outcome_won"])
+        self.assertFalse(by_wallet["0xloser"]["seed_outcome_won"])
+        # 各侧独立排名 → 每侧 rank 从 1 开始
+        self.assertEqual(by_wallet["0xaaa"]["seed_rank"], 1)
+        self.assertEqual(by_wallet["0xloser"]["seed_rank"], 1)
+
+    def test_seed_positions_dual_side_caps_each_side_independently(self):
+        # 双侧各按 positions_per_market 截断,胜方占满不会把负方挤掉。
+        market = {
+            "condition_id": "m1", "game_family": "lol", "market_type": "main_match",
+            "outcome_prices": [1.0, 0.0], "end_date": "2026-06-08T00:00:00Z",
+        }
+        winners = [
+            {"proxyWallet": f"0xW{i}", "outcomeIndex": 0, "avgPrice": 0.5,
+             "totalBought": 100, "realizedPnl": 50, "totalPnl": 50}
+            for i in range(3)
+        ]
+        losers = [
+            {"proxyWallet": f"0xL{i}", "outcomeIndex": 1, "avgPrice": 0.2,
+             "totalBought": 100, "realizedPnl": 30, "totalPnl": 30}
+            for i in range(3)
+        ]
+        rows = collect_seed_positions(
+            market, [{"positions": winners}, {"positions": losers}],
+            positions_per_market=2, include_losing_side=True,
+        )
+        kept = {row["wallet"] for row in rows}
+        self.assertEqual(len([r for r in rows if r["seed_outcome_won"]]), 2)
+        self.assertEqual(len([r for r in rows if not r["seed_outcome_won"]]), 2)
+        self.assertEqual(kept, {"0xw0", "0xw1", "0xl0", "0xl1"})
+
+    def test_classify_edge_type(self):
+        # directional: 持有到结算也盈利,且 swing 占比低
+        self.assertEqual(
+            classify_edge_type({"esports_closed_count": 8, "actual_pnl": 1000,
+                                "hold_pnl": 950, "actual_minus_hold_pnl_rate": 0.05}),
+            "directional",
+        )
+        # technical: hold_pnl<=0 但实际盈利 → 纯出场时机(附录 A 的 0x594d 型)
+        self.assertEqual(
+            classify_edge_type({"esports_closed_count": 6, "actual_pnl": 16868,
+                                "hold_pnl": -14482, "actual_minus_hold_pnl_rate": None}),
+            "technical",
+        )
+        # technical: swing 占比超阈值
+        self.assertEqual(
+            classify_edge_type({"esports_closed_count": 8, "actual_pnl": 1000,
+                                "hold_pnl": 400, "actual_minus_hold_pnl_rate": 1.5}),
+            "technical",
+        )
+        # unknown: 无样本无盈亏
+        self.assertEqual(
+            classify_edge_type({"esports_closed_count": 0, "actual_pnl": 0, "hold_pnl": 0}),
+            "unknown",
+        )
+
+    def _v2_profile(self, wallet, game, *, roi=0.25, pnl=2000.0, wilson=0.62,
+                    positive=0.78, two_sided=0.02, edge_type="directional",
+                    now=1_700_000_000, market_type="main_match"):
+        hold = pnl if edge_type != "technical" else -abs(pnl)
+        rate = 0.0 if edge_type != "technical" else None
+        metrics = {
+            "esports_closed_count": 8,
+            "median_market_roi": roi,
+            "esports_roi": roi,
+            "esports_realized_pnl": pnl,
+            "positive_market_rate": positive,
+            "median_entry_price": 0.45,
+            "wilson_win_rate_lower_bound": wilson,
+            "esports_total_cost": 8 * 1500.0,
+            "last_esports_trade_at": now - 86400,
+            "recent_14d_market_count": 0,
+            "hold_pnl": hold,
+            "actual_pnl": pnl,
+            "actual_minus_hold_pnl_rate": rate,
+        }
+        bucket = {**metrics, "game_family": game, "market_type": market_type}
+        return {
+            "wallet": wallet,
+            **metrics,  # 顶层冗余存一份(builder 实际读 per_game_type 桶)
+            "two_sided_trade_market_rate": two_sided,
+            "bot_like_score": 10,
+            "edge_type": edge_type,
+            "candidate": {"avg_market_cash": 1500.0, "tail_entry_market_count": 0,
+                          "participated_market_count": 8},
+            # 逐桶指标(build_collector_leaderboard_v2 读)
+            "per_game_type": {f"{game}:{market_type}": bucket},
+        }
+
+    def _seed_wallet(self, wallet, game, *, score, cost=2000.0, markets=4):
+        return {"wallet": wallet, "seed_market_count": markets, "seed_cost_total": cost,
+                "seed_game_family_counts": {game: markets}, "seed_score": score,
+                "seed_win_count": markets, "seed_pnl_total": cost * 0.3}
+
+    def test_filter_profile_seed_wallets_v2_dust_and_round_robin(self):
+        sw = {
+            "0xlol1": self._seed_wallet("0xlol1", "lol", score=0.9),
+            "0xlol2": self._seed_wallet("0xlol2", "lol", score=0.8),
+            "0xlol3": self._seed_wallet("0xlol3", "lol", score=0.7),
+            "0xlol4": self._seed_wallet("0xlol4", "lol", score=0.6),
+            "0xcs2a": self._seed_wallet("0xcs2a", "cs2", score=0.3),   # 低 seed_score 的低交易游戏
+            "0xdust": self._seed_wallet("0xdust", "lol", score=0.95, cost=200.0, markets=4),  # 均额 50<150
+        }
+        out = filter_profile_seed_wallets_v2(sw, max_wallets=3, min_avg_seed_cash=150.0)
+        wallets = [r["wallet"] for r in out]
+        self.assertEqual(len(out), 3)
+        self.assertNotIn("0xdust", wallets)        # dust 被去掉(即使 seed_score 最高)
+        # round-robin:cs2 唯一钱包即使 seed_score 全局垫底也拿到 profiling 名额
+        # (全局 top-3 会是 3 个 lol、把 cs2 挤掉)。从源头解决偏科。
+        self.assertIn("0xcs2a", wallets)
+
+    def test_v2_leaderboard_per_game_quota_prevents_domination(self):
+        now = 1_700_000_000
+        profiles = {
+            "0xlol1": self._v2_profile("0xlol1", "lol", wilson=0.80, now=now),
+            "0xlol2": self._v2_profile("0xlol2", "lol", wilson=0.75, now=now),
+            "0xcs2a": self._v2_profile("0xcs2a", "cs2", wilson=0.60, edge_type="technical", now=now),
+            "0xdota": self._v2_profile("0xdota", "dota2", wilson=0.58, now=now),
+            "0xbad": self._v2_profile("0xbad", "lol", roi=0.01, now=now),  # 残渣,被门拦
+        }
+        # include_technical=True 才纳入技术型(默认关闭,见下个测试)
+        out = build_collector_leaderboard_v2(profiles, now_ts=now, per_game_quota=1, include_technical=True)
+        games = sorted(row["primary_game"] for row in out["leaderboard"])
+        # 每游戏配额=1:lol 只留最强的 0xlol1,cs2/dota 各保底 1 名 → 偏科被打破
+        self.assertEqual(games, ["cs2", "dota2", "lol"])
+        kept = {row["wallet"] for row in out["leaderboard"]}
+        self.assertIn("0xlol1", kept)
+        self.assertNotIn("0xlol2", kept)   # 同游戏次优被配额挤出
+        self.assertNotIn("0xbad", kept)    # 残渣被门拦
+        self.assertEqual(out["edge_type_counts"].get("technical"), 1)
+
+    def test_v2_excludes_technical_by_default(self):
+        now = 1_700_000_000
+        profiles = {
+            "0xdir": self._v2_profile("0xdir", "lol", wilson=0.70, now=now),                       # 单向
+            "0xtech": self._v2_profile("0xtech", "cs2", wilson=0.70, edge_type="technical", now=now),  # 技术型
+        }
+        # 默认:技术型被排除
+        out = build_collector_leaderboard_v2(profiles, now_ts=now)
+        kept = {row["wallet"] for row in out["leaderboard"]}
+        self.assertEqual(kept, {"0xdir"})
+        self.assertNotIn("technical", out["edge_type_counts"])
+        self.assertEqual(out["rejected_counts"].get("technical_excluded"), 1)
+        # 一键开回:--v2-include-technical
+        out2 = build_collector_leaderboard_v2(profiles, now_ts=now, include_technical=True)
+        self.assertEqual({row["wallet"] for row in out2["leaderboard"]}, {"0xdir", "0xtech"})
+
+    def test_v2_specialist_qualifies_via_strong_bucket(self):
+        # 专精评估:钱包整体平庸(lol 主赛很差),但在 cs2 地图胜负上很强 →
+        # 应凭专精桶入榜,eligible_buckets 只含该桶,不被 lol 拖累。
+        now = 1_700_000_000
+        strong = {"game_family": "cs2", "market_type": "map_winner", "esports_closed_count": 5,
+                  "median_market_roi": 0.40, "esports_roi": 0.40, "esports_realized_pnl": 3000.0,
+                  "positive_market_rate": 0.80, "median_entry_price": 0.30,
+                  "wilson_win_rate_lower_bound": 0.62, "esports_total_cost": 5 * 1200.0,
+                  "last_esports_trade_at": now - 86400, "recent_14d_market_count": 0,
+                  "hold_pnl": 3000.0, "actual_pnl": 3000.0, "actual_minus_hold_pnl_rate": 0.0}
+        weak = {"game_family": "lol", "market_type": "main_match", "esports_closed_count": 6,
+                "median_market_roi": 0.02, "esports_roi": 0.02, "esports_realized_pnl": 50.0,
+                "positive_market_rate": 0.40, "median_entry_price": 0.50,
+                "wilson_win_rate_lower_bound": 0.30, "esports_total_cost": 6 * 1200.0,
+                "last_esports_trade_at": now - 86400, "recent_14d_market_count": 0,
+                "hold_pnl": 50.0, "actual_pnl": 50.0, "actual_minus_hold_pnl_rate": 0.0}
+        profile = {"wallet": "0xspec", "two_sided_trade_market_rate": 0.05, "bot_like_score": 10,
+                   "candidate": {"tail_entry_market_count": 0, "participated_market_count": 11},
+                   "per_game_type": {"cs2:map_winner": strong, "lol:main_match": weak}}
+        out = build_collector_leaderboard_v2({"0xspec": profile}, now_ts=now)
+        self.assertEqual(out["qualified_count"], 1)
+        row = out["leaderboard"][0]
+        self.assertEqual(row["eligible_buckets"], ["cs2:map_winner"])  # 只在专精盘口够格
+        self.assertEqual(row["primary_game"], "cs2")
+        self.assertEqual(row["best_market_type"], "map_winner")
+
+    def test_v2_bucket_gate_risk_controls(self):
+        now = 1_700_000_000
+        base = {"esports_closed_count": 8, "median_market_roi": 0.30, "esports_roi": 0.30,
+                "esports_realized_pnl": 2000.0, "positive_market_rate": 0.78, "median_entry_price": 0.45,
+                "wilson_win_rate_lower_bound": 0.60, "esports_total_cost": 8 * 1500.0,
+                "last_esports_trade_at": now - 86400, "recent_14d_market_count": 0,
+                "hold_pnl": 2000.0, "actual_pnl": 2000.0, "actual_minus_hold_pnl_rate": 0.0}
+        self.assertEqual(v2_bucket_gate(base, "main_match", now_ts=now), [])
+        # 胜率 0.60 < 0.75 → 短窗口方差不安全
+        self.assertIn("low_positive_rate",
+                      v2_bucket_gate({**base, "positive_market_rate": 0.60}, "main_match", now_ts=now))
+        # 买热门 median_entry 0.80 → 负EV风险
+        self.assertIn("entry_too_high",
+                      v2_bucket_gate({**base, "median_entry_price": 0.80}, "main_match", now_ts=now))
+        # aggregate ROI 0.05 < 0.10(单向)→ 真实非盈利(中位 0.30 骗不过 aggregate)
+        self.assertIn("low_aggregate_roi",
+                      v2_bucket_gate({**base, "esports_roi": 0.05}, "main_match", now_ts=now))
+        # 技术型 aggregate ROI 门更高:0.12 < 0.15 被拒(hold<0<actual → technical)
+        self.assertIn("low_aggregate_roi",
+                      v2_bucket_gate({**base, "hold_pnl": -500.0, "esports_roi": 0.12}, "main_match", now_ts=now))
+        # 近 14 天手冷:样本足但近期胜率差 → 复检拒
+        self.assertIn("recent_low_positive_rate",
+                      v2_bucket_gate({**base, "recent_14d_market_count": 5,
+                                      "recent_14d_positive_rate": 0.40, "recent_14d_roi": 0.30},
+                                     "main_match", now_ts=now))
+        # 子盘样本下限 3:closed=3 主赛 thin、子盘不 thin
+        self.assertIn("thin_sample", v2_bucket_gate({**base, "esports_closed_count": 3}, "main_match", now_ts=now))
+        self.assertNotIn("thin_sample", v2_bucket_gate({**base, "esports_closed_count": 3}, "map_winner", now_ts=now))
+
+    def test_scoring_basis_actual_flips_technical_wallet(self):
+        # 买了负方(hold_pnl<0)但靠出场盈利(actual_pnl>0):
+        #   hold 基 → 算成亏损/押错(v1 会 excluded);actual 基 → 算成盈利市场。
+        positions = [{
+            "conditionId": "m1", "totalBought": 1000.0, "avgPrice": 0.1,
+            "realizedPnl": -100.0, "holdPnl": -100.0, "actualPnl": 50.0,
+            "timestamp": 1_700_000_000,
+        }]
+        cids = {"m1"}
+        now = 1_700_100_000
+        hold = summarize_closed_positions(positions, cids, now_ts=now, scoring_basis="hold")
+        actual = summarize_closed_positions(positions, cids, now_ts=now, scoring_basis="actual")
+
+        self.assertAlmostEqual(hold["esports_realized_pnl"], -100.0)
+        self.assertEqual(hold["positive_market_rate"], 0.0)
+        self.assertAlmostEqual(actual["esports_realized_pnl"], 50.0)
+        self.assertEqual(actual["positive_market_rate"], 1.0)
+        # hold/actual 字段两套都在,edge_type 仍可判定(用于打标)
+        self.assertAlmostEqual(actual["hold_pnl"], -100.0)
+        self.assertAlmostEqual(actual["actual_pnl"], 50.0)
 
     def test_seed_wallet_scoring_balances_frequency_profit_entry_and_rank(self):
         seed_positions = [
