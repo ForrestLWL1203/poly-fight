@@ -11,6 +11,7 @@ import re
 import signal
 import shutil
 import sqlite3
+import threading
 import time
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -5371,42 +5372,138 @@ def detect_newly_settled_markets(
     return new_markets
 
 
-def _observe_v2_rescore_targets(
+def rescore_demote_wallets(
+    client: PolymarketClient,
+    args: argparse.Namespace,
+    *,
+    wallets: set[str],
+    follow_dir: Path | str | None = None,
+    now_ts: int | None = None,
+) -> dict[str, Any]:
+    """M5 降级重评(独立于 observe-v2 周期发现,由 follow runner 按结算笔数事件触发)。
+
+    对给定 batch 钱包用当前 scope 重 profile,跌出 grade-A 榜的 → 隔离进 follow.db
+    (reason=rescore_below_grade_a,7 天冷却由 observe-v2 恢复)。只读榜 + 只写 follow.db
+    quarantine:**不**写 leaderboard_v2.db、**不**写共享交易缓存(use_cache=False)、**不**发布,
+    因此与周期 observe-v2 进程无写争用。榜面显示由下次发现 tick 调和;隔离即时停止跟单。
+    """
+    now_dt = datetime.now(timezone.utc) if now_ts is None else datetime.fromtimestamp(now_ts, tz=timezone.utc)
+    now_ts = int(now_dt.timestamp())
+    targets = {normalize_wallet(w) for w in wallets if normalize_wallet(w)}
+    if not targets:
+        return {"rescored": 0, "demoted": 0, "demoted_wallets": []}
+
+    # data_dir/output_dir target the esports category dir (leaderboard_v2.db +
+    # collector_v2 outputs); follow_dir is the SHARED follow dir (follow.db) —
+    # the runner passes it explicitly since it differs from the category dir.
+    data_dir = resolve_data_dir(args)
+    follow_dir = Path(follow_dir) if follow_dir else resolve_follow_dir(args, data_dir)
+    output_dir = resolve_collector_output_dir(args) / "collector_v2"
+    follow_store = FollowStore(follow_dir / "follow.db")
+
+    # 只重评在榜且未隔离的目标(下榜的本就不跟,已隔离的已淘汰)。
+    observe_store = LeaderboardStore(data_dir / "leaderboard_v2.db")
+    board_rows, _meta = observe_store.load_leaderboard(category="esports")
+    board_wallets = {normalize_wallet(r.get("wallet")) for r in board_rows if normalize_wallet(r.get("wallet"))}
+    quarantined = {
+        normalize_wallet((info or {}).get("wallet") or key)
+        for key, info in follow_store.load_wallet_quarantine(category="esports").items()
+    }
+    targets = (targets & board_wallets) - quarantined
+    if not targets:
+        return {"rescored": 0, "demoted": 0, "demoted_wallets": []}
+
+    # scope 分类集(与 observe-v2 一致)。
+    profile_lookback_days = int(getattr(args, "profile_lookback_days", COLLECTOR_PROFILE_LOOKBACK_DAYS) or 15)
+    lookback_days = int(getattr(args, "lookback_days", 15) or 15)
+    closed_events = client.list_events_paginated(
+        closed=True, active=None, max_pages=getattr(args, "gamma_pages", 10),
+        min_end_date=now_dt - timedelta(days=lookback_days), max_end_date=now_dt,
+        tag_slugs=CATEGORY_TAG_SLUGS["esports"],
+    )
+    classification_set = build_classification_set(closed_events, now=now_dt, lookback_days=lookback_days)
+    profile_cls = filter_classification_set_by_lookback(classification_set, now=now_dt, lookback_days=profile_lookback_days)
+    condition_ids = {str(r.get("condition_id") or "").lower() for r in profile_cls if r.get("condition_id")}
+    market_records_by_id = {str(r.get("condition_id") or "").lower(): r for r in profile_cls if r.get("condition_id")}
+    condition_type_by_id = {cid: str(r.get("market_type") or MAIN_MATCH) for cid, r in market_records_by_id.items()}
+    condition_game_family_by_id = {cid: str(r.get("game_family") or "unknown") for cid, r in market_records_by_id.items()}
+
+    def profile_one(wallet: str) -> dict[str, Any] | None:
+        wallet = normalize_wallet(wallet)
+        try:
+            trades, _src = fetch_recent_esports_user_trades_for_wallet(
+                client, wallet, condition_ids,
+                page_limit=getattr(args, "user_history_trades_limit", 500),
+                max_pages=getattr(args, "user_history_trades_max_pages", 3),
+                max_esports_markets=getattr(args, "max_esports_markets_per_wallet", 100),
+                data_dir=output_dir, now_ts=now_ts,
+                cache_ttl_days=0, force_refresh=True, use_cache=False, include_source=True,
+                retention_days=profile_lookback_days,
+            )
+        except Exception:
+            return None
+        seed_candidate = build_profile_candidate_from_trades(
+            collector_seed_candidate({"wallet": wallet}), trades, market_records_by_id)
+        profile = profile_candidate_wallet(
+            seed_candidate, condition_ids,
+            market_records_by_id=market_records_by_id,
+            condition_type_by_id=condition_type_by_id,
+            condition_game_family_by_id=condition_game_family_by_id,
+            user_trades_loader=lambda _w: trades,
+            current_positions_loader=lambda _w: [],
+            now_ts=now_ts, scoring_basis="actual",
+        )
+        return {**profile, "profile_lookback_days": profile_lookback_days, "observed_at": now_ts}
+
+    reprofiled: dict[str, dict[str, Any]] = {}
+    for result in run_ordered_io_tasks(sorted(targets), profile_one, max_workers=getattr(args, "max_workers", 8)):
+        if isinstance(result, Exception) or not result:
+            continue
+        wallet = normalize_wallet(result.get("wallet"))
+        if wallet:
+            reprofiled[wallet] = result
+
+    # 内存重建榜(现有 profiles 叠加重评结果)判断 batch 是否仍在 A 榜;不持久化、不发布。
+    existing = load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2")
+    profiles_by_wallet = dict(existing)
+    profiles_by_wallet.update(reprofiled)
+    collector_result = build_collector_leaderboard_v2(
+        profiles_by_wallet, now_ts=now_ts,
+        per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
+        max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
+        include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
+        gate_kwargs=_v2_gate_kwargs_from_args(args),
+    )
+    new_board = {normalize_wallet(r.get("wallet")) for r in collector_result["leaderboard"] if normalize_wallet(r.get("wallet"))}
+    demoted: list[str] = []
+    for wallet in sorted(targets):
+        if wallet in reprofiled and wallet not in new_board:
+            follow_store.upsert_wallet_quarantine(wallet, reason=RESCORE_QUARANTINE_REASON, ts=now_ts, category="esports")
+            demoted.append(wallet)
+    return {"rescored": len(reprofiled), "demoted": len(demoted), "demoted_wallets": demoted}
+
+
+def _observe_v2_recovery_targets(
     follow_store: "FollowStore",
-    board_wallets: set[str],
     *,
     now_ts: int,
-    recent_window_days: int,
     cooldown_days: int,
-) -> tuple[set[str], set[str]]:
-    """M5 重评目标。返回 (降级候选, 恢复候选):
-    - 降级候选 = 当前在榜 grade-A ∩ 最近有跟单活动 − 已隔离(重评其近期交易,跌出 A 即隔离)。
-    - 恢复候选 = 自动原因隔离且满冷却的钱包(重评回到 A 即解隔离)。"""
-    quarantined: dict[str, dict[str, Any]] = {}
-    for key, info in follow_store.load_wallet_quarantine(category="esports").items():
-        wallet = normalize_wallet((info or {}).get("wallet") or key)
-        if wallet:
-            quarantined[wallet] = info or {}
-    cutoff = now_ts - max(1, int(recent_window_days)) * SECONDS_PER_DAY
-    followed: set[str] = set()
-    for signal in follow_store.load_open_signals():
-        wallet = normalize_wallet(signal.get("wallet"))
-        if wallet:
-            followed.add(wallet)
-    for result in follow_store.load_results():
-        if _signal_result_at(result) >= cutoff:
-            wallet = normalize_wallet(result.get("wallet"))
-            if wallet:
-                followed.add(wallet)
-    demotion = (set(board_wallets) & followed) - set(quarantined)
+) -> set[str]:
+    """M5 恢复候选 = 自动原因隔离且满冷却的钱包(observe-v2 重评回到 A 即解隔离)。
+
+    降级已拆到 follow runner(rescore_demote_wallets,按结算笔数事件触发),不在此计算。"""
     cooldown_cut = now_ts - max(1, int(cooldown_days)) * SECONDS_PER_DAY
-    recovery = {
-        wallet
-        for wallet, info in quarantined.items()
-        if str(info.get("reason") or "") in AUTO_RECOVERABLE_QUARANTINE_REASONS
-        and to_int(info.get("quarantined_at")) < cooldown_cut
-    }
-    return demotion, recovery
+    recovery: set[str] = set()
+    for key, info in follow_store.load_wallet_quarantine(category="esports").items():
+        info = info or {}
+        wallet = normalize_wallet(info.get("wallet") or key)
+        if (
+            wallet
+            and str(info.get("reason") or "") in AUTO_RECOVERABLE_QUARANTINE_REASONS
+            and to_int(info.get("quarantined_at")) < cooldown_cut
+        ):
+            recovery.add(wallet)
+    return recovery
 
 
 def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
@@ -5428,22 +5525,16 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
         lookback_hours=float(getattr(args, "observe_lookback_hours", 4.0)),
         gamma_pages=int(getattr(args, "observe_gamma_pages", 2)),
     )
-    # M5 重评目标(本地 SQLite,廉价):在榜∩最近跟单的降级候选 + 满冷却的恢复候选。
+    # M5 降级已拆出到 follow runner(按结算笔数事件触发 rescore_demote_wallets)。observe-v2
+    # 只保留:M4 发现 + 满冷却的恢复(本地 SQLite,廉价:重评隔离钱包,回到 A 榜则解隔离)。
     follow_store = FollowStore(follow_dir / "follow.db")
-    board_rows, _board_meta = observe_store.load_leaderboard(category="esports")
-    board_wallets = {
-        normalize_wallet(row.get("wallet"))
-        for row in board_rows
-        if normalize_wallet(row.get("wallet"))
-    }
     profile_lookback_days = int(getattr(args, "profile_lookback_days", COLLECTOR_PROFILE_LOOKBACK_DAYS) or 15)
-    demotion_targets, recovery_targets = _observe_v2_rescore_targets(
-        follow_store, board_wallets, now_ts=now_ts,
-        recent_window_days=profile_lookback_days, cooldown_days=RESCORE_COOLDOWN_DAYS,
+    recovery_targets = _observe_v2_recovery_targets(
+        follow_store, now_ts=now_ts, cooldown_days=RESCORE_COOLDOWN_DAYS,
     )
-    rescore_wallets = demotion_targets | recovery_targets
+    rescore_wallets = set(recovery_targets)
 
-    # 无新结算盘且无重评目标 → 真没事做(省一次分类集 Gamma 调用)
+    # 无新结算盘且无恢复目标 → 真没事做(省一次分类集 Gamma 调用)
     if not new_markets and not rescore_wallets:
         print(json.dumps({"event": "observe_v2_tick", "new_settled_markets": 0, "rescored": 0}))
         return 0
@@ -5531,13 +5622,9 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
     leaderboard = collector_result["leaderboard"]
     write_json(output_dir / "collector_v2_leaderboard.json", leaderboard)
 
-    # M5 降级/恢复:重评后跌出 A 的降级目标 → 隔离;满冷却又重评回 A 的恢复目标 → 解隔离。
+    # M5 恢复:满冷却的隔离钱包重评回到 A 榜 → 解隔离。(降级已拆到 follow runner。)
     new_board_wallets = {normalize_wallet(r.get("wallet")) for r in leaderboard if normalize_wallet(r.get("wallet"))}
     demoted: list[str] = []
-    for wallet in sorted(demotion_targets):
-        if wallet not in new_board_wallets:
-            follow_store.upsert_wallet_quarantine(wallet, reason=RESCORE_QUARANTINE_REASON, ts=now_ts, category="esports")
-            demoted.append(wallet)
     recovered: list[str] = []
     for wallet in sorted(recovery_targets):
         if wallet in new_board_wallets:
@@ -6147,8 +6234,9 @@ def command_follow(
         performance = aggregate_follow_performance(performance, result_events)
     else:
         performance = aggregate_follow_performance(performance, [])
-    # 自动降级/隔离统一由 observe-v2 重评负责(M5:重跑近期交易跌出 grade-A 即隔离)。
-    # follow tick 不再写隔离 —— 隔离入口收束为两个:人工按钮 + M5 重评。
+    # follow tick 本身不写隔离。M5 自动降级由 runner 按结算笔数事件触发(command_run →
+    # rescore_demote_wallets,重评被跟钱包跌出 grade-A 即隔离);冷却恢复由 observe-v2 负责。
+    # 隔离入口仍是两个:人工按钮 + M5 重评。
     stage_seconds["settlement_and_quarantine"] = round(time.monotonic() - settlement_started_mono, 3)
     balance_ledger_result = {"configured": account_balance_configured, "applied_count": 0, "applied_amount_usdc": 0.0}
     if account_balance_configured:
@@ -6218,6 +6306,9 @@ def command_follow(
         "balance_ledger_applied_amount_usdc": balance_ledger_result.get("applied_amount_usdc", 0.0),
         "open_signal_count": len(open_signals),
         "settled_signal_count": len(settled),
+        # Wallets behind newly-settled follow signals this tick — the runner
+        # accumulates these to event-trigger M5 demotion re-scoring.
+        "newly_settled_wallets": sorted({normalize_wallet(s.get("wallet")) for s in settled if normalize_wallet(s.get("wallet"))}),
         "desired_next_interval_seconds": next_interval,
         "tick_runtime_seconds": round(time.monotonic() - follow_started_mono, 3),
         "stage_seconds": stage_seconds,
@@ -6304,6 +6395,13 @@ def command_run(args: argparse.Namespace) -> int:
         print(json.dumps({"status": "onchain_collector_started", "rpc": wss_url.split("/v2/")[0] + "/v2/***"}, ensure_ascii=False), flush=True)
     else:
         print(json.dumps({"status": "onchain_disabled", "reason": "no secret/rpc; using data-api polling"}, ensure_ascii=False), flush=True)
+
+    # M5 动态降级:跨 tick 累计被跟钱包的新结算笔数,满阈值就对那批钱包后台重评/隔离
+    # (事件驱动,替代旧的固定 2h observe-v2 降级扫描)。
+    rescore_threshold = int(getattr(args, "rescore_settled_threshold", 10) or 0)
+    pending_rescore_wallets: set[str] = set()
+    pending_settled_count = 0
+    rescore_thread: threading.Thread | None = None
 
     def sleep_or_stop(seconds: int) -> None:
         if not stop_requested["value"] and int(seconds) > 0:
@@ -6394,6 +6492,34 @@ def command_run(args: argparse.Namespace) -> int:
                 continue
             first_error_at = None
             tick_count += 1
+
+            # Accumulate newly-settled follow trades; at the threshold, re-score that
+            # batch of wallets off-thread (demote below-A ones). Skips while a prior
+            # re-score is still running (its wallets stay pending for the next round).
+            if rescore_threshold > 0:
+                pending_rescore_wallets.update(
+                    normalize_wallet(w) for w in (summary.get("newly_settled_wallets") or []) if normalize_wallet(w)
+                )
+                pending_settled_count += int(summary.get("settled_signal_count") or 0)
+                if pending_settled_count >= rescore_threshold and (rescore_thread is None or not rescore_thread.is_alive()):
+                    batch = set(pending_rescore_wallets)
+                    pending_rescore_wallets = set()
+                    pending_settled_count = 0
+
+                    def _run_rescore(wallets: set[str] = batch) -> None:
+                        try:
+                            # esports category dir for leaderboard_v2.db/collector outputs;
+                            # shared follow_dir for the quarantine write.
+                            result = rescore_demote_wallets(
+                                client, category_args("esports"), wallets=wallets, follow_dir=follow_dir)
+                            print(json.dumps({"status": "rescore_demote", **result}, ensure_ascii=False), flush=True)
+                        except Exception as exc:  # noqa: BLE001
+                            print(json.dumps({"status": "rescore_demote_error", "error": str(exc)}, ensure_ascii=False), flush=True)
+
+                    if batch:
+                        rescore_thread = threading.Thread(target=_run_rescore, name="m5-rescore-demote", daemon=True)
+                        rescore_thread.start()
+
             if args.max_run_ticks and tick_count >= args.max_run_ticks:
                 break
             # WS healthy -> drain on the short cadence (fills were already detected
@@ -6704,6 +6830,9 @@ def build_parser() -> argparse.ArgumentParser:
     # Fixed polling cadence (seconds). >0 overrides the adaptive min/max curve; 0 = adaptive.
     run.add_argument("--tick-seconds", type=int, default=60)
     run.add_argument("--ws-drain-seconds", type=int, default=5)
+    # M5 动态降级:每累计这么多笔新结算跟单,就对那批被跟钱包重评一次,跌出 A 榜即隔离
+    # (事件驱动,替代旧的固定 2h observe-v2 降级扫描)。<=0 关闭 runner 侧降级。
+    run.add_argument("--rescore-settled-threshold", type=int, default=10)
     run.add_argument("--quarantine-sell-frac", type=float, default=0.2)
     run.add_argument("--error-retry-seconds", type=int, default=180)
     run.add_argument("--max-consecutive-error-seconds", type=int, default=600)

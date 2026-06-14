@@ -13195,35 +13195,56 @@ class CoreTest(unittest.TestCase):
             # 不存在的 db → 空(不抛)
             self.assertEqual(storage_module.LeaderboardStore(Path(d) / "nope.db").load_observe_analyzed(now_ts=now), {})
 
-    def test_observe_v2_rescore_targets_demotion_and_recovery(self):
-        from poly_fight.cli import _observe_v2_rescore_targets, RESCORE_QUARANTINE_REASON
+    def test_observe_v2_recovery_targets_cooldown_and_reason(self):
+        # 降级已拆到 follow runner;observe-v2 只算恢复:auto 原因隔离且满冷却。
+        from poly_fight.cli import _observe_v2_recovery_targets, RESCORE_QUARANTINE_REASON
         with TemporaryDirectory() as tmp:
             store = FollowStore(Path(tmp) / "follow.db")
             now = 1_700_000_000
-            store.save_follow_snapshot(
-                wallet_trade_state={},
-                open_signals=[{"signal_id": "wa:m:0", "wallet": "0xWA", "category": "esports",
-                               "condition_id": "m", "outcome_index": 0, "status": "open",
-                               "created_at": now, "updated_at": now}],
-                result_events=[
-                    {"signal_id": "wb:m:0", "wallet": "0xWB", "category": "esports", "condition_id": "m",
-                     "outcome_index": 0, "status": "settled", "settled_at": now - 3 * 86400,
-                     "created_at": now - 3 * 86400, "updated_at": now - 3 * 86400},
-                    {"signal_id": "wc:m:0", "wallet": "0xWC", "category": "esports", "condition_id": "m",
-                     "outcome_index": 0, "status": "settled", "settled_at": now - 40 * 86400,
-                     "created_at": now - 40 * 86400, "updated_at": now - 40 * 86400},
-                ],
-                performance={},
-            )
             store.upsert_wallet_quarantine("0xWD", reason=RESCORE_QUARANTINE_REASON, ts=now - 10 * 86400, category="esports")
             store.upsert_wallet_quarantine("0xWE", reason="manual_dashboard_quarantine", ts=now - 10 * 86400, category="esports")
             store.upsert_wallet_quarantine("0xWF", reason=RESCORE_QUARANTINE_REASON, ts=now - 1 * 86400, category="esports")
-            board = {"0xwa", "0xwb", "0xwd", "0xwf"}
-            demotion, recovery = _observe_v2_rescore_targets(
-                store, board, now_ts=now, recent_window_days=15, cooldown_days=7,
+            recovery = _observe_v2_recovery_targets(store, now_ts=now, cooldown_days=7)
+            self.assertEqual(recovery, {"0xwd"})  # auto 满冷却;manual 排除、冷却内(wf)排除
+
+    def test_rescore_demote_wallets_quarantines_off_board_only(self):
+        from unittest.mock import patch
+        from poly_fight.cli import rescore_demote_wallets, RESCORE_QUARANTINE_REASON, normalize_wallet
+        import poly_fight.storage as storage_module
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            esports_dir = root / "esports"
+            follow_dir = root / "follow"
+            now = 1_700_000_000
+            storage_module.LeaderboardStore(esports_dir / "leaderboard_v2.db").replace_leaderboard(
+                [{"wallet": "0xdrop", "grade": "A"}, {"wallet": "0xkeep", "grade": "A"}],
+                category="esports", updated_at=now,
             )
-            self.assertEqual(demotion, {"0xwa", "0xwb"})   # 在榜∩近期跟单 − 已隔离;wc 旧窗不算
-            self.assertEqual(recovery, {"0xwd"})           # auto 满冷却;manual 排除、冷却内排除
+
+            class FakeClient:
+                def list_events_paginated(self, **_kwargs):
+                    return []  # empty scope -> profiling is cheap and offline
+
+            parser = build_parser()
+            args = parser.parse_args(["--data-dir", str(esports_dir), "run", "--stake-usdc", "1"])
+
+            # After re-profile, 0xdrop fell off the A-board, 0xkeep stayed.
+            def fake_build(profiles, **_kwargs):
+                return {"leaderboard": [{"wallet": "0xkeep"}]}
+
+            with patch("poly_fight.cli.build_collector_leaderboard_v2", side_effect=fake_build):
+                result = rescore_demote_wallets(
+                    FakeClient(), args, wallets={"0xdrop", "0xkeep", "0xnotonboard"},
+                    follow_dir=follow_dir, now_ts=now,
+                )
+
+            self.assertEqual(set(result["demoted_wallets"]), {"0xdrop"})
+            q = FollowStore(follow_dir / "follow.db").load_wallet_quarantine(category="esports")
+            quarantined = {normalize_wallet((info or {}).get("wallet") or k): (info or {}) for k, info in q.items()}
+            self.assertIn("0xdrop", quarantined)          # fell off board -> quarantined
+            self.assertNotIn("0xkeep", quarantined)        # stayed on board -> spared
+            self.assertNotIn("0xnotonboard", quarantined)  # not on board -> not a target
+            self.assertEqual(quarantined["0xdrop"].get("reason"), RESCORE_QUARANTINE_REASON)
 
     def test_clear_revalidated_quarantine_protects_sticky_reasons(self):
         with TemporaryDirectory() as tmp:
