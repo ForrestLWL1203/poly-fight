@@ -6969,7 +6969,6 @@ def command_follow(
     new_signal_count = 0
     exited_signal_count = 0
     hedge_event_count = 0
-    quarantine_event_count = 0
     market_type_not_eligible_count = 0
     opposite_blocked_count = 0
     contested_signal_count = 0
@@ -7275,7 +7274,6 @@ def command_follow(
         "new_signal_count": new_signal_count,
         "exited_signal_count": exited_signal_count,
         "hedge_event_count": hedge_event_count,
-        "quarantine_event_count": quarantine_event_count,
         "contested_signal_count": contested_signal_count,
         "closing_line_snapshot_count": closing_line_snapshot_count,
         "account_balance_configured": account_balance_configured,

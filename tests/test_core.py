@@ -7532,55 +7532,6 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(requested_wallets, [])
             self.assertIn(wallet, store.load_wallet_quarantine(category="esports"))
 
-    def test_follow_tick_does_not_quarantine_favorite_for_bad_observed_performance(self):
-        with TemporaryDirectory() as tmp:
-            data_dir = Path(tmp)
-            wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            _seed_leaderboard(
-                data_dir / "smart_wallet_leaderboard.json",
-                [
-                    {
-                        "wallet": wallet,
-                        "category": "esports",
-                        "grade": "A",
-                        "last_esports_trade_at": int(time.time()),
-                        "eligible_market_types": ["main_match"],
-                    }
-                ],
-            )
-            store = FollowStore(data_dir / "follow" / "follow.db")
-            store.upsert_wallet_favorite(wallet, category="esports", favorite=True, ts=200, snapshot={"wallet": wallet})
-            store.save_follow_snapshot(
-                wallet_trade_state={},
-                open_signals=[],
-                result_events=[],
-                performance={"wallets": {wallet: {"signals": 10, "wins": 4, "our_pnl": -1.5}}, "total": {}},
-            )
-
-            class FakeClient:
-                def list_events_paginated(self, **_kwargs):
-                    return []
-
-            parser = build_parser()
-            args = parser.parse_args(
-                [
-                    "--data-dir",
-                    str(data_dir),
-                    "follow",
-                    "--stake-usdc",
-                    "1",
-                    "--gamma-pages",
-                    "1",
-                    "--max-workers",
-                    "1",
-                ]
-            )
-
-            summary = command_follow(args, client=FakeClient(), emit=False)
-
-            self.assertEqual(summary["quarantine_event_count"], 0)
-            self.assertEqual(store.load_wallet_quarantine(category="esports"), {})
-
     def test_dashboard_events_parse_sports_matchups_and_team_logos(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)

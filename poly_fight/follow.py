@@ -1141,15 +1141,3 @@ def aggregate_follow_performance(prev_perf: dict[str, Any], newly_settled: list[
         "groups": groups,
         "updated_at": int(datetime.now(timezone.utc).timestamp()),
     }
-
-
-def prune_jsonl(rows: list[dict[str, Any]], *, now_ts: int, retention_days: int) -> list[dict[str, Any]]:
-    if retention_days <= 0:
-        return rows
-    cutoff = now_ts - retention_days * SECONDS_PER_DAY
-    kept = []
-    for row in rows:
-        ts = to_int(row.get("created_at") or row.get("settled_at") or row.get("timestamp"))
-        if ts >= cutoff:
-            kept.append(row)
-    return kept

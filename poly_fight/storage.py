@@ -13,7 +13,6 @@ from .follow_strategy import ACTIVE_FOLLOW_STRATEGY_ID, normalize_follow_strateg
 
 LEADERBOARD_SCHEMA_VERSION = 2
 FOLLOW_SCHEMA_VERSION = 2
-SCHEMA_VERSION = FOLLOW_SCHEMA_VERSION
 
 
 def _dumps(value: Any) -> str:
@@ -1403,16 +1402,6 @@ class FollowStore:
         with self.connect() as conn:
             conn.execute(f"DELETE FROM wallet_quarantine WHERE reason IN ({placeholders})", tuple(sorted(clean)))
 
-    def clear_wallet_quarantine_except(self, wallets: set[str]) -> None:
-        self.init_db()
-        wallets = {str(wallet).lower() for wallet in wallets if wallet}
-        with self.connect() as conn:
-            if not wallets:
-                conn.execute("DELETE FROM wallet_quarantine")
-                return
-            placeholders = ",".join("?" for _ in wallets)
-            conn.execute(f"DELETE FROM wallet_quarantine WHERE wallet NOT IN ({placeholders})", tuple(sorted(wallets)))
-
     def clear_wallet_quarantine_wallets(self, wallets: set[str]) -> None:
         self.init_db()
         clean = {str(wallet).lower() for wallet in wallets if str(wallet).strip()}
@@ -1511,13 +1500,6 @@ class FollowStore:
             result_key = wallet if category else str(row["wallet_key"]).lower()
             result[result_key] = value
         return result
-
-    def is_wallet_favorite(self, wallet: str, *, category: str = "esports") -> bool:
-        wallet = str(wallet or "").lower()
-        category = str(category or "esports").lower()
-        if not wallet or not category:
-            return False
-        return f"{category}:{wallet}" in self.load_wallet_favorites()
 
     def save_market_cache(self, markets: dict[str, dict[str, Any]], *, cache_kind: str, updated_at: int) -> None:
         cache_kind = str(cache_kind or "active").lower()
