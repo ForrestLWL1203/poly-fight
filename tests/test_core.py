@@ -7147,6 +7147,46 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(client.event_calls, 0)  # no broad closed-events pull
         self.assertEqual(client.market_calls, [["m1"]])
 
+    def test_follow_resolution_ws_first_drains_collector_and_skips_dataapi(self):
+        # Healthy market-channel collector -> settle from its drained resolutions,
+        # no data-api markets_by_condition_ids call. Unhealthy -> data-api fallback.
+        class FakeClient:
+            def __init__(self):
+                self.market_calls = 0
+
+            def markets_by_condition_ids(self, condition_ids, *, limit=500):
+                self.market_calls += 1
+                return [{"conditionId": "m1", "outcomePrices": '["0", "1"]', "closed": True}]
+
+        class FakeCollector:
+            def __init__(self, healthy):
+                self._healthy = healthy
+            @property
+            def healthy(self):
+                return self._healthy
+            def drain(self):
+                return {"m1": 0}
+
+        signal = {"condition_id": "m1", "match_start_time": datetime.fromtimestamp(500, timezone.utc).isoformat()}
+
+        # healthy WS -> drained resolution, no data-api
+        c1 = FakeClient()
+        res = fetch_resolutions_for_open_signals(
+            c1, [signal], state={}, now_ts=1000, gamma_pages=1, ttl_seconds=900,
+            resolution_collector=FakeCollector(True),
+        )
+        self.assertEqual(res, {"m1": 0})
+        self.assertEqual(c1.market_calls, 0)            # WS-first: no data-api poll
+
+        # unhealthy WS -> data-api fallback
+        c2 = FakeClient()
+        res2 = fetch_resolutions_for_open_signals(
+            c2, [signal], state={}, now_ts=1000, gamma_pages=1, ttl_seconds=900,
+            resolution_collector=FakeCollector(False),
+        )
+        self.assertEqual(res2, {"m1": 1})
+        self.assertEqual(c2.market_calls, 1)            # fell back to data-api
+
     def test_follow_tick_does_not_write_performance_json(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)

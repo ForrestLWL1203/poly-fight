@@ -43,11 +43,43 @@ class WSClient:
         self._buf = b""
 
     # -- connection ------------------------------------------------------- #
+    @staticmethod
+    def _proxy_for(scheme: str, host: str) -> str | None:
+        """Honor HTTPS_PROXY/HTTP_PROXY + NO_PROXY (so WS works behind a local
+        proxy like Clash; raw sockets otherwise bypass it and get reset)."""
+        no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+        for entry in no_proxy.split(","):
+            entry = entry.strip().lstrip(".").lower()
+            if entry and (entry == "*" or host.lower() == entry or host.lower().endswith("." + entry)):
+                return None
+        if scheme == "wss":
+            return os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
+        return os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or None
+
     def connect(self) -> None:
         u = urlparse(self.url)
         host = u.hostname
         port = u.port or (443 if u.scheme == "wss" else 80)
-        raw = socket.create_connection((host, port), timeout=self.connect_timeout)
+        proxy = self._proxy_for(u.scheme, host)
+        if proxy:
+            pu = urlparse(proxy)
+            raw = socket.create_connection((pu.hostname, pu.port or 80), timeout=self.connect_timeout)
+            req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            if pu.username:
+                token = base64.b64encode(f"{pu.username}:{pu.password or ''}".encode()).decode()
+                req += f"Proxy-Authorization: Basic {token}\r\n"
+            raw.sendall((req + "\r\n").encode())
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = raw.recv(4096)
+                if not chunk:
+                    raise WSError("proxy closed during CONNECT")
+                buf += chunk
+            status = buf.split(b"\r\n", 1)[0]
+            if b" 200 " not in status:
+                raise WSError(f"proxy CONNECT failed: {status.decode(errors='replace')}")
+        else:
+            raw = socket.create_connection((host, port), timeout=self.connect_timeout)
         if u.scheme == "wss":
             ctx = ssl.create_default_context()
             raw = ctx.wrap_socket(raw, server_hostname=host)
