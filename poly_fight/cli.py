@@ -1383,18 +1383,6 @@ def backfill_user_trade_submarkets(
     }
 
 
-def empty_user_trade_backfill_summary() -> dict[str, Any]:
-    return {
-        "user_trade_backfill_candidate_count": 0,
-        "user_trade_backfilled_market_count": 0,
-        "user_trade_backfilled_by_market_type": {},
-        "user_trade_backfill_cache_hits": 0,
-        "user_trade_backfill_api_fetches": 0,
-        "user_trade_backfill_api_error_count": 0,
-        "user_trade_backfill_api_error_condition_count": 0,
-    }
-
-
 def _signal_result_at(signal: dict[str, Any]) -> int:
     return to_int(signal.get("exit_at") or signal.get("settled_at") or signal.get("updated_at") or signal.get("created_at"))
 
@@ -2124,13 +2112,6 @@ def copyable_two_sided_reject_reasons(
     return sorted(set(reasons))
 
 
-def copyable_two_sided_behavior_ok(
-    candidate_metrics: dict[str, Any],
-    quality_metrics: dict[str, Any],
-) -> bool:
-    return not copyable_two_sided_reject_reasons(candidate_metrics, quality_metrics)
-
-
 def filter_profile_candidates(
     candidates: list[dict[str, Any]],
     *,
@@ -2233,50 +2214,6 @@ def filter_profile_candidates(
                 continue
         rows.append(candidate)
     return rows
-
-
-def league_event_counts_from_classification_set(classification_set: list[dict[str, Any]]) -> dict[str, int]:
-    event_keys_by_league: dict[str, set[str]] = {}
-    for row in classification_set:
-        if str(row.get("category") or "").lower() != "sports":
-            continue
-        league = str(row.get("league") or "").lower()
-        if not league:
-            continue
-        event_key = str(row.get("event_id") or row.get("event_slug") or row.get("condition_id") or "").lower()
-        if not event_key:
-            continue
-        event_keys_by_league.setdefault(league, set()).add(event_key)
-    return {league: len(event_keys) for league, event_keys in sorted(event_keys_by_league.items())}
-
-
-def augment_profile_sports_league_fields(profile: dict[str, Any], market_records_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    if str(profile.get("category") or "").lower() != "sports":
-        return profile
-    condition_ids = [str(value).lower() for value in profile.get("esports_condition_ids") or [] if value]
-    condition_ids_by_league: dict[str, set[str]] = {}
-    for condition_id in condition_ids:
-        record = market_records_by_id.get(condition_id) or {}
-        league = str(record.get("league") or "").lower()
-        if league:
-            condition_ids_by_league.setdefault(league, set()).add(condition_id)
-    if not condition_ids_by_league and profile.get("league"):
-        league = str(profile.get("league") or "").lower()
-        condition_ids_by_league[league] = set(condition_ids)
-    if not condition_ids_by_league:
-        return profile
-    primary_league = max(
-        sorted(condition_ids_by_league),
-        key=lambda league: len(condition_ids_by_league.get(league) or set()),
-    )
-    augmented = dict(profile)
-    augmented["league"] = primary_league
-    augmented["league_label"] = LEAGUE_LABELS.get(primary_league, primary_league.upper())
-    augmented["league_condition_ids_by_league"] = {
-        league: sorted(ids)
-        for league, ids in sorted(condition_ids_by_league.items())
-    }
-    return augmented
 
 
 def sports_wallet_participation(profile: dict[str, Any], league_event_counts: dict[str, int]) -> dict[str, Any] | None:
@@ -3073,70 +3010,6 @@ RECENT_BUCKET_METRIC_KEYS = (
 )
 
 
-def merge_recent_trade_metrics_into_profile(
-    profile: dict[str, Any],
-    raw_trades: list[dict],
-    market_records_by_id: dict[str, dict[str, Any]],
-    *,
-    now_ts: int,
-) -> dict[str, Any]:
-    if not raw_trades or not market_records_by_id:
-        return profile
-    try:
-        summary = summarize_trade_reconstructed_positions(
-            raw_trades,
-            market_records_by_id,
-            now_ts=now_ts,
-        )
-    except Exception:
-        return profile
-    per_type_recent = summary.get("per_type") if isinstance(summary.get("per_type"), dict) else {}
-    per_game_type_recent = summary.get("per_game_type") if isinstance(summary.get("per_game_type"), dict) else {}
-    if not per_type_recent and not per_game_type_recent:
-        return profile
-    updated = dict(profile)
-    per_type_grades = (
-        dict(updated.get("per_type_grades"))
-        if isinstance(updated.get("per_type_grades"), dict)
-        else {}
-    )
-    for market_type, recent_metrics in per_type_recent.items():
-        if not isinstance(recent_metrics, dict):
-            continue
-        existing = per_type_grades.get(market_type)
-        if isinstance(existing, dict):
-            per_type_grades[market_type] = {
-                **existing,
-                **{key: recent_metrics.get(key) for key in RECENT_BUCKET_METRIC_KEYS if key in recent_metrics},
-            }
-    if per_type_grades:
-        updated["per_type_grades"] = per_type_grades
-    per_game_type_grades = (
-        dict(updated.get("per_game_type_grades"))
-        if isinstance(updated.get("per_game_type_grades"), dict)
-        else {}
-    )
-    for key, recent_metrics in per_game_type_recent.items():
-        if not isinstance(recent_metrics, dict):
-            continue
-        existing = per_game_type_grades.get(key)
-        if isinstance(existing, dict):
-            per_game_type_grades[key] = {
-                **existing,
-                **{metric_key: recent_metrics.get(metric_key) for metric_key in RECENT_BUCKET_METRIC_KEYS if metric_key in recent_metrics},
-            }
-    if per_game_type_grades:
-        updated["per_game_type_grades"] = per_game_type_grades
-    if not isinstance(updated.get("per_type_grades"), dict):
-        updated.update({key: summary.get(key) for key in RECENT_BUCKET_METRIC_KEYS if key in summary})
-    if summary.get("last_esports_trade_at"):
-        updated["last_esports_trade_at"] = max(
-            int(updated.get("last_esports_trade_at") or 0),
-            int(summary.get("last_esports_trade_at") or 0),
-        )
-    return updated
-
-
 def prune_profile_store(
     profiles_by_wallet: dict[str, dict[str, Any]],
     *,
@@ -3291,140 +3164,6 @@ def build_profile_fetch_plan(
     normal_items = [*selected_candidates, *selected_migrations]
     forced_wallets = {row["wallet"] for row in forced_items}
     return [*forced_items, *(row for row in normal_items if row["wallet"] not in forced_wallets)]
-
-
-def dashboard_follow_db_for_category_data_dir(data_dir: Path, category: str) -> Path:
-    category = str(category or "").lower()
-    root = Path(data_dir)
-    if category and root.name.lower() == category:
-        root = root.parent
-    return root / "follow" / "follow.db"
-
-
-def load_favorite_wallet_rows_for_category(data_dir: Path, category: str) -> dict[str, dict[str, Any]]:
-    snapshot = FollowStore(dashboard_follow_db_for_category_data_dir(data_dir, category)).load_dashboard_wallet_favorites()
-    rows = snapshot.get("wallet_favorites") if isinstance(snapshot, dict) else {}
-    result: dict[str, dict[str, Any]] = {}
-    category = str(category or "esports").lower()
-    for key, row in (rows or {}).items():
-        if not isinstance(row, dict):
-            continue
-        wallet = normalize_wallet(row.get("wallet") or str(key).split(":", 1)[-1])
-        row_category = str(row.get("category") or str(key).split(":", 1)[0] or "esports").lower()
-        if not wallet or row_category != category:
-            continue
-        result[wallet] = row
-    return result
-
-
-def favorite_profile_candidates(favorites: dict[str, dict[str, Any]], *, category: str) -> list[dict[str, Any]]:
-    rows = []
-    category = str(category or "esports").lower()
-    for wallet, favorite in sorted(favorites.items()):
-        if not isinstance(favorite, dict):
-            continue
-        snapshot = favorite.get("snapshot") if isinstance(favorite.get("snapshot"), dict) else {}
-        candidate = dict(snapshot.get("candidate") or {})
-        candidate.update(
-            {
-                "wallet": wallet,
-                "category": category,
-                "favorite": True,
-                "favorite_protected": True,
-                "favorited_at": favorite.get("favorited_at"),
-            }
-        )
-        for field in (
-            "qualified_market_types",
-            "eligible_market_types",
-            "eligible_buckets",
-            "eligible_game_families",
-            "league",
-        ):
-            if field in snapshot and not candidate.get(field):
-                candidate[field] = snapshot.get(field)
-        if not candidate.get("qualified_market_types") and candidate.get("eligible_market_types"):
-            candidate["qualified_market_types"] = list(candidate.get("eligible_market_types") or [])
-        if category == "esports" and not candidate.get("qualified_market_types"):
-            candidate["qualified_market_types"] = ["main_match"]
-        rows.append(candidate)
-    return rows
-
-
-def apply_favorite_profile_defaults(
-    profiles_by_wallet: dict[str, dict[str, Any]],
-    favorites: dict[str, dict[str, Any]],
-    *,
-    category: str,
-) -> dict[str, dict[str, Any]]:
-    if not favorites:
-        return profiles_by_wallet
-    result = dict(profiles_by_wallet)
-    category = str(category or "esports").lower()
-    scope_fields = (
-        "eligible_market_types",
-        "eligible_market_type_labels",
-        "eligible_buckets",
-        "eligible_bucket_labels",
-        "eligible_game_families",
-        "eligible_game_family_labels",
-        "best_market_type",
-        "best_market_type_label",
-        "best_bucket",
-        "best_bucket_label",
-        "best_game_family",
-        "league",
-        "league_label",
-    )
-    for wallet, favorite in favorites.items():
-        if not isinstance(favorite, dict):
-            continue
-        snapshot = favorite.get("snapshot") if isinstance(favorite.get("snapshot"), dict) else {}
-        profile = dict(result.get(wallet) or snapshot or {})
-        if not profile:
-            profile = {"wallet": wallet, "category": category}
-        profile["wallet"] = wallet
-        profile["category"] = category
-        profile["favorite"] = True
-        profile["favorite_protected"] = True
-        profile["favorited_at"] = favorite.get("favorited_at")
-        for field in scope_fields:
-            if not profile.get(field) and snapshot.get(field):
-                profile[field] = snapshot.get(field)
-        if not profile.get("eligible_market_types") and category == "esports":
-            profile["eligible_market_types"] = ["main_match"]
-        result[wallet] = profile
-    return result
-
-
-def merge_favorites_into_leaderboard(
-    leaderboard: list[dict[str, Any]],
-    profiles_by_wallet: dict[str, dict[str, Any]],
-    favorites: dict[str, dict[str, Any]],
-    *,
-    category: str,
-) -> list[dict[str, Any]]:
-    if not favorites:
-        return leaderboard
-    rows = [dict(row) for row in leaderboard]
-    by_wallet = {normalize_wallet(row.get("wallet")) for row in rows if normalize_wallet(row.get("wallet"))}
-    for wallet in sorted(favorites):
-        if wallet in by_wallet:
-            continue
-        profile = profiles_by_wallet.get(wallet)
-        if not profile:
-            favorite = favorites.get(wallet) or {}
-            profile = favorite.get("snapshot") if isinstance(favorite.get("snapshot"), dict) else {}
-        if not isinstance(profile, dict) or not profile:
-            continue
-        row = dict(profile)
-        row["wallet"] = wallet
-        row["category"] = category
-        row["favorite"] = True
-        row["favorite_protected"] = True
-        rows.append(row)
-        by_wallet.add(wallet)
-    return rows
 
 
 def build_profile_budget_summary(
@@ -4797,25 +4536,6 @@ def strict_final_quality_ok(row: dict[str, Any]) -> bool:
         else row
     )
     return strict_final_quality_metrics_ok(metrics)
-
-
-def recent_health_ok(row: dict[str, Any]) -> bool:
-    recent_14d_markets = int(row.get("recent_14d_market_count") or 0)
-    if recent_14d_markets < CORE_MIN_RECENT_14D_MARKETS:
-        return False
-    if to_float(row.get("recent_14d_roi")) <= CORE_MIN_RECENT_ROI:
-        return False
-    if to_float(row.get("recent_14d_positive_rate")) < CORE_MIN_RECENT_POSITIVE_RATE:
-        return False
-    recent_7d_markets = int(row.get("recent_7d_market_count") or 0)
-    if recent_7d_markets > 0:
-        if to_float(row.get("recent_7d_roi")) <= CORE_MIN_RECENT_ROI:
-            return False
-        if to_float(row.get("recent_7d_positive_rate")) < CORE_MIN_RECENT_POSITIVE_RATE:
-            return False
-    return True
-
-
 
 
 def _copyable_reject_reasons(row: dict[str, Any]) -> list[str]:
