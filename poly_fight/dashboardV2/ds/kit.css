@@ -317,10 +317,9 @@ table.ps-table { width: 100%; border-collapse: collapse; font-variant-numeric: t
   font: var(--text-label); text-transform: uppercase; letter-spacing: var(--ls-label);
   color: var(--text-tertiary); white-space: nowrap;
   border-bottom: 1px solid var(--border-hairline);
-  /* 透明 + 自带 backdrop blur:不再叠加卡片底色(避免比表体更白),滚动时把行内容
-     磨成毛玻璃。与整体玻璃质感统一。 */
+  /* 纯 transparent,不加任何 backdrop-filter:表头就是卡片表面本身,和表体物理同色,
+     不会因二次合成/saturate 而发亮。滚动时由 .tbl-wrap 的卡片底色兜底。 */
   background: transparent;
-  -webkit-backdrop-filter: var(--blur-regular); backdrop-filter: var(--blur-regular);
 }
 .ps-table tbody td { padding: var(--sp-3) var(--sp-3); border-bottom: 1px solid var(--border-hairline); vertical-align: middle; }
 .ps-table tbody tr:last-child td { border-bottom: 0; }
