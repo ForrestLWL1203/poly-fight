@@ -7,6 +7,7 @@ import os
 from io import BytesIO, StringIO
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import threading
@@ -45,7 +46,12 @@ from poly_fight.dashboard import (
 )
 from poly_fight import dashboard as dashboard_module
 from poly_fight import storage as storage_module
-from poly_fight.control import read_follow_control, write_follow_control
+from poly_fight.control import (
+    read_follow_control,
+    reconcile_pause_new_signals,
+    set_pause_new_signals,
+    write_follow_control,
+)
 from poly_fight.storage import FollowStore
 from poly_fight.cli import (
     BuildLockUnavailable,
@@ -9508,6 +9514,47 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(calls[0][1].parent, data_dir / "logs" / "follow")
             self.assertEqual(read_follow_control(follow_dir)["runner"]["pid"], 4321)
             self.assertTrue(status["strategy_configured"])
+
+    def test_set_pause_stamps_owner_pid(self):
+        with TemporaryDirectory() as tmp:
+            follow_dir = Path(tmp) / "follow"
+            set_pause_new_signals(follow_dir, "esports", {"status": "paused", "reason": "wallet_refresh", "started_at": 100})
+            entry = read_follow_control(follow_dir)["pause_new_signals"]["esports"]
+            self.assertEqual(entry["owner_pid"], os.getpid())
+            self.assertEqual(entry["reason"], "wallet_refresh")
+
+    def test_reconcile_clears_orphaned_pause_dead_owner(self):
+        # 属主进程已死(dashboard 重启 / collect 被杀)→ pause 视为孤儿被清除。
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        dead_pid = dead.pid
+        with TemporaryDirectory() as tmp:
+            follow_dir = Path(tmp) / "follow"
+            write_follow_control(follow_dir, {"pause_new_signals": {"esports": {
+                "status": "paused", "reason": "wallet_refresh", "started_at": 100, "owner_pid": dead_pid, "category": "esports"}}})
+            survivors = reconcile_pause_new_signals(follow_dir, now_ts=200)
+            self.assertEqual(survivors, {})
+            self.assertNotIn("pause_new_signals", read_follow_control(follow_dir))
+
+    def test_reconcile_keeps_pause_live_owner(self):
+        # 属主进程仍存活 → pause 保留(不会误清掉正在跑的刷新)。
+        with TemporaryDirectory() as tmp:
+            follow_dir = Path(tmp) / "follow"
+            set_pause_new_signals(follow_dir, "esports", {"status": "paused", "reason": "pool_refresh", "started_at": 100})
+            survivors = reconcile_pause_new_signals(follow_dir, now_ts=200)
+            self.assertIn("esports", survivors)
+            self.assertIn("esports", read_follow_control(follow_dir)["pause_new_signals"])
+
+    def test_reconcile_legacy_pause_ttl(self):
+        # 旧格式(无 owner_pid)退化为 TTL 自愈:超时清除,未超时保留。
+        with TemporaryDirectory() as tmp:
+            follow_dir = Path(tmp) / "follow"
+            write_follow_control(follow_dir, {"pause_new_signals": {"esports": {
+                "status": "paused", "reason": "wallet_refresh", "started_at": 100, "category": "esports"}}})
+            self.assertEqual(reconcile_pause_new_signals(follow_dir, now_ts=100 + 31 * 60), {})
+            write_follow_control(follow_dir, {"pause_new_signals": {"esports": {
+                "status": "paused", "reason": "wallet_refresh", "started_at": 100, "category": "esports"}}})
+            self.assertIn("esports", reconcile_pause_new_signals(follow_dir, now_ts=100 + 5 * 60))
 
     def test_dashboard_runner_start_realtime_refresh_spawns_observe(self):
         with TemporaryDirectory() as tmp:

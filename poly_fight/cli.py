@@ -89,7 +89,7 @@ from .onchain import (
     load_rpc_endpoints,
 )
 from .storage import FollowStore, LeaderboardStore
-from .control import read_follow_control, set_pause_new_signals
+from .control import read_follow_control, reconcile_pause_new_signals, set_pause_new_signals
 
 try:
     import fcntl
@@ -5823,8 +5823,9 @@ def command_follow(
     performance = store.load_performance()
     account_balance = store.load_account_balance()
     account_balance_configured = bool(account_balance.get("configured"))
-    control = read_follow_control(follow_dir)
-    pause_new_signals = control.get("pause_new_signals") if isinstance(control.get("pause_new_signals"), dict) else {}
+    # 每 tick 先自愈孤儿暂停:设置 pause 的进程若已死(dashboard 重启 / collect 被杀),
+    # 其 finally 不会清除 pause,这里按属主 pid 存活性当场清掉 → 跟单不会被永久静默挡住。
+    pause_new_signals = reconcile_pause_new_signals(follow_dir)
     paused_new_signal_categories = {
         str(category).lower()
         for category, status in pause_new_signals.items()
