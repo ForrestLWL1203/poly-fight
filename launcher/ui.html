@@ -63,9 +63,9 @@
     <div class="sec">登录 + 链上 <span id="saved" class="saved">已保存 ✓</span></div>
     <div class="grid">
       <div><label>面板用户名</label><input id="dashboard.username"></div>
-      <div><label>面板密码</label><input id="dashboard.password" type="password" placeholder="••••"></div>
-      <div class="full"><label>Alchemy HTTPS</label><input id="rpc.https" placeholder="https://… (留 •••• 不改)"></div>
-      <div class="full"><label>Alchemy WSS</label><input id="rpc.wss" placeholder="wss://… (留 •••• 不改)"></div>
+      <div><label>面板密码</label><input id="dashboard.password" type="password"></div>
+      <div class="full"><label>Alchemy HTTPS</label><input id="rpc.https"></div>
+      <div class="full"><label>Alchemy WSS</label><input id="rpc.wss"></div>
     </div>
 
     <div id="local-fields">
@@ -105,6 +105,13 @@ const $ = id => document.getElementById(id);
 const FIELDS = ["dashboard.username","dashboard.password","rpc.https","rpc.wss",
   "local.host","local.port","local.data_dir",
   "remote.vps_host","remote.vps_user","remote.ssh_key","remote.port","remote.repo_dir","remote.domain"];
+const SECRET = new Set(["dashboard.password","rpc.https","rpc.wss"]);
+const DEFAULTS = {
+  "dashboard.username":"admin",
+  "local.host":"127.0.0.1", "local.port":"8787", "local.data_dir":"data",
+  "remote.vps_user":"root", "remote.ssh_key":"~/.ssh/id_ed25519", "remote.port":"8787",
+  "remote.repo_dir":"/opt/poly-fight", "remote.domain":"dashboard.polylwl1203.top"
+};
 
 function setMode(m){
   MODE = m;
@@ -116,11 +123,23 @@ function setMode(m){
 function get(path){ const [a,b]=path.split("."); return (window.CFG[a]||{})[b]; }
 async function load(){
   window.CFG = await (await fetch("/api/config")).json();
-  for(const f of FIELDS){ const v=get(f); if($(f)) $(f).value = (v==null?"":v); }
+  for(const f of FIELDS){
+    const el=$(f); if(!el) continue;
+    const v=get(f);
+    if(SECRET.has(f)){               // 密钥不回显:留空=保持不变,有值=已设置
+      el.value=""; el.placeholder = (v==="••••") ? "已设置 · 留空不改" : "未设置";
+    }else{
+      el.value = (v==null||v==="") ? (DEFAULTS[f]||"") : v;
+    }
+  }
 }
 function collect(){
   const out={};
-  for(const f of FIELDS){ const [a,b]=f.split("."); (out[a]=out[a]||{})[b]=$(f).value; }
+  for(const f of FIELDS){
+    const [a,b]=f.split("."); const val=$(f).value;
+    if(SECRET.has(f) && val==="") continue;   // 密钥留空 → 不提交 → 后端保持原值
+    (out[a]=out[a]||{})[b]=val;
+  }
   return out;
 }
 async function save(){
