@@ -63,7 +63,7 @@ const initials = (name) => {
   if (!p.length) return "?";
   return (p.length === 1 ? p[0].slice(0, 2) : p[0][0] + p[1][0]).toUpperCase();
 };
-// Two fixed, theme-aware side colors (same A/B convention as the SplitBar).
+// Two fixed, theme-aware side colors (A/B = the two match sides).
 const TEAM_SIDE_COLOR = { a: "var(--side-a)", b: "var(--side-b)" };
 function TeamMonogram({ name, logo, side = "a", size = 26 }) {
   if (logo) return <img className="team-logo" src={logo} alt="" style={{ width: size, height: size, borderRadius: "50%", objectFit: "cover", flex: "none" }} />;
@@ -111,10 +111,6 @@ function EquityArea({ points, width = 520, height = 76 }) {
       <circle cx={last[0]} cy={last[1]} r="3" fill={col} />
     </svg>
   );
-}
-function SplitBar({ a, b }) {
-  const total = a + b || 1;
-  return <div className="split-bar" title={`${a} : ${b}`}><span className="split-a" style={{ width: (a / total) * 100 + "%" }}></span><span className="split-b" style={{ width: (b / total) * 100 + "%" }}></span></div>;
 }
 const qualityBadge = (q) =>
   q === "clean" ? <Badge tone="up">单向</Badge> : q === "contested" ? <Badge tone="warn">分歧</Badge> : <Badge tone="warn" outline>双边</Badge>;
@@ -482,7 +478,7 @@ function EventsPage({ data }) {
         </div>
         <div className="tbl-wrap">
           <table className="ps-table">
-            <thead><tr><th>赛事</th><th>状态</th><th>{archive ? "结算 PNL" : "跟单情况 (A : B)"}</th></tr></thead>
+            <thead><tr><th>赛事</th><th>状态</th><th>{archive ? "结算 PNL" : "跟单"}</th></tr></thead>
             <tbody key={tab + game + cur} className="tbl-fade">
               {pageRows.map((e) => (
                 <tr key={e.cid}>
@@ -496,7 +492,7 @@ function EventsPage({ data }) {
                   <td>{archive
                     ? <span className={pnlClass(e.pnl) + " strong num"} style={{ fontSize: "var(--fs-h4)" }}>{signedMoney(e.pnl)}</span>
                     : ((e.followA + e.followB) > 0
-                      ? <div className="follow-count-line"><SplitBar a={e.followA} b={e.followB} /><span><b className="ca">{e.followA}</b> : <b className="cb">{e.followB}</b></span></div>
+                      ? <Badge tone="accent" dot>已跟单</Badge>
                       : <span className="muted">暂无跟单</span>)}
                   </td>
                 </tr>

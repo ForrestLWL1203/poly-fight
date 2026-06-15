@@ -337,13 +337,6 @@ table.ps-table { width: 100%; border-collapse: collapse; font-variant-numeric: t
 .match-times { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-footnote); color: var(--text-quaternary); }
 .dot-sep { opacity: 0.5; }
 
-.split-bar { display: flex; height: 8px; width: 120px; border-radius: var(--r-pill); overflow: hidden; background: var(--ink-600); }
-.split-a { background: var(--side-a); }
-.split-b { background: var(--side-b); }
-.follow-count-line { display: flex; align-items: center; gap: var(--sp-3); }
-.follow-count-line b { font-variant-numeric: tabular-nums; font-weight: var(--fw-semibold); }
-.follow-count-line .ca { color: var(--side-a); } .follow-count-line .cb { color: var(--side-b); }
-
 /* ---- Event countdown + status ---- */
 .evt-status { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
 .evt-count { font-size: var(--fs-footnote); color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
