@@ -5749,12 +5749,105 @@ def command_analyze_event(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_position_backfill_trades(
+    client: PolymarketClient,
+    follow_wallets: list[dict[str, Any]],
+    markets_by_condition: dict[str, dict[str, Any]],
+    *,
+    max_entry_price: float,
+    now_ts: int,
+    cost_ratio_cap: float = 1.15,
+    positions_limit: int = 200,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
+    """启动补单(只跑一次):逐 leaderboard 钱包查当前持仓,对**已经持有**且落在
+    watch scope 的仓位,合成一笔 BUY trade 走同一条 process_follow_trades 管线建 paper
+    leg —— 弥补"WS 只看订阅后新成交、漏掉启动前存量持仓"。
+
+    两道补单专属价格闸(在策略其它过滤之外):
+      1. 我们现价(CLOB ask,退化到持仓 curPrice)≤ 钱包成本 avgPrice × cost_ratio_cap
+         (默认 1.15,即不追高过钱包成本 15%);
+      2. 现价 ≤ max_entry_price(策略最高价,如 0.9)。
+    trade.price=avgPrice(钱包成本 → wallet_cash / 钱包入场价);并把市场 outcome_prices[idx]
+    设为现价 → process_follow_trades 以现价作为我们的 our_entry_price。
+    返回 ({wallet:[trade,...]}, stats)。
+    """
+    asset_map = build_asset_map(markets_by_condition)
+    by_wallet: dict[str, list[dict[str, Any]]] = {}
+    stats: dict[str, int] = {
+        "wallets_scanned": 0, "positions_in_scope": 0,
+        "cost_gate_blocked": 0, "price_ceiling_blocked": 0, "candidates": 0,
+    }
+    for row in follow_wallets:
+        wallet = normalize_wallet(row.get("wallet"))
+        if not wallet:
+            continue
+        try:
+            positions = client.positions(wallet, limit=positions_limit)
+        except Exception:
+            continue
+        stats["wallets_scanned"] += 1
+        for pos in positions or []:
+            cid = str(pos.get("conditionId") or "").lower()
+            market = markets_by_condition.get(cid)
+            if not market:
+                continue
+            token_id = str(pos.get("asset") or "")
+            mapping = asset_map.get(token_id)
+            if not mapping or mapping.get("conditionId") != cid:
+                continue
+            idx = int(mapping.get("outcomeIndex", -1))
+            if idx < 0:
+                continue
+            avg = to_float(pos.get("avgPrice"))
+            size = to_float(pos.get("size"))
+            if avg <= 0 or size <= 0:
+                continue
+            stats["positions_in_scope"] += 1
+            try:
+                quote = clob_price(token_id, "buy")
+            except Exception:
+                quote = None
+            entry = to_float(quote) if quote is not None else 0.0
+            if entry <= 0:
+                entry = to_float(pos.get("curPrice"))
+            if entry <= 0:
+                continue
+            if entry > avg * cost_ratio_cap:                      # 闸1:不追高过成本 15%
+                stats["cost_gate_blocked"] += 1
+                continue
+            if max_entry_price > 0 and entry > max_entry_price:   # 闸2:策略最高价
+                stats["price_ceiling_blocked"] += 1
+                continue
+            prices = list(market.get("outcome_prices") or [])
+            while len(prices) <= idx:
+                prices.append(0.0)
+            prices[idx] = round(entry, 8)
+            market["outcome_prices"] = prices
+            tid = f"backfill:{wallet}:{cid}:{idx}"
+            by_wallet.setdefault(wallet, []).append({
+                "conditionId": cid,
+                "outcomeIndex": idx,
+                "outcome_index": idx,
+                "asset": token_id,
+                "side": "BUY",
+                "size": size,
+                "price": round(avg, 8),
+                "timestamp": int(now_ts),
+                "id": tid,
+                "transactionHash": tid,
+                "source": "position_backfill",
+            })
+            stats["candidates"] += 1
+    return by_wallet, stats
+
+
 def command_follow(
     args: argparse.Namespace,
     client: PolymarketClient | None = None,
     *,
     emit: bool = True,
     collector: "WSFollowCollector | None" = None,
+    backfill_positions: bool = False,
 ) -> dict[str, Any]:
     client = client or build_client(args)
     data_dir = resolve_dashboard_root(args)
@@ -5937,6 +6030,9 @@ def command_follow(
     contested_signal_count = 0
     closing_line_snapshot_count = 0
     cold_start_wallet_count = 0
+    backfill_legs_opened = 0
+    backfill_ran = False
+    backfill_stats: dict[str, int] = {}
     trade_request_count = 0
     insufficient_balance_count = 0
     low_entry_price_blocked_count = 0
@@ -5996,6 +6092,55 @@ def command_follow(
     tracked_condition_ids = {str(condition_id).lower() for condition_id in watched}
     tracked_condition_ids.update(str(signal.get("condition_id") or "").lower() for signal in open_signals)
     if gate_open and follow_wallets:
+        # 启动补单(每个 runner 进程只跑一次):把 leaderboard 钱包**启动前已有**的、落在
+        # watch scope 的持仓,按现价补成 paper leg(同一套策略过滤 + signal_id 判重,所以
+        # WS 之后看到同一钱包加仓也不会重复开)。
+        if backfill_positions:
+            markets_for_bf = active_markets_for_follow or watched
+            bf_by_wallet, backfill_stats = build_position_backfill_trades(
+                client, follow_wallets, markets_for_bf,
+                max_entry_price=effective_max_entry_price, now_ts=now_ts,
+            )
+            for row in follow_wallets:
+                wallet = normalize_wallet(row.get("wallet"))
+                bf_trades = bf_by_wallet.get(wallet)
+                if not bf_trades:
+                    continue
+                category = str(row.get("category") or "esports").lower()
+                scope_key = str(row.get("scope_key") or f"{category}:{wallet}")
+                if not (scope_key in eligible_wallet_set and category not in paused_new_signal_categories):
+                    continue
+                before_ids = {signal.get("signal_id") for signal in open_signals}
+                open_signals, _bf_pft_stats = process_follow_trades(
+                    open_signals,
+                    wallet=wallet,
+                    trades=bf_trades,
+                    markets_by_condition=markets_for_bf,
+                    now_ts=now_ts,
+                    stake_usdc=args.stake_usdc,
+                    max_follow_legs=args.max_follow_legs,
+                    max_slippage=1.0,  # 15% 成本闸已在 helper 应用,放开绝对滑点闸避免二次拦
+                    min_wallet_entry_price=args.min_wallet_entry_price,
+                    max_entry_price=effective_max_entry_price,
+                    stake_ratio_percent=args.stake_ratio_percent,
+                    require_pre_match=args.require_pre_match,
+                    post_start_grace_seconds=args.post_start_trade_grace_seconds,
+                    quarantine_sell_frac=args.quarantine_sell_frac,
+                    eligible_market_types=eligible_market_types_by_wallet.get(scope_key),
+                    eligible_buckets=eligible_buckets_by_wallet.get(scope_key),
+                    eligible_category=category,
+                    eligible_leagues=eligible_leagues_by_wallet.get(scope_key),
+                    conflict_policy="dual_follow",
+                    bankroll_usdc=bankroll_usdc,
+                    max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
+                    max_signal_stake_usdc=max_signal_stake_usdc,
+                    follow_strategy=follow_strategy,
+                )
+                backfill_legs_opened += len({signal.get("signal_id") for signal in open_signals} - before_ids)
+            backfill_ran = True
+            if emit:
+                print(json.dumps({"status": "position_backfill", "opened_legs": backfill_legs_opened, **backfill_stats}, ensure_ascii=False), flush=True)
+
         def fetch_trades_for_wallet(row: dict[str, Any]) -> tuple[str, list[dict], dict[str, Any]]:
             wallet = normalize_wallet(row.get("wallet"))
             scope_key = str(row.get("scope_key") or f"{str(row.get('category') or 'esports').lower()}:{wallet}")
@@ -6273,6 +6418,9 @@ def command_follow(
         "observed_trade_delay_seconds": summarize_seconds(observed_delay_values),
         "index_lag_lower_bound_seconds": summarize_seconds(index_lag_lower_bound_values),
         "cold_start_wallet_count": cold_start_wallet_count,
+        "backfill_ran": backfill_ran,
+        "backfill_legs_opened": backfill_legs_opened,
+        "backfill_stats": backfill_stats,
         "total_new_trade_count": total_new_trade_count,
         "watched_new_trade_count": watched_new_trade_count,
         "new_trade_count": watched_new_trade_count,
@@ -6354,6 +6502,8 @@ def command_run(args: argparse.Namespace) -> int:
     last_build_at = now_init if args.skip_initial_build else 0
     tick_count = 0
     first_error_at: float | None = None
+    # 启动补单只在第一个**成功执行了补单**的 tick 后置位(避免首 tick 因暂停/异常而漏补)。
+    backfill_done = False
     stop_requested = {"value": False, "reason": ""}
     collection_root = resolve_dashboard_root(args)
     follow_dir = resolve_follow_dir(args, collection_root)
@@ -6457,7 +6607,12 @@ def command_run(args: argparse.Namespace) -> int:
             iteration_started_mono = time.monotonic()
             try:
                 maybe_build(force=False)
-                summary = command_follow(args, client=client, emit=True, collector=collector)
+                summary = command_follow(
+                    args, client=client, emit=True, collector=collector,
+                    backfill_positions=not backfill_done,
+                )
+                if summary.get("backfill_ran"):
+                    backfill_done = True
             except Exception as exc:
                 now = time.time()
                 if first_error_at is None:

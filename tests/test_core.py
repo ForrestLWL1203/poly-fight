@@ -9515,6 +9515,45 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(read_follow_control(follow_dir)["runner"]["pid"], 4321)
             self.assertTrue(status["strategy_configured"])
 
+    def test_build_position_backfill_trades_gates(self):
+        from poly_fight import cli as cli_mod
+        market = {
+            "condition_id": "0xabc", "conditionId": "0xabc",
+            "outcomes": ["Team A", "Team B"], "clobTokenIds": ["111", "222"],
+            "outcome_prices": [0.0, 0.0], "market_type": "main_match", "league": "cs2",
+        }
+        markets = {"0xabc": market}
+        positions_by_wallet = {
+            # 现价 0.55 vs 成本 0.50 → 0.55 ≤ 0.575,且 < 0.9 → 命中
+            "0xw1": [{"conditionId": "0xabc", "asset": "111", "outcome": "Team A", "avgPrice": 0.50, "curPrice": 0.55, "size": 1000}],
+            # 现价 0.70 vs 成本 0.50 → > 15% → cost_gate_blocked
+            "0xw2": [{"conditionId": "0xabc", "asset": "222", "outcome": "Team B", "avgPrice": 0.50, "curPrice": 0.70, "size": 1000}],
+            # 现价 0.92 在成本 0.88 的 15% 内,但 > max_entry 0.9 → price_ceiling_blocked
+            "0xw3": [{"conditionId": "0xabc", "asset": "111", "outcome": "Team A", "avgPrice": 0.88, "curPrice": 0.92, "size": 1000}],
+            # 不在 watch scope
+            "0xw4": [{"conditionId": "0xdef", "asset": "999", "outcome": "X", "avgPrice": 0.40, "curPrice": 0.40, "size": 1000}],
+        }
+
+        class FakeClient:
+            def positions(self, wallet, *, limit=200):
+                return positions_by_wallet[wallet]
+
+        follow_wallets = [{"wallet": w} for w in ("0xw1", "0xw2", "0xw3", "0xw4")]
+        with patch("poly_fight.cli.clob_price", return_value=None):  # 退化用 pos.curPrice
+            by_wallet, stats = cli_mod.build_position_backfill_trades(
+                FakeClient(), follow_wallets, markets, max_entry_price=0.9, now_ts=1000,
+            )
+        self.assertEqual(set(by_wallet), {"0xw1"})
+        trade = by_wallet["0xw1"][0]
+        self.assertEqual(trade["side"], "BUY")
+        self.assertEqual(trade["outcomeIndex"], 0)
+        self.assertEqual(trade["price"], 0.5)                  # 钱包成本
+        self.assertEqual(trade["source"], "position_backfill")
+        self.assertEqual(market["outcome_prices"][0], 0.55)    # 我们现价快照
+        self.assertEqual(stats["candidates"], 1)
+        self.assertEqual(stats["cost_gate_blocked"], 1)
+        self.assertEqual(stats["price_ceiling_blocked"], 1)
+
     def test_set_pause_stamps_owner_pid(self):
         with TemporaryDirectory() as tmp:
             follow_dir = Path(tmp) / "follow"
