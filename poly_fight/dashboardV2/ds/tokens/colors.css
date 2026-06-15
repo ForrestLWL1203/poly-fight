@@ -52,6 +52,8 @@
   /* ---- P&L / financial semantics (the ONLY green/red) ---- */
   --pnl-up: #1f9d57;
   --pnl-up-soft: rgba(31, 157, 87, 0.14);
+  --info: #2f6fed;
+  --info-soft: rgba(47, 111, 237, 0.13);
   --pnl-down: #e5484d;
   --pnl-down-soft: rgba(229, 72, 77, 0.12);
   --pnl-flat: var(--text-secondary);
@@ -136,6 +138,8 @@
 
   --pnl-up: #34c46d;
   --pnl-up-soft: rgba(52, 196, 109, 0.16);
+  --info: #5b8def;
+  --info-soft: rgba(91, 141, 239, 0.18);
   --pnl-down: #ff5a5f;
   --pnl-down-soft: rgba(255, 90, 95, 0.16);
 

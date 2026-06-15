@@ -484,7 +484,7 @@ function EventsPage({ data }) {
                 <tr key={e.cid}>
                   <td>{e.eventUrl ? <a className="evt-link" href={e.eventUrl} target="_blank" rel="noopener noreferrer" title="在 Polymarket 打开该赛事"><MatchCell ev={e} /></a> : <MatchCell ev={e} />}</td>
                   <td><div className="evt-status">
-                    {e.status === "live" && <StatusPill status="live" label="进行中" />}
+                    {e.status === "live" && <Badge tone="up" dot>进行中</Badge>}
                     {e.status === "upcoming" && <Badge tone="accent" dot>即将开始</Badge>}
                     {e.status === "settled" && <Badge tone="neutral">已结算</Badge>}
                     {e.countdown && !archive && e.status !== "live" && <span className="evt-count">{e.countdown}</span>}
@@ -492,7 +492,7 @@ function EventsPage({ data }) {
                   <td>{archive
                     ? <span className={pnlClass(e.pnl) + " strong num"} style={{ fontSize: "var(--fs-h4)" }}>{signedMoney(e.pnl)}</span>
                     : ((e.followA + e.followB) > 0
-                      ? <Badge tone="accent" dot>已跟单</Badge>
+                      ? <Badge tone="info" dot>已跟单</Badge>
                       : <span className="muted">暂无跟单</span>)}
                   </td>
                 </tr>

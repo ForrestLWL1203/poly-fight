@@ -337,6 +337,10 @@ table.ps-table { width: 100%; border-collapse: collapse; font-variant-numeric: t
 .match-times { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-footnote); color: var(--text-quaternary); }
 .dot-sep { opacity: 0.5; }
 
+/* extra badge tone for the watch-list "已跟单" mark — blue, distinct from
+   accent(即将开始) and the up-green(进行中) status pills. */
+.ps-badge.t-info { --_bg: var(--info-soft); --_fg: var(--info); }
+
 /* ---- Event countdown + status ---- */
 .evt-status { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
 .evt-count { font-size: var(--fs-footnote); color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
