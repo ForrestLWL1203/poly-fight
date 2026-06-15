@@ -67,6 +67,7 @@ from .follow import (
     contested_markets,
     desired_tick_interval,
     eligible_follow_wallets,
+    follow_signal_id,
     leg_actual_stake,
     market_current_price,
     paper_exit_pnl,
@@ -5756,6 +5757,7 @@ def build_position_backfill_trades(
     *,
     max_entry_price: float,
     now_ts: int,
+    existing_signal_ids: set[str] | None = None,
     cost_ratio_cap: float = 1.15,
     positions_limit: int = 200,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
@@ -5772,9 +5774,10 @@ def build_position_backfill_trades(
     返回 ({wallet:[trade,...]}, stats)。
     """
     asset_map = build_asset_map(markets_by_condition)
+    existing_signal_ids = existing_signal_ids or set()
     by_wallet: dict[str, list[dict[str, Any]]] = {}
     stats: dict[str, int] = {
-        "wallets_scanned": 0, "positions_in_scope": 0,
+        "wallets_scanned": 0, "positions_in_scope": 0, "already_followed": 0,
         "cost_gate_blocked": 0, "price_ceiling_blocked": 0, "candidates": 0,
     }
     for row in follow_wallets:
@@ -5797,6 +5800,11 @@ def build_position_backfill_trades(
                 continue
             idx = int(mapping.get("outcomeIndex", -1))
             if idx < 0:
+                continue
+            # 幂等:已有该 wallet+condition+outcome 的开放信号 → 已在跟,不再补腿
+            # (补单的合成 trade id 是确定性的,不挡的话每次重启都会给已有信号加重复腿)。
+            if follow_signal_id(wallet, cid, idx) in existing_signal_ids:
+                stats["already_followed"] += 1
                 continue
             avg = to_float(pos.get("avgPrice"))
             size = to_float(pos.get("size"))
@@ -6100,6 +6108,7 @@ def command_follow(
             bf_by_wallet, backfill_stats = build_position_backfill_trades(
                 client, follow_wallets, markets_for_bf,
                 max_entry_price=effective_max_entry_price, now_ts=now_ts,
+                existing_signal_ids={str(s.get("signal_id") or "") for s in open_signals},
             )
             for row in follow_wallets:
                 wallet = normalize_wallet(row.get("wallet"))

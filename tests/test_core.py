@@ -9554,6 +9554,30 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(stats["cost_gate_blocked"], 1)
         self.assertEqual(stats["price_ceiling_blocked"], 1)
 
+    def test_build_position_backfill_trades_idempotent(self):
+        # 已有该 wallet+condition+outcome 的开放信号 → 不再补腿(防重启重复扣)。
+        from poly_fight import cli as cli_mod
+        from poly_fight.follow import follow_signal_id
+        market = {
+            "condition_id": "0xabc", "conditionId": "0xabc",
+            "outcomes": ["Team A", "Team B"], "clobTokenIds": ["111", "222"],
+            "outcome_prices": [0.0, 0.0], "market_type": "main_match", "league": "cs2",
+        }
+
+        class FakeClient:
+            def positions(self, wallet, *, limit=200):
+                return [{"conditionId": "0xabc", "asset": "111", "outcome": "Team A", "avgPrice": 0.50, "curPrice": 0.55, "size": 1000}]
+
+        sid = follow_signal_id("0xw1", "0xabc", 0)
+        with patch("poly_fight.cli.clob_price", return_value=None):
+            by_wallet, stats = cli_mod.build_position_backfill_trades(
+                FakeClient(), [{"wallet": "0xw1"}], {"0xabc": market},
+                max_entry_price=0.9, now_ts=1000, existing_signal_ids={sid},
+            )
+        self.assertEqual(by_wallet, {})
+        self.assertEqual(stats["already_followed"], 1)
+        self.assertEqual(stats["candidates"], 0)
+
     def test_set_pause_stamps_owner_pid(self):
         with TemporaryDirectory() as tmp:
             follow_dir = Path(tmp) / "follow"
