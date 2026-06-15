@@ -1627,7 +1627,7 @@ if (typeof document !== "undefined" && !document.getElementById("ps-button-css")
   .ps-btn.sz-lg { height: var(--control-lg); padding: 0 var(--sp-7); font-size: var(--fs-h4); }
   .ps-btn.v-primary {
     --_bg: var(--gradient-brand); --_fg: var(--text-on-accent); --_bd: transparent;
-    background-clip: padding-box;
+    background-clip: border-box;
     box-shadow: var(--shadow-accent), inset 0 1px 0 rgba(255, 255, 255, 0.22);
   }
   .ps-btn.v-primary:hover { filter: brightness(1.05); }
@@ -2532,7 +2532,7 @@ if (typeof document !== "undefined" && !document.getElementById("ps-switch-css")
     width: 50px; height: 30px; border-radius: var(--r-pill);
     background: var(--surface-inset);
     border: 1px solid var(--border-hairline);
-    background-clip: padding-box;
+    background-clip: border-box;
     box-shadow: inset 0 1px 3px rgba(0,0,0,0.28);
     transition: border-color var(--dur-base) var(--ease-out), box-shadow var(--dur-base) var(--ease-out);
     flex: none;

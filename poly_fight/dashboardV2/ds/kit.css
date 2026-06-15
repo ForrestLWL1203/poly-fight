@@ -3,6 +3,19 @@
    Composes the DS tokens; only kit-level layout/table styling here.
    ============================================================ */
 
+/* ── Filled-control fill normalization — single source of truth ──────────────
+   Every filled control (button / switch / pill / icon-button / badge) keeps a
+   1px border for layout and sets border-color:transparent when filled. The fill
+   MUST reach the rounded edge: any `background-clip: padding-box` clips it
+   *inside* that transparent border and reveals a 1px seam of whatever sits
+   behind the control (the "按钮填充偏移 / 白色缝隙" bug). This recurred per
+   component because each injects its own style with no shared primitive — so we
+   pin the whole class to border-box here, in one place. Override or extend this
+   list instead of adding a per-component clip. */
+.ps-btn, .ps-iconbtn, .ps-switch-track, .ps-statuspill, .ps-badge {
+  background-clip: border-box !important;
+}
+
 .app-shell { display: flex; height: 100vh; overflow: hidden; }
 .app-main { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
 
