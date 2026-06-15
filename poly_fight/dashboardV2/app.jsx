@@ -395,9 +395,6 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
   const [gameFilter, setGameFilter] = React.useState("all");
   const [pg, setPg] = React.useState(1);
   const [busy, setBusy] = React.useState({});
-  const [samplePanel, setSamplePanel] = React.useState(false);
-  const [wrInput, setWrInput] = React.useState("75");
-  const [entryInput, setEntryInput] = React.useState("0.65");
   React.useEffect(() => { setPg(1); }, [view, gameFilter]);
   React.useEffect(() => { window.lucide && window.lucide.createIcons(); });
 
@@ -438,11 +435,9 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
   };
   const refreshing = JSON.stringify(data.refresh || {}).includes('"running"');
   const updatedLabel = lb.updatedAt ? Adapt.timeAgo(lb.updatedAt) : "—";
+  // 门槛(胜率/edge/n_eff/价格带)现在全在 core.py 评分常量里,采集无需前端传参。
   const startSample = () => {
-    const pr = Math.max(50, Math.min(99, parseFloat(wrInput) || 75)) / 100;
-    const me = Math.max(0.30, Math.min(0.95, parseFloat(entryInput) || 0.65));
-    setSamplePanel(false);
-    onSample && onSample("esports", { min_positive_rate: pr, max_median_entry: me });
+    onSample && onSample("esports", {});
   };
 
   return (
@@ -464,17 +459,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
               </select>
               <span className="lb-updated" style={{ marginRight: 4 }}>最后更新 {updatedLabel} · {lb.activeCount} 个活跃</span>
               <div className="sample-trigger">
-                <Button variant="primary" disabled={refreshing} iconLeft={refreshing ? <Spinner sm /> : <Ico n="radar" />} onClick={() => setSamplePanel((v) => !v)}>采样钱包</Button>
-                {samplePanel && <>
-                  <div className="sample-backdrop" onClick={() => setSamplePanel(false)} />
-                  <div className="sample-pop" role="dialog" aria-label="采集门槛设置">
-                    <div className="sample-pop-title">采集门槛</div>
-                    <Input label="胜率门槛" type="number" min="50" max="99" step="1" suffix="%" value={wrInput} onChange={(e) => setWrInput(e.target.value)} block />
-                    <Input label="买入价上限" type="number" min="0.3" max="0.95" step="0.01" value={entryInput} onChange={(e) => setEntryInput(e.target.value)} block />
-                    <div className="sample-pop-hint">仅采集专精盘口胜率 ≥ 门槛、买入价 ≤ 上限的钱包</div>
-                    <Button variant="primary" disabled={refreshing} iconLeft={<Ico n="radar" />} onClick={startSample}>开始采样</Button>
-                  </div>
-                </>}
+                <Button variant="primary" disabled={refreshing} iconLeft={refreshing ? <Spinner sm /> : <Ico n="radar" />} onClick={startSample}>钱包采集</Button>
               </div>
             </div>
           </div>

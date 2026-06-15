@@ -2807,15 +2807,8 @@ def start_runner(
             "--defer-first-tick",  # 榜单刚被手动采集刷新过,先睡满一轮再维护
             "--follow-dir", str(follow_dir),
         ]
-        # 继承上次手动采集用的阈值(记录在 wallet_refresh.command 里),否则 observe-v2
-        # 会用默认阈值重算,把榜单覆盖成不一致的一份。
-        last_refresh = (read_follow_control(follow_dir).get("wallet_refresh") or {}).get("esports") or {}
-        last_cmd = last_refresh.get("command") or []
-        for flag in ("--v2-min-positive-rate", "--v2-max-median-entry"):
-            if flag in last_cmd:
-                i = last_cmd.index(flag)
-                if i + 1 < len(last_cmd):
-                    observe_command += [flag, str(last_cmd[i + 1])]
+        # 门槛全在 core.py 评分常量里:collect-v2 与 observe-v2 天然一致,无需再从上次
+        # 采集命令继承阈值 flag(那些 --v2-* 参数已从 CLI 删除)。
         observe_log = log_dir / f"dashboard-observe-{now_ts}.out"
         observe_pid, observe_pgid = _spawn_detached_process(
             observe_command, observe_log, config.runner_process_starter
@@ -3094,29 +3087,11 @@ def build_wallet_refresh_status(data_dir: Path, *, follow_dir: Path | None = Non
     }
 
 
-def _clamp_optional_float(value: Any, *, lo: float, hi: float) -> float | None:
-    """把表单值解析为 float 并夹到 [lo,hi];无效/缺失返回 None(用 collect-v2 默认)。"""
-    if value is None or value == "":
-        return None
-    try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    if f != f:  # NaN
-        return None
-    return max(lo, min(hi, f))
-
-
 def v2_refresh_extra_args(form: dict[str, Any]) -> list[str]:
-    """从采样表单构造 collect-v2 阈值参数(仅 esports)。值经 float 解析+夹紧+格式化,防注入。"""
-    args: list[str] = []
-    pr = _clamp_optional_float(form.get("min_positive_rate"), lo=0.50, hi=0.99)
-    if pr is not None:
-        args += ["--v2-min-positive-rate", f"{pr:.4f}"]
-    me = _clamp_optional_float(form.get("max_median_entry"), lo=0.30, hi=0.95)
-    if me is not None:
-        args += ["--v2-max-median-entry", f"{me:.4f}"]
-    return args
+    """采集不再接受前端阈值参数:门槛(胜率/edge/n_eff/价格带)全在 core.py 评分常量里。
+    旧的 --v2-min-positive-rate / --v2-max-median-entry 已从 CLI 删除,传入会让 collect-v2
+    报 unrecognized arguments 而崩,因此这里恒返回空。"""
+    return []
 
 
 def start_wallet_refresh(
