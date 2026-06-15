@@ -733,6 +733,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
+        # 静态资源(app.jsx / adapt.js / css)从磁盘按请求实时读取,服务端永远是最新的。
+        # 但无缓存头时浏览器会启发式缓存,普通刷新复用旧 JS → "UI 改了代码没生效 / 保存无效"
+        # 这类幽灵 bug。no-store 强制每次重新拉取,代码改动普通刷新即生效。
+        self.send_header("Cache-Control", "no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(payload)
 

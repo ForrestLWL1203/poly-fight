@@ -307,5 +307,5 @@ def strategy_summary(strategy: dict[str, Any] | None) -> str:
     if to_float(balance.get("usable_balance_usdc")) > 0:
         parts.append(f"可用余额 {to_float(balance.get('usable_balance_usdc')):g}")
     if normalized.get("realtime_refresh"):
-        parts.append("实时刷新")
+        parts.append("动态刷新")
     return "，".join(parts)

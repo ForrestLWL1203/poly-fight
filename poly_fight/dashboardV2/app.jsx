@@ -861,7 +861,7 @@ function strategyNodes(s) {
     { k: "单笔金额", v: dg.sizing, key: true },
     { k: "单场笔数", v: s.countOn ? (s.countMode === "event" ? `整场 ${s.count} 笔` : `每钱包 ${s.count} 笔`) : "不限" },
     { k: "单场投入", v: s.spendOn ? (s.spendMode === "fixed" ? `≤ ${usdInt(n(s.spendFixed))}` : `≤ 余额 ${s.spendPct}%`) : "不限" },
-    { k: "实时刷新", v: s.realtimeRefresh ? "每 2h 更新" : "关闭" },
+    { k: "动态刷新", v: s.realtimeRefresh ? "开启" : "关闭" },
   ];
 }
 function StrategyPipe({ kit }) {
@@ -951,10 +951,10 @@ function StrategyEditor({ s, up, wallet, locked }) {
           </div> : null}
         </div>
         <div className="cfg-head"><h3>动态榜单</h3></div>
-        <p className="cfg-sub">启动跟单时一并维护 Leaderboard · 仅在跟单运行期间生效</p>
+        <p className="cfg-sub">仅在跟单运行期间生效</p>
         <div className="sub-block">
           <div className="switch-row">
-            <div className="sr-text"><span className="sr-title">实时刷新 Leaderboard</span><span className="sr-desc">随跟单起一个 observer，每 2h 发现新钱包并放回冷却到期的隔离地址（掉级隔离始终自动执行）</span></div>
+            <div className="sr-text"><span className="sr-title">动态刷新</span><span className="sr-desc">跟单期间动态刷新 Leaderboard</span></div>
             <Switch checked={s.realtimeRefresh} onChange={(v) => up("realtimeRefresh")(v)} accent />
           </div>
         </div>
@@ -1261,7 +1261,7 @@ function Dashboard({ onLogout, toast }) {
       await Api.runnerStart();
       const [rn, hh] = await Promise.all([Api.runner().catch(() => null), Api.health().catch(() => null)]);
       merge({ ...(rn ? { runner: rn } : {}), ...(hh ? { health: hh } : {}) });
-      toast(rn && rn.realtime_refresh ? "跟单已启动 · 实时刷新开启" : "跟单已启动", "success");
+      toast(rn && rn.realtime_refresh ? "跟单已启动 · 动态刷新开启" : "跟单已启动", "success");
     } catch (e) {
       toast(e && e.error === "runner_already_running" ? "已在运行中" : (e && e.detail) || "启动失败，请先完成并保存跟单策略", "error");
     }
