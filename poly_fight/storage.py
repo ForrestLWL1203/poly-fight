@@ -14,6 +14,10 @@ from .follow_strategy import ACTIVE_FOLLOW_STRATEGY_ID, normalize_follow_strateg
 LEADERBOARD_SCHEMA_VERSION = 2
 FOLLOW_SCHEMA_VERSION = 2
 
+# run_ticks 是 runner 心跳日志(每行含完整 stats blob),dashboard 只读最近若干条。
+# 保留最近 RUN_TICKS_RETENTION 条,写入时裁掉更旧的,防止该表无界增长。
+RUN_TICKS_RETENTION = 5000
+
 
 def _dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
@@ -1668,6 +1672,16 @@ class FollowStore:
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('run_ticks_updated_at', ?)",
                 (str(max(created_at, int(time.time()))),),
+            )
+            # 保留最近 RUN_TICKS_RETENTION 条,裁掉更旧的(与 load_run_ticks 同序)
+            conn.execute(
+                """
+                DELETE FROM run_ticks WHERE tick_id NOT IN (
+                    SELECT tick_id FROM run_ticks
+                    ORDER BY created_at DESC, tick_id DESC LIMIT ?
+                )
+                """,
+                (RUN_TICKS_RETENTION,),
             )
         return payload
 

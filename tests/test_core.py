@@ -2995,6 +2995,24 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(latest["watched_market_count"], 2)
             self.assertEqual(len(ticks), 1)
 
+    def test_follow_store_run_ticks_retention_caps_old_rows(self):
+        import poly_fight.storage as storage_mod
+
+        original = storage_mod.RUN_TICKS_RETENTION
+        storage_mod.RUN_TICKS_RETENTION = 5
+        try:
+            with TemporaryDirectory() as tmp:
+                store = FollowStore(Path(tmp) / "follow.db")
+                for i in range(12):
+                    store.save_run_tick({"created_at": 1000 + i, "status": "ok"})
+                ticks = store.load_run_ticks(limit=100)
+                # 只保留最近 5 条;且裁掉的是最旧的(created_at 1000..1006)
+                self.assertEqual(len(ticks), 5)
+                kept = sorted(t["created_at"] for t in ticks)
+                self.assertEqual(kept, [1007, 1008, 1009, 1010, 1011])
+        finally:
+            storage_mod.RUN_TICKS_RETENTION = original
+
     def test_category_follow_db_migration_is_guarded_and_dedupes_behavior_events(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp) / "data"
