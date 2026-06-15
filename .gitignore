@@ -11,8 +11,9 @@ data*/
 # Long-running local logs.
 logs/
 
-# Runtime-downloaded team logo cache.
+# Runtime-downloaded team logo cache (regenerated on each host from active markets).
 poly_fight/dashboard/static/team_logos/
+poly_fight/dashboardV2/logo/
 
 # Local review scratch files.
 review/
