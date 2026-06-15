@@ -29,12 +29,20 @@ ESPORTS_MIN_A_WILSON = 0.57
 SPORTS_MIN_A_WILSON = 0.50
 ESPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE = 0.08
 SPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE = 0.10
-ESPORTS_EMERGING_RECENT_7D_MIN_MARKETS = 3
-ESPORTS_EMERGING_RECENT_7D_MIN_POSITIVE_RATE = 0.80
-ESPORTS_EMERGING_RECENT_7D_MIN_ROI = 0.30
-ESPORTS_EMERGING_MIN_WILSON = ESPORTS_MIN_A_WILSON
-ESPORTS_EMERGING_MIN_CAPITAL_WEIGHTED_EDGE = ESPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE
-ESPORTS_EMERGING_MAX_MEDIAN_ENTRY_PRICE = 0.68
+# ── Copy 评分轴（固定注、持有到结算 copy；目标的美元盈亏/仓位大小与我们无关）──
+# 不用 Wilson(它对小样本过度惩罚、误杀真专家)。单层三条,全是点估、人话可讲:
+#   1) 胜率够高 + 够样本: θ̂(近期加权点估胜率) ≥ WIN_RATE_MIN 且 有效样本 n_eff ≥ MIN_EFF_SAMPLE
+#   2) 价格不超线:        PRICE_LO ≤ 入场价 ≤ PRICE_HI
+#   3) 有 edge:           θ̂ − 入场价 ≥ EDGE_MIN  (固定注每股期望收益 = 胜率 − 价格)
+# 美元盈亏 / capital_weighted_edge 不再是门槛(降为软 reason)。
+ESPORTS_COPY_WIN_RATE_MIN = 0.58      # θ̂ 点估胜率下限(高胜率,挡抛硬币/彩票桶)
+ESPORTS_COPY_MIN_EFF_SAMPLE = 10.0    # 有效样本下限(回测最优;透明替代 Wilson 的"防小样本侥幸")
+ESPORTS_COPY_EDGE_MIN = 0.06          # θ̂ − 入场价 的加性 edge 下限
+ESPORTS_COPY_PRICE_LO = 0.40          # 价格带下界(防极端 longshot;低胜率彩票已被胜率下限挡掉)
+ESPORTS_COPY_PRICE_HI = 0.68          # 价格带上界(避开 priced-in 大热门)
+# 近期活跃度:按时间半衰期对每盘加权(近期热度 > 陈旧战绩),折算 Kish 有效样本 n_eff,
+# 得到近期加权点估胜率 θ̂。让"钱包当前在打的桶"靠成熟分升级。
+ESPORTS_RECENCY_HALF_LIFE_DAYS = 21
 # actual_minus_hold_pnl_rate 超过此值 = 利润主要靠盘中卖出（我们复制不了）→ 软标记
 SWING_DEPENDENT_RATE = 0.2
 # 卖出赢家侧且价格已经接近 1.0，大多是赛果基本确定后的释放资金，不按波段/提前卖出处理。
@@ -42,6 +50,9 @@ NEAR_RESOLVED_WINNER_SELL_PRICE = 0.95
 # 单市场成交 >=20 笔记为 high churn。high_churn 市场占比超过此值 = 机器人/高频/做市
 # （盈利来自微观价差和速度，复制不了）→ 直接排除出 leaderboard。
 MAX_HIGH_CHURN_MARKET_RATE = 0.5
+# 实质性双边:买了≥2个结果、且少数侧买量占比 ≥ 此值 = 真对冲/套利(无方向判断)。
+# 主仓占绝对大头(少数侧 < 此值)= 方向单 + 小对冲,仍算方向性。这类市场从"方向胜率"里剔除当中性。
+MATERIAL_TWO_SIDED_MIN_MINORITY_FRAC = 0.20
 MAIN_MATCH = "main_match"
 GAME_WINNER = "game_winner"
 MAP_WINNER = "map_winner"
@@ -1233,12 +1244,18 @@ def summarize_closed_positions(
                 "avg_price": avg_price,
                 "timestamp": to_int(position.get("timestamp")),
                 "first_buy_won": position.get("firstBuyWon") if "firstBuyWon" in position else None,
+                "material_two_sided": bool(position.get("materialTwoSided")),
             }
         )
 
     summary_now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
 
     def summarize_bucket(bucket_rows: list[dict[str, Any]], *, neutral_market_count: int) -> dict[str, Any]:
+        # 实质性双边市场无方向判断 → 当中性,从方向胜率/样本/edge 里剔除(套利者因此 n_eff→0 自动出局)。
+        two_sided_count = sum(1 for row in bucket_rows if row.get("material_two_sided"))
+        if two_sided_count:
+            bucket_rows = [row for row in bucket_rows if not row.get("material_two_sided")]
+            neutral_market_count += two_sided_count
         count = len(bucket_rows)
         total_bought = sum(row["total_bought"] for row in bucket_rows)
         total_cost = sum(row["cost_basis"] for row in bucket_rows)
@@ -1262,6 +1279,19 @@ def summarize_closed_positions(
         first_direction_wins = sum(1 for row in first_direction_rows if row.get("first_buy_won"))
         capital_weighted_entry_price = total_cost / total_bought if total_bought else 0.0
         capital_weighted_win_rate = winning_cost / total_cost if total_cost else 0.0
+
+        # 时间衰减:近期盘权重高,陈旧盘指数衰减。a_i = 0.5^(age/half_life)。
+        # n_eff = (Σa)²/Σa² (Kish 有效样本);θ̂ = Σ(a·win)/Σa(近期加权点估胜率)。
+        half_life_s = ESPORTS_RECENCY_HALF_LIFE_DAYS * SECONDS_PER_DAY
+        decay_w = [
+            0.5 ** (max(0.0, summary_now_ts - row["timestamp"]) / half_life_s) if half_life_s > 0 else 1.0
+            for row in bucket_rows
+        ]
+        weight_sum = sum(decay_w)
+        weight_sq_sum = sum(w * w for w in decay_w)
+        effective_sample = (weight_sum * weight_sum / weight_sq_sum) if weight_sq_sum > 0 else 0.0
+        positive_weight = sum(w for w, row in zip(decay_w, bucket_rows) if row["realized_pnl"] > 0)
+        recency_weighted_win_rate = positive_weight / weight_sum if weight_sum > 0 else 0.0
 
         def recent_window(days: int) -> dict[str, Any]:
             cutoff = summary_now_ts - days * SECONDS_PER_DAY
@@ -1341,6 +1371,9 @@ def summarize_closed_positions(
         "positive_market_rate": round(positive / count, 8) if count else 0.0,
         "wilson_z": WILSON_Z,
         "wilson_win_rate_lower_bound": round(wilson_lower_bound(positive, count), 8),
+        "recency_weighted_win_rate": round(recency_weighted_win_rate, 8),
+        "effective_sample_size": round(effective_sample, 6),
+        "recency_half_life_days": ESPORTS_RECENCY_HALF_LIFE_DAYS,
         "avg_position_size": round(total_bought / count, 6) if count else 0.0,
         "median_position_size": round(median(sizes), 6) if sizes else 0.0,
         "avg_entry_price": round(sum(entry_prices) / len(entry_prices), 8) if entry_prices else 0.0,
@@ -1502,6 +1535,12 @@ def reconstruct_closed_positions(
         )
         two_sided = len(bought_outcomes) >= 2
         total_bought = sum(buy_size_by_outcome.values())
+        # 少数侧(非主仓)买量占比 ≥ 阈值 → 实质性双边(对冲/套利,无方向)。
+        minority_buy = total_bought - (max(buy_size_by_outcome.values()) if buy_size_by_outcome else 0.0)
+        material_two_sided = (
+            two_sided and total_bought > 0
+            and (minority_buy / total_bought) >= MATERIAL_TWO_SIDED_MIN_MINORITY_FRAC
+        )
         buy_cost = sum(buy_cost_by_outcome.values())
         sell_proceeds = sum(sell_proceeds_by_outcome.values())
         net_cost = buy_cost - sell_proceeds
@@ -1550,12 +1589,14 @@ def reconstruct_closed_positions(
                 "firstBuyWon": first_buy_outcome_index == winner_index if first_buy_outcome_index is not None else None,
                 "soldBeforeResolution": has_material_sell,
                 "twoSidedTrade": two_sided,
+                "materialTwoSided": material_two_sided,
             }
         )
         behavior_by_market[condition_id] = {
             "condition_id": condition_id,
             "sold_before_resolution": has_material_sell,
             "two_sided": two_sided,
+            "material_two_sided": material_two_sided,
             "buy_size_by_outcome": {str(k): round(v, 8) for k, v in sorted(buy_size_by_outcome.items())},
             "sell_size_by_outcome": {str(k): round(v, 8) for k, v in sorted(sell_size_by_outcome.items())},
             "material_sell_size_by_outcome": {
@@ -1604,7 +1645,8 @@ def summarize_trade_reconstructed_positions(
     )
     behavior_market_count = len(behavior_by_market)
     sold_before_resolution_market_count = sum(1 for row in behavior_by_market.values() if row.get("sold_before_resolution"))
-    two_sided_trade_market_count = sum(1 for row in behavior_by_market.values() if row.get("two_sided"))
+    # 钱包级"系统性双边"排除也用 material(与方向胜率口径一致):频繁小对冲不触发,真套利才触发。
+    two_sided_trade_market_count = sum(1 for row in behavior_by_market.values() if row.get("material_two_sided"))
 
     per_type_behavior: dict[str, dict[str, int]] = {}
     per_game_type_behavior: dict[str, dict[str, int]] = {}
@@ -1622,7 +1664,7 @@ def summarize_trade_reconstructed_positions(
         bucket["historical_trade_behavior_market_count"] += 1
         if behavior_row.get("sold_before_resolution"):
             bucket["sold_before_resolution_market_count"] += 1
-        if behavior_row.get("two_sided"):
+        if behavior_row.get("material_two_sided"):
             bucket["two_sided_trade_market_count"] += 1
         game_bucket = per_game_type_behavior.setdefault(
             game_type_key,
@@ -1635,7 +1677,7 @@ def summarize_trade_reconstructed_positions(
         game_bucket["historical_trade_behavior_market_count"] += 1
         if behavior_row.get("sold_before_resolution"):
             game_bucket["sold_before_resolution_market_count"] += 1
-        if behavior_row.get("two_sided"):
+        if behavior_row.get("material_two_sided"):
             game_bucket["two_sided_trade_market_count"] += 1
 
     per_type = dict(summary.get("per_type") or {})
@@ -1749,7 +1791,13 @@ def summarize_historical_trade_behavior(
         if has_material_sell:
             sold_before_resolution_market_count += 1
             bucket["sold_before_resolution_market_count"] += 1
-        if len(traded_outcomes) >= 2:
+        # 实质性双边:买了≥2个结果且少数侧买量占比 ≥ 阈值(对冲/套利),而非单边分批。
+        total_buy = sum(buy_size_by_outcome.values())
+        minority_buy = total_buy - (max(buy_size_by_outcome.values()) if buy_size_by_outcome else 0.0)
+        if (
+            len(buy_size_by_outcome) >= 2 and total_buy > 0
+            and (minority_buy / total_buy) >= MATERIAL_TWO_SIDED_MIN_MINORITY_FRAC
+        ):
             two_sided_trade_market_count += 1
             bucket["two_sided_trade_market_count"] += 1
 
@@ -1858,66 +1906,59 @@ def classify_wallet_bucket(
             "profile_state": "unqualified",
             "reasons": ["bot_like"],
         }
-    if pnl <= 0:
-        return {
-            **summary,
-            "entry_edge": round(entry_edge, 8),
-            "grade": "excluded",
-            "profile_state": "unqualified",
-            "reasons": ["negative_roi"],
-        }
-    # Skill axis: exclude only wallets with no real edge (won no more capital than the
-    # entry price implied). roi is NOT a hard gate — it's a payoff-structure artifact that
-    # penalizes favorite-buyers (high win rate, thin payoff). roi only soft-flags below.
-    if capital_weighted_edge <= 0:
-        return {
-            **summary,
-            "entry_edge": round(entry_edge, 8),
-            "grade": "excluded",
-            "profile_state": "unqualified",
-            "reasons": ["no_capital_edge"],
-        }
-    if count < min_sample:
+    # 注:不按"成交笔数"(high_churn)排除——分批建仓/分批止盈是单边方向性交易,合理。
+    # 真正要排除的双边套利(同时买 A 和 B)已由上面的 two_sided 门槛精准抓住
+    # (two_sided = 买了≥2个不同结果),与成交频率无关。
+    # Copy 轴(单层三条,无 Wilson):点估胜率持续(回测 corr≈0.49),Wilson 的小样本折扣
+    # 只会误杀真专家,故改用"近期加权点估胜率 θ̂ + 有效样本下限 n_eff"。
+    #   θ̂(win_rate) = recency_weighted_win_rate;缺则回退全历史 positive_market_rate。
+    #   n_eff        = effective_sample_size;缺则回退 count。
+    win_rate = to_float(summary.get("recency_weighted_win_rate")) if summary.get("recency_weighted_win_rate") is not None else positive_rate
+    eff_sample = to_float(summary.get("effective_sample_size")) if summary.get("effective_sample_size") is not None else float(count)
+    copy_edge = win_rate - median_entry if median_entry > 0 else None  # 每股期望收益 = 胜率 − 价格
+    in_price_band = ESPORTS_COPY_PRICE_LO <= median_entry <= ESPORTS_COPY_PRICE_HI
+    min_win_rate = ESPORTS_COPY_WIN_RATE_MIN
+    min_edge = ESPORTS_COPY_EDGE_MIN
+    min_eff = ESPORTS_COPY_MIN_EFF_SAMPLE
+
+    if eff_sample < min_eff:
         reasons.append("thin_sample")
-    if total_bought < 1_000:
-        reasons.append("low_volume")
-    if median_entry <= 0 or median_entry > 0.68:
-        reasons.append("weak_entry_price")
+    if not in_price_band:
+        reasons.append("price_out_of_band")
     if loss_count > 0:
         reasons.append("has_losses")
-    if wilson_lb < min_a_wilson:
-        reasons.append("weak_wilson")
-    if edge_value < min_a_edge:
-        reasons.append(weak_edge_reason)
-    if positive_rate < MIN_A_POSITIVE_MARKET_RATE:
-        reasons.append("low_positive_market_rate")
-    if median_roi < 0 or positive_rate < 0.5:
-        reasons.append("unstable_returns")
+    if win_rate < min_win_rate:
+        reasons.append("low_win_rate")
+    if copy_edge is None or copy_edge < min_edge:
+        reasons.append("weak_copy_edge")
+    if pnl <= 0:
+        reasons.append("negative_pnl")  # 软：目标自己亏钱(常因把大注押在输的盘),与我们无关
+    if capital_weighted_edge <= 0:
+        reasons.append(weak_edge_reason)  # 软
     if historical_roi < min_roi:
         reasons.append("low_roi")  # soft/informational only — not an exclusion
     if actual_minus_hold_rate > SWING_DEPENDENT_RATE:
         reasons.append("swing_dependent")  # profit leans on in-game selling we can't copy
 
+    if total_bought < 1_000:
+        reasons.append("low_volume")
+    edge_ok = copy_edge is not None
     if (
-        count >= min_sample
-        and wilson_lb >= min_a_wilson
-        and edge_value >= min_a_edge
-        and pnl > 0
-        and positive_rate >= MIN_A_POSITIVE_MARKET_RATE
-        and total_bought >= 5_000
-        and 0 < median_entry <= 0.68
+        eff_sample >= min_eff
+        and in_price_band
+        and win_rate >= min_win_rate
+        and edge_ok and copy_edge >= min_edge
+        and total_bought >= 1_000
         and not stale
         and bot_score < 40
     ):
         grade = "A"
     elif (
-        count >= min_sample
-        and wilson_lb >= 0.50
-        and edge_value >= 0.0
-        and pnl > 0
-        and positive_rate >= MIN_B_POSITIVE_MARKET_RATE
+        eff_sample >= min_eff
+        and in_price_band
+        and win_rate >= (min_win_rate - 0.05)
+        and edge_ok and copy_edge >= (min_edge - 0.04)
         and total_bought >= 1_000
-        and 0 < median_entry <= 0.68
         and not stale
         and bot_score < 50
     ):
@@ -1927,7 +1968,16 @@ def classify_wallet_bucket(
     else:
         grade = "C"
     state = "qualified" if grade in {"A", "B"} else "stale" if grade == "stale" else "unqualified"
-    return {**summary, "entry_edge": round(entry_edge, 8), "grade": grade, "profile_state": state, "reasons": reasons}
+    return {
+        **summary,
+        "entry_edge": round(entry_edge, 8),
+        "bucket_win_rate": round(win_rate, 8),                       # θ̂ 近期加权点估胜率
+        "bucket_eff_sample": round(eff_sample, 4),                   # n_eff 有效样本
+        "bucket_copy_edge": round(copy_edge, 8) if copy_edge is not None else None,  # 胜率 − 价格
+        "grade": grade,
+        "profile_state": state,
+        "reasons": reasons,
+    }
 
 
 def wallet_bucket_min_sample(category: str, market_type: str) -> int:
@@ -1936,41 +1986,6 @@ def wallet_bucket_min_sample(category: str, market_type: str) -> int:
     if str(market_type or MAIN_MATCH) == MAIN_MATCH:
         return ESPORTS_MAIN_MATCH_MIN_SAMPLE
     return ESPORTS_SUBMARKET_MIN_SAMPLE
-
-
-def emerging_bucket_reject_reasons(summary: dict[str, Any]) -> list[str]:
-    if str(summary.get("category") or "").lower() == "sports":
-        return ["emerging_non_esports"]
-    reasons: list[str] = []
-    if to_int(summary.get("recent_7d_market_count")) < ESPORTS_EMERGING_RECENT_7D_MIN_MARKETS:
-        reasons.append("emerging_recent_count_lt_min")
-    if to_float(summary.get("recent_7d_positive_rate")) < ESPORTS_EMERGING_RECENT_7D_MIN_POSITIVE_RATE:
-        reasons.append("emerging_recent_win_rate_lt_min")
-    if to_float(summary.get("recent_7d_roi")) < ESPORTS_EMERGING_RECENT_7D_MIN_ROI:
-        reasons.append("emerging_recent_roi_lt_min")
-    if to_float(summary.get("wilson_win_rate_lower_bound")) < ESPORTS_EMERGING_MIN_WILSON:
-        reasons.append("emerging_wilson_lt_min")
-    if to_float(summary.get("capital_weighted_edge")) < ESPORTS_EMERGING_MIN_CAPITAL_WEIGHTED_EDGE:
-        reasons.append("emerging_capital_edge_lt_min")
-    median_entry = to_float(summary.get("median_entry_price"))
-    if median_entry <= 0 or median_entry > ESPORTS_EMERGING_MAX_MEDIAN_ENTRY_PRICE:
-        reasons.append("emerging_median_entry_gt_max")
-    if to_float(summary.get("actual_minus_hold_pnl_rate")) > SWING_DEPENDENT_RATE:
-        reasons.append("emerging_swing_dependent")
-    if to_int(summary.get("bot_like_score")) >= 40:
-        reasons.append("emerging_bot_like")
-    behavior_market_count = to_int(summary.get("historical_trade_behavior_market_count"))
-    if (
-        to_int(summary.get("two_sided_trade_market_count")) > 0
-        and behavior_market_count >= TRADE_BEHAVIOR_MIN_MARKETS
-        and to_float(summary.get("two_sided_trade_market_rate")) > TRADE_BEHAVIOR_EXCLUDE_RATE
-    ):
-        reasons.append("emerging_systemic_two_sided")
-    high_churn_count = to_int(summary.get("high_churn_market_count"))
-    market_count = to_int(summary.get("participated_market_count")) or to_int(summary.get("esports_closed_count"))
-    if market_count > 0 and high_churn_count / market_count > MAX_HIGH_CHURN_MARKET_RATE:
-        reasons.append("emerging_high_churn")
-    return sorted(set(reasons))
 
 
 def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> dict[str, Any]:
@@ -2029,13 +2044,6 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
             bucket_classified["eligible_mode"] = "mature"
             eligible_market_types.append(market_type)
             eligible_market_type_modes[market_type] = "mature"
-        else:
-            emerging_reasons = emerging_bucket_reject_reasons(bucket_input)
-            bucket_classified["emerging_reject_reasons"] = emerging_reasons
-            if not emerging_reasons:
-                bucket_classified["eligible_mode"] = "emerging"
-                eligible_market_types.append(market_type)
-                eligible_market_type_modes[market_type] = "emerging"
         bucket_rank = grade_rank.get(str(bucket_classified.get("grade")), 0)
         if bucket_rank > best_rank:
             best_grade = bucket_classified.get("grade")
@@ -2096,13 +2104,6 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
                 bucket_classified["eligible_mode"] = "mature"
                 eligible_buckets.append(key)
                 eligible_bucket_modes[key] = "mature"
-            else:
-                emerging_reasons = emerging_bucket_reject_reasons(bucket_input)
-                bucket_classified["emerging_reject_reasons"] = emerging_reasons
-                if not emerging_reasons:
-                    bucket_classified["eligible_mode"] = "emerging"
-                    eligible_buckets.append(key)
-                    eligible_bucket_modes[key] = "emerging"
             bucket_rank = grade_rank.get(str(bucket_classified.get("grade")), 0)
             if bucket_rank > best_rank:
                 best_grade = bucket_classified.get("grade")

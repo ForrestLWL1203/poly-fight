@@ -9,7 +9,8 @@ from .core import to_float, to_int
 
 DEFAULT_FOLLOW_STRATEGY_SCHEMA_VERSION = 1
 ACTIVE_FOLLOW_STRATEGY_ID = "active"
-DEFAULT_MAX_FOLLOW_ENTRY_PRICE = 0.85   # 现价上限默认(0 = 不限)
+DEFAULT_MAX_FOLLOW_ENTRY_PRICE = 0.68   # 现价上限默认(0 = 不限);与评分价格带上界对齐
+DEFAULT_FIXED_STAKE_USDC = 1.0          # 固定注默认每信号金额
 
 
 def _finite_positive(value: Any) -> bool:
@@ -33,12 +34,14 @@ def default_follow_strategy(*, balance_usdc: float | None = None) -> dict[str, A
         # (每 2h 发现新钱包 + 放回冷却到期的隔离钱包 + 增量更新榜单)。
         # 作为策略字段持久化,运行中不可改。
         "realtime_refresh": False,
+        # 默认固定注:我们按自己定额下单,不抄目标钱包的仓位大小(proportional 会放大他的
+        # 大注 → 等同跟着赌)。proportional/balance_percent 仍可选,但不再是默认。
         "stake_sizing": {
-            "mode": "proportional",
+            "mode": "fixed",
             "ratio_percent": 10.0,
             "per_order_cap_enabled": False,
             "per_order_cap_usdc": 0.0,
-            "fixed_usdc": 0.0,
+            "fixed_usdc": DEFAULT_FIXED_STAKE_USDC,
             "balance_percent": 0.0,
         },
         "prefilters": {

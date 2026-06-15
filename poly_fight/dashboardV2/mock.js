@@ -205,16 +205,16 @@
   /* ---- strategy / runner / health ---- */
   let strategy = {
     configured: true, schema_version: 1, updated_at: ago(600),
-    stake_sizing: { mode: "proportional", ratio_percent: 10, per_order_cap_enabled: true, per_order_cap_usdc: 100, fixed_usdc: 50, balance_percent: 1 },
-    prefilters: { min_target_wallet_order_cash_usdc: 10 },
+    stake_sizing: { mode: "fixed", ratio_percent: 10, per_order_cap_enabled: false, per_order_cap_usdc: 0, fixed_usdc: 1, balance_percent: 1 },
+    prefilters: { min_target_wallet_order_cash_usdc: 10, max_follow_entry_price: 0.68 },
     condition_limits: { order_count_mode: "condition", max_orders: 10, stake_cap_mode: "fixed", stake_cap_usdc: 200, stake_cap_balance_percent: 5 },
     balance: { required: true, usable_balance_usdc: 5000 },
   };
   /* ---- named strategy library (stateful: create/update/activate/delete) ---- */
   const mkStrat = (over) => Object.assign({
     configured: true, schema_version: 1, updated_at: ago(600),
-    stake_sizing: { mode: "proportional", ratio_percent: 10, per_order_cap_enabled: true, per_order_cap_usdc: 100, fixed_usdc: 50, balance_percent: 1 },
-    prefilters: { min_target_wallet_order_cash_usdc: 10 },
+    stake_sizing: { mode: "fixed", ratio_percent: 10, per_order_cap_enabled: false, per_order_cap_usdc: 0, fixed_usdc: 1, balance_percent: 1 },
+    prefilters: { min_target_wallet_order_cash_usdc: 10, max_follow_entry_price: 0.68 },
     condition_limits: { order_count_mode: "condition", max_orders: 10, stake_cap_mode: "fixed", stake_cap_usdc: 200, stake_cap_balance_percent: 5 },
     balance: { required: true, usable_balance_usdc: 5000 },
   }, over || {});

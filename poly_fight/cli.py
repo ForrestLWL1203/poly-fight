@@ -278,26 +278,19 @@ MOMENTUM_MAX_TWO_SIDED_RATE = 0.05
 # --- collect-v2 全新 actual 口径选择门(不继承 V1 老门;见 review/collector-v2-plan.md 附录 C/D)---
 # V2 跟两类钱包:单向(押对+持有到结算)与技术型(低买弱势方、盘中短涨清仓),两类都要求场均 ROI 足够高。
 # 评分基准为 actual(实际进出场),故这些阈值读到的 pnl/roi/胜率均为 actual 口径。
-# 风控门(短跟单窗口下,高胜率=低方差,优先于长期 EV;二元市场买入价=盈亏平衡胜率)。
-V2_MIN_DIRECTIONAL_ROI = 0.10      # 单向型 aggregate actual ROI(总盈亏/总成本)≥ 0.10;真实 +EV(magnitude-aware)
-V2_MIN_TECHNICAL_ROI = 0.15        # 技术型 aggregate actual ROI ≥ 0.15;出场难复制,留跟单滑点余地
-V2_MIN_ACTUAL_PNL = 100.0          # 总 actual PnL ≥ $100;补杀"赚几十刀"的残渣
-V2_MIN_AVG_MARKET_CASH = 300.0     # 单场均额 ≥ $300;温和挡微注,保留"小而精"
-V2_MIN_POSITIVE_RATE = 0.75        # actual 盈利市场率 ≥ 0.75;短窗口最大化胜率(网格回测后定,~56个钱包)
-V2_MAX_MEDIAN_ENTRY = 0.65         # 买入价上限 ≤ 0.65;防"买热门胜率虚高但一亏全损"的负EV,强制低价买赢家
-V2_MIN_WILSON = 0.50               # actual 胜率 Wilson 下界 ≥ 0.50;小样本防运气
-V2_MIN_RECENT_MARKETS = 3          # 近14天达此样本数才复检近期战绩(否则只靠 inactive 门)
-V2_MAX_TWO_SIDED_RATE = 0.20       # 双边市场率 ≤ 0.20(实证空谷,降噪;edge 无关)
+# 钱包级硬排除门(逐桶质量门已统一到 classify_wallet_bucket 的新三条,见 core.py;
+# 原 v2_bucket_gate 的 Wilson/ROI/PnL/positive_rate/entry 门已随该函数删除)。
+V2_MAX_TWO_SIDED_RATE = 0.20       # material 双边市场率 ≤ 0.20(实证空谷,降噪;edge 无关)
 V2_MAX_BOT_SCORE = 70              # bot 评分硬排除阈
 V2_MAX_TAIL_ENTRY_RATE = 0.25      # 尾盘追高市场占比 ≤ 0.25
-V2_MAX_INACTIVE_DAYS = 14          # 逐桶门:该盘口桶近 14 天内有 scoped 交易
 # 钱包级硬门:最后一笔(scoped)交易超过这么多小时 → 直接不入榜(比逐桶 14 天门紧得多)。
 # 跟单要钱包当下活跃;沉寂 >72h 的不再上榜(collector 发现 + observer 重评共用)。
 V2_MAX_LEADERBOARD_IDLE_HOURS = 72
 V2_PER_GAME_QUOTA = 0              # 0 = 不设每游戏上限(榜单=全部够格);>0 时才强制每游戏封顶
 V2_MAX_LEADERBOARD_WALLETS = 200   # 仅作安全上限(质量门已把关,大小不重要)
 # 技术型(低买高卖/靠出场)默认不纳入:占比极低 + 我们 follow 延迟高跟不准卖点,风险大。
-# 路径保留(--v2-include-technical 可一键开回),scoring_basis 仍用 actual(单向卖0.99回收也算得准)。
+# 路径保留(--v2-include-technical 可一键开回)。scoring_basis 用 hold(方向正确性):
+# 技术型方向常错 → hold 口径下算亏损,自然出局,与"复制方向"一致。
 V2_INCLUDE_TECHNICAL = False
 # 榜单只发 grade-A(= 有 ≥1 个 A 级桶 = follow 实际跟单的集合)。B 档不跟单 → 不上榜、不展示,
 # 但仍保留在内部 profiles 池里(observe-v2 去重必需 + 保留 B→A 晋升路径)。
@@ -2507,15 +2500,8 @@ def _with_esports_followable_market_types(profile: dict[str, Any]) -> dict[str, 
             game_family, _market_type = split_bucket_key(key)
             if game_family and game_family not in ALLOWED_GAME_FAMILIES:
                 continue
-            metrics = dict(profile)
-            if isinstance(per_game_type.get(key), dict):
-                metrics.update(per_game_type[key])
-            if isinstance(per_game_type_grades.get(key), dict):
-                metrics.update(per_game_type_grades[key])
-            if _esports_followable_roi(metrics) < ESPORTS_LEADERBOARD_MIN_TYPE_ROI:
-                continue
-            if _followable_capital_edge(metrics) < ESPORTS_LEADERBOARD_MIN_TYPE_CAPITAL_EDGE:
-                continue
+            # 不再用美元 ROI / 资金加权边际二次过滤:评分层的胜率(θ̂≥0.58)+ edge(θ̂−价格≥0.06)
+            # 已是质量护栏。ROI 门槛会把"高胜率但因 sizing 亏/买热门 ROI 低"的钱包再次误杀。
             followable_buckets.append(key)
         if not followable_buckets:
             return None
@@ -2549,26 +2535,11 @@ def _with_esports_followable_market_types(profile: dict[str, Any]) -> dict[str, 
             }
         return filtered
     if not eligible_market_types:
-        if _esports_followable_roi(profile) < ESPORTS_LEADERBOARD_MIN_TYPE_ROI:
-            return None
-        if _followable_capital_edge(profile) < ESPORTS_LEADERBOARD_MIN_TYPE_CAPITAL_EDGE:
-            return None
         return profile
 
-    per_type = profile.get("per_type") if isinstance(profile.get("per_type"), dict) else {}
+    # legacy per_type 路径:同样不再用美元轴二次过滤(评分层已守住)。
     per_type_grades = profile.get("per_type_grades") if isinstance(profile.get("per_type_grades"), dict) else {}
-    followable_types = []
-    for market_type in eligible_market_types:
-        metrics = dict(profile)
-        if isinstance(per_type.get(market_type), dict):
-            metrics.update(per_type[market_type])
-        if isinstance(per_type_grades.get(market_type), dict):
-            metrics.update(per_type_grades[market_type])
-        if _esports_followable_roi(metrics) < ESPORTS_LEADERBOARD_MIN_TYPE_ROI:
-            continue
-        if _followable_capital_edge(metrics) < ESPORTS_LEADERBOARD_MIN_TYPE_CAPITAL_EDGE:
-            continue
-        followable_types.append(market_type)
+    followable_types = list(eligible_market_types)
     if not followable_types:
         return None
     if followable_types == eligible_market_types:
@@ -4602,79 +4573,6 @@ def _v2_candidate_metric(profile: dict[str, Any], key: str) -> Any:
     return candidate.get(key)
 
 
-def v2_bucket_gate(
-    metrics: dict[str, Any],
-    market_type: str,
-    *,
-    now_ts: int,
-    wallet_tail_rate: float = 0.0,
-    min_directional_roi: float = V2_MIN_DIRECTIONAL_ROI,
-    min_technical_roi: float = V2_MIN_TECHNICAL_ROI,
-    min_actual_pnl: float = V2_MIN_ACTUAL_PNL,
-    min_avg_market_cash: float = V2_MIN_AVG_MARKET_CASH,
-    min_positive_rate: float = V2_MIN_POSITIVE_RATE,
-    max_median_entry: float = V2_MAX_MEDIAN_ENTRY,
-    min_wilson: float = V2_MIN_WILSON,
-    min_recent_markets: int = V2_MIN_RECENT_MARKETS,
-    max_tail_entry_rate: float = V2_MAX_TAIL_ENTRY_RATE,
-    max_inactive_days: int = V2_MAX_INACTIVE_DAYS,
-) -> list[str]:
-    """V2 逐 game×market_type 桶的 actual 口径风控门。专精评估:钱包在某盘口够格即合格。
-
-    风控原则(短跟单窗口,方差优先于长期 EV):
-      - 高胜率(盈利市场率 ≥ 0.75,两类通用;技术型=盈利出场率)→ 短窗口少踩连败
-      - 买入价上限(median ≤ 0.65)→ 防"买热门胜率虚高但负EV",强制低价买赢家
-      - aggregate ROI(总盈亏/总成本)→ 真实 +EV,堵临界负EV(中位ROI会被热门骗过);技术型更高
-      - 近 14 天用同样的胜率+ROI 标准复检 → 近期手冷不跟
-    样本下限按盘口:主赛 6 / 子盘 3。
-    """
-    reasons: list[str] = []
-    closed = to_int(metrics.get("esports_closed_count"))
-    min_closed = 6 if str(market_type) == MAIN_MATCH else 3
-    if closed < min_closed:
-        reasons.append("thin_sample")
-    is_technical = classify_edge_type(metrics) == "technical"
-    min_aggregate_roi = min_technical_roi if is_technical else min_directional_roi
-    # 胜率(方差安全,两类通用)
-    if to_float(metrics.get("positive_market_rate")) < min_positive_rate:
-        reasons.append("low_positive_rate")
-    # 买入价上限(防热门负EV;技术型买冷门自动过)
-    median_entry = to_float(metrics.get("median_entry_price"))
-    if median_entry <= 0 or median_entry > max_median_entry:
-        reasons.append("entry_too_high")
-    # aggregate ROI(总盈亏/总成本):真实 +EV,magnitude-aware(中位ROI在高胜率门下从不触发,故已删)
-    if to_float(metrics.get("esports_roi")) < min_aggregate_roi:
-        reasons.append("low_aggregate_roi")
-    if to_float(metrics.get("wilson_win_rate_lower_bound")) < min_wilson:
-        reasons.append("low_wilson")
-    if to_float(metrics.get("esports_realized_pnl")) < min_actual_pnl:
-        reasons.append("low_actual_pnl")
-    bucket_avg_cash = to_float(metrics.get("esports_total_cost")) / closed if closed else 0.0
-    if bucket_avg_cash < min_avg_market_cash:
-        reasons.append("low_avg_market_cash")
-    if wallet_tail_rate > max_tail_entry_rate:
-        reasons.append("tail_entry_over_limit")
-    # 活跃 + 近 14 天同标准复检(样本足够时)
-    last_trade = to_int(metrics.get("last_esports_trade_at"))
-    if last_trade <= 0 or (now_ts - last_trade) > max_inactive_days * 86400:
-        reasons.append("inactive")
-    if to_int(metrics.get("recent_14d_market_count")) >= min_recent_markets:
-        if to_float(metrics.get("recent_14d_positive_rate")) < min_positive_rate:
-            reasons.append("recent_low_positive_rate")
-        if to_float(metrics.get("recent_14d_roi")) < min_aggregate_roi:
-            reasons.append("recent_low_roi")
-    return reasons
-
-
-def v2_rank_score(profile: dict[str, Any]) -> tuple[Any, ...]:
-    """V2 排序键(降序优先):actual 胜率 Wilson → 场均 ROI → actual PnL。"""
-    return (
-        to_float(profile.get("wilson_win_rate_lower_bound")),
-        to_float(profile.get("median_market_roi")),
-        to_float(profile.get("esports_realized_pnl")),
-    )
-
-
 _V2_GRADE_RANK = {"a": 4, "b": 3, "stale": 2, "c": 1}
 
 
@@ -4699,15 +4597,12 @@ def build_collector_leaderboard_v2(
     copyable / recent_health。
     """
     gate_kwargs = gate_kwargs or {}
-    # bot / 系统性双边 / 沉寂超时是钱包级硬排除;其余是逐桶质量门。
+    # 钱包级硬排除:bot / 系统性 material 双边 / 沉寂超时 / 尾盘进场过多(跟单跟不准)。
+    # 逐桶质量门已统一到 classify_wallet_bucket 的逐桶 A(新三条),不再有独立的 v2_bucket_gate。
     max_two_sided_rate = float(gate_kwargs.get("max_two_sided_rate", V2_MAX_TWO_SIDED_RATE))
     max_bot_score = int(gate_kwargs.get("max_bot_score", V2_MAX_BOT_SCORE))
     max_idle_hours = int(gate_kwargs.get("max_idle_hours", V2_MAX_LEADERBOARD_IDLE_HOURS))
-    bucket_gate_kwargs = {
-        key: value
-        for key, value in gate_kwargs.items()
-        if key not in ("max_two_sided_rate", "max_bot_score", "max_idle_hours", "min_closed")
-    }
+    max_tail_entry_rate = float(gate_kwargs.get("max_tail_entry_rate", V2_MAX_TAIL_ENTRY_RATE))
     qualified: list[dict[str, Any]] = []
     rejected_counts: dict[str, int] = {}
     for wallet, profile in profiles_by_wallet.items():
@@ -4735,11 +4630,14 @@ def build_collector_leaderboard_v2(
         wallet_tail_rate = (
             to_int(_v2_candidate_metric(profile, "tail_entry_market_count")) / participated if participated > 0 else 0.0
         )
-        # 逐 game×market_type 桶评估专精方向
-        per_game_type = profile.get("per_game_type") if isinstance(profile.get("per_game_type"), dict) else {}
+        if max_tail_entry_rate > 0 and wallet_tail_rate > max_tail_entry_rate:
+            rejected_counts["tail_entry_over_limit"] = rejected_counts.get("tail_entry_over_limit", 0) + 1
+            continue
+        # 逐桶 = classify_wallet_bucket 已算好的逐桶 A(θ̂≥0.58 + n_eff≥10 + edge,非 esports/别桶已隔离)。
+        per_game_type_grades = profile.get("per_game_type_grades") if isinstance(profile.get("per_game_type_grades"), dict) else {}
         eligible: list[dict[str, Any]] = []
-        for bucket_key, metrics in per_game_type.items():
-            if not isinstance(metrics, dict):
+        for bucket_key, metrics in per_game_type_grades.items():
+            if not isinstance(metrics, dict) or _v2_grade_rank(metrics.get("grade")) < _v2_grade_rank(min_grade):
                 continue
             game_family, market_type = split_bucket_key(bucket_key)
             bucket_edge = classify_edge_type(metrics)
@@ -4747,28 +4645,23 @@ def build_collector_leaderboard_v2(
             if not include_technical and bucket_edge == "technical":
                 rejected_counts["technical_excluded"] = rejected_counts.get("technical_excluded", 0) + 1
                 continue
-            reasons = v2_bucket_gate(
-                metrics, market_type, now_ts=now_ts, wallet_tail_rate=wallet_tail_rate, **bucket_gate_kwargs
-            )
-            if reasons:
-                for reason in reasons:
-                    rejected_counts[reason] = rejected_counts.get(reason, 0) + 1
-                continue
             eligible.append(
                 {
                     "bucket_key": bucket_key,
                     "game_family": str(game_family or "unknown"),
                     "market_type": str(market_type),
                     "edge_type": bucket_edge,
-                    "median_market_roi": round(to_float(metrics.get("median_market_roi")), 6),
+                    "win_rate": round(to_float(metrics.get("bucket_win_rate")), 6),
+                    "copy_edge": round(to_float(metrics.get("bucket_copy_edge")), 6),
+                    "eff_sample": round(to_float(metrics.get("bucket_eff_sample")), 4),
+                    "median_entry_price": round(to_float(metrics.get("median_entry_price")), 6),
                     "positive_market_rate": round(to_float(metrics.get("positive_market_rate")), 6),
-                    "wilson_win_rate_lower_bound": round(to_float(metrics.get("wilson_win_rate_lower_bound")), 6),
-                    "esports_realized_pnl": round(to_float(metrics.get("esports_realized_pnl")), 4),
                     "esports_closed_count": to_int(metrics.get("esports_closed_count")),
+                    # 主桶排序:活跃度(有效样本)→ copy-edge(能赚)→ 近期加权胜率
                     "rank_score": (
-                        to_float(metrics.get("wilson_win_rate_lower_bound")),
-                        to_float(metrics.get("median_market_roi")),
-                        to_float(metrics.get("esports_realized_pnl")),
+                        to_float(metrics.get("bucket_eff_sample")),
+                        to_float(metrics.get("bucket_copy_edge")),
+                        to_float(metrics.get("bucket_win_rate")),
                     ),
                 }
             )
@@ -4824,17 +4717,9 @@ def build_collector_leaderboard_v2(
 
 
 def _v2_gate_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    # 仅钱包级硬排除门(逐桶质量统一走 classify_wallet_bucket)。
     return {
-        "min_directional_roi": float(getattr(args, "v2_min_directional_roi", V2_MIN_DIRECTIONAL_ROI)),
-        "min_technical_roi": float(getattr(args, "v2_min_technical_roi", V2_MIN_TECHNICAL_ROI)),
-        "min_actual_pnl": float(getattr(args, "v2_min_actual_pnl", V2_MIN_ACTUAL_PNL)),
-        "min_avg_market_cash": float(getattr(args, "v2_min_avg_market_cash", V2_MIN_AVG_MARKET_CASH)),
-        "min_positive_rate": float(getattr(args, "v2_min_positive_rate", V2_MIN_POSITIVE_RATE)),
-        "max_median_entry": float(getattr(args, "v2_max_median_entry", V2_MAX_MEDIAN_ENTRY)),
-        "min_wilson": float(getattr(args, "v2_min_wilson", V2_MIN_WILSON)),
-        "min_recent_markets": int(getattr(args, "v2_min_recent_markets", V2_MIN_RECENT_MARKETS)),
         "max_tail_entry_rate": float(getattr(args, "v2_max_tail_entry_rate", V2_MAX_TAIL_ENTRY_RATE)),
-        "max_inactive_days": int(getattr(args, "v2_max_inactive_days", V2_MAX_INACTIVE_DAYS)),
         "max_two_sided_rate": float(getattr(args, "v2_max_two_sided_rate", V2_MAX_TWO_SIDED_RATE)),
         "max_bot_score": int(getattr(args, "v2_max_bot_score", V2_MAX_BOT_SCORE)),
         "max_idle_hours": int(getattr(args, "max_leaderboard_idle_hours", V2_MAX_LEADERBOARD_IDLE_HOURS)),
@@ -4882,9 +4767,11 @@ def _command_collect_wallets(
     *,
     variant: str = "v2",
 ) -> int:
-    # collect-v2 是唯一管线 —— 双侧发现 + actual 口径打分 + V2 导出门 + 每游戏配额,
+    # collect-v2 是唯一管线 —— 双侧发现 + hold 口径打分 + V2 导出门 + 每游戏配额,
     # 产出隔离到 collector_v2_* / leaderboard_v2.db。
-    scoring_basis = "actual"
+    # hold 口径 = 按"方向是否猜对(持有到结算)"算胜率/ROI:技术型(靠出场盈利、方向常错)
+    # 自然被算成亏损而出局,与我们"复制方向、跟随卖出"的策略一致。提前卖出是执行层的事。
+    scoring_basis = "hold"
     include_losing_side = True
     client = client or build_client(args)
     output_dir = resolve_collector_output_dir(args) / "collector_v2"
@@ -5463,7 +5350,7 @@ def rescore_demote_wallets(
             condition_game_family_by_id=condition_game_family_by_id,
             user_trades_loader=lambda _w: trades,
             current_positions_loader=lambda _w: [],
-            now_ts=now_ts, scoring_basis="actual",
+            now_ts=now_ts, scoring_basis="hold",
         )
         return {**profile, "profile_lookback_days": profile_lookback_days, "observed_at": now_ts}
 
@@ -5601,7 +5488,7 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
             condition_game_family_by_id=condition_game_family_by_id,
             user_trades_loader=lambda _w: trades,
             current_positions_loader=lambda _w: [],
-            now_ts=now_ts, scoring_basis="actual",
+            now_ts=now_ts, scoring_basis="hold",
         )
         # observed_at:M4 发现并打分的时间 → dashboard 据此显示 2h "new" 标记
         return {**profile, "profile_lookback_days": profile_lookback_days, "seed": collector_seed_payload(seed_wallet), "observed_at": now_ts}
@@ -6903,19 +6790,10 @@ def build_parser() -> argparse.ArgumentParser:
     collect.set_defaults(func=command_collect)
 
     def add_collector_v2_arguments(subparser: argparse.ArgumentParser) -> None:
-        # V2 actual 口径选择门(都可调;默认见 cli 顶部 V2_* 常量)。
-        subparser.add_argument("--v2-min-directional-roi", type=float, default=V2_MIN_DIRECTIONAL_ROI)
-        subparser.add_argument("--v2-min-technical-roi", type=float, default=V2_MIN_TECHNICAL_ROI)
-        subparser.add_argument("--v2-min-actual-pnl", type=float, default=V2_MIN_ACTUAL_PNL)
-        subparser.add_argument("--v2-min-avg-market-cash", type=float, default=V2_MIN_AVG_MARKET_CASH)
-        subparser.add_argument("--v2-min-positive-rate", type=float, default=V2_MIN_POSITIVE_RATE)
-        subparser.add_argument("--v2-max-median-entry", type=float, default=V2_MAX_MEDIAN_ENTRY)
-        subparser.add_argument("--v2-min-wilson", type=float, default=V2_MIN_WILSON)
-        subparser.add_argument("--v2-min-recent-markets", type=int, default=V2_MIN_RECENT_MARKETS)
+        # V2 钱包级硬排除门(逐桶质量统一走 classify_wallet_bucket,不再有逐桶 ROI/Wilson 参数)。
         subparser.add_argument("--v2-max-two-sided-rate", type=float, default=V2_MAX_TWO_SIDED_RATE)
         subparser.add_argument("--v2-max-bot-score", type=int, default=V2_MAX_BOT_SCORE)
         subparser.add_argument("--v2-max-tail-entry-rate", type=float, default=V2_MAX_TAIL_ENTRY_RATE)
-        subparser.add_argument("--v2-max-inactive-days", type=int, default=V2_MAX_INACTIVE_DAYS)
         # 钱包级硬门:最后一笔交易超过这么多小时 → 不入榜(默认 72h;<=0 关闭)。
         subparser.add_argument("--max-leaderboard-idle-hours", type=int, default=V2_MAX_LEADERBOARD_IDLE_HOURS)
         subparser.add_argument("--v2-per-game-quota", type=int, default=V2_PER_GAME_QUOTA)

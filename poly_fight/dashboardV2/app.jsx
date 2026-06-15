@@ -999,7 +999,13 @@ function StrategyEditor({ s, up, wallet, locked }) {
         <div className="cfg-head"><h3>单笔跟单金额</h3><Badge tone="up" outline>必填</Badge></div>
         <p className="cfg-sub">每个有效信号买入多少 · 三选一，金额向下取整规避下单异常</p>
         <div className="opt-list">
-          <SizingOption id="ratio" active={s.sizing === "ratio"} onSelect={up("sizing")} title="按目标比例" desc="跟随目标钱包买入额的固定比例">
+          <SizingOption id="fixed" active={s.sizing === "fixed"} onSelect={up("sizing")} title="固定金额（推荐）" desc="每笔买入固定金额，与目标下单额无关 · 稳定、不抄对方仓位">
+            <div className="ctrl-row"><NumField value={s.fixed} onChange={up("fixed")} unit="USDC" lead="每笔买入" /></div>
+          </SizingOption>
+          <SizingOption id="balancePct" active={s.sizing === "balancePct"} onSelect={up("sizing")} title="按本金百分比" desc="按当前可动用余额的百分比动态买入">
+            <div className="ctrl-row"><NumField value={s.balancePct} onChange={up("balancePct")} unit="%" lead="每笔占用" /></div>
+          </SizingOption>
+          <SizingOption id="ratio" active={s.sizing === "ratio"} onSelect={up("sizing")} title="按目标比例" desc="跟随目标钱包买入额的固定比例 · 会放大其大注，等同跟着赌，谨慎">
             <div className="ratio-rows">
               <span className="rr-lead"><span className="rr-check-slot"></span>跟单比例</span>
               <NumField value={s.ratio} onChange={up("ratio")} unit="%" width={56} />
@@ -1008,12 +1014,6 @@ function StrategyEditor({ s, up, wallet, locked }) {
               </label>
               <NumField value={s.ratioCap} onChange={up("ratioCap")} unit="USDC" width={56} disabled={!s.ratioCapOn} />
             </div>
-          </SizingOption>
-          <SizingOption id="fixed" active={s.sizing === "fixed"} onSelect={up("sizing")} title="固定金额" desc="每笔买入固定金额，与目标下单额无关">
-            <div className="ctrl-row"><NumField value={s.fixed} onChange={up("fixed")} unit="USDC" lead="每笔买入" /></div>
-          </SizingOption>
-          <SizingOption id="balancePct" active={s.sizing === "balancePct"} onSelect={up("sizing")} title="按本金百分比" desc="按当前可动用余额的百分比动态买入">
-            <div className="ctrl-row"><NumField value={s.balancePct} onChange={up("balancePct")} unit="%" lead="每笔占用" /></div>
           </SizingOption>
         </div>
       </div>

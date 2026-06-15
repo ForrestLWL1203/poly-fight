@@ -205,6 +205,91 @@ def paper_exit_pnl(entry_price: float, exit_price: float, stake: float) -> float
     return round(stake * (exit_price - entry_price) / entry_price, 8)
 
 
+# 跟卖最小下单额(Polymarket ~$1)。等比例算出的卖额小于此 → 凑到 $1;
+# 若卖完后剩余 < $1(无法再单独成单的 dust)→ 一刀切全平。
+MIN_FOLLOW_SELL_USDC = 1.0
+
+
+def _signal_total_stake(signal: dict[str, Any]) -> float:
+    return sum(leg_actual_stake(leg) for leg in signal.get("legs") or [])
+
+
+def _signal_full_exit_pnl(signal: dict[str, Any], exit_price: float, *, hypothetical: bool = False) -> float:
+    stake_fn = leg_hypothetical_stake if hypothetical else leg_actual_stake
+    return sum(
+        paper_exit_pnl(to_float(leg.get("our_entry_price")), exit_price, stake_fn(leg))
+        for leg in signal.get("legs") or []
+    )
+
+
+def apply_follow_sell(signal: dict[str, Any], trade: dict[str, Any], exit_price: float, now_ts: int) -> str:
+    """目标卖出 → 我们按"占总仓比例"同步平仓,返回 "exited" / "partial" / "hold"。
+
+    等比例:目标累计卖出占仓 wf → 我们目标也卖到 wf。受 $1 最小下单约束,
+    比例还没攒够 $1 就等("hold");卖了之后剩余会成 dust(<$1)就一刀切全平。
+    记 our_sold_fraction、our_partial_exit_pnl(各次按盘口现价实现);余量留到结算。
+    """
+    sold_before = to_float(signal.get("wallet_sell_size"))
+    signal["wallet_sell_size"] = round(sold_before + trade_size(trade), 8)
+    signal.setdefault("behavior_events", []).append(_behavior_event("sell", trade))
+
+    bought = sum(to_float(leg.get("wallet_trade_size")) for leg in signal.get("legs") or [])
+    wallet_sold_frac = min(1.0, to_float(signal.get("wallet_sell_size")) / bought) if bought > 0 else 1.0
+    sold_frac = to_float(signal.get("our_sold_fraction"))
+    total_stake = _signal_total_stake(signal)
+
+    if total_stake <= 0:
+        # 未注资(纯研究信号):纯比例镜像 hypothetical,不受 $1 约束。
+        delta = max(0.0, wallet_sold_frac - sold_frac)
+    else:
+        held_dollar = total_stake * (1.0 - sold_frac)
+        pending = total_stake * max(0.0, wallet_sold_frac - sold_frac)   # 还应补卖的额
+        if pending <= 0:
+            signal["wallet_behavior"] = wallet_behavior_summary(signal)
+            return "exited" if sold_frac >= 1.0 - 1e-9 else "hold"
+        if held_dollar - pending < MIN_FOLLOW_SELL_USDC:    # 卖后剩余成 dust → 全平
+            sell = held_dollar
+        elif pending < MIN_FOLLOW_SELL_USDC:                # 比例还没攒够 $1 → 等
+            signal["wallet_behavior"] = wallet_behavior_summary(signal)
+            return "hold"
+        else:
+            sell = pending
+        delta = max(0.0, min(sell, held_dollar)) / total_stake
+
+    if delta <= 0:
+        signal["wallet_behavior"] = wallet_behavior_summary(signal)
+        return "exited" if sold_frac >= 1.0 - 1e-9 else "hold"
+
+    signal["our_partial_exit_pnl"] = round(
+        to_float(signal.get("our_partial_exit_pnl")) + delta * _signal_full_exit_pnl(signal, exit_price), 8
+    )
+    signal["our_partial_exit_pnl_hypothetical"] = round(
+        to_float(signal.get("our_partial_exit_pnl_hypothetical"))
+        + delta * _signal_full_exit_pnl(signal, exit_price, hypothetical=True), 8
+    )
+    new_sold = min(1.0, sold_frac + delta)
+    signal["our_sold_fraction"] = round(new_sold, 8)
+    signal.setdefault("partial_exits", []).append({
+        "timestamp": now_ts,
+        "price": round(exit_price, 8),
+        "sold_stake": round(delta * total_stake, 8),
+        "sold_fraction_delta": round(delta, 8),
+        "cumulative_sold_fraction": round(new_sold, 8),
+    })
+    signal.setdefault("behavior_events", []).append(_behavior_event("exit", trade))
+    signal["updated_at"] = now_ts
+    fully = new_sold >= 1.0 - 1e-9
+    if fully:
+        signal["status"] = "exited"
+        signal["exit_price"] = round(exit_price, 8)
+        signal["exit_at"] = now_ts
+        signal["exit_reason"] = "wallet_sell"
+        signal["our_realized_pnl"] = signal["our_partial_exit_pnl"]
+        signal["hypothetical_pnl"] = signal["our_partial_exit_pnl_hypothetical"]
+    signal["wallet_behavior"] = wallet_behavior_summary(signal)
+    return "exited" if fully else "partial"
+
+
 def _behavior_event(kind: str, trade: dict[str, Any], *, note: str | None = None) -> dict[str, Any]:
     event = {
         "kind": kind,
@@ -463,6 +548,7 @@ def process_follow_trades(
     stats: dict[str, Any] = {
         "new_leg_count": 0,
         "exited_signal_count": 0,
+        "partial_exit_count": 0,
         "hedge_event_count": 0,
         "ignored_trade_count": 0,
         "market_type_not_eligible_count": 0,
@@ -501,30 +587,22 @@ def process_follow_trades(
         existing = _open_signal_by_id(open_signals, sid)
 
         if side == "SELL":
-            signal_for_sell = existing or _signal_by_id(open_signals, sid)
+            if existing:
+                # 等比例跟卖:目标累计卖到仓位 x% → 我们也卖到 x%(min $1,不够攒着;dust 全平)。
+                state = apply_follow_sell(existing, trade, current_price, now_ts)
+                if state == "exited":
+                    stats["exited_signal_count"] += 1
+                elif state == "partial":
+                    stats["partial_exit_count"] += 1
+                continue
+            # 没有 open 信号(已平/已结算)→ 仅记录卖出供 behavior/quarantine 分析。
+            signal_for_sell = _signal_by_id(open_signals, sid)
             if not signal_for_sell:
                 stats["ignored_trade_count"] += 1
                 continue
             signal_for_sell["wallet_sell_size"] = round(to_float(signal_for_sell.get("wallet_sell_size")) + trade_size(trade), 8)
             signal_for_sell.setdefault("behavior_events", []).append(_behavior_event("sell", trade))
             signal_for_sell["wallet_behavior"] = wallet_behavior_summary(signal_for_sell)
-            if not existing:
-                continue
-            existing["status"] = "exited"
-            existing["exit_price"] = current_price
-            existing["exit_at"] = now_ts
-            existing["updated_at"] = now_ts
-            existing.setdefault("behavior_events", []).append(_behavior_event("exit", trade))
-            existing["our_realized_pnl"] = round(
-                sum(paper_exit_pnl(to_float(leg.get("our_entry_price")), current_price, leg_actual_stake(leg)) for leg in existing.get("legs") or []),
-                8,
-            )
-            existing["hypothetical_pnl"] = round(
-                sum(paper_exit_pnl(to_float(leg.get("our_entry_price")), current_price, leg_hypothetical_stake(leg)) for leg in existing.get("legs") or []),
-                8,
-            )
-            existing["wallet_behavior"] = wallet_behavior_summary(existing)
-            stats["exited_signal_count"] += 1
             continue
 
         if side != "BUY":
@@ -1008,12 +1086,19 @@ def settle_open_signals(
         outcome_won = winner == to_int(signal.get("outcome_index"), -1)
         if signal.get("legs") is not None:
             legs = signal.get("legs") or []
+            # 部分跟卖后:只把"没卖完的余量"(1−our_sold_fraction)拿到结算,加上此前各次部分平仓的累计 PnL。
+            # 无部分卖出时 sold_frac=0、partial=0 → 退化为整仓结算(向后兼容)。
+            sold_frac = to_float(signal.get("our_sold_fraction"))
+            remaining_frac = max(0.0, 1.0 - sold_frac)
+            partial_pnl = to_float(signal.get("our_partial_exit_pnl"))
+            partial_pnl_hypo = to_float(signal.get("our_partial_exit_pnl_hypothetical"))
             wallet_pnl = round(
                 sum(paper_pnl(to_float(leg.get("wallet_fill_price")), outcome_won, leg_actual_stake(leg)) for leg in legs),
                 8,
             )
             our_pnl = round(
-                sum(paper_pnl(to_float(leg.get("our_entry_price")), outcome_won, leg_actual_stake(leg)) for leg in legs),
+                partial_pnl
+                + remaining_frac * sum(paper_pnl(to_float(leg.get("our_entry_price")), outcome_won, leg_actual_stake(leg)) for leg in legs),
                 8,
             )
             hypothetical_wallet_pnl = round(
@@ -1021,7 +1106,8 @@ def settle_open_signals(
                 8,
             )
             hypothetical_pnl = round(
-                sum(paper_pnl(to_float(leg.get("our_entry_price")), outcome_won, leg_hypothetical_stake(leg)) for leg in legs),
+                partial_pnl_hypo
+                + remaining_frac * sum(paper_pnl(to_float(leg.get("our_entry_price")), outcome_won, leg_hypothetical_stake(leg)) for leg in legs),
                 8,
             )
             compact = {

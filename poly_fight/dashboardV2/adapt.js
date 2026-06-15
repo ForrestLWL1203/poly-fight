@@ -367,7 +367,7 @@
     const usable = num(bal.usable_balance_usdc);
     const minSignal = num(pre.min_target_wallet_order_cash_usdc);
     const str = (v, d) => (v === 0 || v ? String(v) : d);
-    // 现价上限:字段缺失(老策略)→ 默认开 0.85(与后端 CLI 默认一致);显式 0 → 关。
+    // 现价上限:字段缺失(老策略)→ 默认开 0.68(与后端默认/评分价格带一致);显式 0 → 关。
     const maxEntryRaw = pre.max_follow_entry_price;
     const maxEntryVal = num(maxEntryRaw);
     return {
@@ -376,7 +376,7 @@
       minSignalOn: minSignal > 0,
       minSignal: str(minSignal || 10, "10"),
       maxEntryOn: maxEntryRaw === undefined || maxEntryRaw === null ? true : maxEntryVal > 0 && maxEntryVal < 1,
-      maxEntry: str(maxEntryVal > 0 ? maxEntryVal : 0.85, "0.85"),
+      maxEntry: str(maxEntryVal > 0 ? maxEntryVal : 0.68, "0.68"),
       sizing: mode,
       ratio: str(num(sizing.ratio_percent) || 10, "10"),
       ratioCapOn: !!sizing.per_order_cap_enabled,
