@@ -88,7 +88,6 @@ from .onchain import (
     fill_to_trade,
     load_rpc_endpoints,
 )
-from .market_ws import MARKET_WS_URL, WSResolutionCollector
 from .storage import FollowStore, LeaderboardStore
 from .control import read_follow_control, set_pause_new_signals
 
@@ -1900,14 +1899,7 @@ def fetch_resolutions_for_open_signals(
     now_ts: int,
     gamma_pages: int,
     ttl_seconds: int,
-    resolution_collector: "WSResolutionCollector | None" = None,
 ) -> dict[str, int]:
-    # WS-first: when the Polymarket market-channel collector is healthy, settle
-    # from its pushed `market_resolved` events (drain) — no data-api polling. Its
-    # reconcile-on-connect backfills anything resolved while it was disconnected.
-    # data-api stays the fallback below only when the WS is unavailable.
-    if resolution_collector is not None and resolution_collector.healthy:
-        return resolution_collector.drain()
     eligible_signals = []
     for signal in open_signals:
         start_dt = parse_dt(signal.get("match_start_time"))
@@ -5763,7 +5755,6 @@ def command_follow(
     *,
     emit: bool = True,
     collector: "WSFollowCollector | None" = None,
-    resolution_collector: "WSResolutionCollector | None" = None,
 ) -> dict[str, Any]:
     client = client or build_client(args)
     data_dir = resolve_dashboard_root(args)
@@ -5923,28 +5914,6 @@ def command_follow(
         collector.update_asset_map(onchain_asset_map)
         collector.update_wallets({normalize_wallet(row.get("wallet")) for row in follow_wallets})
     detection_source = "onchain" if (collector is not None and collector.healthy) else "data_api"
-    # Settlement via the Polymarket market channel: subscribe to the markets we
-    # hold open follows on (settlement only matters for those). Accumulate tokens
-    # so a market's tokens survive after it leaves the upcoming-window watch list;
-    # one-shot fetch tokens for any open-signal market we haven't mapped yet.
-    if resolution_collector is not None:
-        resolution_collector.merge_asset_map(build_asset_map(watched))
-        open_conditions = {
-            str(s.get("condition_id") or "").lower() for s in open_signals if s.get("condition_id")
-        }
-        unmapped = open_conditions - resolution_collector.mapped_conditions()
-        if unmapped:
-            try:
-                extra = client.markets_by_condition_ids(sorted(unmapped), limit=len(unmapped))
-                resolution_collector.merge_asset_map(build_asset_map(extra))
-            except Exception:  # noqa: BLE001
-                pass
-        # Prune token mappings to the currently-relevant set (open follows +
-        # watched) so ended matches don't pile up; subscribe ONLY to markets we
-        # hold open follows on — settlement matters for those alone, and watched-
-        # but-unfollowed markets would just stream orderbook noise.
-        resolution_collector.retain_conditions(open_conditions | set(watched))
-        resolution_collector.set_conditions(open_conditions)
     next_interval = desired_tick_interval(
         list(watched.values()),
         open_signals,
@@ -6258,7 +6227,6 @@ def command_follow(
         now_ts=now_ts,
         gamma_pages=args.resolution_gamma_pages,
         ttl_seconds=args.resolution_cache_ttl_seconds,
-        resolution_collector=resolution_collector,
     )
     open_signals, settled = settle_open_signals(open_signals, resolutions, now_ts=now_ts)
     result_events = [*exited_signals, *settled]
@@ -6428,31 +6396,6 @@ def command_run(args: argparse.Namespace) -> int:
     else:
         print(json.dumps({"status": "onchain_disabled", "reason": "no secret/rpc; using data-api polling"}, ensure_ascii=False), flush=True)
 
-    # Settlement via the Polymarket market channel (public WS, no RPC key). Primary
-    # path; the per-tick data-api resolution poll is the fallback when this is down.
-    def _reconcile_resolutions(condition_ids: list[str]) -> dict[str, int]:
-        if not condition_ids:
-            return {}
-        records = resolution_market_records_from_markets(
-            client.markets_by_condition_ids(condition_ids, limit=len(condition_ids))
-        )
-        out: dict[str, int] = {}
-        for cid, market in records.items():
-            winner = winner_outcome_index(market)
-            if winner is not None:
-                out[str(cid).lower()] = winner
-        return out
-
-    resolution_collector: WSResolutionCollector | None = WSResolutionCollector(
-        reconcile=_reconcile_resolutions,
-        on_event=lambda kind, data: print(
-            json.dumps({"status": "settlement_ws", "event": kind, **{k: v for k, v in data.items() if k in ("error", "tokens", "resolved", "conditionId", "outcomeIndex")}}, ensure_ascii=False),
-            flush=True,
-        ),
-    )
-    resolution_collector.start()
-    print(json.dumps({"status": "settlement_ws_started", "url": MARKET_WS_URL}, ensure_ascii=False), flush=True)
-
     # M5 动态降级:跨 tick 累计被跟钱包的新结算笔数,满阈值就对那批钱包后台重评/隔离
     # (事件驱动,替代旧的固定 2h observe-v2 降级扫描)。
     rescore_threshold = int(getattr(args, "rescore_settled_threshold", 10) or 0)
@@ -6513,7 +6456,7 @@ def command_run(args: argparse.Namespace) -> int:
             iteration_started_mono = time.monotonic()
             try:
                 maybe_build(force=False)
-                summary = command_follow(args, client=client, emit=True, collector=collector, resolution_collector=resolution_collector)
+                summary = command_follow(args, client=client, emit=True, collector=collector)
             except Exception as exc:
                 now = time.time()
                 if first_error_at is None:
@@ -6594,8 +6537,6 @@ def command_run(args: argparse.Namespace) -> int:
     finally:
         if collector is not None:
             collector.stop()
-        if resolution_collector is not None:
-            resolution_collector.stop()
         if stop_requested["value"]:
             print(json.dumps({"status": "stopped", "reason": stop_requested["reason"], "ticks": tick_count}, ensure_ascii=False))
         if previous_sigterm is not None:
