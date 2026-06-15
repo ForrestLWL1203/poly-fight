@@ -355,6 +355,7 @@ table.ps-table { width: 100%; border-collapse: collapse; font-variant-numeric: t
 .side-chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .side-chip.s-a { color: var(--side-a); background: color-mix(in srgb, var(--side-a) 13%, transparent); }
 .side-chip.s-b { color: var(--side-b); background: color-mix(in srgb, var(--side-b) 13%, transparent); }
+.mh-teamrow { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
 .mh-held { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; margin-top: var(--sp-3); }
 .mh-held-label { font-size: var(--fs-footnote); color: var(--text-tertiary); }
 

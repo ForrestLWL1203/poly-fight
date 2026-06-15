@@ -722,11 +722,11 @@ function FollowDetailModal({ cid, onClose, toast }) {
       <div className="modal-body">
         <div className="modal-hero">
           <div className="mh-match">
-            <Badge tone="accent">{detail.market_type_label || detail.market_type}</Badge>
-            <div style={{ marginTop: "var(--sp-3)" }}>
+            <div className="mh-teamrow">
               <TeamLine ev={ev} held={heldNames} />
-              {(ev.start || ev.end) && <div className="match-times" style={{ marginTop: "6px" }}><span>开始 {ev.start || "—"}</span><span className="dot-sep">·</span><span>截止 {ev.end || "—"}</span></div>}
+              {(detail.market_type_label || detail.market_type) && <span className="mkt-tag">{detail.market_type_label || detail.market_type}</span>}
             </div>
+            {(ev.start || ev.end) && <div className="match-times" style={{ marginTop: "6px" }}><span>开始 {ev.start || "—"}</span><span className="dot-sep">·</span><span>截止 {ev.end || "—"}</span></div>}
             {sideSummary.length > 0 && (
               <div className="mh-held">
                 <span className="mh-held-label">持仓</span>
