@@ -342,6 +342,25 @@ table.ps-table { width: 100%; border-collapse: collapse; font-variant-numeric: t
 .team-line .team-name { font-weight: var(--fw-semibold); font-size: var(--fs-callout); color: var(--text-primary); white-space: nowrap; }
 .team-line .vs { font: var(--fw-bold) var(--fs-caption)/1 var(--font-sans); color: var(--text-quaternary); text-transform: uppercase; letter-spacing: 0.08em; }
 
+/* held-side highlight: the outcome(s) we bought are colored by side (a=coral,
+   b=teal), the non-held side is muted. Both sides held (对手盘/自对冲) → both lit. */
+.team-line .team.is-held .team-name { font-weight: var(--fw-bold); }
+.team-line .team.s-a.is-held .team-name { color: var(--side-a); }
+.team-line .team.s-b.is-held .team-name { color: var(--side-b); }
+.team-line .team.is-muted .team-name { color: var(--text-tertiary); font-weight: var(--fw-medium); }
+
+/* outcome side chip (买入边标) — used in follow detail per-wallet + hero summary */
+.side-chips { display: inline-flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.side-chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px var(--sp-2); border-radius: var(--r-sm); font-size: var(--fs-caption); font-weight: var(--fw-semibold); white-space: nowrap; }
+.side-chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.side-chip.s-a { color: var(--side-a); background: color-mix(in srgb, var(--side-a) 13%, transparent); }
+.side-chip.s-b { color: var(--side-b); background: color-mix(in srgb, var(--side-b) 13%, transparent); }
+.mh-held { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; margin-top: var(--sp-3); }
+.mh-held-label { font-size: var(--fs-footnote); color: var(--text-tertiary); }
+
+/* both-sides-held marker (列表/详情) — amber, distinct from side colors */
+.dual-tag { margin-left: var(--sp-2); padding: 1px var(--sp-2); border-radius: var(--r-sm); font-size: var(--fs-caption); font-weight: var(--fw-semibold); color: var(--status-warn); background: var(--status-warn-soft); white-space: nowrap; }
+
 .match-cell { display: flex; flex-direction: column; gap: 5px; }
 .match-game { display: flex; align-items: center; gap: var(--sp-2); }
 .match-meta { font-size: var(--fs-footnote); color: var(--text-tertiary); }

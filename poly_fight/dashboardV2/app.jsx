@@ -69,21 +69,41 @@ function TeamMonogram({ name, logo, side = "a", size = 26 }) {
   if (logo) return <img className="team-logo" src={logo} alt="" style={{ width: size, height: size, borderRadius: "50%", objectFit: "cover", flex: "none" }} />;
   return <span className="team-mono" style={{ width: size, height: size, "--team": TEAM_SIDE_COLOR[side] || TEAM_SIDE_COLOR.a }}>{initials(name)}</span>;
 }
-function TeamLine({ ev, size = 26 }) {
+// outcome 名 → side(a/b):优先按队名匹配 teamA/teamB(与队伍单色一致),
+// 匹配不上(如地图盘 outcome ≠ 标题队名)退化按 outcome_index 奇偶。
+function sideLetter(outcome, index, ev) {
+  const o = String(outcome == null ? "" : outcome).trim();
+  if (o && ev && ev.teamB && o === String(ev.teamB)) return "b";
+  if (o && ev && ev.teamA && o === String(ev.teamA)) return "a";
+  return Number(index) % 2 === 1 ? "b" : "a";
+}
+function SideChip({ outcome, index, ev }) {
+  const side = sideLetter(outcome, index, ev);
+  const label = String(outcome == null ? "" : outcome).trim() || ("#" + (Number(index) || 0));
+  return <span className={"side-chip s-" + side}>{label}</span>;
+}
+function TeamLine({ ev, size = 26, held }) {
   const logos = ev.teamLogos || {};
+  const heldSet = held && held.length ? new Set(held.map((x) => String(x))) : null;
+  const cls = (side, name) => {
+    let c = "team s-" + side;
+    if (heldSet) c += heldSet.has(String(name)) ? " is-held" : " is-muted";
+    return c;
+  };
   return (
     <div className="team-line">
-      <span className="team"><TeamMonogram name={ev.teamA} logo={logos[ev.teamA]} side="a" size={size} /><span className="team-name">{ev.teamA || "—"}</span></span>
+      <span className={cls("a", ev.teamA)}><TeamMonogram name={ev.teamA} logo={logos[ev.teamA]} side="a" size={size} /><span className="team-name">{ev.teamA || "—"}</span></span>
       <span className="vs">vs</span>
-      <span className="team"><TeamMonogram name={ev.teamB} logo={logos[ev.teamB]} side="b" size={size} /><span className="team-name">{ev.teamB || "—"}</span></span>
+      <span className={cls("b", ev.teamB)}><TeamMonogram name={ev.teamB} logo={logos[ev.teamB]} side="b" size={size} /><span className="team-name">{ev.teamB || "—"}</span></span>
     </div>
   );
 }
-function MatchCell({ ev, tag }) {
+function MatchCell({ ev, tag, held }) {
+  const dual = held && held.length >= 2;
   return (
     <div className="match-cell">
-      <div className="match-game">{ev.game ? <GameIcon game={ev.game} base={ASSET_BASE} chip /> : null}<span className="match-meta">{ev.meta}</span>{tag ? <span className="mkt-tag">{tag}</span> : null}</div>
-      <TeamLine ev={ev} />
+      <div className="match-game">{ev.game ? <GameIcon game={ev.game} base={ASSET_BASE} chip /> : null}<span className="match-meta">{ev.meta}</span>{tag ? <span className="mkt-tag">{tag}</span> : null}{dual ? <span className="dual-tag">双边</span> : null}</div>
+      <TeamLine ev={ev} held={held} />
       {(ev.start || ev.end) && <div className="match-times"><span>开始 {ev.start || "—"}</span><span className="dot-sep">·</span><span>截止 {ev.end || "—"}</span></div>}
     </div>
   );
@@ -295,7 +315,7 @@ function OverviewPage({ data, onNav, onOpenFollow }) {
                 if (!f) return null;
                 return (
                   <tr key={f.cid} className="clickable" onClick={() => onOpenFollow && onOpenFollow(f.cid)}>
-                    <td><MatchCell ev={f} tag={f.marketType} /></td>
+                    <td><MatchCell ev={f} tag={f.marketType} held={(f.sides || []).map((s) => s.outcome)} /></td>
                     <td>{f.status === "open" ? <Badge tone="up" dot>进行中</Badge> : <Badge tone="neutral">已结算</Badge>}</td>
                     <td className="strong">{f.wallets}</td>
                     <td className="num">{money(f.stake)}</td>
@@ -546,7 +566,7 @@ function FollowsPage({ data, goStrategy, onOpenFollow }) {
             <tbody key={status + cur} className="tbl-fade">
               {pageRows.map((f) => (
                 <tr key={f.cid} className="clickable" onClick={() => onOpenFollow(f.cid)}>
-                  <td><MatchCell ev={f} tag={f.marketType} /></td>
+                  <td><MatchCell ev={f} tag={f.marketType} held={(f.sides || []).map((s) => s.outcome)} /></td>
                   <td><div className="evt-status">{f.status === "open" ? <Badge tone="up" dot>进行中</Badge> : <Badge tone="neutral">已结算</Badge>}{f.sourceOffLeaderboard && <Badge tone="warn" title="源钱包已不在最新榜单 — 此跟单继续跟至结算，但不再新开仓">源已脱榜</Badge>}</div></td>
                   <td>{f.settlement === "盈利" ? <span className="pnl-up strong">盈利</span> : f.settlement === "亏损" ? <span className="pnl-down strong">亏损</span> : <span className="muted">未结算</span>}</td>
                   <td className="strong">{f.wallets}</td>
@@ -577,11 +597,24 @@ const stripGamePrefix = (title) => { const t = String(title || ""); const i = t.
 
 const WALLET_LEGS_PER_PAGE = 5;
 const isFundedLeg = (leg) => leg.would_follow !== false && leg.funding_status !== "unfunded";
-function WalletLegBlock({ w, prices }) {
+function WalletLegBlock({ w, prices, ev }) {
   const [pg, setPg] = React.useState(1);
   const legs = (w.signals || []).flatMap((s) => (s.legs || [])
     .filter(isFundedLeg)
     .map((leg, i) => ({ leg, key: s.signal_id + ":" + i })));
+
+  // 该钱包在这场买入的边(去重);自对冲会有两边。
+  const sides = (() => {
+    const seen = new Set(); const out = [];
+    (w.signals || []).forEach((s) => {
+      const o = s.outcome != null ? String(s.outcome) : "";
+      const key = o || ("#" + (Number(s.outcome_index) || 0));
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push({ outcome: o, index: Number(s.outcome_index) || 0 });
+    });
+    return out;
+  })();
 
   // P&L: settled → realized; open → unrealized from current orderbook
   // (Σ funded_stake × (current_price − our_entry_price) / our_entry_price).
@@ -607,6 +640,7 @@ function WalletLegBlock({ w, prices }) {
         <div style={{ display: "flex", alignItems: "center", gap: "var(--sp-3)" }}>
           {w.leaderboard_rank != null && <RankBadge rank={w.leaderboard_rank} />}
           <WalletAddress address={w.wallet} copyable />
+          <span className="side-chips">{sides.map((sd) => <SideChip key={sd.index + ":" + sd.outcome} outcome={sd.outcome} index={sd.index} ev={ev} />)}</span>
         </div>
         <div className="wallet-block-meta">
           <span>投入 <b>{money(w.follow_total_stake)}</b></span>
@@ -671,15 +705,33 @@ function FollowDetailModal({ cid, onClose, toast }) {
     const ev = { game: Adapt.normalizeGame((detail.match_parts || {}).game), teamA: (detail.match_parts || {}).teamA, teamB: (detail.match_parts || {}).teamB, meta: (detail.match_parts || {}).meta, teamLogos: (() => { const tl = detail.team_logos || {}; const m = {}; const mp = detail.match_parts || {}; if (mp.teamA && tl.teamA) m[mp.teamA] = tl.teamA; if (mp.teamB && tl.teamB) m[mp.teamB] = tl.teamB; return m; })(), start: Adapt.fmtClock(detail.match_start_time), end: Adapt.fmtClock(detail.end_date) };
     const outs = detail.outcomes || [];
     const px = prices || detail.outcome_prices || [];
+    const sideSummary = (() => {
+      const m = new Map();
+      (detail.wallets || []).forEach((w) => (w.signals || []).forEach((s) => {
+        const idx = Number(s.outcome_index) || 0;
+        const o = s.outcome != null && String(s.outcome) ? String(s.outcome) : ("#" + idx);
+        const cur = m.get(o) || { outcome: String(s.outcome || ""), index: idx, count: 0 };
+        cur.count += 1; m.set(o, cur);
+      }));
+      return [...m.values()].sort((a, b) => a.index - b.index);
+    })();
+    const heldNames = sideSummary.map((s) => s.outcome).filter(Boolean);
     body = (
       <div className="modal-body">
         <div className="modal-hero">
           <div className="mh-match">
             <Badge tone="accent">{detail.market_type_label || detail.market_type}</Badge>
             <div style={{ marginTop: "var(--sp-3)" }}>
-              <TeamLine ev={ev} />
+              <TeamLine ev={ev} held={heldNames} />
               {(ev.start || ev.end) && <div className="match-times" style={{ marginTop: "6px" }}><span>开始 {ev.start || "—"}</span><span className="dot-sep">·</span><span>截止 {ev.end || "—"}</span></div>}
             </div>
+            {sideSummary.length > 0 && (
+              <div className="mh-held">
+                <span className="mh-held-label">持仓</span>
+                {sideSummary.map((s) => <SideChip key={s.index + ":" + s.outcome} outcome={s.outcome} index={s.index} ev={ev} />)}
+                {sideSummary.length >= 2 && <span className="dual-tag">双边</span>}
+              </div>
+            )}
           </div>
           <div className="mh-prices">
             <span className="mh-prices-label">实时盘口</span>
@@ -687,7 +739,7 @@ function FollowDetailModal({ cid, onClose, toast }) {
             <Button size="sm" variant="secondary" disabled={refreshing} iconLeft={refreshing ? <Spinner sm /> : <Ico n="refresh-cw" />} onClick={refreshPrices}>刷新价</Button>
           </div>
         </div>
-        {(detail.wallets || []).map((w) => <WalletLegBlock w={w} prices={px} key={w.wallet} />)}
+        {(detail.wallets || []).map((w) => <WalletLegBlock w={w} prices={px} ev={ev} key={w.wallet} />)}
       </div>
     );
   }

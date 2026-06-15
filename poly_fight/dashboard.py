@@ -3205,6 +3205,7 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                 "category": _signal_category(signal),
                 "wallets": set(),
                 "leg_count": 0,
+                "side_counts": {},
                 "stake": 0.0,
                 "signal_stakes": [],
                 "stake_mode_counts": {},
@@ -3237,6 +3238,18 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
         bucket["quality_signals"].append(signal)
         legs = signal.get("legs") or []
         bucket["leg_count"] += len(legs)
+        # 我们买入哪一边:按 outcome 名聚合(对手盘/自对冲时一场会出现两个 outcome)。
+        outcome_name = signal.get("outcome")
+        if outcome_name in (None, ""):
+            _oi = signal.get("outcome_index")
+            outcome_name = str(_oi) if _oi not in (None, "") else "unknown"
+        side = bucket["side_counts"].setdefault(
+            str(outcome_name),
+            {"outcome": str(outcome_name), "outcome_index": int(signal.get("outcome_index") or 0),
+             "signal_count": 0, "leg_count": 0},
+        )
+        side["signal_count"] += 1
+        side["leg_count"] += len(legs)
         entry_summary = _signal_follow_entry_summary(signal)
         bucket["stake"] += entry_summary["follow_total_stake"]
         signal_stake = entry_summary["follow_total_stake"]
@@ -3311,6 +3324,9 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
         signal_stakes = [value for value in bucket.get("signal_stakes") or [] if value > 0]
         bucket["signal_stake_min"] = min(signal_stakes) if signal_stakes else None
         bucket["signal_stake_max"] = max(signal_stakes) if signal_stakes else None
+        bucket["sides"] = sorted(
+            bucket.pop("side_counts").values(), key=lambda s: s.get("outcome_index", 0)
+        )
         bucket.pop("signal_stakes", None)
         bucket.pop("quality_signals", None)
         bucket.pop("funded_open_leg_count", None)

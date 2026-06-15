@@ -333,6 +333,8 @@
       game: info.game, teamA: info.teamA, teamB: info.teamB, meta: info.meta,
       teamLogos: teamLogoMap(row, info),
       marketType: row.market_type_label || row.market_type || "",
+      // 我们买入哪一边(可能两边:对手盘 / 自对冲)。
+      sides: (row.sides || []).map((s) => ({ outcome: String(s.outcome || ""), index: num(s.outcome_index), legs: num(s.leg_count) })),
       status: open ? "open" : "settled",
       settlement,
       wallets: num(row.wallet_count),

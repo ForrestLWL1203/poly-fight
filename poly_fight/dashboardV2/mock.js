@@ -135,15 +135,15 @@
     wallet_count: 1, leg_count: 1, stake: 100, our_realized_pnl: 0,
     status: "open", settlement_type: "", display_pnl: 0, display_pnl_kind: "unrealized",
     quality_label: "one_way", quality_two_sided: false, quality_disagreement: false,
-    current_price: m.outcome_prices[0],
+    current_price: m.outcome_prices[0], sides: [],
   }, over);
   const follows = {
     page: 1, size: 25, total: 4, status: "", category: "esports", db_ready: true,
     follows: [
-      mkFollow(M.cs2_main, { wallet_count: 5, leg_count: 11, stake: 880, display_pnl: 142.6, display_pnl_kind: "unrealized", status: "open", quality_label: "one_way" }),
-      mkFollow(M.dota_main, { wallet_count: 4, leg_count: 8, stake: 640, display_pnl: -38.2, display_pnl_kind: "unrealized", status: "open", quality_two_sided: true, quality_label: "two_sided", market_type: "map_winner", market_type_label: "地图" }),
-      mkFollow(M.lol_main, { wallet_count: 6, leg_count: 14, stake: 1200, our_realized_pnl: 502.7, display_pnl: 502.7, display_pnl_kind: "realized", status: "settled" }),
-      mkFollow({ ...M.cs2_main, condition_id: "0xmockarchcs2faze0009", title: "Counter-Strike: FaZe vs G2 (BO3) - 八强", match_parts: { game: "Counter-Strike", teamA: "FaZe", teamB: "G2", meta: "(BO3) 八强" } }, { wallet_count: 3, leg_count: 6, stake: 480, our_realized_pnl: -86.2, display_pnl: -86.2, display_pnl_kind: "realized", status: "settled", quality_disagreement: true, quality_label: "disagreement" }),
+      mkFollow(M.cs2_main, { wallet_count: 5, leg_count: 11, stake: 880, display_pnl: 142.6, display_pnl_kind: "unrealized", status: "open", quality_label: "one_way", sides: [{ outcome: "PARIVISION", outcome_index: 0, leg_count: 11 }] }),
+      mkFollow(M.dota_main, { wallet_count: 4, leg_count: 8, stake: 640, display_pnl: -38.2, display_pnl_kind: "unrealized", status: "open", quality_two_sided: true, quality_label: "two_sided", market_type: "map_winner", market_type_label: "地图", sides: [{ outcome: "Team Spirit", outcome_index: 0, leg_count: 5 }, { outcome: "Falcons", outcome_index: 1, leg_count: 3 }] }),
+      mkFollow(M.lol_main, { wallet_count: 6, leg_count: 14, stake: 1200, our_realized_pnl: 502.7, display_pnl: 502.7, display_pnl_kind: "realized", status: "settled", sides: [{ outcome: "Gen.G", outcome_index: 1, leg_count: 14 }] }),
+      mkFollow({ ...M.cs2_main, condition_id: "0xmockarchcs2faze0009", title: "Counter-Strike: FaZe vs G2 (BO3) - 八强", match_parts: { game: "Counter-Strike", teamA: "FaZe", teamB: "G2", meta: "(BO3) 八强" } }, { wallet_count: 3, leg_count: 6, stake: 480, our_realized_pnl: -86.2, display_pnl: -86.2, display_pnl_kind: "realized", status: "settled", quality_disagreement: true, quality_label: "disagreement", sides: [{ outcome: "FaZe", outcome_index: 0, leg_count: 4 }, { outcome: "G2", outcome_index: 1, leg_count: 2 }] }),
     ],
   };
 
@@ -168,19 +168,23 @@
           wallet: "0x8f3c2a1b9d4e5f60718293a4b5c6d7e8f9012345", short_addr: "0x8f3...345",
           leaderboard_rank: 1, leg_count: 7, follow_total_stake: 175, followed_outcome_count: 1,
           follow_avg_entry_price: 0.5565, follow_realized_pnl: null,
-          signals: [{ signal_id: "sig-1", legs: [
+          signals: [{ signal_id: "sig-1", outcome: "PARIVISION", outcome_index: 0, legs: [
             ...Array.from({ length: 7 }, (_, i) => mkLeg({ wallet_trade_at: ago(6000 - i * 600), wallet_fill_price: 0.55 + (i % 3) * 0.003, wallet_trade_cash: 320 - i * 25, our_entry_price: 0.555 + (i % 3) * 0.002, slippage_over_wallet_entry: i % 2 ? -0.002 : 0.005, observed_delay_seconds: 25 + i * 7 })),
             mkLeg({ wallet_trade_at: ago(900), wallet_fill_price: 0.552, our_entry_price: 0.557, slippage_over_wallet_entry: 0.005, observed_delay_seconds: 120, would_follow: false, funding_status: "unfunded", funded_stake: 0 }),
           ] }],
         },
         {
           wallet: "0x2b71e9c4a8d3f50612839a4b5c6d7e8f90126789", short_addr: "0x2b7...789",
-          leaderboard_rank: 2, leg_count: 2, follow_total_stake: 50, followed_outcome_count: 1,
+          leaderboard_rank: 2, leg_count: 2, follow_total_stake: 50, followed_outcome_count: 2,
           follow_avg_entry_price: 0.561, follow_realized_pnl: 12.4,
-          signals: [{ signal_id: "sig-2", legs: [
-            mkLeg({ wallet_trade_at: ago(6000), wallet_fill_price: 0.56, wallet_trade_cash: 420, our_entry_price: 0.562, slippage_over_wallet_entry: 0.002, observed_delay_seconds: 22 }),
-            mkLeg({ wallet_trade_at: ago(2400), wallet_fill_price: 0.559, wallet_trade_cash: 130, our_entry_price: 0.561, slippage_over_wallet_entry: 0.002, observed_delay_seconds: 75 }),
-          ] }],
+          signals: [
+            { signal_id: "sig-2", outcome: "PARIVISION", outcome_index: 0, legs: [
+              mkLeg({ wallet_trade_at: ago(6000), wallet_fill_price: 0.56, wallet_trade_cash: 420, our_entry_price: 0.562, slippage_over_wallet_entry: 0.002, observed_delay_seconds: 22 }),
+            ] },
+            { signal_id: "sig-3", outcome: "Monte", outcome_index: 1, legs: [
+              mkLeg({ wallet_trade_at: ago(2400), wallet_fill_price: 0.449, wallet_trade_cash: 130, our_entry_price: 0.447, slippage_over_wallet_entry: -0.002, observed_delay_seconds: 75 }),
+            ] },
+          ],
         },
       ],
     };
