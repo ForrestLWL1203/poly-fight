@@ -2531,20 +2531,18 @@ if (typeof document !== "undefined" && !document.getElementById("ps-switch-css")
     position: relative; box-sizing: border-box;
     width: 50px; height: 30px; border-radius: var(--r-pill);
     background: var(--surface-inset);
-    border: 1px solid var(--border-hairline);
-    background-clip: border-box;
     box-shadow: inset 0 1px 3px rgba(0,0,0,0.28);
-    transition: border-color var(--dur-base) var(--ease-out), box-shadow var(--dur-base) var(--ease-out);
+    transition: background var(--dur-base) var(--ease-out), box-shadow var(--dur-base) var(--ease-out);
     flex: none;
   }
   .ps-switch-thumb {
-    position: absolute; top: 3px; left: 3px; width: 22px; height: 22px;
+    position: absolute; top: 4px; left: 4px; width: 22px; height: 22px;
     border-radius: 50%; background: #fff;
     box-shadow: 0 1px 3px rgba(0,0,0,0.45), 0 1px 1px rgba(0,0,0,0.25);
     transition: transform var(--dur-base) var(--ease-spring);
   }
-  .ps-switch.on .ps-switch-track { background: var(--pnl-up); border-color: transparent; box-shadow: 0 2px 10px var(--pnl-up-soft), inset 0 1px 0 rgba(255,255,255,0.22); }
-  .ps-switch.on.accent .ps-switch-track { background: var(--gradient-brand); border-color: transparent; box-shadow: var(--shadow-accent), inset 0 1px 0 rgba(255,255,255,0.22); }
+  .ps-switch.on .ps-switch-track { background: var(--pnl-up); box-shadow: 0 2px 10px var(--pnl-up-soft); }
+  .ps-switch.on.accent .ps-switch-track { background: var(--gradient-brand); box-shadow: var(--shadow-accent); }
   .ps-switch.on .ps-switch-thumb { transform: translateX(20px); }
   .ps-switch-label { font: var(--text-body); font-size: var(--fs-callout); color: var(--text-primary); }
   `;
