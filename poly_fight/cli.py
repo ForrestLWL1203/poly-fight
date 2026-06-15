@@ -6427,6 +6427,10 @@ def command_follow(
         "observed_trade_delay_seconds": summarize_seconds(observed_delay_values),
         "index_lag_lower_bound_seconds": summarize_seconds(index_lag_lower_bound_values),
         "cold_start_wallet_count": cold_start_wallet_count,
+        # 健康检查:链上检测来源(onchain WS 实时 / data_api 兜底)+ WS 是否健康。
+        "detection_source": detection_source,
+        "onchain_healthy": bool(collector is not None and getattr(collector, "healthy", False)),
+        "onchain_configured": bool(collector is not None),
         "backfill_ran": backfill_ran,
         "backfill_legs_opened": backfill_legs_opened,
         "backfill_stats": backfill_stats,

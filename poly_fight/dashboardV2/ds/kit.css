@@ -255,6 +255,25 @@
 .ov-qtitle { font: var(--text-headline); letter-spacing: var(--ls-body); margin: 2px 0 0; }
 
 /* in-hero historical distribution */
+/* 运行健康面板(概览 hero) */
+.health-panel { padding-top: var(--sp-5); border-top: 1px solid var(--border-hairline); }
+.hp-title { font: var(--text-label); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--text-tertiary); margin-bottom: var(--sp-2); }
+.hp-row { display: flex; align-items: center; gap: var(--sp-3); padding: 7px 0; border-bottom: 1px solid var(--border-hairline); }
+.hp-row:last-child { border-bottom: 0; }
+.hp-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.hp-dot.ok { background: var(--pnl-up); }
+.hp-dot.warn { background: var(--status-warn); }
+.hp-dot.off { background: var(--status-idle); }
+.hp-dot.down { background: var(--pnl-down); }
+.hp-ico { width: 17px; height: 17px; color: var(--text-tertiary); flex: none; }
+.hp-name { font-size: var(--fs-callout); font-weight: var(--fw-medium); }
+.hp-chip { font-size: var(--fs-caption); font-weight: var(--fw-semibold); padding: 2px var(--sp-3); border-radius: var(--r-sm); min-width: 42px; text-align: center; white-space: nowrap; }
+.hp-chip.t-up { color: var(--pnl-up); background: var(--pnl-up-soft); }
+.hp-chip.t-warn { color: var(--status-warn); background: var(--status-warn-soft); }
+.hp-chip.t-neutral { color: var(--text-secondary); background: var(--surface-inset); }
+.hp-spacer { flex: 1; }
+.hp-detail { font-size: var(--fs-caption); color: var(--text-tertiary); white-space: nowrap; }
+
 .ov-herodist { margin-top: auto; padding-top: var(--sp-5); border-top: 1px solid var(--border-hairline); }
 .ov-herodist-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-4); margin-bottom: var(--sp-4); flex-wrap: wrap; }
 .ov-herodist-title { font-size: var(--fs-h4); font-weight: var(--fw-semibold); letter-spacing: var(--ls-title); margin: 2px 0 0; }

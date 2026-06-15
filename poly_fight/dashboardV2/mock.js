@@ -269,6 +269,7 @@
   const runnerBase = {
     pid: 12345, source: "dashboard", started_at: ago(7445),
     stake_usdc: 1, stake_ratio_percent: 10,
+    realtime_refresh: true, observe_running: true, observe_pid: 12346,
     strategy_configured: true, strategy_updated_at: ago(600), strategy_summary: "比例 10%（封顶 $100）· 门槛 $10",
   };
   // stateful mock so the progress masks (sample / stop) animate end-to-end
@@ -289,9 +290,10 @@
     return { status: { esports: { status: st, started_at: Math.floor(sampleAt / 1000) }, sports: { status: "idle" } } };
   }
   const health = {
-    db_ready: true, status: "healthy", last_tick_at: ago(20), gate_open: true,
+    db_ready: true, status: "healthy", healthy: true, last_tick_at: ago(20), gate_open: true,
     watched_market_count: 18, open_signal_count: 7, leaderboard_updated_at: ago(1800),
     scoring_version: 15, recent_error_count: 0, last_error: null, uptime_seconds: 7445,
+    detection_source: "onchain", onchain_configured: true, onchain_healthy: true, follow_wallet_count: 41,
   };
 
   window.PSMock = {

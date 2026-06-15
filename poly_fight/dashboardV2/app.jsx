@@ -150,6 +150,58 @@ function PagePlaceholder({ title }) {
 /* ============================================================
    Overview
    ============================================================ */
+/* 运行健康面板:跟单脚本 / 动态刷新 / 链上检测 三项长期 health check。
+   色点 ok(绿)/warn(琥珀)/off(灰);文案统一短词,chip 统一 3 字。 */
+function HealthPanel({ data }) {
+  const runner = data.runner || {};
+  const health = data.health || {};
+  const running = runner.status === "running";
+  const tickFresh = health.healthy !== false;
+
+  const runnerRow = running
+    ? { dot: tickFresh ? "ok" : "warn", chip: "运行中", tone: "up", detail: "已跑 " + hms(health.uptime_seconds) }
+    : { dot: "off", chip: runner.status === "stopping" ? "停止中" : "已停止", tone: "neutral", detail: "—" };
+
+  const rtOn = !!runner.realtime_refresh;
+  const obsRow = !running
+    ? { dot: "off", chip: "未运行", tone: "neutral", detail: "—" }
+    : rtOn
+      ? (runner.observe_running
+        ? { dot: "ok", chip: "已开启", tone: "up", detail: "每 2h 自动" }
+        : { dot: "warn", chip: "已退出", tone: "warn", detail: "进程已退" })
+      : { dot: "off", chip: "未开启", tone: "neutral", detail: "策略未勾" };
+
+  const wallets = Adapt.num(health.follow_wallet_count);
+  const wsRow = !running
+    ? { dot: "off", chip: "未运行", tone: "neutral", detail: "—" }
+    : (health.onchain_configured && health.onchain_healthy && health.detection_source === "onchain")
+      ? { dot: "ok", chip: "实时中", tone: "up", detail: wallets + " 个钱包" }
+      : health.onchain_configured
+        ? { dot: "warn", chip: "已降级", tone: "warn", detail: "自动重连" }
+        : { dot: "off", chip: "未启用", tone: "neutral", detail: "纯轮询" };
+
+  const rows = [
+    { icon: "activity", name: "跟单脚本", ...runnerRow },
+    { icon: "refresh-cw", name: "动态刷新", ...obsRow },
+    { icon: "radio", name: "链上检测", ...wsRow },
+  ];
+  return (
+    <div className="health-panel">
+      <div className="hp-title">运行健康</div>
+      {rows.map((r) => (
+        <div className="hp-row" key={r.name}>
+          <span className={"hp-dot " + r.dot}></span>
+          <Ico n={r.icon} className="hp-ico" />
+          <span className="hp-name">{r.name}</span>
+          <span className={"hp-chip t-" + r.tone}>{r.chip}</span>
+          <span className="hp-spacer"></span>
+          <span className="hp-detail">{r.detail}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function OverviewPage({ data, onNav, onOpenFollow }) {
   const raw = data.overview;
   const [distMetric, setDistMetric] = React.useState("count");
@@ -187,7 +239,6 @@ function OverviewPage({ data, onNav, onOpenFollow }) {
           <div className="ov-hero">
             <div className="ov-hero-top">
               <StatTile size="lg" tone="up" label="已结算盈亏" value={signedMoney(o.realizedPnl)} delta={<TrendValue value={o.realizedRoi} percent chip />} sub={`累计投入 ${money(o.totalStake)}`} />
-              <StatusPill status={runnerLive ? "live" : "idle"} label={runnerLive ? "运行中" : "已停止"} extra={runnerLive ? hms(data.health && data.health.uptime_seconds) : undefined} />
             </div>
             <div className="ov-metricbar">
               <div className="m"><span>已结算 ROI</span><b className={pnlClass(o.realizedPnl)}>{o.realizedRoi > 0 ? "+" : ""}{o.realizedRoi}%</b></div>
@@ -195,6 +246,7 @@ function OverviewPage({ data, onNav, onOpenFollow }) {
               <div className="m"><span>当前持仓</span><b>{money(o.openExposure)}</b></div>
               <div className="m"><span>钱包余额</span><b>{o.walletConfigured ? money(o.walletBalance) : "—"}</b></div>
             </div>
+            <HealthPanel data={data} />
             {hasDist && (
               <div className="ov-herodist">
                 <div className="ov-herodist-head">
@@ -900,6 +952,8 @@ function Ico({ n, className }) {
     case "alert-triangle": return <svg {...p}><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>;
     case "square": return <svg {...p}><rect width="18" height="18" x="3" y="3" rx="2" /></svg>;
     case "refresh-cw": return <svg {...p}><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" /><path d="M8 16H3v5" /></svg>;
+    case "activity": return <svg {...p}><path d="M22 12h-4l-3 9L9 3l-3 9H2" /></svg>;
+    case "radio": return <svg {...p}><path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9" /><path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5" /><circle cx="12" cy="12" r="2" /><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5" /><path d="M19.1 4.9C23 8.8 23 15.2 19.1 19.1" /></svg>;
     default: return null;
   }
 }

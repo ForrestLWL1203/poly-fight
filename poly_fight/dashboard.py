@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .control import read_follow_control, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
+from .control import _pid_alive, read_follow_control, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
 from .core import (
     GAME_FAMILY_LABELS,
     LEAGUE_LABELS,
@@ -875,6 +875,11 @@ def build_health(data_dir: Path, *, started_at: float, log_dir: Path | None = No
         "last_tick": last_tick,
         "by_category": last_tick.get("by_category") if isinstance(last_tick.get("by_category"), dict) else {},
         "uptime_seconds": int(time.time() - started_at),
+        # 链上检测健康(供概览健康面板):来源 onchain/data_api、WS 是否健康、订阅钱包数。
+        "detection_source": str(last_tick.get("detection_source") or ""),
+        "onchain_configured": bool(last_tick.get("onchain_configured")),
+        "onchain_healthy": bool(last_tick.get("onchain_healthy")),
+        "follow_wallet_count": int(last_tick.get("eligible_follow_wallet_count") or 0),
     }
 
 
@@ -2674,6 +2679,7 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
             "strategy_summary": recorded.get("strategy_summary", defaults.get("strategy_summary")),
             "log_path": recorded.get("log_path") if source == "dashboard" else None,
             "realtime_refresh": bool(recorded.get("realtime_refresh")) if source == "dashboard" else False,
+            "observe_running": bool(source == "dashboard" and _pid_alive(int(recorded.get("observe_pid") or 0))),
             "observe_pid": recorded.get("observe_pid") if source == "dashboard" else None,
             "observe_pgid": recorded.get("observe_pgid") if source == "dashboard" else None,
             "observe_log_path": recorded.get("observe_log_path") if source == "dashboard" else None,
