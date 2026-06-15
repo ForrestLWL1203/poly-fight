@@ -684,7 +684,7 @@ function FollowDetailModal({ cid, onClose, toast }) {
           <div className="mh-prices">
             <span className="mh-prices-label">实时盘口</span>
             {outs.map((o, i) => <div className="price-cell" key={o}><span>{o}</span><b>{priceStr(px[i])}</b></div>)}
-            <Button size="sm" variant="secondary" disabled={refreshing} iconLeft={refreshing ? <Spinner sm /> : <i data-lucide="refresh-cw" style={{ width: 14, height: 14 }} />} onClick={refreshPrices}>刷新价</Button>
+            <Button size="sm" variant="secondary" disabled={refreshing} iconLeft={refreshing ? <Spinner sm /> : <Ico n="refresh-cw" />} onClick={refreshPrices}>刷新价</Button>
           </div>
         </div>
         {(detail.wallets || []).map((w) => <WalletLegBlock w={w} prices={px} key={w.wallet} />)}
@@ -841,6 +841,10 @@ function Ico({ n, className }) {
     case "wallet": return <svg {...p}><path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1" /><path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4" /></svg>;
     case "filter": return <svg {...p}><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" /></svg>;
     case "radar": return <svg {...p}><path d="M19.07 4.93A10 10 0 0 0 6.99 3.34" /><path d="M4 6h.01" /><path d="M2.29 9.62A10 10 0 1 0 21.31 8.35" /><path d="M16.24 7.76A6 6 0 1 0 8.23 16.67" /><path d="M12 18h.01" /><path d="M17.99 11.66A6 6 0 0 1 15.77 16.67" /><circle cx="12" cy="12" r="2" /><path d="m13.41 10.59 5.66-5.66" /></svg>;
+    case "check": return <svg {...p}><path d="M20 6 9 17l-5-5" /></svg>;
+    case "alert-triangle": return <svg {...p}><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>;
+    case "square": return <svg {...p}><rect width="18" height="18" x="3" y="3" rx="2" /></svg>;
+    case "refresh-cw": return <svg {...p}><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" /><path d="M8 16H3v5" /></svg>;
     default: return null;
   }
 }
@@ -1142,13 +1146,12 @@ function ProgressMask({ kind, done, error, label, hint, onClose }) {
     const t = setTimeout(() => onClose && onClose(), 3000);
     return () => { cancelAnimationFrame(raf); clearTimeout(t); };
   }, [done, onClose]);
-  React.useEffect(() => { window.lucide && window.lucide.createIcons(); });
   const icon = error ? "alert-triangle" : kind === "stop" ? "square" : "radar";
   return (
     <div className="mask-overlay">
       <div className="mask-card">
         <div className={"mask-icon" + (done && !error ? " done" : "") + (error ? " err" : "")}>
-          {!done && !error ? <Spinner /> : <i data-lucide={done && !error ? "check" : icon}></i>}
+          {!done && !error ? <Spinner /> : <Ico n={done && !error ? "check" : icon} />}
         </div>
         <div className="mask-title">{label}</div>
         <div className="mask-hint">{hint}</div>
