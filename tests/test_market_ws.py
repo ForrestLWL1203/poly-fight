@@ -43,6 +43,16 @@ class WSResolutionCollectorTest(unittest.TestCase):
                                       "winning_asset_id": "unknown_token"}))  # off-scope
         self.assertEqual(c.drain(), {"0xcid1": 0})
 
+    def test_retain_conditions_prunes_stale_markets(self):
+        c = _collector()
+        c.merge_asset_map({
+            "tokA": {"conditionId": "0xkeep", "outcomeIndex": 0},
+            "tokB": {"conditionId": "0xstale", "outcomeIndex": 0},
+        })
+        self.assertEqual(c.mapped_conditions(), {"0xkeep", "0xstale"})
+        c.retain_conditions({"0xkeep"})                       # drop ended matches
+        self.assertEqual(c.mapped_conditions(), {"0xkeep"})
+
     def test_reconcile_seeds_buffer(self):
         c = WSResolutionCollector(reconcile=lambda conds: {"0xcid1": 1})
         c.merge_asset_map({"tokA": {"conditionId": "0xcid1", "outcomeIndex": 0}})

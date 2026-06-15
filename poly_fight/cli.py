@@ -5939,7 +5939,12 @@ def command_follow(
                 resolution_collector.merge_asset_map(build_asset_map(extra))
             except Exception:  # noqa: BLE001
                 pass
-        resolution_collector.set_conditions(open_conditions | set(watched))
+        # Prune token mappings to the currently-relevant set (open follows +
+        # watched) so ended matches don't pile up; subscribe ONLY to markets we
+        # hold open follows on — settlement matters for those alone, and watched-
+        # but-unfollowed markets would just stream orderbook noise.
+        resolution_collector.retain_conditions(open_conditions | set(watched))
+        resolution_collector.set_conditions(open_conditions)
     next_interval = desired_tick_interval(
         list(watched.values()),
         open_signals,

@@ -85,6 +85,15 @@ class WSResolutionCollector(threading.Thread):
         with self._lock:
             self._asset_map.update(asset_map)
 
+    def retain_conditions(self, conditions: set[str]) -> None:
+        """Drop token mappings for conditions we no longer track, so historical
+        (ended) matches don't accumulate in the map without bound."""
+        keep = {str(c).lower() for c in conditions if c}
+        with self._lock:
+            self._asset_map = {
+                token: m for token, m in self._asset_map.items() if m.get("conditionId") in keep
+            }
+
     def set_conditions(self, conditions: set[str]) -> None:
         """Set which conditions' tokens to subscribe to; resubscribe if the
         resulting token set changed."""
