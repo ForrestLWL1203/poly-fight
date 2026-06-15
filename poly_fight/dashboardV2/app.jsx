@@ -79,10 +79,10 @@ function TeamLine({ ev, size = 26 }) {
     </div>
   );
 }
-function MatchCell({ ev }) {
+function MatchCell({ ev, tag }) {
   return (
     <div className="match-cell">
-      <div className="match-game">{ev.game ? <GameIcon game={ev.game} base={ASSET_BASE} chip /> : null}<span className="match-meta">{ev.meta}</span></div>
+      <div className="match-game">{ev.game ? <GameIcon game={ev.game} base={ASSET_BASE} chip /> : null}<span className="match-meta">{ev.meta}</span>{tag ? <span className="mkt-tag">{tag}</span> : null}</div>
       <TeamLine ev={ev} />
       {(ev.start || ev.end) && <div className="match-times"><span>开始 {ev.start || "—"}</span><span className="dot-sep">·</span><span>截止 {ev.end || "—"}</span></div>}
     </div>
@@ -295,8 +295,8 @@ function OverviewPage({ data, onNav, onOpenFollow }) {
                 if (!f) return null;
                 return (
                   <tr key={f.cid} className="clickable" onClick={() => onOpenFollow && onOpenFollow(f.cid)}>
-                    <td><MatchCell ev={f} /></td>
-                    <td>{f.status === "open" ? <StatusPill status="live" label="进行中" /> : <Badge tone="neutral">已结算</Badge>}</td>
+                    <td><MatchCell ev={f} tag={f.marketType} /></td>
+                    <td>{f.status === "open" ? <Badge tone="up" dot>进行中</Badge> : <Badge tone="neutral">已结算</Badge>}</td>
                     <td className="strong">{f.wallets}</td>
                     <td className="num">{money(f.stake)}</td>
                     <td className={pnlClass(f.pnl)}><div className="cell-stack"><span className="strong">{signedMoney(f.pnl)}</span>{f.pnlKind === "unrealized" && <span className="muted">未实现</span>}</div></td>
@@ -467,7 +467,7 @@ function EventsPage({ data }) {
       <Card pad="flush">
         <div style={{ padding: "var(--sp-6) var(--sp-6) var(--sp-5)" }}>
           <div className="panel-toolbar" style={{ marginBottom: 0 }}>
-            <Tabs value={tab} onChange={setTab} tabs={[{ id: "active", label: "进行中 / 即将开始", count: ev.events.length }, { id: "archive", label: "已结算", count: ev.archive.length }]} />
+            <Tabs value={tab} onChange={setTab} tabs={[{ id: "active", label: "进行中 / 未开始", count: ev.events.length }, { id: "archive", label: "已结算", count: ev.archive.length }]} />
             <div className="filter-group">
               <label htmlFor="game-f">项目</label>
               <select id="game-f" className="ps-select" value={game} onChange={(e) => setGame(e.target.value)}>
@@ -485,7 +485,7 @@ function EventsPage({ data }) {
                   <td>{e.eventUrl ? <a className="evt-link" href={e.eventUrl} target="_blank" rel="noopener noreferrer" title="在 Polymarket 打开该赛事"><MatchCell ev={e} /></a> : <MatchCell ev={e} />}</td>
                   <td><div className="evt-status">
                     {e.status === "live" && <Badge tone="up" dot>进行中</Badge>}
-                    {e.status === "upcoming" && <Badge tone="accent" dot>即将开始</Badge>}
+                    {e.status === "upcoming" && <Badge tone="accent" dot>未开始</Badge>}
                     {e.status === "settled" && <Badge tone="neutral">已结算</Badge>}
                     {e.countdown && !archive && e.status !== "live" && <span className="evt-count">{e.countdown}</span>}
                   </div></td>
@@ -546,8 +546,8 @@ function FollowsPage({ data, goStrategy, onOpenFollow }) {
             <tbody key={status + cur} className="tbl-fade">
               {pageRows.map((f) => (
                 <tr key={f.cid} className="clickable" onClick={() => onOpenFollow(f.cid)}>
-                  <td><MatchCell ev={f} /></td>
-                  <td><div className="evt-status">{f.status === "open" ? <StatusPill status="live" label="进行中" /> : <Badge tone="neutral">已结算</Badge>}{f.sourceOffLeaderboard && <Badge tone="warn" title="源钱包已不在最新榜单 — 此跟单继续跟至结算，但不再新开仓">源已脱榜</Badge>}</div></td>
+                  <td><MatchCell ev={f} tag={f.marketType} /></td>
+                  <td><div className="evt-status">{f.status === "open" ? <Badge tone="up" dot>进行中</Badge> : <Badge tone="neutral">已结算</Badge>}{f.sourceOffLeaderboard && <Badge tone="warn" title="源钱包已不在最新榜单 — 此跟单继续跟至结算，但不再新开仓">源已脱榜</Badge>}</div></td>
                   <td>{f.settlement === "盈利" ? <span className="pnl-up strong">盈利</span> : f.settlement === "亏损" ? <span className="pnl-down strong">亏损</span> : <span className="muted">未结算</span>}</td>
                   <td className="strong">{f.wallets}</td>
                   <td className="num">{f.legs}</td>
@@ -741,7 +741,7 @@ function WalletFollowsModal({ wallet, onClose }) {
                       <tr key={(s.signal_id || i)}>
                         <td><div className="cell-stack"><span className="strong">{s.event_title || s.market_question || Adapt.matchInfo(s).teamA + " vs " + Adapt.matchInfo(s).teamB}</span><span className="muted">{Adapt.fmtClock(s.match_start_time)}</span></div></td>
                         <td>{s.outcome || "—"}</td>
-                        <td>{s.status === "open" ? <StatusPill status="live" label="进行中" /> : <Badge tone="neutral">{s.status === "settled" ? "已结算" : s.status === "exited" ? "已退出" : s.status}</Badge>}</td>
+                        <td>{s.status === "open" ? <Badge tone="up" dot>进行中</Badge> : <Badge tone="neutral">{s.status === "settled" ? "已结算" : s.status === "exited" ? "已退出" : s.status}</Badge>}</td>
                         <td className="num">{priceStr(s.follow_avg_entry_price)}</td>
                         <td className="num">{s.settlement_price != null ? priceStr(s.settlement_price) : "—"}</td>
                       </tr>

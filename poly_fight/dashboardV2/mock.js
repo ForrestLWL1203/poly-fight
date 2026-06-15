@@ -141,7 +141,7 @@
     page: 1, size: 25, total: 4, status: "", category: "esports", db_ready: true,
     follows: [
       mkFollow(M.cs2_main, { wallet_count: 5, leg_count: 11, stake: 880, display_pnl: 142.6, display_pnl_kind: "unrealized", status: "open", quality_label: "one_way" }),
-      mkFollow(M.dota_main, { wallet_count: 4, leg_count: 8, stake: 640, display_pnl: -38.2, display_pnl_kind: "unrealized", status: "open", quality_two_sided: true, quality_label: "two_sided" }),
+      mkFollow(M.dota_main, { wallet_count: 4, leg_count: 8, stake: 640, display_pnl: -38.2, display_pnl_kind: "unrealized", status: "open", quality_two_sided: true, quality_label: "two_sided", market_type: "map_winner", market_type_label: "地图" }),
       mkFollow(M.lol_main, { wallet_count: 6, leg_count: 14, stake: 1200, our_realized_pnl: 502.7, display_pnl: 502.7, display_pnl_kind: "realized", status: "settled" }),
       mkFollow({ ...M.cs2_main, condition_id: "0xmockarchcs2faze0009", title: "Counter-Strike: FaZe vs G2 (BO3) - 八强", match_parts: { game: "Counter-Strike", teamA: "FaZe", teamB: "G2", meta: "(BO3) 八强" } }, { wallet_count: 3, leg_count: 6, stake: 480, our_realized_pnl: -86.2, display_pnl: -86.2, display_pnl_kind: "realized", status: "settled", quality_disagreement: true, quality_label: "disagreement" }),
     ],
