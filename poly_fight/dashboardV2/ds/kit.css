@@ -19,8 +19,6 @@
 .topbar-sub { font-size: var(--fs-subhead); color: var(--text-tertiary); margin-left: 2px; }
 .topbar-spacer { flex: 1; }
 .topbar-actions { display: flex; align-items: center; gap: var(--sp-3); }
-.tb-realtime { display: inline-flex; align-items: center; gap: 5px; font-size: var(--fs-subhead); color: var(--text-secondary); cursor: pointer; user-select: none; white-space: nowrap; }
-.tb-realtime input { cursor: pointer; accent-color: var(--accent, #ff6a3d); }
 
 /* ============================================================
    Strategy page (跟单策略)

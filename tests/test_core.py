@@ -9529,10 +9529,13 @@ class CoreTest(unittest.TestCase):
                 runner_process_lister=lambda: [],
                 runner_process_starter=fake_starter,
             )
-            FollowStore(follow_dir / "follow.db").save_follow_strategy(default_follow_strategy(balance_usdc=100), ts=100)
+            store = FollowStore(follow_dir / "follow.db")
+            strat_off = default_follow_strategy(balance_usdc=100)
+            strat_off["realtime_refresh"] = False
+            store.save_follow_strategy(strat_off, ts=100)
 
-            # 不勾选 → 只起 runner,无 observe
-            off = start_runner(config, realtime_refresh=False)
+            # 策略未勾实时刷新 → 只起 runner,无 observe
+            off = start_runner(config)
             self.assertEqual(len(calls), 1)
             self.assertFalse(off["realtime_refresh"])
             self.assertIsNone(off["observe_pid"])
@@ -9540,8 +9543,11 @@ class CoreTest(unittest.TestCase):
             # lister 返回 [] → 状态判定永远非 running,可直接再次 start(无需真停进程)
             calls.clear()
 
-            # 勾选 → runner + observe-v2 两个进程
-            on = start_runner(config, realtime_refresh=True)
+            # 策略勾上实时刷新 → runner + observe-v2 两个进程
+            strat_on = default_follow_strategy(balance_usdc=100)
+            strat_on["realtime_refresh"] = True
+            store.save_follow_strategy(strat_on, ts=200)
+            on = start_runner(config)
             self.assertEqual(len(calls), 2)
             observe_cmd = calls[1]
             self.assertIn("observe-v2", observe_cmd)

@@ -480,11 +480,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if current.get("status") == "running":
             self._json({"ok": False, "error": "runner_already_running", "data": current}, status=HTTPStatus.CONFLICT)
             return
-        form = self._read_request_form()
-        raw_realtime = form.get("realtime_refresh")
-        realtime = raw_realtime is True or str(raw_realtime).strip().lower() in {"1", "true", "yes", "on"}
         try:
-            status = start_runner(self.dashboard_config, realtime_refresh=realtime)
+            status = start_runner(self.dashboard_config)
         except RunnerAlreadyRunning as exc:
             self._json({"ok": False, "error": "runner_already_running", "data": exc.status}, status=HTTPStatus.CONFLICT)
             return
@@ -2733,7 +2730,6 @@ def start_runner(
     stake_ratio_percent: float | None = None,
     max_stake_usdc: float | None = None,
     max_signal_stake_balance_percent: float | None = None,
-    realtime_refresh: bool = False,
 ) -> dict[str, Any]:
     current = build_runner_status(config)
     if current.get("status") == "running":
@@ -2750,6 +2746,8 @@ def start_runner(
     strategy_valid, strategy_errors = validate_follow_strategy(strategy)
     if not strategy_valid:
         raise ValueError("invalid_follow_strategy")
+    # 实时刷新现在是策略字段(运行中不可改),启动时从生效策略读取。
+    realtime_refresh = bool(strategy.get("realtime_refresh"))
     log_dir = _follow_log_dir(config.data_dir, log_dir=config.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"dashboard-runner-{now_ts}.out"

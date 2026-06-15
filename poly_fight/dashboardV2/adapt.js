@@ -388,6 +388,7 @@
       spendMode: lim.stake_cap_mode === "balance_percent" ? "balancePct" : "fixed",
       spendFixed: str(num(lim.stake_cap_usdc) || 200, "200"),
       spendPct: str(num(lim.stake_cap_balance_percent) || 5, "5"),
+      realtimeRefresh: !!s.realtime_refresh,
     };
   }
 
@@ -418,6 +419,7 @@
         stake_cap_balance_percent: num(k.spendPct),
       },
       balance: { required: balanceRequired, usable_balance_usdc: usable },
+      realtime_refresh: !!k.realtimeRefresh,
     };
   }
 

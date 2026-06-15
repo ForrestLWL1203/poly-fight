@@ -82,6 +82,11 @@ eq("b3.backend_valid", backendErrors(s3), []);
 const rt = A.strategyToKit(A.strategyFromKit(k1, 8000), 8000);
 ["usableMode", "minSignalOn", "sizing", "ratio", "ratioCapOn", "ratioCap", "countOn", "countMode", "count", "spendOn", "spendMode", "spendFixed"].forEach((f) => eq("roundtrip." + f, rt[f], k1[f]));
 
+// 4b) realtime_refresh round-trips through fromKit/toKit (off by default, on when set)
+eq("rt.realtime_default", A.strategyFromKit(k1, 8000).realtime_refresh, false);
+eq("rt.realtime_on", A.strategyFromKit(Object.assign({}, k1, { realtimeRefresh: true }), 8000).realtime_refresh, true);
+eq("rt.realtime_toKit", A.strategyToKit({ realtime_refresh: true }, 8000).realtimeRefresh, true);
+
 // 5) toKit from a configured backend strategy
 const api = { configured: true, stake_sizing: { mode: "proportional", ratio_percent: 12, per_order_cap_enabled: true, per_order_cap_usdc: 80, fixed_usdc: 0, balance_percent: 0 }, prefilters: { min_target_wallet_order_cash_usdc: 15 }, condition_limits: { order_count_mode: "condition", max_orders: 6, stake_cap_mode: "fixed", stake_cap_usdc: 150, stake_cap_balance_percent: 0 }, balance: { required: true, usable_balance_usdc: 4000 } };
 const k = A.strategyToKit(api, 4000);

@@ -217,7 +217,7 @@
   let _slugSeq = 1;
   const newSlug = () => "s_mock_" + (_slugSeq++);
   let library = [
-    { slug: "s_mock_steady", name: "稳健跟单", active: true, updated_at: ago(600), strategy: mkStrat() },
+    { slug: "s_mock_steady", name: "稳健跟单", active: true, updated_at: ago(600), strategy: mkStrat({ realtime_refresh: true }) },
     { slug: "s_mock_aggro", name: "激进满仓", active: false, updated_at: ago(3600), strategy: mkStrat({
       stake_sizing: { mode: "balance_percent", ratio_percent: 10, per_order_cap_enabled: false, per_order_cap_usdc: 0, fixed_usdc: 50, balance_percent: 8 },
       condition_limits: { order_count_mode: "none", max_orders: 0, stake_cap_mode: "balance_percent", stake_cap_usdc: 0, stake_cap_balance_percent: 20 },

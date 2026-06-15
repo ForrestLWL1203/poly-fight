@@ -29,6 +29,10 @@ def default_follow_strategy(*, balance_usdc: float | None = None) -> dict[str, A
         "configured": configured,
         "schema_version": DEFAULT_FOLLOW_STRATEGY_SCHEMA_VERSION,
         "updated_at": 0,
+        # 实时刷新 Leaderboard:启动跟单时随 runner 起一个 observe-v2 sidecar
+        # (每 2h 发现新钱包 + 放回冷却到期的隔离钱包 + 增量更新榜单)。
+        # 作为策略字段持久化,运行中不可改。
+        "realtime_refresh": False,
         "stake_sizing": {
             "mode": "proportional",
             "ratio_percent": 10.0,
@@ -61,7 +65,7 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
     base = default_follow_strategy()
     if isinstance(strategy, dict):
         merged = copy.deepcopy(base)
-        for key in ("configured", "schema_version", "updated_at"):
+        for key in ("configured", "schema_version", "updated_at", "realtime_refresh"):
             if key in strategy:
                 merged[key] = strategy[key]
         for section in ("stake_sizing", "prefilters", "condition_limits", "balance"):
@@ -110,6 +114,7 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
     else:
         strategy["updated_at"] = to_int(strategy.get("updated_at"))
     strategy["configured"] = bool(strategy.get("configured"))
+    strategy["realtime_refresh"] = bool(strategy.get("realtime_refresh"))
     return strategy
 
 
@@ -301,4 +306,6 @@ def strategy_summary(strategy: dict[str, Any] | None) -> str:
     balance = normalized["balance"]
     if to_float(balance.get("usable_balance_usdc")) > 0:
         parts.append(f"可用余额 {to_float(balance.get('usable_balance_usdc')):g}")
+    if normalized.get("realtime_refresh"):
+        parts.append("实时刷新")
     return "，".join(parts)

@@ -770,6 +770,7 @@ const STRATEGY_DEFAULTS = {
   fixed: "50", balancePct: "1",
   countOn: false, countMode: "event", count: "10",
   spendOn: false, spendMode: "fixed", spendFixed: "200", spendPct: "5",
+  realtimeRefresh: false,
 };
 const clampNum = (v) => String(v).replace(/[^\d.]/g, "");
 
@@ -860,6 +861,7 @@ function strategyNodes(s) {
     { k: "单笔金额", v: dg.sizing, key: true },
     { k: "单场笔数", v: s.countOn ? (s.countMode === "event" ? `整场 ${s.count} 笔` : `每钱包 ${s.count} 笔`) : "不限" },
     { k: "单场投入", v: s.spendOn ? (s.spendMode === "fixed" ? `≤ ${usdInt(n(s.spendFixed))}` : `≤ 余额 ${s.spendPct}%`) : "不限" },
+    { k: "实时刷新", v: s.realtimeRefresh ? "每 2h 更新" : "关闭" },
   ];
 }
 function StrategyPipe({ kit }) {
@@ -947,6 +949,14 @@ function StrategyEditor({ s, up, wallet, locked }) {
           {s.spendOn ? <div className="sub-controls">
             <div className="ctrl-row"><SegmentedControl value={s.spendMode} onChange={up("spendMode")} options={[{ value: "fixed", label: "固定金额" }, { value: "balancePct", label: "余额百分比" }]} />{s.spendMode === "fixed" ? <NumField value={s.spendFixed} onChange={up("spendFixed")} unit="USDC" width={88} /> : <NumField value={s.spendPct} onChange={up("spendPct")} unit="%" width={58} />}</div>
           </div> : null}
+        </div>
+        <div className="cfg-head"><h3>动态榜单</h3></div>
+        <p className="cfg-sub">启动跟单时一并维护 Leaderboard · 仅在跟单运行期间生效</p>
+        <div className="sub-block">
+          <div className="switch-row">
+            <div className="sr-text"><span className="sr-title">实时刷新 Leaderboard</span><span className="sr-desc">随跟单起一个 observer，每 2h 发现新钱包并放回冷却到期的隔离地址（掉级隔离始终自动执行）</span></div>
+            <Switch checked={s.realtimeRefresh} onChange={(v) => up("realtimeRefresh")(v)} accent />
+          </div>
         </div>
       </div>
     </div>
@@ -1229,8 +1239,6 @@ function Dashboard({ onLogout, toast }) {
     }
   }, [merge]);
 
-  const [realtimeRefresh, setRealtimeRefresh] = React.useState(false);
-
   const runStop = React.useCallback(async () => {
     maskCancel.current = false;
     setMask({ kind: "stop", done: false, error: false, label: "正在停止跟单", hint: "等待跟单进程安全退出…" });
@@ -1250,14 +1258,14 @@ function Dashboard({ onLogout, toast }) {
 
   const runStart = React.useCallback(async () => {
     try {
-      await Api.runnerStart({ realtime_refresh: realtimeRefresh });
+      await Api.runnerStart();
       const [rn, hh] = await Promise.all([Api.runner().catch(() => null), Api.health().catch(() => null)]);
       merge({ ...(rn ? { runner: rn } : {}), ...(hh ? { health: hh } : {}) });
-      toast(realtimeRefresh ? "跟单已启动 · 实时刷新开启" : "跟单已启动", "success");
+      toast(rn && rn.realtime_refresh ? "跟单已启动 · 实时刷新开启" : "跟单已启动", "success");
     } catch (e) {
       toast(e && e.error === "runner_already_running" ? "已在运行中" : (e && e.detail) || "启动失败，请先完成并保存跟单策略", "error");
     }
-  }, [merge, toast, realtimeRefresh]);
+  }, [merge, toast]);
 
   /* initial load */
   React.useEffect(() => {
@@ -1352,10 +1360,6 @@ function Dashboard({ onLogout, toast }) {
             {runnerLive || runnerStatus === "stopping"
               ? <Button variant="danger" size="sm" className="tb-runbtn" disabled={runnerStatus === "stopping"} iconLeft={<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2.5" /></svg>} onClick={() => runStop()}>停止跟单</Button>
               : <React.Fragment>
-                  <label className="tb-realtime" data-tip="勾选后随跟单起一个 observer，每 2 小时动态发现新钱包并更新 Leaderboard">
-                    <input type="checkbox" checked={realtimeRefresh} onChange={(e) => setRealtimeRefresh(e.target.checked)} />
-                    <span>实时刷新</span>
-                  </label>
                   <span className={"tb-tip" + (strategyReady ? "" : " disabled")} data-tip={startTip}>
                     <Button variant="primary" size="sm" className="tb-runbtn" disabled={!strategyReady} iconLeft={<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M7 4.5v15a1 1 0 0 0 1.5.87l13-7.5a1 1 0 0 0 0-1.74l-13-7.5A1 1 0 0 0 7 4.5z" /></svg>} onClick={() => runStart()}>启动跟单</Button>
                   </span>
