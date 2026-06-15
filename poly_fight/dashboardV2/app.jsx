@@ -8,6 +8,8 @@ const {
 const Api = window.PSApi;
 const Adapt = window.PSAdapt;
 const ASSET_BASE = "/ds/assets";
+// 钱包地址 → Polymarket 个人主页(按地址,中文站)。
+const polymarketProfileUrl = (addr) => "https://polymarket.com/zh/profile/" + String(addr || "").toLowerCase();
 const RECENT_FOLLOWS = 5; // Overview「最近跟单」shows the most recent N follows
 
 /* ---------- formatters & helpers ---------- */
@@ -435,7 +437,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                 <tr key={w.addr} className="clickable" onClick={() => onOpenWallet && onOpenWallet(w.addr)}>
                   {!q && <td><button className={"fav-btn" + (w.fav ? " on" : "")} disabled={busy[w.addr]} onClick={(e) => { e.stopPropagation(); toggleFav(w); }} aria-label="收藏">{w.fav ? "★" : "☆"}</button></td>}
                   <td>{w.rank != null ? <RankBadge rank={w.rank} /> : <span className="muted">—</span>}</td>
-                  <td><div className="wallet-cell"><WalletAddress address={w.addr} copyable />{w.isNew && <span className="new-badge" title="动态观测刚发现并入榜（2 小时内）">NEW</span>}</div></td>
+                  <td><div className="wallet-cell"><WalletAddress address={w.addr} href={polymarketProfileUrl(w.addr)} onClick={(e) => e.stopPropagation()} copyable />{w.isNew && <span className="new-badge" title="动态观测刚发现并入榜（2 小时内）">NEW</span>}</div></td>
                   {q && <td><div className="cell-stack"><span className="strong" style={{ color: "var(--status-warn)" }}>{w.reason}</span><span className="muted">{w.reasonTime}</span></div></td>}
                   <td><div className="cell-stack"><span className={pnlClass(w.roi) + " strong"}>{w.roi > 0 ? "+" : ""}{w.roi}%</span>{w.overallRoi != null && <span className="muted">全部 {w.overallRoi > 0 ? "+" : ""}{w.overallRoi}%</span>}</div></td>
                   <td><div className="cell-stack"><span className="strong">{w.winRate != null ? w.winRate + "%" : "—"}</span>{w.closedCount > 0 && <span className="muted">{w.closedCount} 场</span>}</div></td>
@@ -639,7 +641,7 @@ function WalletLegBlock({ w, prices, ev }) {
       <div className="wallet-block-head">
         <div style={{ display: "flex", alignItems: "center", gap: "var(--sp-3)" }}>
           {w.leaderboard_rank != null && <RankBadge rank={w.leaderboard_rank} />}
-          <WalletAddress address={w.wallet} copyable />
+          <WalletAddress address={w.wallet} href={polymarketProfileUrl(w.wallet)} onClick={(e) => e.stopPropagation()} copyable />
           <span className="side-chips">{sides.map((sd) => <SideChip key={sd.index + ":" + sd.outcome} outcome={sd.outcome} index={sd.index} ev={ev} />)}</span>
         </div>
         <div className="wallet-block-meta">
@@ -779,7 +781,7 @@ function WalletFollowsModal({ wallet, onClose }) {
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-card" onClick={stop}>
         <div className="modal-head">
-          <h2 className="modal-title"><WalletAddress address={wallet} copyable /></h2>
+          <h2 className="modal-title"><WalletAddress address={wallet} href={polymarketProfileUrl(wallet)} copyable /></h2>
           <button className="modal-close" onClick={onClose} aria-label="关闭"><i data-lucide="x"></i></button>
         </div>
         <div className="modal-body">
