@@ -5,7 +5,10 @@ crucially that on-chain-derived trade dicts are compatible with the existing
 follow cursor + accessors (select_new_trades / trade_* helpers), so the detection
 source can be swapped without touching process_follow_trades.
 """
+import json
+import time
 import unittest
+from unittest import mock
 
 from poly_fight import onchain as oc
 from poly_fight.follow import (
@@ -138,6 +141,90 @@ class TestTradeCompatibility(unittest.TestCase):
         new, _, cold = select_new_trades([onchain_newer], dataapi_cursor)
         self.assertFalse(cold)
         self.assertEqual([trade_id(x) for x in new], ["0xzzz"])
+
+
+class _ScriptedWS:
+    """Fake WSClient: replays a script of payloads / exceptions for recv_message."""
+
+    def __init__(self, url, script):
+        self.url = url
+        self._script = list(script)
+        self.sent = []
+
+    def connect(self):
+        pass
+
+    def set_timeout(self, _t):
+        pass
+
+    def send_text(self, text):
+        self.sent.append(text)
+
+    def recv_message(self):
+        if not self._script:
+            raise oc.WSError("script exhausted")
+        item = self._script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return (oc.WSClient.OP_TEXT, item)
+
+    def close(self):
+        pass
+
+
+class TestHeartbeat(unittest.TestCase):
+    def _collector(self, script, **kw):
+        events = []
+        col = oc.WSFollowCollector(
+            wss_url="ws://x", https_url="http://x",
+            wallets={WALLET},
+            asset_map=oc.build_asset_map([{"conditionId": COND, "clobTokenIds": [TOKEN_YES, TOKEN_NO]}]),
+            recv_timeout=0.001,
+            on_event=lambda k, d: events.append((k, d)),
+            ws_factory=lambda url: _ScriptedWS(url, script),
+            **kw,
+        )
+        return col, events
+
+    def test_silent_stall_flips_unhealthy_and_reconnects(self):
+        # WS never pushes anything (not even newHeads) -> stale detection fires.
+        class _StallWS(_ScriptedWS):
+            def recv_message(self):
+                time.sleep(0.002)  # let wall-clock advance toward stale_timeout
+                raise oc.WSTimeout()
+
+        events = []
+        col = oc.WSFollowCollector(
+            wss_url="ws://x", https_url="http://x", wallets={WALLET},
+            recv_timeout=0.001, stale_timeout=0.05,
+            on_event=lambda k, d: events.append((k, d)),
+            ws_factory=lambda url: _StallWS(url, []),
+        )
+        with mock.patch.object(oc, "block_number", return_value=1000):
+            with self.assertRaises(oc.WSError):
+                col._connect_and_listen()
+        self.assertFalse(col._healthy)
+        self.assertTrue(any(k == "ws_stale" for k, _ in events))
+
+    def test_heartbeat_keeps_alive_and_buffers_fill(self):
+        buy_log = make_log(TOKEN_YES, frm=OTHER, to=WALLET, value_shares=100, tx="0xtx1", block=1001)
+        script = [
+            json.dumps({"id": 1, "result": "S1"}),
+            json.dumps({"id": 2, "result": "S2"}),
+            json.dumps({"id": 3, "result": "S3"}),
+            json.dumps({"method": "eth_subscription", "params": {"subscription": "S3", "result": {"number": "0x3e8"}}}),
+            json.dumps({"method": "eth_subscription", "params": {"subscription": "S1", "result": buy_log}}),
+            oc.WSError("end"),
+        ]
+        col, events = self._collector(script, stale_timeout=5.0)
+        with mock.patch.object(oc, "block_number", return_value=900):
+            with self.assertRaises(oc.WSError):
+                col._connect_and_listen()
+        buffered = col.drain()
+        self.assertIn(WALLET, buffered)
+        self.assertEqual(col._last_block, 1001)  # max(newHeads 1000, fill 1001)
+        self.assertFalse(any(k == "ws_stale" for k, _ in events))
+        self.assertTrue(any(k == "ws_connected" for k, _ in events))
 
 
 if __name__ == "__main__":

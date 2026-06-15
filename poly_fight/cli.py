@@ -6538,7 +6538,7 @@ def command_run(args: argparse.Namespace) -> int:
             wss_url=wss_url,
             https_url=https_url,
             on_event=lambda kind, data: print(
-                json.dumps({"status": "onchain", "event": kind, **{k: v for k, v in data.items() if k in ("error", "wallets", "from", "to", "count")}}, ensure_ascii=False),
+                json.dumps({"status": "onchain", "event": kind, **{k: v for k, v in data.items() if k in ("error", "wallets", "from", "to", "count", "idle_seconds")}}, ensure_ascii=False),
                 flush=True,
             ),
         )

@@ -207,17 +207,24 @@ class WSFollowCollector(threading.Thread):
         wallets: set[str] | None = None,
         asset_map: dict[str, dict] | None = None,
         recv_timeout: float = 1.0,
+        stale_timeout: float = 90.0,
         reconnect_min: float = 1.0,
         reconnect_max: float = 30.0,
         on_event: Callable[[str, dict], None] | None = None,
+        ws_factory: Callable[[str], Any] | None = None,
     ):
         super().__init__(daemon=True, name="ws-follow-collector")
         self.wss_url = wss_url
         self.https_url = https_url
         self.recv_timeout = recv_timeout
+        # 静默停推检测:WS 不断开但停止推送时(healthy 仍 True、却收不到任何成交,
+        # data-api 兜底也不触发)。订阅 newHeads 当独立心跳,超过 stale_timeout 没收到
+        # 任何消息就判定停推 → 翻 unhealthy + 重连(进而触发 data-api 兜底)。
+        self.stale_timeout = stale_timeout
         self.reconnect_min = reconnect_min
         self.reconnect_max = reconnect_max
         self.on_event = on_event or (lambda *_: None)
+        self._ws_factory = ws_factory or WSClient
 
         self._lock = threading.Lock()
         self._wallets = {w.lower() for w in (wallets or set())}
@@ -282,7 +289,7 @@ class WSFollowCollector(threading.Thread):
         with self._lock:
             wallets = set(self._wallets)
         self._dirty.clear()
-        ws = WSClient(self.wss_url)
+        ws = self._ws_factory(self.wss_url)
         ws.connect()
         ws.set_timeout(self.recv_timeout)
         try:
@@ -292,7 +299,7 @@ class WSFollowCollector(threading.Thread):
                 self._backfill(self._last_block + 1, current, wallets)
             self._last_block = current
 
-            sub_buy = sub_sell = None
+            sub_buy = sub_sell = sub_block = None
             if wallets:
                 topics = [topic_for_address(w) for w in wallets]
                 if len(topics) > 900:
@@ -303,14 +310,25 @@ class WSFollowCollector(threading.Thread):
                 ws.send_text(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "eth_subscribe",
                                          "params": ["logs", {"address": CTF_ADDRESS,
                                                              "topics": [TRANSFER_SINGLE_TOPIC, None, topics, None]}]}))
+            # Heartbeat: newHeads streams a block ~every 2s regardless of trades, so
+            # silence here (unlike on the logs subs) unambiguously means a stall.
+            ws.send_text(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "eth_subscribe",
+                                     "params": ["newHeads"]}))
             self._healthy = True
             self.on_event("ws_connected", {"wallets": len(wallets)})
 
+            last_msg_mono = time.monotonic()
             while not self._stop_evt.is_set() and not self._dirty.is_set():
                 try:
                     opcode, payload = ws.recv_message()
                 except WSTimeout:
+                    if time.monotonic() - last_msg_mono > self.stale_timeout:
+                        self._healthy = False  # flip first so command_follow falls back now
+                        idle = round(time.monotonic() - last_msg_mono, 1)
+                        self.on_event("ws_stale", {"idle_seconds": idle})
+                        raise WSError(f"stale: no ws message for {idle}s")
                     continue
+                last_msg_mono = time.monotonic()  # any frame (incl. newHeads) is a heartbeat
                 if opcode == WSClient.OP_CLOSE:
                     raise WSError("server closed")
                 try:
@@ -322,6 +340,8 @@ class WSFollowCollector(threading.Thread):
                         sub_buy = msg["result"]
                     elif msg["id"] == 2:
                         sub_sell = msg["result"]
+                    elif msg["id"] == 3:
+                        sub_block = msg["result"]
                     continue
                 if msg.get("method") != "eth_subscription":
                     continue
@@ -332,6 +352,15 @@ class WSFollowCollector(threading.Thread):
                     self._handle_log(log, is_sell=False)
                 elif sub == sub_sell:
                     self._handle_log(log, is_sell=True)
+                elif sub == sub_block:
+                    # heartbeat only; advance the block cursor so a reconnect backfills
+                    # exactly the gap.
+                    try:
+                        num = int(str(log.get("number")), 16)
+                    except (TypeError, ValueError):
+                        num = 0
+                    if num > self._last_block:
+                        self._last_block = num
         finally:
             self._healthy = False
             ws.close()
