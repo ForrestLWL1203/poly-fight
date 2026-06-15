@@ -358,6 +358,11 @@ table.ps-table { width: 100%; border-collapse: collapse; font-variant-numeric: t
 .mh-held { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; margin-top: var(--sp-3); }
 .mh-held-label { font-size: var(--fs-footnote); color: var(--text-tertiary); }
 
+/* icon-only 刷新盘口价 按钮:刷新中让刷新符号自转(比换成 spinner 更克制好看) */
+.mh-refresh.spinning { pointer-events: none; }
+.mh-refresh.spinning svg { animation: mh-refresh-spin 0.8s linear infinite; transform-origin: center; }
+@keyframes mh-refresh-spin { to { transform: rotate(360deg); } }
+
 /* both-sides-held marker (列表/详情) — amber, distinct from side colors */
 .dual-tag { margin-left: var(--sp-2); padding: 1px var(--sp-2); border-radius: var(--r-sm); font-size: var(--fs-caption); font-weight: var(--fw-semibold); color: var(--status-warn); background: var(--status-warn-soft); white-space: nowrap; }
 

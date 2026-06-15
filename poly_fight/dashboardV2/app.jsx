@@ -738,7 +738,7 @@ function FollowDetailModal({ cid, onClose, toast }) {
           <div className="mh-prices">
             <span className="mh-prices-label">实时盘口</span>
             {outs.map((o, i) => <div className="price-cell" key={o}><span>{o}</span><b>{priceStr(px[i])}</b></div>)}
-            <Button size="sm" variant="secondary" disabled={refreshing} iconLeft={refreshing ? <Spinner sm /> : <Ico n="refresh-cw" />} onClick={refreshPrices}>刷新价</Button>
+            <IconButton size="sm" label="刷新盘口价" disabled={refreshing} className={"mh-refresh" + (refreshing ? " spinning" : "")} onClick={refreshPrices}><Ico n="refresh-cw" /></IconButton>
           </div>
         </div>
         {(detail.wallets || []).map((w) => <WalletLegBlock w={w} prices={px} ev={ev} key={w.wallet} />)}
