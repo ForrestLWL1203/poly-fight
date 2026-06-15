@@ -107,7 +107,9 @@ def merge_ui(cfg: dict, ui: dict) -> dict:
 # --------------------------------------------------------------------------- #
 REMOTE_SCRIPT = r"""
 set -euo pipefail
+@@SECRETS@@
 REPO=@@REPO@@
+DATADIR=@@DATADIR@@
 GITHUB=@@GITHUB@@
 PY=@@PYTHON@@
 PORT=@@PORT@@
@@ -134,38 +136,38 @@ echo "    at $(git rev-parse --short HEAD)"
 
 echo "[2/5] write secrets (chmod 600)"
 mkdir -p secret
-# secrets arrive on stdin below this script as KEY=VALUE lines after the marker.
-while IFS= read -r line; do
-  [ "$line" = "__SECRETS_END__" ] && break
-  case "$line" in
-    RPC_HTTPS=*) RPC_HTTPS="${line#RPC_HTTPS=}" ;;
-    RPC_WSS=*)   RPC_WSS="${line#RPC_WSS=}" ;;
-    DASH_PW=*)   DASH_PW="${line#DASH_PW=}" ;;
-    DASH_SECRET=*) DASH_SECRET="${line#DASH_SECRET=}" ;;
-  esac
-done
+# secret vars (RPC_HTTPS/RPC_WSS/DASH_PW/DASH_SECRET) are injected at the top of
+# this script by the launcher — only ever travels over SSH stdin, never argv.
 printf '%s\n%s\n' "${RPC_HTTPS:-}" "${RPC_WSS:-}" > secret/rpc
 chmod 600 secret/rpc
 printf 'POLY_FIGHT_DASH_PASSWORD=%s\nPOLY_FIGHT_DASH_COOKIE_SECRET=%s\n' "${DASH_PW:-}" "${DASH_SECRET:-}" > secret/dashboard.env
 chmod 600 secret/dashboard.env
 
-echo "[3/5] systemd unit"
+echo "[3/5] systemd unit (dashboard 托管模式 — runner 由面板「启动跟单」spawn)"
+mkdir -p "$DATADIR"
+# 旧版把 runner 当独立常驻服务;现模型是 dashboard spawn runner，停用旧 runner 服务避免冲突。
+if systemctl list-unit-files 2>/dev/null | grep -q '^poly-fight-runner.service'; then
+  systemctl disable --now poly-fight-runner.service 2>/dev/null || true
+  echo "    disabled stale poly-fight-runner.service"
+fi
 cat > /etc/systemd/system/poly-fight-dashboard.service <<UNIT
 [Unit]
 Description=poly-fight dashboard
-After=network.target
+After=network-online.target
+Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$REPO
 EnvironmentFile=$REPO/secret/dashboard.env
-ExecStart=$PY -m poly_fight.cli --data-dir data serve --host 127.0.0.1 --port $PORT
-Restart=on-failure
-RestartSec=3
+ExecStart=$PY -m poly_fight.cli --data-dir $DATADIR serve --host 127.0.0.1 --port $PORT
+Restart=always
+RestartSec=4
 [Install]
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
-systemctl enable --now poly-fight-dashboard
+systemctl enable poly-fight-dashboard
+systemctl restart poly-fight-dashboard
 
 echo "[4/5] caddy reverse_proxy for $DOMAIN"
 if [ -f "$CADDYFILE" ] && ! grep -q "$DOMAIN" "$CADDYFILE"; then
@@ -186,7 +188,8 @@ def build_remote_payload(cfg: dict) -> str:
     r = cfg.get("remote", {})
     script = REMOTE_SCRIPT
     for token, value in {
-        "@@REPO@@": shlex.quote(r.get("repo_dir", "/opt/poly-fight")),
+        "@@REPO@@": shlex.quote(r.get("repo_dir", "/opt/poly-fight/repo")),
+        "@@DATADIR@@": shlex.quote(r.get("data_dir", "/opt/poly-fight/data")),
         "@@GITHUB@@": shlex.quote(cfg.get("github_url", "")),
         "@@PYTHON@@": shlex.quote(r.get("python", "python3")),
         "@@PORT@@": str(int(r.get("port", 8787))),
@@ -196,15 +199,17 @@ def build_remote_payload(cfg: dict) -> str:
         script = script.replace(token, value)
     rpc = cfg.get("rpc", {})
     dash = cfg.get("dashboard", {})
+    # Secrets inlined as shell-quoted assignments — the whole script (incl. these)
+    # is piped to `bash -s` over SSH stdin, so secrets never reach argv / the
+    # process table, and the script reads them as ordinary vars (no stdin trick).
+    cookie = f"{dash.get('password','')}-cookie-{r.get('domain','')}"
     secrets = "\n".join([
-        f"RPC_HTTPS={rpc.get('https','')}",
-        f"RPC_WSS={rpc.get('wss','')}",
-        f"DASH_PW={dash.get('password','')}",
-        f"DASH_SECRET={dash.get('password','')}-cookie-{r.get('domain','')}",
-        "__SECRETS_END__",
+        f"RPC_HTTPS={shlex.quote(rpc.get('https',''))}",
+        f"RPC_WSS={shlex.quote(rpc.get('wss',''))}",
+        f"DASH_PW={shlex.quote(dash.get('password',''))}",
+        f"DASH_SECRET={shlex.quote(cookie)}",
     ])
-    # script first; the `while read` loop then consumes the secret lines from stdin.
-    return script + "\n" + secrets + "\n"
+    return script.replace("@@SECRETS@@", secrets) + "\n"
 
 
 def ssh_base(cfg: dict) -> list[str]:

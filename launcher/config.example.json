@@ -1,36 +1,31 @@
 {
   "_comment": "复制为 secret/launcher.json 并填值（secret/ 已 gitignore）。也可运行 `python3 launcher/launcher.py --init` 从现有 secret/rpc、secret/dashboard-password、secret/vps-password 自动合成。敏感值只存本地这一份。",
-
   "github_url": "https://github.com/ForrestLWL1203/poly-fight.git",
-
   "dashboard": {
     "username": "admin",
     "password": ""
   },
-
   "rpc": {
     "https": "",
     "wss": ""
   },
-
   "local": {
     "host": "127.0.0.1",
     "port": 8787,
     "data_dir": "data"
   },
-
   "remote": {
     "vps_host": "",
     "vps_user": "root",
     "ssh_key": "~/.ssh/id_ed25519",
     "vps_password_file": "secret/vps-password",
-    "repo_dir": "/opt/poly-fight",
+    "repo_dir": "/opt/poly-fight/repo",
     "python": "python3",
     "port": 8787,
     "domain": "dashboard.polylwl1203.top",
-    "caddyfile": "/etc/caddy/Caddyfile"
+    "caddyfile": "/etc/caddy/Caddyfile",
+    "data_dir": "/opt/poly-fight/data"
   },
-
   "polymarket": {
     "private_key": ""
   }
