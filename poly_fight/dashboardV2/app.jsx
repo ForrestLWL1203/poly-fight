@@ -390,7 +390,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
               </select>
               <span className="lb-updated" style={{ marginRight: 4 }}>最后更新 {updatedLabel} · {lb.activeCount} 个活跃</span>
               <div className="sample-trigger">
-                <Button variant="primary" disabled={refreshing} iconLeft={refreshing ? <Spinner sm /> : <i data-lucide="radar" style={{ width: 16, height: 16 }} />} onClick={() => setSamplePanel((v) => !v)}>采样钱包</Button>
+                <Button variant="primary" disabled={refreshing} iconLeft={refreshing ? <Spinner sm /> : <Ico n="radar" />} onClick={() => setSamplePanel((v) => !v)}>采样钱包</Button>
                 {samplePanel && <>
                   <div className="sample-backdrop" onClick={() => setSamplePanel(false)} />
                   <div className="sample-pop" role="dialog" aria-label="采集门槛设置">
@@ -398,7 +398,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                     <Input label="胜率门槛" type="number" min="50" max="99" step="1" suffix="%" value={wrInput} onChange={(e) => setWrInput(e.target.value)} block />
                     <Input label="买入价上限" type="number" min="0.3" max="0.95" step="0.01" value={entryInput} onChange={(e) => setEntryInput(e.target.value)} block />
                     <div className="sample-pop-hint">仅采集专精盘口胜率 ≥ 门槛、买入价 ≤ 上限的钱包</div>
-                    <Button variant="primary" disabled={refreshing} iconLeft={<i data-lucide="radar" style={{ width: 15, height: 15 }} />} onClick={startSample}>开始采样</Button>
+                    <Button variant="primary" disabled={refreshing} iconLeft={<Ico n="radar" />} onClick={startSample}>开始采样</Button>
                   </div>
                 </>}
               </div>
@@ -840,6 +840,7 @@ function Ico({ n, className }) {
     case "crosshair": return <svg {...p}><circle cx="12" cy="12" r="10" /><line x1="22" x2="18" y1="12" y2="12" /><line x1="6" x2="2" y1="12" y2="12" /><line x1="12" x2="12" y1="6" y2="2" /><line x1="12" x2="12" y1="22" y2="18" /></svg>;
     case "wallet": return <svg {...p}><path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1" /><path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4" /></svg>;
     case "filter": return <svg {...p}><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" /></svg>;
+    case "radar": return <svg {...p}><path d="M19.07 4.93A10 10 0 0 0 6.99 3.34" /><path d="M4 6h.01" /><path d="M2.29 9.62A10 10 0 1 0 21.31 8.35" /><path d="M16.24 7.76A6 6 0 1 0 8.23 16.67" /><path d="M12 18h.01" /><path d="M17.99 11.66A6 6 0 0 1 15.77 16.67" /><circle cx="12" cy="12" r="2" /><path d="m13.41 10.59 5.66-5.66" /></svg>;
     default: return null;
   }
 }
