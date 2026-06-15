@@ -5679,6 +5679,11 @@ def command_observe_v2(args: argparse.Namespace, client: PolymarketClient | None
     retry = max(30, int(getattr(args, "loop_error_retry_seconds", 300) or 300))
     max_iter = int(getattr(args, "loop_max_iterations", 0) or 0)
     iterations = 0
+    # 作为 follow sidecar 启动时,榜单刚被手动采集刷新过,第一轮先睡满 interval 再跑,
+    # 避免"刚采完就立即用另一套默认阈值重算覆盖"。
+    if getattr(args, "defer_first_tick", False):
+        print(json.dumps({"event": "observe_v2_deferred", "first_tick_in_seconds": interval}))
+        time.sleep(interval)
     while True:
         try:
             _command_observe_v2(args, client=cli_client)
@@ -6952,6 +6957,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_build_arguments(observe_v2, include_category=True)
     add_collector_arguments(observe_v2)
     add_collector_v2_arguments(observe_v2)
+    observe_v2.add_argument("--defer-first-tick", action="store_true",
+                            help="作为 follow sidecar 时先睡满一轮再跑(避免刚采集完立即重算覆盖)")
     observe_v2.set_defaults(
         func=command_observe_v2,
         max_leaderboard_wallets=V2_MAX_LEADERBOARD_WALLETS,

@@ -2804,8 +2804,18 @@ def start_runner(
             "--data-dir", str(observe_data_dir),
             "observe-v2", "--category", "esports",
             "--loop-hours", "2", "--observe-lookback-hours", "4",
+            "--defer-first-tick",  # 榜单刚被手动采集刷新过,先睡满一轮再维护
             "--follow-dir", str(follow_dir),
         ]
+        # 继承上次手动采集用的阈值(记录在 wallet_refresh.command 里),否则 observe-v2
+        # 会用默认阈值重算,把榜单覆盖成不一致的一份。
+        last_refresh = (read_follow_control(follow_dir).get("wallet_refresh") or {}).get("esports") or {}
+        last_cmd = last_refresh.get("command") or []
+        for flag in ("--v2-min-positive-rate", "--v2-max-median-entry"):
+            if flag in last_cmd:
+                i = last_cmd.index(flag)
+                if i + 1 < len(last_cmd):
+                    observe_command += [flag, str(last_cmd[i + 1])]
         observe_log = log_dir / f"dashboard-observe-{now_ts}.out"
         observe_pid, observe_pgid = _spawn_detached_process(
             observe_command, observe_log, config.runner_process_starter

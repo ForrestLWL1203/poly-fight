@@ -9653,6 +9653,12 @@ class CoreTest(unittest.TestCase):
             # lister 返回 [] → 状态判定永远非 running,可直接再次 start(无需真停进程)
             calls.clear()
 
+            # 模拟上次手动采集:把所用阈值记进 wallet_refresh.command,observe-v2 应继承它
+            write_follow_control(follow_dir, {"wallet_refresh": {"esports": {"command": [
+                "python", "-m", "poly_fight.cli", "collect-v2",
+                "--v2-min-positive-rate", "0.7500", "--v2-max-median-entry", "0.7500",
+            ]}}})
+
             # 策略勾上实时刷新 → runner + observe-v2 两个进程
             strat_on = default_follow_strategy(balance_usdc=100)
             strat_on["realtime_refresh"] = True
@@ -9664,6 +9670,11 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(observe_cmd[observe_cmd.index("--loop-hours") + 1], "2")
             self.assertEqual(observe_cmd[observe_cmd.index("--observe-lookback-hours") + 1], "4")
             self.assertIn(str(data_dir / "esports"), observe_cmd)   # 与 collect-v2 同一 data 目录
+            # 刚采集完先睡满一轮再跑,避免立即用另一套阈值重算覆盖
+            self.assertIn("--defer-first-tick", observe_cmd)
+            # 继承上次采集的阈值(否则用默认 0.65 会把榜单砍小)
+            self.assertEqual(observe_cmd[observe_cmd.index("--v2-min-positive-rate") + 1], "0.7500")
+            self.assertEqual(observe_cmd[observe_cmd.index("--v2-max-median-entry") + 1], "0.7500")
             self.assertTrue(on["realtime_refresh"])
             self.assertEqual(on["observe_pid"], 4321)
 
