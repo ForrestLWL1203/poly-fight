@@ -5,9 +5,9 @@
 
 :root {
   /* ---- Backdrop blur (frosted glass) ---- */
-  --blur-thin: blur(12px) saturate(160%); /* @kind other */
-  --blur-regular: blur(24px) saturate(175%); /* @kind other */
-  --blur-thick: blur(40px) saturate(185%); /* @kind other */
+  --blur-thin: blur(14px) saturate(180%); /* @kind other */
+  --blur-regular: blur(30px) saturate(200%); /* @kind other */
+  --blur-thick: blur(48px) saturate(210%); /* @kind other */
 
   /* ---- Shadows — soft, diffuse, theme-aware (warm on light) ---- */
   --shadow-xs: 0 1px 2px var(--shadow-c-1);

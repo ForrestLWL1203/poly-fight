@@ -22,9 +22,9 @@
   /* Signature gradient — soft coral, used sparingly on CTAs / hero */
   --gradient-brand: linear-gradient(135deg, #ff8a5f 0%, #ff6b4a 55%, #f0512f 100%); /* @kind color */
   --gradient-brand-soft: linear-gradient(135deg, rgba(255,138,95,0.16), rgba(240,81,47,0.10)); /* @kind color */
-  --gradient-mesh: radial-gradient(120% 120% at 0% 0%, rgba(255,107,74,0.10) 0%, rgba(255,107,74,0) 46%),
-                   radial-gradient(120% 120% at 100% 0%, rgba(255,176,120,0.12) 0%, rgba(255,176,120,0) 50%),
-                   radial-gradient(140% 140% at 100% 100%, rgba(44,140,132,0.07) 0%, rgba(44,140,132,0) 55%); /* @kind color */
+  --gradient-mesh: radial-gradient(120% 120% at 0% 0%, rgba(255,107,74,0.16) 0%, rgba(255,107,74,0) 46%),
+                   radial-gradient(120% 120% at 100% 0%, rgba(255,176,120,0.18) 0%, rgba(255,176,120,0) 50%),
+                   radial-gradient(140% 140% at 100% 100%, rgba(44,140,132,0.12) 0%, rgba(44,140,132,0) 55%); /* @kind color */
 
   /* ---- Warm cream surface ladder (light) ---- */
   --ink-base: #f0eadf;           /* canvas */
@@ -35,10 +35,11 @@
   --ink-500: #e4dccb;            /* strong borders */
   --ink-400: #d6ccb7;
 
-  /* Glass surfaces (translucent, sit over the warm mesh) */
-  --glass-1: rgba(255, 253, 248, 0.74);
-  --glass-2: rgba(255, 255, 255, 0.82);
-  --glass-3: rgba(244, 238, 227, 0.72);
+  /* Glass surfaces (translucent, sit over the warm mesh) — lower alpha + stronger
+     blur(effects.css) = a more pronounced frosted-glass read. */
+  --glass-1: rgba(255, 253, 248, 0.62);
+  --glass-2: rgba(255, 255, 255, 0.68);
+  --glass-3: rgba(244, 238, 227, 0.60);
   --glass-hairline: rgba(58, 46, 32, 0.10);
   --glass-hairline-strong: rgba(58, 46, 32, 0.15);
 
@@ -123,9 +124,9 @@
   --ink-500: #41382c;
   --ink-400: #4f4537;
 
-  --glass-1: rgba(34, 28, 21, 0.58);
-  --glass-2: rgba(43, 36, 28, 0.64);
-  --glass-3: rgba(52, 44, 34, 0.56);
+  --glass-1: rgba(34, 28, 21, 0.48);
+  --glass-2: rgba(43, 36, 28, 0.54);
+  --glass-3: rgba(52, 44, 34, 0.46);
   --glass-hairline: rgba(255, 244, 230, 0.09);
   --glass-hairline-strong: rgba(255, 244, 230, 0.15);
 
@@ -162,10 +163,10 @@
 
   --bg-canvas: var(--ink-base);
   --bg-app: var(--ink-900);
-  --surface-sidebar: rgba(27, 22, 16, 0.74);
-  --surface-panel: rgba(34, 28, 21, 0.58);
-  --surface-card: rgba(43, 36, 28, 0.64);
-  --surface-inset: rgba(52, 44, 34, 0.56);
+  --surface-sidebar: rgba(27, 22, 16, 0.66);
+  --surface-panel: rgba(34, 28, 21, 0.48);
+  --surface-card: rgba(43, 36, 28, 0.54);
+  --surface-inset: rgba(52, 44, 34, 0.46);
   --surface-solid: var(--ink-700);
   --border-hairline: rgba(255, 244, 230, 0.09);
   --border-strong: rgba(255, 244, 230, 0.15);
