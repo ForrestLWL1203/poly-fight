@@ -162,12 +162,14 @@ EnvironmentFile=$REPO/secret/dashboard.env
 ExecStart=$PY -m poly_fight.cli --data-dir $DATADIR serve --host 127.0.0.1 --port $PORT
 Restart=always
 RestartSec=4
+# 只管 dashboard 进程本身 — 重启/停 dashboard 不连带杀掉它 spawn 的 runner+observe，
+# 这样「停 dashboard」和「停 runner」可以分开控制。
+KillMode=process
 [Install]
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
 systemctl enable poly-fight-dashboard
-systemctl restart poly-fight-dashboard
 
 echo "[4/5] caddy reverse_proxy for $DOMAIN"
 if [ -f "$CADDYFILE" ] && ! grep -q "$DOMAIN" "$CADDYFILE"; then
@@ -178,9 +180,8 @@ else
   echo "    caddy block already present (or no Caddyfile) — skipped"
 fi
 
-echo "[5/5] status"
-sleep 1
-systemctl is-active poly-fight-dashboard && echo "OK https://$DOMAIN"
+echo "[5/5] 环境就绪"
+echo "PREPARED — 代码/密钥/服务/反代已就绪，点「启动」拉起 dashboard"
 """
 
 
@@ -240,6 +241,36 @@ def _stream(cmd: list[str], emit, *, stdin_data: str | None = None, env: dict | 
     return p.wait()
 
 
+# ---- 环境准备(prepare):重活,不启动 dashboard ----
+def prepare_local(cfg: dict, emit) -> bool:
+    rpc = cfg.get("rpc", {})
+    if rpc.get("https") or rpc.get("wss"):
+        (ROOT / "secret").mkdir(exist_ok=True)
+        (ROOT / "secret" / "rpc").write_text(f"{rpc.get('https','')}\n{rpc.get('wss','')}\n", encoding="utf-8")
+        os.chmod(ROOT / "secret" / "rpc", 0o600)
+        emit("已写入 secret/rpc(链上检测用)")
+    emit("RESULT_OK 本地环境就绪 — 点「启动」")
+    return True
+
+
+def prepare_remote(cfg: dict, emit) -> bool:
+    r = cfg.get("remote", {})
+    if not r.get("vps_host"):
+        emit("ERROR: remote.vps_host 未设置")
+        return False
+    if not cfg.get("dashboard", {}).get("password"):
+        emit("ERROR: dashboard.password 未设置")
+        return False
+    emit(f"SSH → {r.get('vps_user','root')}@{r.get('vps_host')}  环境准备(拉代码/密钥/服务/反代)…")
+    rc = _stream(ssh_base(cfg) + ["bash", "-s"], emit, stdin_data=build_remote_payload(cfg))
+    if rc == 0:
+        emit("RESULT_OK 环境就绪 — 点「启动」拉起 dashboard")
+        return True
+    emit(f"RESULT_FAIL (exit {rc})")
+    return False
+
+
+# ---- 启动(start):只起 dashboard ----
 def start_local(cfg: dict, emit) -> bool:
     loc = cfg.get("local", {})
     dash = cfg.get("dashboard", {})
@@ -251,11 +282,6 @@ def start_local(cfg: dict, emit) -> bool:
         "POLY_FIGHT_DASH_PASSWORD": dash.get("password", ""),
         "POLY_FIGHT_DASH_COOKIE_SECRET": f"{dash.get('password','')}-local-cookie",
     }
-    # rpc to disk so the runner's WS detection works locally too
-    rpc = cfg.get("rpc", {})
-    if rpc.get("https") or rpc.get("wss"):
-        (ROOT / "secret").mkdir(exist_ok=True)
-        (ROOT / "secret" / "rpc").write_text(f"{rpc.get('https','')}\n{rpc.get('wss','')}\n", encoding="utf-8")
     (ROOT / "logs").mkdir(exist_ok=True)
     log = ROOT / "logs" / "dashboard-serve.out"
     emit(f"启动本地 dashboard → http://{loc.get('host','127.0.0.1')}:{port}")
@@ -274,11 +300,12 @@ def start_remote(cfg: dict, emit) -> bool:
     if not r.get("vps_host"):
         emit("ERROR: remote.vps_host 未设置")
         return False
-    if not cfg.get("dashboard", {}).get("password"):
-        emit("ERROR: dashboard.password 未设置")
-        return False
-    emit(f"SSH → {r.get('vps_user','root')}@{r.get('vps_host')}  部署 + 启动…")
-    rc = _stream(ssh_base(cfg) + ["bash", "-s"], emit, stdin_data=build_remote_payload(cfg))
+    emit("启动 VPS dashboard (systemctl restart)…")
+    sh = ("set +e\n"
+          "systemctl restart poly-fight-dashboard\n"
+          "sleep 1\n"
+          'echo "状态: $(systemctl is-active poly-fight-dashboard)"\n')
+    rc = _stream(ssh_base(cfg) + ["bash", "-s"], emit, stdin_data=sh)
     if rc == 0:
         emit("RESULT_OK " + f"https://{r.get('domain','')}")
         return True
@@ -303,7 +330,7 @@ def stop_local(cfg: dict, emit) -> None:
 def stop_remote(cfg: dict, emit) -> None:
     emit("停止 VPS dashboard (systemctl stop)…")
     rc = _stream(ssh_base(cfg) + ["systemctl", "stop", "poly-fight-dashboard"], emit)
-    emit("RESULT_OK 已停止" if rc == 0 else f"RESULT_FAIL (exit {rc})")
+    emit("RESULT_OK dashboard 已停" if rc == 0 else f"RESULT_FAIL (exit {rc})")
 
 
 # --------------------------------------------------------------------------- #
@@ -328,7 +355,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, (HERE / "ui.html").read_bytes(), "text/html; charset=utf-8")
         elif u.path == "/api/config":
             self._send(200, json.dumps(masked(load_config())))
-        elif u.path in ("/api/start", "/api/stop"):
+        elif u.path in ("/api/prepare", "/api/start", "/api/stop"):
             self._sse_run(u.path, parse_qs(u.query))
         else:
             self._send(404, json.dumps({"error": "not_found"}))
@@ -360,8 +387,9 @@ class Handler(BaseHTTPRequestHandler):
         self._sse_open()
         mode = (qs.get("mode") or ["local"])[0]
         cfg = load_config()
-        action = "stop" if path == "/api/stop" else "start"
+        action = {"/api/prepare": "prepare", "/api/start": "start", "/api/stop": "stop"}.get(path, "start")
         fn = {
+            ("prepare", "local"): prepare_local, ("prepare", "remote"): prepare_remote,
             ("start", "local"): start_local, ("start", "remote"): start_remote,
             ("stop", "local"): stop_local, ("stop", "remote"): stop_remote,
         }.get((action, mode))
