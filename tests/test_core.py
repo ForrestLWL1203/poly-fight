@@ -13258,6 +13258,25 @@ class CoreTest(unittest.TestCase):
         out2 = build_collector_leaderboard_v2(profiles, now_ts=now, include_technical=True)
         self.assertEqual({row["wallet"] for row in out2["leaderboard"]}, {"0xdir", "0xtech"})
 
+    def test_v2_leaderboard_excludes_wallets_idle_over_72h(self):
+        now = 1_700_000_000
+        fresh = self._v2_profile("0xfresh", "lol", wilson=0.70, now=now)   # last trade 24h ago
+        stale = self._v2_profile("0xstale", "lol", wilson=0.70, now=now)
+        stale["last_esports_trade_at"] = now - 80 * 3600                    # 80h ago > 72h
+        out = build_collector_leaderboard_v2({"0xfresh": fresh, "0xstale": stale}, now_ts=now)
+        self.assertEqual({row["wallet"] for row in out["leaderboard"]}, {"0xfresh"})
+        self.assertEqual(out["rejected_counts"].get("idle_over_limit"), 1)
+        # 一笔交易记录都没有 → 同样排除
+        no_trade = self._v2_profile("0xnone", "lol", wilson=0.70, now=now)
+        no_trade["last_esports_trade_at"] = 0
+        out_n = build_collector_leaderboard_v2({"0xnone": no_trade}, now_ts=now)
+        self.assertEqual(out_n["leaderboard"], [])
+        # 可配置:放宽阈值 / 关闭(0)后沉寂钱包可入榜
+        out_loose = build_collector_leaderboard_v2({"0xstale": stale}, now_ts=now, gate_kwargs={"max_idle_hours": 96})
+        self.assertEqual({row["wallet"] for row in out_loose["leaderboard"]}, {"0xstale"})
+        out_off = build_collector_leaderboard_v2({"0xstale": stale}, now_ts=now, gate_kwargs={"max_idle_hours": 0})
+        self.assertEqual({row["wallet"] for row in out_off["leaderboard"]}, {"0xstale"})
+
     def test_v2_specialist_qualifies_via_strong_bucket(self):
         # 专精评估:钱包整体平庸(lol 主赛很差),但在 cs2 地图胜负上很强 →
         # 应凭专精桶入榜,eligible_buckets 只含该桶,不被 lol 拖累。
@@ -13275,6 +13294,7 @@ class CoreTest(unittest.TestCase):
                 "last_esports_trade_at": now - 86400, "recent_14d_market_count": 0,
                 "hold_pnl": 50.0, "actual_pnl": 50.0, "actual_minus_hold_pnl_rate": 0.0}
         profile = {"wallet": "0xspec", "grade": "A", "two_sided_trade_market_rate": 0.05, "bot_like_score": 10,
+                   "last_esports_trade_at": now - 86400,
                    "candidate": {"tail_entry_market_count": 0, "participated_market_count": 11},
                    "per_game_type": {"cs2:map_winner": strong, "lol:main_match": weak}}
         out = build_collector_leaderboard_v2({"0xspec": profile}, now_ts=now)
