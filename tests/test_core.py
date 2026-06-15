@@ -1734,9 +1734,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(rated["per_game_type_grades"]["cs2:main_match"]["grade"], "A")
         self.assertEqual(rated["per_game_type_grades"]["dota2:main_match"]["grade"], "A")
 
-    def test_effective_sample_floor_is_ten(self):
-        # 不用 Wilson;门槛是有效样本 n_eff ≥ 10(透明、统一,替代旧的 per-type min_sample 3/6)。
-        def rate(count):
+    def test_effective_sample_floor_by_bucket_type(self):
+        # n_eff 下限按盘口分档:主盘(main_match)10,子盘(game/map winner)6。
+        def rate(count, market_type):
             positions = [
                 {"conditionId": f"g{i}", "totalBought": 2500, "realizedPnl": 1500,
                  "avgPrice": 0.5, "timestamp": 100 + i}
@@ -1745,18 +1745,18 @@ class CoreTest(unittest.TestCase):
             summary = summarize_closed_positions(
                 positions,
                 {f"g{i}" for i in range(count)},
-                condition_type_by_id={f"g{i}": "game_winner" for i in range(count)},
+                condition_type_by_id={f"g{i}": market_type for i in range(count)},
                 condition_game_family_by_id={f"g{i}": "cs2" for i in range(count)},
                 now_ts=200,
             )
             return classify_wallet(summary, now_ts=200)
 
-        thin = rate(9)
-        ok = rate(10)
-        self.assertEqual(thin["eligible_buckets"], [])
-        self.assertIn("thin_sample", thin["per_game_type_grades"]["cs2:game_winner"]["reasons"])
-        self.assertEqual(ok["per_game_type_grades"]["cs2:game_winner"]["grade"], "A")
-        self.assertNotIn("thin_sample", ok["per_game_type_grades"]["cs2:game_winner"]["reasons"])
+        # 子盘:5 不够、6 够
+        self.assertIn("thin_sample", rate(5, "game_winner")["per_game_type_grades"]["cs2:game_winner"]["reasons"])
+        self.assertEqual(rate(6, "game_winner")["per_game_type_grades"]["cs2:game_winner"]["grade"], "A")
+        # 主盘:9 不够、10 够
+        self.assertIn("thin_sample", rate(9, "main_match")["per_game_type_grades"]["cs2:main_match"]["reasons"])
+        self.assertEqual(rate(10, "main_match")["per_game_type_grades"]["cs2:main_match"]["grade"], "A")
 
     def test_closed_position_wilson_uses_80_percent_confidence(self):
         positions = []

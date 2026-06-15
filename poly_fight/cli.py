@@ -27,7 +27,6 @@ from .core import (
     GAME_FAMILY_LABELS,
     LEAGUE_LABELS,
     MARKET_TYPE_LABELS,
-    MAX_HIGH_CHURN_MARKET_RATE,
     MIN_A_POSITIVE_MARKET_RATE,
     SCORING_VERSION,
     SECONDS_PER_DAY,
@@ -3240,15 +3239,6 @@ def _leaderboard_reject_reasons_for_profile(
         reasons.append("old_scoring_version")
     if profile.get("per_type_grades") is not None and not eligible_market_types:
         reasons.append("no_eligible_per_type")
-        if str(profile.get("category") or "esports").lower() == "esports":
-            per_game_type_grades = (
-                profile.get("per_game_type_grades")
-                if isinstance(profile.get("per_game_type_grades"), dict)
-                else {}
-            )
-            for grade_metrics in per_game_type_grades.values():
-                if isinstance(grade_metrics, dict):
-                    reasons.extend(str(value) for value in grade_metrics.get("emerging_reject_reasons") or [] if value)
     if profile.get("grade") != "A" and not eligible_market_types:
         reasons.append("not_A_no_eligible_type")
     if not eligible_market_types and to_float(profile.get("esports_roi")) < 0.30:
@@ -4541,26 +4531,11 @@ def _copyable_reject_reasons(row: dict[str, Any]) -> list[str]:
         reasons.append("two_sided_over_limit")
         reasons.extend(two_sided_reasons)
     participated = int(candidate_metrics.get("participated_market_count") or 0)
-    if _eligible_bucket_mode(row, bucket_key_value) == "emerging" and participated > 0:
-        high_churn_rate = int(candidate_metrics.get("high_churn_market_count") or 0) / participated
-        if high_churn_rate > MAX_HIGH_CHURN_MARKET_RATE:
-            reasons.append("emerging_high_churn")
     if participated > 0:
         tail_rate = int(candidate_metrics.get("tail_entry_market_count") or 0) / participated
         if tail_rate > MAX_COPYABLE_TAIL_ENTRY_RATE:
             reasons.append("tail_entry_over_limit")
     return sorted(set(reasons))
-
-
-def _eligible_bucket_mode(row: dict[str, Any], bucket_key: str) -> str:
-    if isinstance(row.get("eligible_bucket_modes"), dict):
-        mode = str(row["eligible_bucket_modes"].get(bucket_key) or "")
-        if mode:
-            return mode
-    per_game_type_grades = row.get("per_game_type_grades") if isinstance(row.get("per_game_type_grades"), dict) else {}
-    if isinstance(per_game_type_grades.get(bucket_key), dict):
-        return str(per_game_type_grades[bucket_key].get("eligible_mode") or "")
-    return ""
 
 
 
@@ -4574,6 +4549,23 @@ def _v2_candidate_metric(profile: dict[str, Any], key: str) -> Any:
 
 
 _V2_GRADE_RANK = {"a": 4, "b": 3, "stale": 2, "c": 1}
+
+
+def v2_bucket_display_score(metrics: dict[str, Any], *, now_ts: int | None = None) -> float:
+    """新轴 0-100 展示分(与上榜门同口径):近期加权胜率 θ̂ + copy-edge + 有效样本 + 活跃度。
+    归一化天花板按"顶级实测水平"标定,使最强桶接近 100;刚够格的桶约 30+。
+    """
+    win_rate = to_float(metrics.get("bucket_win_rate"))
+    copy_edge = to_float(metrics.get("bucket_copy_edge"))
+    eff_sample = to_float(metrics.get("bucket_eff_sample"))
+    last_trade = to_int(metrics.get("last_esports_trade_at"))
+    n_wr = _clamp_float((win_rate - 0.50) / 0.28)     # 胜率 0.78 → 1.0
+    n_edge = _clamp_float(copy_edge / 0.22)           # copy-edge 0.22 → 1.0
+    n_eff = _clamp_float(eff_sample / 22.0)           # n_eff 22 → 1.0
+    n_rec = 0.0
+    if now_ts and last_trade > 0:
+        n_rec = _clamp_float(1.0 - max(0, int(now_ts) - last_trade) / (14 * 86400))  # 当天 → 1.0
+    return round(100.0 * (0.45 * n_wr + 0.30 * n_edge + 0.15 * n_eff + 0.10 * n_rec), 1)
 
 
 def _v2_grade_rank(grade: Any) -> int:
@@ -4657,11 +4649,12 @@ def build_collector_leaderboard_v2(
                     "median_entry_price": round(to_float(metrics.get("median_entry_price")), 6),
                     "positive_market_rate": round(to_float(metrics.get("positive_market_rate")), 6),
                     "esports_closed_count": to_int(metrics.get("esports_closed_count")),
-                    # 主桶排序:活跃度(有效样本)→ copy-edge(能赚)→ 近期加权胜率
+                    "score": v2_bucket_display_score(metrics, now_ts=now_ts),
+                    # 主桶排序 = 新轴展示分(高分=更准/更能赚/更活跃),并列时用 eff/edge 兜底确定性。
                     "rank_score": (
+                        v2_bucket_display_score(metrics, now_ts=now_ts),
                         to_float(metrics.get("bucket_eff_sample")),
                         to_float(metrics.get("bucket_copy_edge")),
-                        to_float(metrics.get("bucket_win_rate")),
                     ),
                 }
             )
@@ -4676,6 +4669,7 @@ def build_collector_leaderboard_v2(
                 "primary_game": best["game_family"],
                 "best_bucket": best["bucket_key"],
                 "best_market_type": best["market_type"],
+                "best_bucket_score": best["score"],   # 0-100 新轴展示分(dashboard 显示)
                 "edge_type": best["edge_type"],
                 "eligible_buckets": [item["bucket_key"] for item in eligible],
                 # follow 循环按 eligible_market_types 判定可跟盘口;从够格桶派生,否则 v2 钱包会被跳过。
@@ -4779,7 +4773,7 @@ def _command_collect_wallets(
     prefix = "collector_v2"
     now_dt = datetime.now(timezone.utc)
     now_ts = int(now_dt.timestamp())
-    lookback_days = int(getattr(args, "lookback_days", 30) or 30)
+    lookback_days = int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS)
     min_end_date = now_dt - timedelta(days=lookback_days)
     stage_timings: dict[str, float] = {}
     stage_started_at = time.monotonic()
@@ -4892,7 +4886,7 @@ def _command_collect_wallets(
         for row in classification_set
         if row.get("condition_id")
     }
-    profile_lookback_days = int(getattr(args, "profile_lookback_days", COLLECTOR_PROFILE_LOOKBACK_DAYS) or 0)
+    profile_lookback_days = int(getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS) or V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
     profile_classification_set = filter_classification_set_by_lookback(
         classification_set,
         now=now_dt,
@@ -5313,8 +5307,8 @@ def rescore_demote_wallets(
         return {"rescored": 0, "demoted": 0, "demoted_wallets": []}
 
     # scope 分类集(与 observe-v2 一致)。
-    profile_lookback_days = int(getattr(args, "profile_lookback_days", COLLECTOR_PROFILE_LOOKBACK_DAYS) or 15)
-    lookback_days = int(getattr(args, "lookback_days", 15) or 15)
+    profile_lookback_days = int(getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS) or V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
+    lookback_days = int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS)
     closed_events = client.list_events_paginated(
         closed=True, active=None, max_pages=getattr(args, "gamma_pages", 10),
         min_end_date=now_dt - timedelta(days=lookback_days), max_end_date=now_dt,
@@ -5427,7 +5421,7 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
     # M5 降级已拆出到 follow runner(按结算笔数事件触发 rescore_demote_wallets)。observe-v2
     # 只保留:M4 发现 + 满冷却的恢复(本地 SQLite,廉价:重评隔离钱包,回到 A 榜则解隔离)。
     follow_store = FollowStore(follow_dir / "follow.db")
-    profile_lookback_days = int(getattr(args, "profile_lookback_days", COLLECTOR_PROFILE_LOOKBACK_DAYS) or 15)
+    profile_lookback_days = int(getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS) or V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
     recovery_targets = _observe_v2_recovery_targets(
         follow_store, now_ts=now_ts, cooldown_days=RESCORE_COOLDOWN_DAYS,
     )
@@ -5450,7 +5444,7 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
     seed_wallets = aggregate_seed_wallets(seed_positions)
 
     # 2) 分类集(15 天)给 profiling 提供 scope(发现/重评共用,总是构建)
-    lookback_days = int(getattr(args, "lookback_days", 15) or 15)
+    lookback_days = int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS)
     closed_events = client.list_events_paginated(
         closed=True, active=None, max_pages=getattr(args, "gamma_pages", 10),
         min_end_date=now_dt - timedelta(days=lookback_days), max_end_date=now_dt,

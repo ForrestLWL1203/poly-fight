@@ -12,10 +12,11 @@ SCORING_VERSION = 15
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 TRADE_BEHAVIOR_EXCLUDE_RATE = 0.5
-ESPORTS_OVERALL_MIN_SAMPLE = 6
-ESPORTS_MAIN_MATCH_MIN_SAMPLE = 6
-ESPORTS_SUBMARKET_MIN_SAMPLE = 3
-SPORTS_MIN_SAMPLE = 8
+# 有效样本 n_eff 下限(按盘口分档):主盘 10(回测最优);子盘(单局/地图)6,赛事更密、放宽。
+ESPORTS_OVERALL_MIN_SAMPLE = 10
+ESPORTS_MAIN_MATCH_MIN_SAMPLE = 10
+ESPORTS_SUBMARKET_MIN_SAMPLE = 6
+SPORTS_MIN_SAMPLE = 10
 # Thresholds recalibrated for the de-biased trade-reconstruction win rates (v11):
 # real top esports wallets win ~66-81%, not the survivorship-inflated ~90% the old
 # closed_positions floors assumed. See review/scoring analysis.
@@ -31,13 +32,12 @@ ESPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE = 0.08
 SPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE = 0.10
 # ── Copy 评分轴（固定注、持有到结算 copy；目标的美元盈亏/仓位大小与我们无关）──
 # 不用 Wilson(它对小样本过度惩罚、误杀真专家)。单层三条,全是点估、人话可讲:
-#   1) 胜率够高 + 够样本: θ̂(近期加权点估胜率) ≥ WIN_RATE_MIN 且 有效样本 n_eff ≥ MIN_EFF_SAMPLE
+#   1) 胜率够高 + 够样本: θ̂(近期加权点估胜率) ≥ WIN_RATE_MIN 且 有效样本 n_eff ≥ 盘口分档下限(主10/子6)
 #   2) 价格不超线:        PRICE_LO ≤ 入场价 ≤ PRICE_HI
 #   3) 有 edge:           θ̂ − 入场价 ≥ EDGE_MIN  (固定注每股期望收益 = 胜率 − 价格)
-# 美元盈亏 / capital_weighted_edge 不再是门槛(降为软 reason)。
-ESPORTS_COPY_WIN_RATE_MIN = 0.58      # θ̂ 点估胜率下限(高胜率,挡抛硬币/彩票桶)
-ESPORTS_COPY_MIN_EFF_SAMPLE = 10.0    # 有效样本下限(回测最优;透明替代 Wilson 的"防小样本侥幸")
-ESPORTS_COPY_EDGE_MIN = 0.06          # θ̂ − 入场价 的加性 edge 下限
+# 美元盈亏 / capital_weighted_edge 不再是门槛(降为软 reason)。n_eff 下限见 ESPORTS_*_MIN_SAMPLE。
+ESPORTS_COPY_WIN_RATE_MIN = 0.65      # θ̂ 点估胜率下限(精筛高胜率;尾部 q1≈70%,中位≈74%)
+ESPORTS_COPY_EDGE_MIN = 0.10          # θ̂ − 入场价 的加性 edge 下限(子盘自动放宽到 0.06)
 ESPORTS_COPY_PRICE_LO = 0.40          # 价格带下界(防极端 longshot;低胜率彩票已被胜率下限挡掉)
 ESPORTS_COPY_PRICE_HI = 0.68          # 价格带上界(避开 priced-in 大热门)
 # 近期活跃度:按时间半衰期对每盘加权(近期热度 > 陈旧战绩),折算 Kish 有效样本 n_eff,
@@ -1861,8 +1861,6 @@ def classify_wallet_bucket(
     category = str(summary.get("category") or "").lower()
     is_sports = category == "sports"
     min_roi = SPORTS_MIN_ROI if is_sports else ESPORTS_MIN_ROI
-    min_a_wilson = SPORTS_MIN_A_WILSON if is_sports else ESPORTS_MIN_A_WILSON
-    min_a_edge = SPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE if is_sports else ESPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE
     # capital_weighted_edge is the skill axis for both categories: it credits wallets that
     # win more (capital-weighted) than their entry price implied, so high-win-rate
     # favorite-buyers (low roi, negative entry_edge) are no longer wrongly cut.
@@ -1919,7 +1917,7 @@ def classify_wallet_bucket(
     in_price_band = ESPORTS_COPY_PRICE_LO <= median_entry <= ESPORTS_COPY_PRICE_HI
     min_win_rate = ESPORTS_COPY_WIN_RATE_MIN
     min_edge = ESPORTS_COPY_EDGE_MIN
-    min_eff = ESPORTS_COPY_MIN_EFF_SAMPLE
+    min_eff = float(min_sample)   # 盘口分档的 n_eff 下限(主盘10/子盘6,来自 wallet_bucket_min_sample)
 
     if eff_sample < min_eff:
         reasons.append("thin_sample")
