@@ -367,6 +367,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/config":
             save_config(merge_ui(load_config(), body))
             self._send(200, json.dumps({"ok": True}))
+        elif u.path == "/api/quit":
+            self._send(200, json.dumps({"ok": True}))
+            threading.Timer(0.3, lambda: os._exit(0)).start()
         else:
             self._send(404, json.dumps({"error": "not_found"}))
 

@@ -107,7 +107,7 @@
 
   <div class="right">
     <div class="card logcard">
-      <div class="loghead"><b>运行日志</b><span class="hint" id="mode-hint">本地</span></div>
+      <div class="loghead"><b>运行日志</b><span><span class="hint" id="mode-hint">本地</span><button class="btn ghost" style="height:28px;padding:0 11px;margin-left:10px" onclick="quit()">退出 launcher</button></span></div>
       <div id="result" class="result"></div>
       <pre id="log" class="log"><span class="ph">点「环境准备 / 启动 / 停 dashboard」这里实时显示日志…</span></pre>
     </div>
@@ -185,6 +185,10 @@ function run(path){
   es.onerror=()=>{ es.close(); document.querySelectorAll(".act").forEach(b=>b.disabled=false); };
 }
 async function act(action){ await save(); run("/api/"+action+"?mode="+MODE); }
+async function quit(){
+  try{ await fetch("/api/quit",{method:"POST"}); }catch(e){}
+  document.body.innerHTML='<div style="max-width:480px;margin:80px auto;text-align:center;color:var(--ink2);font-size:15px">launcher 已退出 ✓<br><span style="font-size:13px;color:var(--ink3)">可以关闭此页面了（VPS / 本地的 dashboard 不受影响，继续运行）</span></div>';
+}
 load();
 </script>
 </body>
