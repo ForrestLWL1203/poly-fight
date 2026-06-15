@@ -312,12 +312,15 @@
 .tbl-wrap { width: 100%; overflow-x: auto; }
 table.ps-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
 .ps-table thead th {
-  position: sticky; top: 0;
+  position: sticky; top: 0; z-index: 1;
   text-align: left; padding: var(--sp-3) var(--sp-3);
   font: var(--text-label); text-transform: uppercase; letter-spacing: var(--ls-label);
   color: var(--text-tertiary); white-space: nowrap;
   border-bottom: 1px solid var(--border-hairline);
-  background: var(--surface-card);
+  /* 透明 + 自带 backdrop blur:不再叠加卡片底色(避免比表体更白),滚动时把行内容
+     磨成毛玻璃。与整体玻璃质感统一。 */
+  background: transparent;
+  -webkit-backdrop-filter: var(--blur-regular); backdrop-filter: var(--blur-regular);
 }
 .ps-table tbody td { padding: var(--sp-3) var(--sp-3); border-bottom: 1px solid var(--border-hairline); vertical-align: middle; }
 .ps-table tbody tr:last-child td { border-bottom: 0; }
