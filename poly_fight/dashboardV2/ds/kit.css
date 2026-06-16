@@ -155,9 +155,7 @@
 .sb-chips { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; flex: 1; }
 .sb-chip { font-size: var(--fs-footnote); color: var(--text-secondary); background: var(--surface-inset); border-radius: var(--r-pill); padding: 3px var(--sp-3); white-space: nowrap; }
 
-/* scrollbar-gutter: stable 预留滚动条槽位 → 切页/加载时内容高度变化不再让滚动条闪入闪出
-   (短列表不显示滚动条,长列表照常滚动)。 */
-.page-scroll { flex: 1; overflow-y: auto; scrollbar-gutter: stable; padding: var(--page-pad); }
+.page-scroll { flex: 1; overflow-y: auto; padding: var(--page-pad); }
 .page-inner { max-width: var(--maxw-content); margin: 0 auto; display: flex; flex-direction: column; gap: var(--gutter); }
 
 /* ---- Section heads ---- */
@@ -422,8 +420,9 @@ table.ps-table { width: 100%; border-collapse: collapse; font-variant-numeric: t
 .pg-ellipsis { display: inline-flex; align-items: flex-end; justify-content: center; min-width: 22px; height: 34px; padding-bottom: 6px; color: var(--text-quaternary); font-size: var(--fs-subhead); }
 
 /* page-change fade for table bodies */
+/* 仅透明度淡入:不要 translateY,否则切页动画期间内容下推会瞬时溢出 page-scroll 触发滚动条闪现。 */
 .tbl-fade { animation: pageFade var(--dur-slow) var(--ease-out); }
-@keyframes pageFade { from { opacity: 0.4; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes pageFade { from { opacity: 0.4; } to { opacity: 1; } }
 
 /* ---- Toolbar row in panels ---- */
 .panel-toolbar { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); margin-bottom: var(--sp-5); flex-wrap: wrap; }
