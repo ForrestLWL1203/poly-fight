@@ -1028,6 +1028,12 @@ function StrategyEditor({ s, up, wallet, locked }) {
             <NumField value={s.minSignal} onChange={up("minSignal")} unit="USDC" lead="忽略目标买入 <" width={64} disabled={!s.minSignalOn} />
           </div>
         </div>
+        {s.sizing === "kelly" ? <div className="cfg-mini">
+          <div className="cm-head"><Ico n="filter" /><span>风控(Kelly 内置)</span></div>
+          <div className="cm-body">
+            <p className="cfg-sub">单笔上限 / 单场上限 / 单笔下限 已在左侧 Kelly 设置内;现价上限固定 0.85(= 评分价区,系统统一),无需重复配置。</p>
+          </div>
+        </div> : <React.Fragment>
         <div className="cfg-mini">
           <div className="cm-head"><Ico n="filter" /><span>现价上限</span></div>
           <div className="cm-body">
@@ -1058,14 +1064,7 @@ function StrategyEditor({ s, up, wallet, locked }) {
             <div className="ctrl-row"><SegmentedControl value={s.spendMode} onChange={up("spendMode")} options={[{ value: "fixed", label: "固定金额" }, { value: "balancePct", label: "余额百分比" }]} />{s.spendMode === "fixed" ? <NumField value={s.spendFixed} onChange={up("spendFixed")} unit="USDC" width={88} /> : <NumField value={s.spendPct} onChange={up("spendPct")} unit="%" width={58} />}</div>
           </div> : null}
         </div>
-        <div className="cfg-head"><h3>动态榜单</h3></div>
-        <p className="cfg-sub">仅在跟单运行期间生效</p>
-        <div className="sub-block">
-          <div className="switch-row">
-            <div className="sr-text"><span className="sr-title">动态刷新</span><span className="sr-desc">跟单期间动态刷新 Leaderboard</span></div>
-            <Switch checked={s.realtimeRefresh} onChange={(v) => up("realtimeRefresh")(v)} accent />
-          </div>
-        </div>
+        </React.Fragment>}
       </div>
     </div>
   );
@@ -1085,8 +1084,14 @@ function StrategyRowEditor({ initName, initKit, wallet, saveLocked, saving, take
     <div className="strat-editor">
       <div className="se-name">
         <label className="se-name-label">策略名称</label>
-        <input className="se-name-input" value={name} maxLength={24} placeholder="给这个策略起个名字，例如：稳健跟单"
-          onChange={(e) => setName(e.target.value)} />
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <input className="se-name-input" value={name} maxLength={24} placeholder="给这个策略起个名字，例如：稳健跟单"
+            onChange={(e) => setName(e.target.value)} />
+          <label onClick={(e) => e.stopPropagation()} title="跟单运行期间动态刷新 Leaderboard(发现新钱包/解隔离)"
+            style={{ display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap" }}>
+            <Switch checked={!!s.realtimeRefresh} onChange={(v) => up("realtimeRefresh")(v)} accent /><span>动态刷新 Leaderboard</span>
+          </label>
+        </div>
         {nameErr ? <span className="se-name-err"><Ico n="circle-alert" />{nameErr}</span> : null}
       </div>
       <StrategyEditor s={s} up={up} wallet={wallet} locked={saveLocked} />
