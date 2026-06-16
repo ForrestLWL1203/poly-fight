@@ -1735,7 +1735,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(rated["per_game_type_grades"]["dota2:main_match"]["grade"], "A")
 
     def test_effective_sample_floor_by_bucket_type(self):
-        # n_eff 下限按盘口分档:主盘(main_match)10,子盘(game/map winner)6。
+        # n_eff 下限按盘口分档:主盘(main_match)8,子盘(game/map winner)6。
         def rate(count, market_type):
             positions = [
                 {"conditionId": f"g{i}", "totalBought": 2500, "realizedPnl": 1500,
@@ -1754,9 +1754,9 @@ class CoreTest(unittest.TestCase):
         # 子盘:5 不够、6 够
         self.assertIn("thin_sample", rate(5, "game_winner")["per_game_type_grades"]["cs2:game_winner"]["reasons"])
         self.assertEqual(rate(6, "game_winner")["per_game_type_grades"]["cs2:game_winner"]["grade"], "A")
-        # 主盘:9 不够、10 够
-        self.assertIn("thin_sample", rate(9, "main_match")["per_game_type_grades"]["cs2:main_match"]["reasons"])
-        self.assertEqual(rate(10, "main_match")["per_game_type_grades"]["cs2:main_match"]["grade"], "A")
+        # 主盘:7 不够、8 够
+        self.assertIn("thin_sample", rate(7, "main_match")["per_game_type_grades"]["cs2:main_match"]["reasons"])
+        self.assertEqual(rate(8, "main_match")["per_game_type_grades"]["cs2:main_match"]["grade"], "A")
 
     def test_closed_position_wilson_uses_80_percent_confidence(self):
         positions = []
@@ -1843,7 +1843,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(rated["grade"], "C")
         self.assertIn("thin_sample", rated["reasons"])
 
-    def test_effective_sample_floor_is_ten_markets(self):
+    def test_effective_sample_floor_is_eight_markets(self):
         base_summary = {
             "esports_realized_pnl": 2_000,
             "median_market_roi": 0.40,
@@ -1857,8 +1857,8 @@ class CoreTest(unittest.TestCase):
             "bot_like_score": 0,
         }
 
-        thin = classify_wallet({**base_summary, "esports_closed_count": 9}, now_ts=100 + 86400)
-        qualified = classify_wallet({**base_summary, "esports_closed_count": 10}, now_ts=100 + 86400)
+        thin = classify_wallet({**base_summary, "esports_closed_count": 7}, now_ts=100 + 86400)
+        qualified = classify_wallet({**base_summary, "esports_closed_count": 8}, now_ts=100 + 86400)
 
         self.assertEqual(thin["grade"], "C")
         self.assertIn("thin_sample", thin["reasons"])

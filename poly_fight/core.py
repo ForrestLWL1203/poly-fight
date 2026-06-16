@@ -12,9 +12,9 @@ SCORING_VERSION = 15
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 TRADE_BEHAVIOR_EXCLUDE_RATE = 0.5
-# 有效样本 n_eff 下限(按盘口分档):主盘 10(回测最优);子盘(单局/地图)6,赛事更密、放宽。
-ESPORTS_OVERALL_MIN_SAMPLE = 10
-ESPORTS_MAIN_MATCH_MIN_SAMPLE = 10
+# 有效样本 n_eff 下限(按盘口分档):主盘 8;子盘(单局/地图)6,赛事更密、放宽。
+ESPORTS_OVERALL_MIN_SAMPLE = 8
+ESPORTS_MAIN_MATCH_MIN_SAMPLE = 8
 ESPORTS_SUBMARKET_MIN_SAMPLE = 6
 SPORTS_MIN_SAMPLE = 10
 # Thresholds recalibrated for the de-biased trade-reconstruction win rates (v11):
