@@ -5789,6 +5789,19 @@ def command_follow(
         for row in eligible_wallet_rows
         if row.get("eligible_buckets")
     }
+    # kelly 下注用:每钱包 桶→wilson_lb(置信下界胜率)。键含 game:type(per_game_type)与 type(per_type),
+    # follow 端按信号的 market_bucket 取,取不到回退 market_type。
+    def _wilson_map(row: dict[str, Any]) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for src in ("per_game_type_grades", "per_type_grades"):
+            for key, val in (row.get(src) or {}).items():
+                if isinstance(val, dict) and val.get("bucket_wilson_lb") is not None:
+                    out[str(key)] = to_float(val.get("bucket_wilson_lb"))
+        return out
+    bucket_wilson_lb_by_wallet = {
+        f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}": _wilson_map(row)
+        for row in eligible_wallet_rows
+    }
     eligible_leagues_by_wallet = {
         f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}": {str(row.get("league") or "").lower()}
         for row in eligible_wallet_rows
@@ -6012,6 +6025,7 @@ def command_follow(
                     quarantine_sell_frac=args.quarantine_sell_frac,
                     eligible_market_types=eligible_market_types_by_wallet.get(scope_key),
                     eligible_buckets=eligible_buckets_by_wallet.get(scope_key),
+                    bucket_wilson_lb=bucket_wilson_lb_by_wallet.get(scope_key),
                     eligible_category=category,
                     eligible_leagues=eligible_leagues_by_wallet.get(scope_key),
                     conflict_policy="dual_follow",
@@ -6196,6 +6210,7 @@ def command_follow(
                 quarantine_sell_frac=args.quarantine_sell_frac,
                 eligible_market_types=eligible_market_types_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 eligible_buckets=eligible_buckets_by_wallet.get(scope_key) if wallet_can_open_new else None,
+                bucket_wilson_lb=bucket_wilson_lb_by_wallet.get(scope_key),
                 eligible_category=category if wallet_can_open_new else None,
                 eligible_leagues=eligible_leagues_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 conflict_policy="dual_follow",

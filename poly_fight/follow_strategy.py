@@ -11,7 +11,12 @@ DEFAULT_FOLLOW_STRATEGY_SCHEMA_VERSION = 1
 ACTIVE_FOLLOW_STRATEGY_ID = "active"
 # 现价上限默认(0 = 不限)= 全系统唯一分水岭 FOLLOWABLE_PRICE_CEILING(评分/跟单/seed 同源)。
 DEFAULT_MAX_FOLLOW_ENTRY_PRICE = FOLLOWABLE_PRICE_CEILING
-DEFAULT_FIXED_STAKE_USDC = 1.0          # 固定注默认每信号金额
+DEFAULT_FIXED_STAKE_USDC = 1.0          # 固定注默认每信号金额(legacy)
+# v18 Kelly 智能引擎默认值:跟多少 = ¼Kelly(edge_lb/(1−p))×本金,落到 单笔%/单场%/最小$ 边界内。
+DEFAULT_KELLY_FRACTION = 0.25           # ¼ Kelly(UI:保守0.125/标准0.25/激进0.5)
+DEFAULT_PER_SIGNAL_CAP_PERCENT = 5.0    # 单笔上限 = 本金 5%
+DEFAULT_PER_MATCH_CAP_PERCENT = 10.0    # 单场(condition)上限 = 本金 10%,防一场亏光
+DEFAULT_MIN_STAKE_USDC = 1.0            # Polymarket CLOB 最小单(INVALID_ORDER_MIN_SIZE)
 
 
 def _finite_positive(value: Any) -> bool:
@@ -35,10 +40,15 @@ def default_follow_strategy(*, balance_usdc: float | None = None) -> dict[str, A
         # (每 2h 发现新钱包 + 放回冷却到期的隔离钱包 + 增量更新榜单)。
         # 作为策略字段持久化,运行中不可改。
         "realtime_refresh": False,
-        # 默认固定注:我们按自己定额下单,不抄目标钱包的仓位大小(proportional 会放大他的
-        # 大注 → 等同跟着赌)。proportional/balance_percent 仍可选,但不再是默认。
+        # v18 默认 = Kelly 智能引擎:按 edge 自己定额(edge_lb=wilson_lb−现价,f*=edge/(1−p),¼Kelly),
+        # 落到 单笔%/单场%/最小$ 三道边界内。legacy fixed/proportional/balance_percent 仍可选(验证 kelly 后再废弃)。
         "stake_sizing": {
-            "mode": "fixed",
+            "mode": "kelly",
+            "kelly_fraction": DEFAULT_KELLY_FRACTION,
+            "per_signal_cap_percent": DEFAULT_PER_SIGNAL_CAP_PERCENT,
+            "per_match_cap_percent": DEFAULT_PER_MATCH_CAP_PERCENT,
+            "min_stake_usdc": DEFAULT_MIN_STAKE_USDC,
+            # legacy(兼容保留):
             "ratio_percent": 10.0,
             "per_order_cap_enabled": False,
             "per_order_cap_usdc": 0.0,
@@ -84,7 +94,13 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
     prefilters = strategy["prefilters"]
     balance = strategy["balance"]
 
-    sizing["mode"] = str(sizing.get("mode") or "proportional").strip().lower()
+    sizing["mode"] = str(sizing.get("mode") or "kelly").strip().lower()
+    # v18 Kelly 引擎参数
+    sizing["kelly_fraction"] = round(to_float(sizing.get("kelly_fraction") if sizing.get("kelly_fraction") is not None else DEFAULT_KELLY_FRACTION), 8)
+    sizing["per_signal_cap_percent"] = round(to_float(sizing.get("per_signal_cap_percent") if sizing.get("per_signal_cap_percent") is not None else DEFAULT_PER_SIGNAL_CAP_PERCENT), 8)
+    sizing["per_match_cap_percent"] = round(to_float(sizing.get("per_match_cap_percent") if sizing.get("per_match_cap_percent") is not None else DEFAULT_PER_MATCH_CAP_PERCENT), 8)
+    sizing["min_stake_usdc"] = round(to_float(sizing.get("min_stake_usdc") if sizing.get("min_stake_usdc") is not None else DEFAULT_MIN_STAKE_USDC), 8)
+    # legacy
     sizing["ratio_percent"] = round(to_float(sizing.get("ratio_percent")), 8)
     sizing["per_order_cap_enabled"] = bool(sizing.get("per_order_cap_enabled"))
     sizing["per_order_cap_usdc"] = round(to_float(sizing.get("per_order_cap_usdc")), 8)
@@ -130,8 +146,18 @@ def validate_follow_strategy(strategy: dict[str, Any] | None) -> tuple[bool, lis
     limits = normalized["condition_limits"]
     balance = normalized["balance"]
 
-    if sizing["mode"] not in {"proportional", "fixed", "balance_percent"}:
+    if sizing["mode"] not in {"kelly", "proportional", "fixed", "balance_percent"}:
         errors.append("stake_sizing.mode")
+    if sizing["mode"] == "kelly":
+        kf = to_float(sizing.get("kelly_fraction"))
+        if not (_finite_positive(kf) and kf <= 1.0):
+            errors.append("stake_sizing.kelly_fraction")
+        if not _finite_positive(sizing.get("per_signal_cap_percent")):
+            errors.append("stake_sizing.per_signal_cap_percent")
+        if not _finite_positive(sizing.get("per_match_cap_percent")):
+            errors.append("stake_sizing.per_match_cap_percent")
+        if not _finite_positive(sizing.get("min_stake_usdc")):
+            errors.append("stake_sizing.min_stake_usdc")
     if sizing["mode"] == "proportional" and not _finite_positive(sizing.get("ratio_percent")):
         errors.append("stake_sizing.ratio_percent")
     if sizing.get("per_order_cap_enabled") and not _finite_positive(sizing.get("per_order_cap_usdc")):
@@ -157,7 +183,7 @@ def validate_follow_strategy(strategy: dict[str, Any] | None) -> tuple[bool, lis
 
     balance_required = (
         bool(balance.get("required"))
-        or sizing["mode"] == "balance_percent"
+        or sizing["mode"] in {"balance_percent", "kelly"}   # kelly 用本金做 Kelly 缩放 + %上限基准
         or limits["stake_cap_mode"] == "balance_percent"
     )
     if balance_required and not _finite_positive(balance.get("usable_balance_usdc")):
@@ -217,6 +243,9 @@ def evaluate_follow_candidate(
     condition_funded_stake_usdc: float,
     condition_funded_order_count: int,
     wallet_condition_funded_order_count: int,
+    bucket_win_rate: float = 0.0,      # kelly:被跟桶 wilson_lb(置信下界胜率)
+    entry_price: float = 0.0,          # kelly:跟单时实时价 p
+    bankroll_usdc: float = 0.0,        # kelly:本金(Kelly 缩放 + %上限基准);缺则回退 available
 ) -> dict[str, Any]:
     normalized = normalize_follow_strategy(strategy)
     valid, errors = validate_follow_strategy(normalized)
@@ -230,10 +259,38 @@ def evaluate_follow_candidate(
         return _block("small_target_wallet_order", strategy=normalized)
 
     sizing = normalized["stake_sizing"]
-    mode = str(sizing.get("mode") or "proportional")
+    mode = str(sizing.get("mode") or "kelly")
     raw_stake = 0.0
     stake_mode = mode
-    if mode == "fixed":
+    if mode == "kelly":
+        # 跟多少 = ¼Kelly × edge_lb/(1−p) × 本金,落到 单笔%/单场%/最小$ 边界内。
+        # 本金基准优先用策略里配置的 usable_balance(总本金),其次入参,最后回退当前可用。
+        bankroll = to_float(normalized["balance"].get("usable_balance_usdc"))
+        if bankroll <= 0:
+            bankroll = to_float(bankroll_usdc) if to_float(bankroll_usdc) > 0 else to_float(available_balance_usdc)
+        win_rate = to_float(bucket_win_rate)   # wilson_lb
+        p = to_float(entry_price)
+        if bankroll <= 0:
+            return _block("no_bankroll", strategy=normalized)
+        if not (0.0 < p < 1.0):
+            return _block("no_live_price", strategy=normalized)
+        edge_lb = win_rate - p
+        if edge_lb <= 0:
+            return _block("no_live_edge", strategy=normalized)   # 价已涨过把握 → 不跟
+        raw_stake = to_float(sizing.get("kelly_fraction")) * (edge_lb / (1.0 - p)) * bankroll
+        per_signal_cap = bankroll * to_float(sizing.get("per_signal_cap_percent")) / 100.0
+        if per_signal_cap > 0:
+            raw_stake = min(raw_stake, per_signal_cap)
+        min_stake = to_float(sizing.get("min_stake_usdc"))
+        per_match_cap = bankroll * to_float(sizing.get("per_match_cap_percent")) / 100.0
+        if per_match_cap > 0:
+            match_remaining = per_match_cap - to_float(condition_funded_stake_usdc)
+            if match_remaining < min_stake:
+                return _block("match_cap_reached", strategy=normalized)   # 本场已到上限
+            raw_stake = min(raw_stake, match_remaining)
+        if 0 < raw_stake < min_stake:   # Kelly 算出 < 最小单 → 补足(edge 正且额度够)
+            raw_stake = min_stake
+    elif mode == "fixed":
         raw_stake = to_float(sizing.get("fixed_usdc"))
     elif mode == "balance_percent":
         raw_stake = to_float(available_balance_usdc) * to_float(sizing.get("balance_percent")) / 100.0
@@ -261,22 +318,23 @@ def evaluate_follow_candidate(
         else:
             return _block("insufficient_balance", target_stake=target_stake, strategy=normalized)
 
-    limits = normalized["condition_limits"]
-    max_orders = to_int(limits.get("max_orders"))
-    order_mode = str(limits.get("order_count_mode") or "none")
-    if order_mode == "condition" and max_orders > 0 and to_int(condition_funded_order_count) >= max_orders:
-        return _block("condition_order_cap_reached", target_stake=target_stake, strategy=normalized)
-    if order_mode == "wallet" and max_orders > 0 and to_int(wallet_condition_funded_order_count) >= max_orders:
-        return _block("wallet_condition_order_cap_reached", target_stake=target_stake, strategy=normalized)
+    if mode != "kelly":   # kelly 自带单场%上限,不走 legacy condition_limits
+        limits = normalized["condition_limits"]
+        max_orders = to_int(limits.get("max_orders"))
+        order_mode = str(limits.get("order_count_mode") or "none")
+        if order_mode == "condition" and max_orders > 0 and to_int(condition_funded_order_count) >= max_orders:
+            return _block("condition_order_cap_reached", target_stake=target_stake, strategy=normalized)
+        if order_mode == "wallet" and max_orders > 0 and to_int(wallet_condition_funded_order_count) >= max_orders:
+            return _block("wallet_condition_order_cap_reached", target_stake=target_stake, strategy=normalized)
 
-    next_condition_stake = to_float(condition_funded_stake_usdc) + target_stake
-    cap_mode = str(limits.get("stake_cap_mode") or "none")
-    if cap_mode == "fixed" and next_condition_stake > to_float(limits.get("stake_cap_usdc")):
-        return _block("condition_stake_cap_reached", target_stake=target_stake, strategy=normalized)
-    if cap_mode == "balance_percent":
-        percent = to_float(limits.get("stake_cap_balance_percent"))
-        if available <= 0 or (next_condition_stake / available) > (percent / 100.0):
+        next_condition_stake = to_float(condition_funded_stake_usdc) + target_stake
+        cap_mode = str(limits.get("stake_cap_mode") or "none")
+        if cap_mode == "fixed" and next_condition_stake > to_float(limits.get("stake_cap_usdc")):
             return _block("condition_stake_cap_reached", target_stake=target_stake, strategy=normalized)
+        if cap_mode == "balance_percent":
+            percent = to_float(limits.get("stake_cap_balance_percent"))
+            if available <= 0 or (next_condition_stake / available) > (percent / 100.0):
+                return _block("condition_stake_cap_reached", target_stake=target_stake, strategy=normalized)
 
     return {
         "would_follow": True,
@@ -294,7 +352,14 @@ def strategy_summary(strategy: dict[str, Any] | None) -> str:
     normalized = normalize_follow_strategy(strategy)
     sizing = normalized["stake_sizing"]
     mode = sizing["mode"]
-    if mode == "fixed":
+    if mode == "kelly":
+        stake_text = (
+            f"Kelly×{to_float(sizing.get('kelly_fraction')):g}"
+            f"(单笔≤{to_float(sizing.get('per_signal_cap_percent')):g}%/"
+            f"单场≤{to_float(sizing.get('per_match_cap_percent')):g}%,"
+            f"最小${to_float(sizing.get('min_stake_usdc')):g})"
+        )
+    elif mode == "fixed":
         stake_text = f"固定 {to_float(sizing.get('fixed_usdc')):g} USDC"
     elif mode == "balance_percent":
         stake_text = f"余额 {to_float(sizing.get('balance_percent')):g}%"

@@ -5221,6 +5221,31 @@ class CoreTest(unittest.TestCase):
 
             self.assertFalse(store.load_follow_strategy()["configured"])
 
+    def test_kelly_stake_sizing_engine(self):
+        # v18 默认 = kelly;按 edge_lb=wilson_lb−p 的 ¼Kelly 定额,落到 单笔5%/单场10%/最小$1 边界。
+        s = default_follow_strategy(balance_usdc=2000)
+        self.assertEqual(s["stake_sizing"]["mode"], "kelly")
+
+        def ev(wlb, p, cond=0.0, avail=2000):
+            return evaluate_follow_candidate(
+                strategy=s, target_wallet_order_cash_usdc=500, available_balance_usdc=avail,
+                condition_funded_stake_usdc=cond, condition_funded_order_count=0,
+                wallet_condition_funded_order_count=0,
+                bucket_win_rate=wlb, entry_price=p, bankroll_usdc=2000,
+            )
+
+        # 高 edge → 撞单笔上限 5%×2000=$100
+        r = ev(0.80, 0.50)
+        self.assertTrue(r["would_follow"]); self.assertEqual(r["funded_stake"], 100); self.assertEqual(r["stake_mode"], "kelly")
+        # 中 edge → Kelly 原值($42)
+        self.assertEqual(ev(0.68, 0.65)["funded_stake"], 42)
+        # 价涨过把握 → 不跟
+        self.assertEqual(ev(0.80, 0.82)["block_reason"], "no_live_edge")
+        # 单场近满(已下 $190,cap $200)→ capped 到剩余 $10
+        self.assertEqual(ev(0.78, 0.55, cond=190)["funded_stake"], 10)
+        # 单场已满 → match_cap_reached
+        self.assertEqual(ev(0.78, 0.55, cond=200)["block_reason"], "match_cap_reached")
+
     def test_follow_strategy_max_entry_price_default_and_clamp(self):
         # 默认 = 全系统唯一分水岭 0.85;缺字段补默认;clamp 到 [0,1];0 = 不限(均 normalize 处理)。
         self.assertEqual(default_follow_strategy()["prefilters"]["max_follow_entry_price"], 0.85)
