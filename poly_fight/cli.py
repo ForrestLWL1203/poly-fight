@@ -4123,7 +4123,12 @@ def collector_cached_profile_usable(
             for value in (profile.get("esports_condition_ids") or [])
             if value
         }
-        if cached_condition_ids != {str(value).lower() for value in profile_condition_ids if value}:
+        current_scope = {str(value).lower() for value in profile_condition_ids if value}
+        # 复用条件:钱包**已交易过的市场**仍全部落在当前 scope 内。若它打过的某个盘滑出了 15 天
+        # 窗口(不在 scope 了)→ 画像会变 → 必须重算。
+        # 原先这里用 `!= 全 scope` 等式比较是 bug:profile 存的是钱包打过的少数盘(如 15/1642),
+        # 与整 scope 永不相等 → 复用永远失效 → 每次全量重 profile(142s)。改成子集判断。
+        if not cached_condition_ids.issubset(current_scope):
             return False
     return True
 

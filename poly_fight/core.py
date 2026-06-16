@@ -8,6 +8,8 @@ from typing import Any, Iterable
 
 
 SECONDS_PER_DAY = 86400
+# profile 复用以此为失效令牌:改任何评分口径(门槛/公式/n_eff 下限/basis)都要 +1,
+# 否则采集会复用旧口径的画像、新规则不生效。改完需全量重采一次,之后才走复用加速。
 SCORING_VERSION = 15
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
