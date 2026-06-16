@@ -2715,20 +2715,9 @@ def esports_bucket_score(
     last_trade_at = int(metrics.get("last_esports_trade_at") or row.get("last_esports_trade_at") or 0)
     if now_ts is not None and last_trade_at > 0:
         recency_norm = _clamp_float(1 - max(0, int(now_ts) - last_trade_at) / (3 * 24 * 60 * 60))
-    score = 100 * (
-        0.30 * wilson
-        + 0.12 * positive_rate
-        + 0.05 * sample_conf
-        + 0.13 * realized_roi_norm
-        + 0.10 * median_roi_norm
-        + 0.06 * participation_norm
-        + 0.04 * recency_norm
-        + 0.02 * avg_cash_norm
-        + 0.05 * edge_norm
-        + 0.03 * price_safety_norm
-        - 0.10 * tail_rate
-        - 0.05 * high_churn_rate
-    )
+    # 展示分走新轴 v2_bucket_display_score(近期加权胜率 θ̂ + copy-edge + n_eff + 活跃度),
+    # 与采集时存入 best_bucket_score 的口径一致;旧 Wilson/ROI 复合分已废弃(ROI 已不是评分依据)。
+    score = v2_bucket_display_score(metrics, now_ts=now_ts)
     return {
         "score": round(score, 6),
         **({"bucket_key": bucket_key, "bucket_label": bucket_label(bucket_key)} if bucket_key else {}),
