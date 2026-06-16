@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .control import _pid_alive, read_follow_control, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
+from .control import _pid_alive, read_follow_control, reconcile_wallet_refresh_status, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
 from .core import (
     GAME_FAMILY_LABELS,
     LEAGUE_LABELS,
@@ -3115,7 +3115,9 @@ def _safe_int(value: Any) -> int:
 
 
 def build_wallet_refresh_status(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str, Any]:
-    control = read_follow_control(follow_dir or data_dir)
+    target = follow_dir or data_dir
+    reconcile_wallet_refresh_status(target)   # 读时自愈:属主(serve)已死的 running → failed,按钮恢复
+    control = read_follow_control(target)
     status = control.get("wallet_refresh") if isinstance(control.get("wallet_refresh"), dict) else {}
     return {
         "status": status or {"status": "idle"},
@@ -3168,6 +3170,7 @@ def start_wallet_refresh(
         "started_at": now_ts,
         "command": command,
         "log_path": str(log_path),
+        "owner_pid": os.getpid(),   # 监控线程所在的 serve;serve 死亡 → 孤儿 → 读时自愈为 failed
     }
     set_pause_new_signals(
         follow_dir,

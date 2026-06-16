@@ -49,6 +49,7 @@ from poly_fight import storage as storage_module
 from poly_fight.control import (
     read_follow_control,
     reconcile_pause_new_signals,
+    reconcile_wallet_refresh_status,
     set_pause_new_signals,
     write_follow_control,
 )
@@ -9557,6 +9558,38 @@ class CoreTest(unittest.TestCase):
             write_follow_control(follow_dir, {"pause_new_signals": {"esports": {
                 "status": "paused", "reason": "wallet_refresh", "started_at": 100, "category": "esports"}}})
             self.assertIn("esports", reconcile_pause_new_signals(follow_dir, now_ts=100 + 5 * 60))
+
+    def test_reconcile_wallet_refresh_dead_owner_marks_failed(self):
+        # 采集 serve 被杀 → running 永久残留、按钮永久变灰。属主已死 → 读时自愈为 failed。
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        with TemporaryDirectory() as tmp:
+            follow_dir = Path(tmp) / "follow"
+            write_follow_control(follow_dir, {"wallet_refresh": {"esports": {
+                "status": "running", "category": "esports", "started_at": 100, "owner_pid": dead.pid}}})
+            healed = reconcile_wallet_refresh_status(follow_dir, now_ts=200)
+            self.assertEqual(healed["esports"]["status"], "failed")
+            self.assertTrue(healed["esports"]["stale"])
+            self.assertEqual(read_follow_control(follow_dir)["wallet_refresh"]["esports"]["status"], "failed")
+
+    def test_reconcile_wallet_refresh_live_owner_kept(self):
+        # 属主(serve)仍存活 → 正在跑的采集不被误判。
+        with TemporaryDirectory() as tmp:
+            follow_dir = Path(tmp) / "follow"
+            write_follow_control(follow_dir, {"wallet_refresh": {"esports": {
+                "status": "running", "category": "esports", "started_at": 100, "owner_pid": os.getpid()}}})
+            healed = reconcile_wallet_refresh_status(follow_dir, now_ts=200)
+            self.assertEqual(healed["esports"]["status"], "running")
+
+    def test_reconcile_wallet_refresh_legacy_ttl(self):
+        # 旧格式(无 owner_pid,如历史卡死的那条)退化为 TTL 自愈:超时判 failed,未超时保留。
+        with TemporaryDirectory() as tmp:
+            follow_dir = Path(tmp) / "follow"
+            base = {"wallet_refresh": {"esports": {"status": "running", "category": "esports", "started_at": 100}}}
+            write_follow_control(follow_dir, base)
+            self.assertEqual(reconcile_wallet_refresh_status(follow_dir, now_ts=100 + 31 * 60)["esports"]["status"], "failed")
+            write_follow_control(follow_dir, base)
+            self.assertEqual(reconcile_wallet_refresh_status(follow_dir, now_ts=100 + 5 * 60)["esports"]["status"], "running")
 
     def test_dashboard_runner_start_realtime_refresh_spawns_observe(self):
         with TemporaryDirectory() as tmp:

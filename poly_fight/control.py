@@ -16,6 +16,10 @@ CONTROL_FILENAME = "follow_control.json"
 # 无需人工干预。
 PAUSE_LEGACY_TTL_SECONDS = 30 * 60        # 无 owner_pid 的旧格式 pause:超 30 分钟自愈
 PAUSE_HARD_TTL_SECONDS = 2 * 3600         # 绝对上限,防 pid 复用误判;任何刷新都不会跑这么久
+# wallet_refresh(采集)状态用同一套属主自愈:监控线程在 serve 里,serve 被杀/重启 → running
+# 永久残留 → dashboard「钱包采集」按钮永久变灰。属主自愈后,进程一死即判 failed,按钮自动恢复。
+WALLET_REFRESH_LEGACY_TTL_SECONDS = 30 * 60
+WALLET_REFRESH_HARD_TTL_SECONDS = 2 * 3600
 
 
 def follow_control_path(data_dir: Path) -> Path:
@@ -86,9 +90,18 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _pause_is_active(status: Any, now_ts: int) -> bool:
-    """一条 pause 记录此刻是否仍然有效(非孤儿)。"""
-    if not isinstance(status, dict) or status.get("status") != "paused":
+def _owned_status_is_live(
+    status: Any,
+    now_ts: int,
+    *,
+    active_value: str,
+    legacy_ttl: int,
+    hard_ttl: int,
+) -> bool:
+    """通用「属主自愈」判活:一条带 owner_pid 的进程状态此刻是否仍有效(非孤儿)。
+    属主进程已死 → 孤儿(False);有属主则受 hard_ttl 兜底(防 pid 复用);无属主退化为 legacy_ttl。
+    pause / wallet_refresh 共用同一口径 —— 各 runner/采集状态的自愈行为保持一致,不再各写各的。"""
+    if not isinstance(status, dict) or status.get("status") != active_value:
         return False
     try:
         started = int(status.get("started_at") or 0)
@@ -99,9 +112,17 @@ def _pause_is_active(status: Any, now_ts: int) -> bool:
     if isinstance(owner_pid, int) and owner_pid > 0:
         if not _pid_alive(owner_pid):
             return False                                   # 属主已死 → 孤儿
-        return not (started > 0 and age > PAUSE_HARD_TTL_SECONDS)   # 防 pid 复用的绝对上限
+        return not (started > 0 and age > hard_ttl)         # 防 pid 复用的绝对上限
     # 旧格式 / 无属主:退化为 TTL 自愈
-    return not (started > 0 and age > PAUSE_LEGACY_TTL_SECONDS)
+    return not (started > 0 and age > legacy_ttl)
+
+
+def _pause_is_active(status: Any, now_ts: int) -> bool:
+    """一条 pause 记录此刻是否仍然有效(非孤儿)。"""
+    return _owned_status_is_live(
+        status, now_ts, active_value="paused",
+        legacy_ttl=PAUSE_LEGACY_TTL_SECONDS, hard_ttl=PAUSE_HARD_TTL_SECONDS,
+    )
 
 
 def reconcile_pause_new_signals(data_dir: Path, *, now_ts: int | None = None) -> dict[str, Any]:
@@ -126,3 +147,33 @@ def reconcile_pause_new_signals(data_dir: Path, *, now_ts: int | None = None) ->
             control.pop("pause_new_signals", None)
         write_follow_control(data_dir, control)
     return survivors
+
+
+def reconcile_wallet_refresh_status(data_dir: Path, *, now_ts: int | None = None) -> dict[str, Any]:
+    """采集(wallet_refresh)状态自愈:running 但属主(serve)已死/超时 → 判为 failed 落盘。
+    监控线程随 serve 死亡 → 状态本会永久卡在 running、按钮永久变灰;按每次读取自愈即恢复。
+    build_wallet_refresh_status 每次读取时调用 —— 进程被杀 / serve 重启即自愈,无需人工清 JSON。"""
+    now_ts = int(time.time()) if now_ts is None else int(now_ts)
+    control = read_follow_control(data_dir)
+    refresh = control.get("wallet_refresh")
+    if not isinstance(refresh, dict) or not refresh:
+        return refresh if isinstance(refresh, dict) else {}
+    healed: dict[str, Any] = {}
+    changed = False
+    for category, status in refresh.items():
+        if (
+            isinstance(status, dict)
+            and status.get("status") == "running"
+            and not _owned_status_is_live(
+                status, now_ts, active_value="running",
+                legacy_ttl=WALLET_REFRESH_LEGACY_TTL_SECONDS, hard_ttl=WALLET_REFRESH_HARD_TTL_SECONDS,
+            )
+        ):
+            healed[category] = {**status, "status": "failed", "finished_at": now_ts, "stale": True}
+            changed = True
+        else:
+            healed[category] = status
+    if changed:
+        control["wallet_refresh"] = healed
+        write_follow_control(data_dir, control)
+    return healed
