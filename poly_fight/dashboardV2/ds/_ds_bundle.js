@@ -1897,8 +1897,20 @@ const GAME_LABELS = {
   cs2: "CS2",
   dota2: "Dota 2",
   lol: "LoL",
-  valorant: "Valorant"
+  valorant: "Valorant",
+  multi: "跨游戏"
 };
+// 无对应 logo 的 game(如 multi / 未来新游戏)→ 破图兜底:把坏 img 换成短文字,不显示裂图。
+function __gameIconOnError(e) {
+  const el = e && e.currentTarget;
+  if (!el || el.dataset.fallback) return;
+  el.dataset.fallback = "1";
+  const txt = (el.getAttribute("alt") || "").slice(0, 2) || "?";
+  const span = document.createElement("span");
+  span.textContent = txt;
+  span.style.cssText = "font:600 10px/1 var(--font-sans);color:var(--text-secondary)";
+  el.replaceWith(span);
+}
 if (typeof document !== "undefined" && !document.getElementById("ps-gameicon-css")) {
   const s = document.createElement("style");
   s.id = "ps-gameicon-css";
@@ -1942,7 +1954,8 @@ function GameIcon({
       ...rest
     }, React.createElement("img", {
       src,
-      alt: ""
+      alt: text,
+      onError: __gameIconOnError
     }), text);
   }
   return React.createElement("span", {
@@ -1951,7 +1964,8 @@ function GameIcon({
     ...rest
   }, React.createElement("img", {
     src,
-    alt: text
+    alt: text,
+    onError: __gameIconOnError
   }));
 }
 Object.assign(__ds_scope, { GameIcon });

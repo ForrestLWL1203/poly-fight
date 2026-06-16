@@ -480,7 +480,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                   <td><div className="cell-stack"><span className="strong">{w.score != null ? w.score : "—"}</span><span className="muted">满分100</span></div></td>
                   <td><div className="cell-stack"><span className="strong">{w.winRate != null ? w.winRate + "%" : "—"}</span>{w.closedCount > 0 && <span className="muted">{w.closedCount} 场</span>}</div></td>
                   <td className="num" title={money(w.avgCash)}>{compactMoney(w.avgCash)}</td>
-                  <td><div className="scope-list">{w.scope.map((s, j) => <span key={j} className="scope-item"><GameIcon game={s.game} base={ASSET_BASE} size="sm" /><span>{s.market}</span></span>)}{!w.scope.length && <span className="muted">–</span>}</div></td>
+                  <td><div className="scope-list">{w.scope.map((s, j) => <span key={j} className="scope-item">{s.game === "multi" ? <span className="ps-gameicon sz-sm" title="跨游戏盘口专家(跨游戏合并达标,无单一游戏专精)" style={{ fontSize: 10, fontWeight: 600, color: "var(--text-secondary)" }}>跨</span> : <GameIcon game={s.game} base={ASSET_BASE} size="sm" />}<span>{s.market}</span></span>)}{!w.scope.length && <span className="muted">–</span>}</div></td>
                   {!q && <td className="strong">{w.followRec}</td>}
                   {!q && <td className={pnlClass(w.followPnl) + " num strong"}>{w.settled ? signedMoney(w.followPnl) : "—"}</td>}
                   <td className="muted">{w.lastTrade || "—"}</td>
