@@ -103,6 +103,8 @@ GAME_FAMILY_LABELS = {
     "cs2": "CS2",
     "dota2": "Dota2",
     "lol": "LoL",
+    # 跨游戏盘口专家:在某盘口上跨游戏合并后达标(per-type 合格),无单一游戏专精桶。
+    "multi": "跨游戏",
 }
 
 

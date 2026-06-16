@@ -4636,6 +4636,40 @@ def build_collector_leaderboard_v2(
                     ),
                 }
             )
+        # Fallback:无任何 per-game-type 够格桶,但有 per-type(跨游戏盘口)够格桶 → 也上榜。
+        # 这类钱包在单个游戏样本不够,但同一盘口跨游戏合并后过了同一道 edge_lb+n_eff 门(经 Wilson
+        # 确认),是"跨游戏盘口专家"。follow 本就按 eligible_market_types 跟它们,这一步把上榜逻辑
+        # 与跟单逻辑对齐(此前能跟却不上榜)。质量门完全相同,只是专精维度从"游戏×盘口"放宽到"盘口"。
+        if not eligible:
+            per_type_grades = profile.get("per_type_grades") if isinstance(profile.get("per_type_grades"), dict) else {}
+            for market_type, metrics in per_type_grades.items():
+                if not isinstance(metrics, dict) or _v2_grade_rank(metrics.get("grade")) < _v2_grade_rank(min_grade):
+                    continue
+                bucket_edge = classify_edge_type(metrics)
+                if not include_technical and bucket_edge == "technical":
+                    rejected_counts["technical_excluded"] = rejected_counts.get("technical_excluded", 0) + 1
+                    continue
+                eligible.append(
+                    {
+                        "bucket_key": f"multi:{market_type}",
+                        "game_family": "multi",
+                        "market_type": str(market_type),
+                        "edge_type": bucket_edge,
+                        "cross_game": True,
+                        "win_rate": round(to_float(metrics.get("bucket_win_rate")), 6),
+                        "copy_edge": round(to_float(metrics.get("bucket_copy_edge")), 6),
+                        "eff_sample": round(to_float(metrics.get("bucket_eff_sample")), 4),
+                        "median_entry_price": round(to_float(metrics.get("median_entry_price")), 6),
+                        "positive_market_rate": round(to_float(metrics.get("positive_market_rate")), 6),
+                        "esports_closed_count": to_int(metrics.get("esports_closed_count")),
+                        "score": v2_bucket_display_score(metrics, now_ts=now_ts),
+                        "rank_score": (
+                            v2_bucket_display_score(metrics, now_ts=now_ts),
+                            to_float(metrics.get("bucket_eff_sample")),
+                            to_float(metrics.get("bucket_copy_edge")),
+                        ),
+                    }
+                )
         if not eligible:
             continue
         best = max(eligible, key=lambda item: item["rank_score"])

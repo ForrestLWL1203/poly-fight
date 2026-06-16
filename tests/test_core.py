@@ -3783,6 +3783,79 @@ class CoreTest(unittest.TestCase):
         self.assertFalse(wallet_is_followable(weak))
         self.assertEqual(board, follow_set)  # 榜单成员 == follow 可跟集合
 
+    def test_v2_board_recovers_per_type_eligible_wallets(self):
+        # 跨游戏盘口专家:只有 per-type(跨游戏盘口)够格桶、无任何 per-game-type A 桶,
+        # 也必须上榜(此前 build_collector_leaderboard_v2 只看 per_game_type_grades → 漏掉)。
+        # 它们过的是和全榜完全相同的 grade-A 门,follow 本就按 eligible_market_types 跟它们。
+        now = 1_000_000
+        base = {
+            "category": "esports",
+            "grade": "A",
+            "last_esports_trade_at": now - 3600,
+            "two_sided_trade_market_rate": 0.0,
+            "bot_like_score": 0,
+            "participated_market_count": 30,
+            "esports_closed_count": 30,
+            "tail_entry_market_count": 0,
+        }
+        cross_game = {
+            **base,
+            "wallet": "0xcrossgame",
+            "eligible_market_types": ["main_match"],
+            "eligible_buckets": [],
+            "per_game_type_grades": {},  # 无任何单游戏专精桶
+            "per_type_grades": {
+                "main_match": {
+                    "grade": "A", "bucket_win_rate": 0.78, "bucket_eff_sample": 15.0,
+                    "bucket_copy_edge": 0.12, "median_entry_price": 0.55,
+                    "positive_market_rate": 0.8, "esports_closed_count": 20,
+                }
+            },
+        }
+        specialist = {
+            **base,
+            "wallet": "0xspecialist",
+            "eligible_market_types": ["main_match"],
+            "eligible_buckets": ["cs2:main_match"],
+            "per_game_type_grades": {
+                "cs2:main_match": {
+                    "grade": "A", "bucket_win_rate": 0.80, "bucket_eff_sample": 15.0,
+                    "bucket_copy_edge": 0.10, "median_entry_price": 0.50,
+                    "positive_market_rate": 0.8, "esports_closed_count": 20,
+                }
+            },
+            "per_type_grades": {"main_match": {"grade": "A"}},
+        }
+        none_a = {
+            **base,
+            "wallet": "0xnone",
+            "grade": "B",
+            "eligible_market_types": [],
+            "per_game_type_grades": {},
+            "per_type_grades": {"main_match": {"grade": "B", "bucket_win_rate": 0.60, "bucket_eff_sample": 8.0}},
+        }
+        profiles = {p["wallet"]: p for p in (cross_game, specialist, none_a)}
+        result = build_collector_leaderboard_v2(profiles, now_ts=now)
+        by_wallet = {normalize_wallet(r["wallet"]): r for r in result["leaderboard"]}
+
+        # per-type 合格钱包被捞上榜,标记为跨游戏
+        self.assertIn("0xcrossgame", by_wallet)
+        row = by_wallet["0xcrossgame"]
+        self.assertEqual(row["primary_game"], "multi")
+        self.assertEqual(row["best_bucket"], "multi:main_match")
+        self.assertIn("main_match", row["eligible_market_types"])
+        self.assertTrue(row["eligible_bucket_details"][0].get("cross_game"))
+        # 正常单游戏专精仍走 per-game-type 路径
+        self.assertIn("0xspecialist", by_wallet)
+        self.assertEqual(by_wallet["0xspecialist"]["primary_game"], "cs2")
+        # 没有任何 A 桶 → 不上榜
+        self.assertNotIn("0xnone", by_wallet)
+        # 上榜集合 == follow 可跟集合(跨游戏钱包也必须可跟)
+        follow_rows = eligible_follow_wallets(result["leaderboard"], now_ts=now, recency_days=365)
+        follow_set = {normalize_wallet(r.get("wallet")) for r in follow_rows}
+        self.assertIn("0xcrossgame", follow_set)
+        self.assertEqual(set(by_wallet), follow_set)
+
     def test_esports_leaderboard_requires_eligible_qualified_type_overlap(self):
         now = 1_000_000
 

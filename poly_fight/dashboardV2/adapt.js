@@ -5,8 +5,8 @@
   "use strict";
 
   /* ---------- shared maps / helpers ---------- */
-  const GAME_LABELS = { dota2: "Dota 2", cs2: "CS2", lol: "LoL", valorant: "Valorant" };
-  const GAME_ORDER = { dota2: 0, lol: 1, cs2: 2, valorant: 3 };
+  const GAME_LABELS = { dota2: "Dota 2", cs2: "CS2", lol: "LoL", valorant: "Valorant", multi: "跨游戏" };
+  const GAME_ORDER = { dota2: 0, lol: 1, cs2: 2, valorant: 3, multi: 9 };
   const MARKET_TYPE_LABELS = { main_match: "主盘", game_winner: "单局", map_winner: "地图" };
   const QUARANTINE_REASONS = {
     manual_dashboard_quarantine: "手动隔离",
@@ -23,6 +23,7 @@
     cs2: ["#d98a1e", "#f0c074"],
     lol: ["#1f7a73", "#6cc0b8"],
     valorant: ["#7d5cff", "#b9a6ff"],
+    multi: ["#6b7280", "#a8b1c0"],
   };
 
   const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
@@ -35,6 +36,7 @@
     if (["dota2", "dota"].includes(compact)) return "dota2";
     if (["lol", "leagueoflegends", "league"].includes(compact)) return "lol";
     if (["valorant", "valo"].includes(compact)) return "valorant";
+    if (compact === "multi") return "multi";  // 跨游戏盘口专家(per-type 合格)
     return "";
   }
 
