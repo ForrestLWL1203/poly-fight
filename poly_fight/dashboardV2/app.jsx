@@ -467,7 +467,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
         <div className="tbl-wrap">
           <table className="ps-table">
             <thead><tr>
-              {!q && <th></th>}<th>Rank</th><th>钱包</th>{q && <th>隔离原因</th>}<th>专精 ROI</th><th>胜率</th><th>场均交易额</th><th>专精</th>{!q && <th>跟单胜负</th>}{!q && <th>跟单 PnL</th>}<th>最后交易</th><th></th>
+              {!q && <th></th>}<th>Rank</th><th>钱包</th>{q && <th>隔离原因</th>}<th>评分</th><th>胜率</th><th>场均交易额</th><th>专精</th>{!q && <th>跟单胜负</th>}{!q && <th>跟单 PnL</th>}<th>最后交易</th><th></th>
             </tr></thead>
             <tbody key={view + cur} className="tbl-fade">
               {pageRows.map((w) => (
@@ -476,7 +476,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                   <td>{w.rank != null ? <RankBadge rank={w.rank} /> : <span className="muted">—</span>}</td>
                   <td><div className="wallet-cell"><WalletAddress address={w.addr} href={polymarketProfileUrl(w.addr)} onClick={(e) => e.stopPropagation()} copyable />{w.isNew && <span className="new-badge" title="动态观测刚发现并入榜（2 小时内）">NEW</span>}</div></td>
                   {q && <td><div className="cell-stack"><span className="strong" style={{ color: "var(--status-warn)" }}>{w.reason}</span><span className="muted">{w.reasonTime}</span></div></td>}
-                  <td><div className="cell-stack"><span className={pnlClass(w.roi) + " strong"}>{w.roi > 0 ? "+" : ""}{w.roi}%</span>{w.overallRoi != null && <span className="muted">全部 {w.overallRoi > 0 ? "+" : ""}{w.overallRoi}%</span>}</div></td>
+                  <td><div className="cell-stack"><span className="strong">{w.score != null ? w.score : "—"}</span><span className="muted">满分100</span></div></td>
                   <td><div className="cell-stack"><span className="strong">{w.winRate != null ? w.winRate + "%" : "—"}</span>{w.closedCount > 0 && <span className="muted">{w.closedCount} 场</span>}</div></td>
                   <td className="num" title={money(w.avgCash)}>{compactMoney(w.avgCash)}</td>
                   <td><div className="scope-list">{w.scope.map((s, j) => <span key={j} className="scope-item"><GameIcon game={s.game} base={ASSET_BASE} size="sm" /><span>{s.market}</span></span>)}{!w.scope.length && <span className="muted">–</span>}</div></td>
