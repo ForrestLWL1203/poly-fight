@@ -322,7 +322,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(default_args.seed_game_winner_min_avg_cash, 100)
         self.assertEqual(default_args.seed_map_winner_min_avg_cash, 100)
         self.assertEqual(default_args.seed_min_weighted_roi, 0.30)
-        self.assertEqual(default_args.seed_max_median_avg_price, 0.75)
+        self.assertEqual(default_args.seed_max_median_avg_price, 0.85)
 
     def test_category_data_dirs_use_fixed_dashboard_root_mapping(self):
         root = Path("/tmp/poly-data")
@@ -5222,10 +5222,10 @@ class CoreTest(unittest.TestCase):
             self.assertFalse(store.load_follow_strategy()["configured"])
 
     def test_follow_strategy_max_entry_price_default_and_clamp(self):
-        # 默认 0.68;缺字段补默认;clamp 到 [0,1];0 = 不限(均 normalize 处理,校验通过)。
-        self.assertEqual(default_follow_strategy()["prefilters"]["max_follow_entry_price"], 0.68)
+        # 默认 = 全系统唯一分水岭 0.85;缺字段补默认;clamp 到 [0,1];0 = 不限(均 normalize 处理)。
+        self.assertEqual(default_follow_strategy()["prefilters"]["max_follow_entry_price"], 0.85)
         miss = normalize_follow_strategy({"prefilters": {"min_target_wallet_order_cash_usdc": 10}})
-        self.assertEqual(miss["prefilters"]["max_follow_entry_price"], 0.68)
+        self.assertEqual(miss["prefilters"]["max_follow_entry_price"], 0.85)
         self.assertEqual(
             normalize_follow_strategy({"prefilters": {"max_follow_entry_price": 1.5}})["prefilters"]["max_follow_entry_price"],
             1.0,
@@ -9713,8 +9713,8 @@ class CoreTest(unittest.TestCase):
             )
 
             self.assertIn("--strategy-source", calls[0][0])
-            self.assertEqual(status["strategy_summary"], "固定 25 USDC，现价上限 0.68，可用余额 250")
-            self.assertEqual(read_follow_control(follow_dir)["runner"]["strategy_summary"], "固定 25 USDC，现价上限 0.68，可用余额 250")
+            self.assertEqual(status["strategy_summary"], "固定 25 USDC，现价上限 0.85，可用余额 250")
+            self.assertEqual(read_follow_control(follow_dir)["runner"]["strategy_summary"], "固定 25 USDC，现价上限 0.85，可用余额 250")
 
     def test_dashboard_runner_start_allows_strategy_without_balance_limit(self):
         with TemporaryDirectory() as tmp:

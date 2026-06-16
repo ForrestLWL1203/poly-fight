@@ -41,9 +41,11 @@ SPORTS_N_EFF_FLOOR = 12
 # B(留池不上榜,observe 观察用):比 A 各放一档
 GRADE_B_WILSON_RELAX = 0.05
 GRADE_B_EDGE_RELAX = 0.03
-# v17:评分只统计"可跟价区"(入场价 ≤ 此值)内的场次——评分口径 = 跟单口径。高价"安全垫"场次
-# 不参与 θ̂/n_eff/median_entry,避免淹没低价 edge(实测 52/205 桶有被高价埋掉的低价 edge)。
-SCORING_PRICE_CEILING = 0.85
+# 全系统唯一的"可跟价格上限"分水岭:评分(只评 ≤此价的场次)、跟单现价上限默认、seed 高价过滤
+# 同用此值 —— 评分口径 = 跟单口径。高价"安全垫"场次不参与 θ̂/n_eff/median_entry(避免淹没低价 edge)。
+# 低端另有 seed 价地板 0.35(防深爆冷),那是 floor、不同概念,不在此收口。
+FOLLOWABLE_PRICE_CEILING = 0.85
+SCORING_PRICE_CEILING = FOLLOWABLE_PRICE_CEILING  # 向后兼容别名
 # 近期活跃度:按时间半衰期对每盘加权(近期热度 > 陈旧战绩),折算 Kish 有效样本 n_eff,
 # 得到近期加权点估胜率 θ̂。让"钱包当前在打的桶"靠成熟分升级。
 ESPORTS_RECENCY_HALF_LIFE_DAYS = 21

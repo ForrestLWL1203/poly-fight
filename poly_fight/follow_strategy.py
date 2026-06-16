@@ -4,12 +4,13 @@ import copy
 import math
 from typing import Any
 
-from .core import to_float, to_int
+from .core import FOLLOWABLE_PRICE_CEILING, to_float, to_int
 
 
 DEFAULT_FOLLOW_STRATEGY_SCHEMA_VERSION = 1
 ACTIVE_FOLLOW_STRATEGY_ID = "active"
-DEFAULT_MAX_FOLLOW_ENTRY_PRICE = 0.68   # 现价上限默认(0 = 不限);与评分价格带上界对齐
+# 现价上限默认(0 = 不限)= 全系统唯一分水岭 FOLLOWABLE_PRICE_CEILING(评分/跟单/seed 同源)。
+DEFAULT_MAX_FOLLOW_ENTRY_PRICE = FOLLOWABLE_PRICE_CEILING
 DEFAULT_FIXED_STAKE_USDC = 1.0          # 固定注默认每信号金额
 
 

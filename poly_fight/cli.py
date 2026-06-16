@@ -24,6 +24,7 @@ from urllib.request import Request, urlopen
 from .api import PolymarketClient, RateLimiter
 from .core import (
     ALLOWED_GAME_FAMILIES,
+    FOLLOWABLE_PRICE_CEILING,
     GAME_FAMILY_LABELS,
     LEAGUE_LABELS,
     MARKET_TYPE_LABELS,
@@ -310,8 +311,8 @@ SEED_MAIN_MATCH_MIN_AVG_CASH = 100.0  # v16:统一 $100,只滤纯试水、不杀
 SEED_GAME_WINNER_MIN_AVG_CASH = 100.0
 SEED_MAP_WINNER_MIN_AVG_CASH = 100.0
 SEED_MIN_WEIGHTED_ROI = 0.30  # v16:seed ROI 门已删(美元口径,质量交给下游 Wilson);此常量仅留作 CLI/记录兼容
-SEED_MIN_MEDIAN_AVG_PRICE = 0.35  # v16:入场价下限(<0.35 多为安全垫/赌爆冷,胜率低)
-SEED_MAX_MEDIAN_AVG_PRICE = 0.75
+SEED_MIN_MEDIAN_AVG_PRICE = 0.35  # 入场价下限(<0.35 多为安全垫/赌爆冷,胜率低);floor,不参与上限收口
+SEED_MAX_MEDIAN_AVG_PRICE = FOLLOWABLE_PRICE_CEILING  # 高价上限 = 全系统唯一分水岭(0.85)
 COLLECTOR_PROFILE_LOOKBACK_DAYS = 14
 COLLECTOR_BUCKETS = (
     ("lol", MAIN_MATCH),
