@@ -3159,7 +3159,7 @@ def start_wallet_refresh(
     base = [sys.executable, "-u", "-m", "poly_fight.cli", "--data-dir", str(category_dir)]
     command = [
         *base, "collect-v2", "--category", category,
-        "--refresh-classification", "--max-profile-wallets", "1000",
+        "--refresh-classification", "--max-profile-wallets", "2000",  # v16:扩漏斗,与 CLI 默认一致
         *(extra_args or []),
     ]
     status = {
