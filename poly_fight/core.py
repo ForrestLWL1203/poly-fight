@@ -10,7 +10,7 @@ from typing import Any, Iterable
 SECONDS_PER_DAY = 86400
 # profile 复用以此为失效令牌:改任何评分口径(门槛/公式/n_eff 下限/basis)都要 +1,
 # 否则采集会复用旧口径的画像、新规则不生效。改完需全量重采一次,之后才走复用加速。
-SCORING_VERSION = 16
+SCORING_VERSION = 17
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 # v16:两边对冲(套利)门统一 0.20——bucket 排除(core)、systemic(cli)、v2 钱包级(V2_MAX_TWO_SIDED_RATE)同口径。
@@ -41,6 +41,9 @@ SPORTS_N_EFF_FLOOR = 12
 # B(留池不上榜,observe 观察用):比 A 各放一档
 GRADE_B_WILSON_RELAX = 0.05
 GRADE_B_EDGE_RELAX = 0.03
+# v17:评分只统计"可跟价区"(入场价 ≤ 此值)内的场次——评分口径 = 跟单口径。高价"安全垫"场次
+# 不参与 θ̂/n_eff/median_entry,避免淹没低价 edge(实测 52/205 桶有被高价埋掉的低价 edge)。
+SCORING_PRICE_CEILING = 0.85
 # 近期活跃度:按时间半衰期对每盘加权(近期热度 > 陈旧战绩),折算 Kish 有效样本 n_eff,
 # 得到近期加权点估胜率 θ̂。让"钱包当前在打的桶"靠成熟分升级。
 ESPORTS_RECENCY_HALF_LIFE_DAYS = 21
@@ -1305,6 +1308,21 @@ def summarize_closed_positions(
         positive_weight = sum(w for w, row in zip(decay_w, bucket_rows) if row["realized_pnl"] > 0)
         recency_weighted_win_rate = positive_weight / weight_sum if weight_sum > 0 else 0.0
 
+        # v17:评分三件套(θ̂/n_eff/median_entry)只在可跟价区(≤ SCORING_PRICE_CEILING)上重算 ——
+        # 评分口径 = 跟单口径(跟单本就有现价上限)。纯大热买家(全部 >ceiling)→ n_eff→0 自动出局;
+        # "高价淹没低价 edge"的钱包 → 中位价回落、edge 浮现。展示类字段(count/正胜率/资金加权)仍用全集。
+        scoring_rows = [row for row in bucket_rows if 0 < row["avg_price"] <= SCORING_PRICE_CEILING]
+        scoring_entry_prices = [row["avg_price"] for row in scoring_rows]
+        if scoring_rows and half_life_s > 0:
+            scoring_decay = [0.5 ** (max(0.0, summary_now_ts - row["timestamp"]) / half_life_s) for row in scoring_rows]
+        else:
+            scoring_decay = [1.0 for _ in scoring_rows]
+        scoring_weight_sum = sum(scoring_decay)
+        scoring_weight_sq_sum = sum(w * w for w in scoring_decay)
+        scoring_effective_sample = (scoring_weight_sum ** 2 / scoring_weight_sq_sum) if scoring_weight_sq_sum > 0 else 0.0
+        scoring_positive_weight = sum(w for w, row in zip(scoring_decay, scoring_rows) if row["realized_pnl"] > 0)
+        scoring_win_rate = scoring_positive_weight / scoring_weight_sum if scoring_weight_sum > 0 else 0.0
+
         def recent_window(days: int) -> dict[str, Any]:
             cutoff = summary_now_ts - days * SECONDS_PER_DAY
             recent_rows = [row for row in bucket_rows if row["timestamp"] >= cutoff]
@@ -1383,13 +1401,17 @@ def summarize_closed_positions(
         "positive_market_rate": round(positive / count, 8) if count else 0.0,
         "wilson_z": WILSON_Z,
         "wilson_win_rate_lower_bound": round(wilson_lower_bound(positive, count), 8),
-        "recency_weighted_win_rate": round(recency_weighted_win_rate, 8),
-        "effective_sample_size": round(effective_sample, 6),
+        "recency_weighted_win_rate": round(scoring_win_rate, 8),          # v17:可跟价区(≤ceiling)θ̂,评分用
+        "recency_weighted_win_rate_full": round(recency_weighted_win_rate, 8),  # 全价区(展示/审计)
+        "effective_sample_size": round(scoring_effective_sample, 6),       # v17:可跟价区 n_eff,评分用
+        "effective_sample_size_full": round(effective_sample, 6),          # 全价区(展示/审计)
+        "scoring_market_count": len(scoring_rows),                         # v17:落在可跟价区的场数
         "recency_half_life_days": ESPORTS_RECENCY_HALF_LIFE_DAYS,
         "avg_position_size": round(total_bought / count, 6) if count else 0.0,
         "median_position_size": round(median(sizes), 6) if sizes else 0.0,
         "avg_entry_price": round(sum(entry_prices) / len(entry_prices), 8) if entry_prices else 0.0,
-        "median_entry_price": round(median(entry_prices), 8) if entry_prices else 0.0,
+        "median_entry_price": round(median(scoring_entry_prices), 8) if scoring_entry_prices else 0.0,  # v17:可跟价区中位价,评分用
+        "median_entry_price_full": round(median(entry_prices), 8) if entry_prices else 0.0,
         "capital_weighted_entry_price": round(capital_weighted_entry_price, 8),
         "capital_weighted_win_rate": round(capital_weighted_win_rate, 8),
         "capital_weighted_edge": round(capital_weighted_win_rate - capital_weighted_entry_price, 8),
@@ -1933,11 +1955,13 @@ def classify_wallet_bucket(
 
     if eff_sample < min_eff:
         reasons.append("thin_sample")
-    if bucket_wilson_lb < min_wilson:
-        reasons.append("weak_wilson_lb")
     if bucket_edge_lb is None or bucket_edge_lb < min_edge_lb:
         reasons.append("weak_edge_lb")
     # 以下全是软 reason(仅展示/观测,不参与判定):
+    # v17:胜率门已删。实证 edge 在 0.55–0.85 ≈ +5% 平线,胜率不预测盈利、edge 才预测;
+    # 胜率门只会偏袒大热、误杀中价专家(盈利一样)。wilson_lb 仅留作展示。
+    if bucket_wilson_lb < min_wilson:
+        reasons.append("low_win_rate")
     if loss_count > 0:
         reasons.append("has_losses")
     if pnl <= 0:
@@ -1952,17 +1976,16 @@ def classify_wallet_bucket(
         reasons.append("low_volume")
 
     edge_ok = bucket_edge_lb is not None
-    # bot>=70 / 系统性双边已在上方提前 return excluded;此处只判 Wilson 双下界 + n_eff + 新鲜度。
+    # v17:edge 是唯一质量轴。bot>=70/系统性双边已在上方提前 return excluded;
+    # 此处只判 edge_lb(内含 Wilson 置信)+ n_eff 兜底 + 新鲜度,不再卡独立胜率门。
     if (
         eff_sample >= min_eff
-        and bucket_wilson_lb >= min_wilson
         and edge_ok and bucket_edge_lb >= min_edge_lb
         and not stale
     ):
         grade = "A"
     elif (
         eff_sample >= min_eff
-        and bucket_wilson_lb >= (min_wilson - GRADE_B_WILSON_RELAX)
         and edge_ok and bucket_edge_lb >= (min_edge_lb - GRADE_B_EDGE_RELAX)
         and not stale
     ):

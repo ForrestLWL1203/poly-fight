@@ -1422,7 +1422,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(summary["esports_roi"], 0.07142857)
         self.assertEqual(summary["positive_market_rate"], 0.5)
         self.assertEqual(summary["avg_entry_price"], 0.7)
-        self.assertEqual(summary["median_entry_price"], 0.7)
+        # v17:median_entry_price 只算可跟价区(≤0.85),0.95 那笔被剔 → 只剩 0.45;全价区另存 _full。
+        self.assertEqual(summary["median_entry_price"], 0.45)
+        self.assertEqual(summary["median_entry_price_full"], 0.7)
         self.assertEqual(summary["high_price_entry_rate"], 0.5)
         self.assertEqual(summary["low_edge_profit_rate"], 0.0)
 
@@ -1822,7 +1824,7 @@ class CoreTest(unittest.TestCase):
         rated = classify_wallet(summary, now_ts=100 + 86400)
 
         self.assertEqual(rated["grade"], "C")
-        self.assertIn("weak_wilson_lb", rated["reasons"])  # wilson_lb(0.45,20)≈0.31 < 0.65
+        self.assertIn("weak_edge_lb", rated["reasons"])  # v17:edge_lb=wilson_lb(0.45,20)−0.55 负 → 唯一质量门挡掉
 
     def test_low_frequency_perfect_wallet_is_not_a_grade(self):
         summary = {
@@ -1906,7 +1908,7 @@ class CoreTest(unittest.TestCase):
         rated = classify_wallet(summary, now_ts=100 + 86400)
 
         self.assertNotEqual(rated["grade"], "A")
-        self.assertIn("weak_wilson_lb", rated["reasons"])
+        self.assertIn("weak_edge_lb", rated["reasons"])  # v17:edge_lb 是唯一质量门
 
     def test_weak_capital_edge_no_longer_blocks_a_grade(self):
         # 资金加权边际(他的美元盈亏轴)不再是门槛。高胜率 + 正 copy 边际(θ̂−入场价) → A,
