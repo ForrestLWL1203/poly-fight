@@ -3706,6 +3706,29 @@ class CoreTest(unittest.TestCase):
         self.assertIn("0xsubspec", wallets)  # sub-specialist kept
         self.assertIn("0xlegacy", wallets)  # v16:grade-A 不再被整体胜率门卡掉
 
+    def test_v18_neff_floor_decoupled_from_price_restriction(self):
+        # v18:n_eff 地板用全样本(eff_full),edge_lb 的 Wilson 用 ≤0.85 子集。
+        now = 100 + 86400
+        # 子集只有 8 场(<12)但全样本 30 场、子集 edge 经 Wilson 仍硬 → 上 A(被 v17 误挡,v18 捞回)。
+        recovered = classify_wallet({
+            "esports_closed_count": 30, "recency_weighted_win_rate": 0.90,
+            "effective_sample_size": 8, "effective_sample_size_full": 30,
+            "median_entry_price": 0.55, "esports_realized_pnl": 5000,
+            "esports_total_bought": 50000, "last_esports_trade_at": 100, "bot_like_score": 0,
+        }, now_ts=now)
+        self.assertEqual(recovered["grade"], "A")
+        self.assertNotIn("thin_sample", recovered["reasons"])
+
+        # 纯大热买家:可跟价区子集为空(eff=0、median=0)→ edge_lb 无 → 仍被挡(即便全样本 30)。
+        favorite = classify_wallet({
+            "esports_closed_count": 30, "recency_weighted_win_rate": 0.0,
+            "effective_sample_size": 0, "effective_sample_size_full": 30,
+            "median_entry_price": 0.0, "esports_realized_pnl": 5000,
+            "esports_total_bought": 50000, "last_esports_trade_at": 100, "bot_like_score": 0,
+        }, now_ts=now)
+        self.assertNotEqual(favorite["grade"], "A")
+        self.assertIn("weak_edge_lb", favorite["reasons"])
+
     def test_grading_eligibility_is_single_source_across_consumers(self):
         # 单一真相源回归护栏:同一份 profile,collector/observe/demote 共用的
         # build_collector_leaderboard_v2,与 follow 的 eligible_follow_wallets / wallet_is_followable,

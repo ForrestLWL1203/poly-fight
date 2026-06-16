@@ -10,7 +10,7 @@ from typing import Any, Iterable
 SECONDS_PER_DAY = 86400
 # profile 复用以此为失效令牌:改任何评分口径(门槛/公式/n_eff 下限/basis)都要 +1,
 # 否则采集会复用旧口径的画像、新规则不生效。改完需全量重采一次,之后才走复用加速。
-SCORING_VERSION = 17
+SCORING_VERSION = 18
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 # v16:两边对冲(套利)门统一 0.20——bucket 排除(core)、systemic(cli)、v2 钱包级(V2_MAX_TWO_SIDED_RATE)同口径。
@@ -1946,16 +1946,20 @@ def classify_wallet_bucket(
     # Copy 轴 v16:点估 → 下界。质量门 = wilson_lb ≥ W_min 且 edge_lb ≥ E_min 且 n_eff ≥ floor。
     #   θ̂(win_rate) = recency_weighted_win_rate(缺则回退 positive_market_rate);n_eff = effective_sample_size(缺则 count)。
     #   薄样本 → Wilson 区间变宽 → 下界自动掉下去 → 蒙中者出局,不再单设 n_eff/价带硬门。
+    # v18 解耦:edge_lb 的 Wilson 用「可跟价区(≤0.85)子集」的 θ̂/n_eff(薄子集自动被 Wilson 惩罚);
+    #          n_eff 数值地板改用「全样本」eff_sample_full —— 只验"是不是真活跃钱包",不重复惩罚薄子集。
+    #          这样"全样本够活跃 + 低价子集 edge 经 Wilson 确认"的钱包能上,纯大热买家(子集为空)仍被 edge_lb 挡。
     win_rate = to_float(summary.get("recency_weighted_win_rate")) if summary.get("recency_weighted_win_rate") is not None else positive_rate
-    eff_sample = to_float(summary.get("effective_sample_size")) if summary.get("effective_sample_size") is not None else float(count)
-    bucket_wilson_lb = wilson_lower_bound_rate(win_rate, eff_sample)
+    eff_sample = to_float(summary.get("effective_sample_size")) if summary.get("effective_sample_size") is not None else float(count)  # 可跟价区子集 n_eff
+    eff_sample_full = to_float(summary.get("effective_sample_size_full")) if summary.get("effective_sample_size_full") is not None else eff_sample  # 全样本 n_eff
+    bucket_wilson_lb = wilson_lower_bound_rate(win_rate, eff_sample)   # 在可跟价区子集上算(薄→宽→自动扣)
     bucket_edge_lb = (bucket_wilson_lb - median_entry) if median_entry > 0 else None  # 悲观胜率下每股 edge
     copy_edge = win_rate - median_entry if median_entry > 0 else None                 # 点估 edge,仅展示
     min_wilson = SPORTS_WILSON_LB_MIN if is_sports else ESPORTS_WILSON_LB_MIN
     min_edge_lb = SPORTS_EDGE_LB_MIN if is_sports else ESPORTS_EDGE_LB_MIN
-    min_eff = float(min_sample)   # n_eff 数值兜底(esports=12,见 wallet_bucket_min_sample)
+    min_eff = float(min_sample)   # n_eff 数值兜底(esports=12),作用于全样本 eff_sample_full
 
-    if eff_sample < min_eff:
+    if eff_sample_full < min_eff:
         reasons.append("thin_sample")
     if bucket_edge_lb is None or bucket_edge_lb < min_edge_lb:
         reasons.append("weak_edge_lb")
@@ -1981,13 +1985,13 @@ def classify_wallet_bucket(
     # v17:edge 是唯一质量轴。bot>=70/系统性双边已在上方提前 return excluded;
     # 此处只判 edge_lb(内含 Wilson 置信)+ n_eff 兜底 + 新鲜度,不再卡独立胜率门。
     if (
-        eff_sample >= min_eff
+        eff_sample_full >= min_eff   # v18:地板用全样本(活跃度);edge_lb 已含子集 Wilson 置信
         and edge_ok and bucket_edge_lb >= min_edge_lb
         and not stale
     ):
         grade = "A"
     elif (
-        eff_sample >= min_eff
+        eff_sample_full >= min_eff
         and edge_ok and bucket_edge_lb >= (min_edge_lb - GRADE_B_EDGE_RELAX)
         and not stale
     ):
