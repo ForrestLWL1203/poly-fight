@@ -534,6 +534,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         name = str(form.get("name") or "").strip()
         strategy = form.get("strategy") if isinstance(form.get("strategy"), dict) else form
         store = FollowStore(_follow_db_path(self.dashboard_config))
+        # 库为空时,新建的第一条会自动激活并覆盖 active strategy。运行中禁止(与
+        # activate/update/delete 同锁),否则能绕过 _follow_strategy_action 的锁在跑单中改策略。
+        current = build_runner_status(self.dashboard_config)
+        if current.get("status") in {"running", "stopping"} and not (
+            store.list_follow_strategies().get("strategies") or []
+        ):
+            self._json(
+                {"ok": False, "error": "follow_strategy_locked", "data": current},
+                status=HTTPStatus.CONFLICT,
+            )
+            return
         try:
             entry = store.create_follow_strategy(name, strategy, ts=int(time.time()))
         except ValueError as exc:

@@ -1150,6 +1150,8 @@ function StrategyPage({ data, merge, toast }) {
   };
 
   const atMax = list.length >= MAX_STRATEGIES;
+  // 库为空时,新建的第一条会自动激活并覆盖 active strategy。运行中禁止(后端也会拒 follow_strategy_locked)。
+  const lockCreate = !!(data.runner && data.runner.status === "running") && list.length === 0;
   const startNew = () => setExpanded("__new__");
   const toggle = (slug) => setExpanded((cur) => (cur === slug ? null : slug));
 
@@ -1160,8 +1162,8 @@ function StrategyPage({ data, merge, toast }) {
           <span className="stt-count">已保存 {list.length} / {MAX_STRATEGIES}</span>
           {lib.activeSlug ? null : list.length ? <span className="stt-warn"><Ico n="circle-alert" /> 未选定生效策略</span> : null}
         </div>
-        <span className={"tb-tip" + (atMax ? " disabled" : "")} data-tip={atMax ? `最多保存 ${MAX_STRATEGIES} 个策略` : undefined}>
-          <Button variant="primary" size="sm" iconLeft={<Ico n="plus" />} disabled={atMax || expanded === "__new__"} onClick={startNew}>新增策略</Button>
+        <span className={"tb-tip" + (atMax || lockCreate ? " disabled" : "")} data-tip={atMax ? `最多保存 ${MAX_STRATEGIES} 个策略` : lockCreate ? "运行中无法新建首个策略(会覆盖生效策略),请先停止跟单" : undefined}>
+          <Button variant="primary" size="sm" iconLeft={<Ico n="plus" />} disabled={atMax || expanded === "__new__" || lockCreate} onClick={startNew}>新增策略</Button>
         </span>
       </div>
 
@@ -1180,7 +1182,8 @@ function StrategyPage({ data, merge, toast }) {
           <div className="se-illo"><Ico n="crosshair" /></div>
           <h3 className="se-title">还没有跟单策略</h3>
           <p className="se-desc">创建一个策略来定义单笔金额、信号门槛与单场风控上限。<br />配置完成后即可选定为生效策略并启动跟单。</p>
-          <Button variant="primary" iconLeft={<Ico n="plus" />} onClick={startNew}>创建第一个策略</Button>
+          <Button variant="primary" iconLeft={<Ico n="plus" />} disabled={lockCreate} onClick={startNew}>创建第一个策略</Button>
+          {lockCreate ? <p className="cfg-sub" style={{ marginTop: "var(--sp-3)" }}>运行中无法创建首个策略(会覆盖当前生效策略),请先停止跟单。</p> : null}
         </div>
       ) : null}
 

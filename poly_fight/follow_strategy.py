@@ -251,7 +251,14 @@ def evaluate_follow_candidate(
         return _block("stake_below_minimum", target_stake=target_stake, strategy=normalized)
     available = to_float(available_balance_usdc)
     if available < target_stake:
-        return _block("insufficient_balance", target_stake=target_stake, strategy=normalized)
+        # 余额不足 target,但仍够最小额($1)→ cap 到余额下单(与 legacy follow_stake_for_signal
+        # 的 limited 模式一致),而不是直接弃单。低于 $1 才真正 insufficient_balance。
+        capped = math.floor(available)
+        if capped >= 1:
+            target_stake = capped
+            stake_mode = "balance_capped"
+        else:
+            return _block("insufficient_balance", target_stake=target_stake, strategy=normalized)
 
     limits = normalized["condition_limits"]
     max_orders = to_int(limits.get("max_orders"))

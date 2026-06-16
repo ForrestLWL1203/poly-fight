@@ -171,26 +171,55 @@ def trade_size(trade: dict[str, Any]) -> float:
     return to_float(trade.get("size") or trade.get("amount"))
 
 
-def _cursor_tuple(cursor: dict[str, Any] | None) -> tuple[int, str]:
-    cursor = cursor or {}
-    return to_int(cursor.get("timestamp")), str(cursor.get("id") or "")
-
-
 def _trade_tuple(trade: dict[str, Any]) -> tuple[int, str]:
     return trade_timestamp(trade), trade_id(trade)
+
+
+def _cursor_seen_ids(cursor: dict[str, Any] | None) -> set[str]:
+    """cursor.timestamp 这一秒里已处理过的 trade id 集合。
+    向后兼容老 cursor(只有单 id、无 seen_ids)→ 退化成 {id}。"""
+    cursor = cursor or {}
+    seen = cursor.get("seen_ids")
+    if isinstance(seen, (list, tuple, set)):
+        return {str(value) for value in seen if value}
+    cid = str(cursor.get("id") or "")
+    return {cid} if cid else set()
+
+
+def _build_trade_cursor(
+    trades: list[dict[str, Any]], previous_cursor: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    latest_ts = max((trade_timestamp(trade) for trade in trades), default=None)
+    if latest_ts is None:
+        return previous_cursor
+    ids_at_latest = {trade_id(trade) for trade in trades if trade_timestamp(trade) == latest_ts}
+    # cursor 停在同一秒 → 累积该秒已见过的 id(否则同秒、后到、id 更小的交易会被漏)
+    if previous_cursor and to_int(previous_cursor.get("timestamp")) == latest_ts:
+        ids_at_latest |= _cursor_seen_ids(previous_cursor)
+    return {
+        "timestamp": latest_ts,
+        "id": max(ids_at_latest) if ids_at_latest else "",  # 保留单 id 供旧读取方/索引列
+        "seen_ids": sorted(ids_at_latest),
+    }
 
 
 def select_new_trades(
     trades: list[dict[str, Any]],
     previous_cursor: dict[str, Any] | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, bool]:
-    ordered_desc = sorted(trades, key=lambda row: _trade_tuple(row), reverse=True)
-    latest = ordered_desc[0] if ordered_desc else None
-    latest_cursor = {"timestamp": trade_timestamp(latest), "id": trade_id(latest)} if latest else previous_cursor
+    latest_cursor = _build_trade_cursor(trades, previous_cursor)
     if previous_cursor is None:
         return [], latest_cursor, True
-    previous_key = _cursor_tuple(previous_cursor)
-    new_trades = [trade for trade in trades if _trade_tuple(trade) > previous_key]
+    prev_ts = to_int(previous_cursor.get("timestamp"))
+    prev_seen = _cursor_seen_ids(previous_cursor)
+    # 新交易:timestamp 更晚,或同一秒但该 id 还没在这一秒处理过。
+    # (原先按 (ts, id) 严格大于 → 同秒、后到、id 更小的交易会被误判为旧而漏掉。)
+    new_trades = [
+        trade
+        for trade in trades
+        if trade_timestamp(trade) > prev_ts
+        or (trade_timestamp(trade) == prev_ts and trade_id(trade) not in prev_seen)
+    ]
     new_trades.sort(key=lambda row: _trade_tuple(row))
     return new_trades, latest_cursor, False
 

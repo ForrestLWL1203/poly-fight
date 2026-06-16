@@ -5431,6 +5431,25 @@ class CoreTest(unittest.TestCase):
         self.assertEqual([row["id"] for row in new_trades], ["t4"])
         self.assertEqual(cursor["id"], "t4")
 
+    def test_select_new_trades_keeps_same_second_smaller_id(self):
+        # 同一秒多笔,cursor 已停在该秒;后到、id 字典序更小的同秒交易不能被漏。
+        first = [{"id": "0xff", "timestamp": 1000}, {"id": "0xee", "timestamp": 1000}]
+        _new, cursor, cold = select_new_trades(first, None)
+        self.assertTrue(cold)
+        self.assertEqual(cursor["timestamp"], 1000)
+        # 下一拨:同秒的 0x0a(< 0xee/0xff)+ 一笔更晚的 0x10@1001
+        second = [*first, {"id": "0x0a", "timestamp": 1000}, {"id": "0x10", "timestamp": 1001}]
+        new_trades, cursor2, _ = select_new_trades(second, cursor)
+        ids = {row["id"] for row in new_trades}
+        self.assertIn("0x0a", ids)        # 同秒小 id 不漏
+        self.assertIn("0x10", ids)        # 更晚的也在
+        self.assertNotIn("0xff", ids)     # 已处理过的不重复
+        self.assertEqual(cursor2["timestamp"], 1001)
+        # 向后兼容:老 cursor 只有单 id、无 seen_ids 时,同秒未见 id 仍不漏
+        legacy_cursor = {"timestamp": 1000, "id": "0xee"}
+        new2, _c, _ = select_new_trades(second, legacy_cursor)
+        self.assertIn("0x0a", {row["id"] for row in new2})
+
     def test_follow_user_trades_fetch_pages_until_cursor(self):
         class FakeClient:
             def __init__(self):
@@ -5681,6 +5700,34 @@ class CoreTest(unittest.TestCase):
         )
         self.assertTrue(accepted["would_follow"])
         self.assertEqual(accepted["funded_stake"], 10)
+
+    def test_follow_strategy_evaluator_caps_to_balance_below_target(self):
+        strategy = default_follow_strategy(balance_usdc=100)
+        strategy["stake_sizing"]["mode"] = "fixed"
+        strategy["stake_sizing"]["fixed_usdc"] = 50
+        # 余额 30 < target 50,但 ≥ $1 → cap 到余额下单,而不是弃单
+        capped = evaluate_follow_candidate(
+            strategy=strategy,
+            target_wallet_order_cash_usdc=50,
+            available_balance_usdc=30,
+            condition_funded_stake_usdc=0,
+            condition_funded_order_count=0,
+            wallet_condition_funded_order_count=0,
+        )
+        self.assertTrue(capped["would_follow"])
+        self.assertEqual(capped["funded_stake"], 30)
+        self.assertEqual(capped["stake_mode"], "balance_capped")
+        # 余额 < $1 → 真正 insufficient_balance
+        broke = evaluate_follow_candidate(
+            strategy=strategy,
+            target_wallet_order_cash_usdc=50,
+            available_balance_usdc=0.5,
+            condition_funded_stake_usdc=0,
+            condition_funded_order_count=0,
+            wallet_condition_funded_order_count=0,
+        )
+        self.assertFalse(broke["would_follow"])
+        self.assertEqual(broke["block_reason"], "insufficient_balance")
 
     def test_follow_strategy_from_legacy_args_preserves_old_ratio_shape(self):
         strategy = strategy_from_legacy_args(
