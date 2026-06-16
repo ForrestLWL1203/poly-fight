@@ -10,7 +10,7 @@ from typing import Any, Iterable
 SECONDS_PER_DAY = 86400
 # profile 复用以此为失效令牌:改任何评分口径(门槛/公式/n_eff 下限/basis)都要 +1,
 # 否则采集会复用旧口径的画像、新规则不生效。改完需全量重采一次,之后才走复用加速。
-SCORING_VERSION = 18
+SCORING_VERSION = 19
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 # v16:两边对冲(套利)门统一 0.20——bucket 排除(core)、systemic(cli)、v2 钱包级(V2_MAX_TWO_SIDED_RATE)同口径。
@@ -38,6 +38,10 @@ ESPORTS_N_EFF_FLOOR = 12
 SPORTS_WILSON_LB_MIN = 0.55
 SPORTS_EDGE_LB_MIN = 0.03
 SPORTS_N_EFF_FLOOR = 12
+# v19:可跟价区(≤ceiling)子集最小厚度。全样本地板(12)管"真活跃",此项管"别拿太薄的可跟切片下判断"
+# (防 3–5 场侥幸过 edge_lb)。edge_lb 的 Wilson 仍在子集上算。
+ESPORTS_SUBSET_MIN_SAMPLE = 6
+SPORTS_SUBSET_MIN_SAMPLE = 6
 # B(留池不上榜,observe 观察用):比 A 各放一档
 GRADE_B_WILSON_RELAX = 0.05
 GRADE_B_EDGE_RELAX = 0.03
@@ -1958,9 +1962,12 @@ def classify_wallet_bucket(
     min_wilson = SPORTS_WILSON_LB_MIN if is_sports else ESPORTS_WILSON_LB_MIN
     min_edge_lb = SPORTS_EDGE_LB_MIN if is_sports else ESPORTS_EDGE_LB_MIN
     min_eff = float(min_sample)   # n_eff 数值兜底(esports=12),作用于全样本 eff_sample_full
+    min_sub = float(SPORTS_SUBSET_MIN_SAMPLE if is_sports else ESPORTS_SUBSET_MIN_SAMPLE)  # v19:可跟价区子集最小厚度
 
     if eff_sample_full < min_eff:
         reasons.append("thin_sample")
+    if eff_sample < min_sub:
+        reasons.append("thin_followable_subset")  # v19:可跟价区子集太薄,不据此判桶
     if bucket_edge_lb is None or bucket_edge_lb < min_edge_lb:
         reasons.append("weak_edge_lb")
     # 以下全是软 reason(仅展示/观测,不参与判定):
@@ -1986,12 +1993,14 @@ def classify_wallet_bucket(
     # 此处只判 edge_lb(内含 Wilson 置信)+ n_eff 兜底 + 新鲜度,不再卡独立胜率门。
     if (
         eff_sample_full >= min_eff   # v18:地板用全样本(活跃度);edge_lb 已含子集 Wilson 置信
+        and eff_sample >= min_sub    # v19:可跟价区子集 ≥6,防太薄切片侥幸
         and edge_ok and bucket_edge_lb >= min_edge_lb
         and not stale
     ):
         grade = "A"
     elif (
         eff_sample_full >= min_eff
+        and eff_sample >= min_sub
         and edge_ok and bucket_edge_lb >= (min_edge_lb - GRADE_B_EDGE_RELAX)
         and not stale
     ):

@@ -3729,6 +3729,16 @@ class CoreTest(unittest.TestCase):
         self.assertNotEqual(favorite["grade"], "A")
         self.assertIn("weak_edge_lb", favorite["reasons"])
 
+        # v19:可跟价区子集太薄(4 < 6)→ 不据此判桶,即便全样本够 + edge 看着硬。
+        thin_sub = classify_wallet({
+            "esports_closed_count": 30, "recency_weighted_win_rate": 0.95,
+            "effective_sample_size": 4, "effective_sample_size_full": 30,
+            "median_entry_price": 0.50, "esports_realized_pnl": 5000,
+            "esports_total_bought": 50000, "last_esports_trade_at": 100, "bot_like_score": 0,
+        }, now_ts=now)
+        self.assertNotEqual(thin_sub["grade"], "A")
+        self.assertIn("thin_followable_subset", thin_sub["reasons"])
+
     def test_grading_eligibility_is_single_source_across_consumers(self):
         # 单一真相源回归护栏:同一份 profile,collector/observe/demote 共用的
         # build_collector_leaderboard_v2,与 follow 的 eligible_follow_wallets / wallet_is_followable,
