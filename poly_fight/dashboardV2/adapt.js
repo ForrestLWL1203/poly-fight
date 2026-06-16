@@ -363,11 +363,11 @@
     const pre = s.prefilters || {};
     const lim = s.condition_limits || {};
     const bal = s.balance || {};
-    const mode = sizing.mode === "fixed" ? "fixed" : sizing.mode === "balance_percent" ? "balancePct" : "ratio";
+    const mode = sizing.mode === "kelly" ? "kelly" : sizing.mode === "fixed" ? "fixed" : sizing.mode === "balance_percent" ? "balancePct" : "ratio";
     const usable = num(bal.usable_balance_usdc);
     const minSignal = num(pre.min_target_wallet_order_cash_usdc);
     const str = (v, d) => (v === 0 || v ? String(v) : d);
-    // 现价上限:字段缺失(老策略)→ 默认开 0.68(与后端默认/评分价格带一致);显式 0 → 关。
+    // 现价上限:字段缺失(老策略)→ 默认开 0.85(全系统唯一分水岭);显式 0 → 关。
     const maxEntryRaw = pre.max_follow_entry_price;
     const maxEntryVal = num(maxEntryRaw);
     return {
@@ -376,8 +376,13 @@
       minSignalOn: minSignal > 0,
       minSignal: str(minSignal || 10, "10"),
       maxEntryOn: maxEntryRaw === undefined || maxEntryRaw === null ? true : maxEntryVal > 0 && maxEntryVal < 1,
-      maxEntry: str(maxEntryVal > 0 ? maxEntryVal : 0.68, "0.68"),
+      maxEntry: str(maxEntryVal > 0 ? maxEntryVal : 0.85, "0.85"),
       sizing: mode,
+      // Kelly 智能引擎参数
+      kellyFraction: str(num(sizing.kelly_fraction) || 0.25, "0.25"),
+      perSignalPct: str(num(sizing.per_signal_cap_percent) || 5, "5"),
+      perMatchPct: str(num(sizing.per_match_cap_percent) || 10, "10"),
+      minStake: str(num(sizing.min_stake_usdc) || 1, "1"),
       ratio: str(num(sizing.ratio_percent) || 10, "10"),
       ratioCapOn: !!sizing.per_order_cap_enabled,
       ratioCap: str(num(sizing.per_order_cap_usdc) || 100, "100"),
@@ -395,14 +400,18 @@
   }
 
   function strategyFromKit(k, walletBalance) {
-    const mode = k.sizing === "fixed" ? "fixed" : k.sizing === "balancePct" ? "balance_percent" : "proportional";
+    const mode = k.sizing === "kelly" ? "kelly" : k.sizing === "fixed" ? "fixed" : k.sizing === "balancePct" ? "balance_percent" : "proportional";
     const usable = k.usableMode === "cap" ? num(k.usableCap) : num(walletBalance);
-    const balanceRequired = k.sizing === "balancePct" || (k.spendOn && k.spendMode === "balancePct") || k.usableMode === "cap";
+    const balanceRequired = k.sizing === "kelly" || k.sizing === "balancePct" || (k.spendOn && k.spendMode === "balancePct") || k.usableMode === "cap";
     return {
       configured: true,
       schema_version: 1,
       stake_sizing: {
         mode,
+        kelly_fraction: num(k.kellyFraction),
+        per_signal_cap_percent: num(k.perSignalPct),
+        per_match_cap_percent: num(k.perMatchPct),
+        min_stake_usdc: num(k.minStake),
         ratio_percent: num(k.ratio),
         per_order_cap_enabled: k.sizing === "ratio" && !!k.ratioCapOn,
         per_order_cap_usdc: num(k.ratioCap),
@@ -461,7 +470,16 @@
     if (threshold > 0 && t < threshold) return { ignored: true };
     const avail = strategyAvail(s, walletBalance);
     let raw, basis;
-    if (s.sizing === "ratio") {
+    if (s.sizing === "kelly") {
+      // Kelly 按实时 edge 定额,与目标下单额无关 → 用代表性场景演示:胜率72% @ 现价62¢(edge 10¢)。
+      const wlb = 0.72, p = 0.62, kf = num(s.kellyFraction) || 0.25;
+      raw = kf * ((wlb - p) / (1 - p)) * avail;
+      const signalCap = avail * num(s.perSignalPct) / 100;
+      if (signalCap > 0) raw = Math.min(raw, signalCap);
+      const minStake = num(s.minStake) || 1;
+      if (raw > 0 && raw < minStake) raw = minStake;
+      basis = `Kelly×${kf}:示例 胜率72%@现价0.62(edge 10¢),单笔≤${s.perSignalPct || 0}%`;
+    } else if (s.sizing === "ratio") {
       raw = t * num(s.ratio) / 100; basis = `${s.ratio || 0}% × ${_usdInt(t)}`;
       if (s.ratioCapOn && raw > num(s.ratioCap)) { raw = num(s.ratioCap); basis = `命中封顶 ${_usdInt(num(s.ratioCap))}`; }
     } else if (s.sizing === "fixed") { raw = num(s.fixed); basis = "固定金额"; }
@@ -473,15 +491,23 @@
      Empty array => ready. Order/labels match the StrategyPage 待完善 list. */
   function strategyIssues(s, walletBalance) {
     const avail = strategyAvail(s, walletBalance);
-    const sizingPrimary = s.sizing === "ratio" ? s.ratio : s.sizing === "fixed" ? s.fixed : s.balancePct;
     const issues = [];
-    if (!(num(sizingPrimary) > 0)) issues.push("单笔金额");
+    if (s.sizing === "kelly") {
+      if (!(num(s.kellyFraction) > 0)) issues.push("Kelly 激进度");
+      if (!(num(s.perSignalPct) > 0)) issues.push("单笔上限%");
+      if (!(num(s.perMatchPct) > 0)) issues.push("单场上限%");
+      if (!(num(s.minStake) > 0)) issues.push("单笔下限");
+      if (!(avail > 0)) issues.push("可用余额");
+    } else {
+      const sizingPrimary = s.sizing === "ratio" ? s.ratio : s.sizing === "fixed" ? s.fixed : s.balancePct;
+      if (!(num(sizingPrimary) > 0)) issues.push("单笔金额");
+      if (s.sizing === "ratio" && s.ratioCapOn && !(num(s.ratioCap) > 0)) issues.push("单笔封顶金额");
+      if (s.sizing === "balancePct" && !(avail > 0)) issues.push("可用余额");
+    }
     if (s.usableMode === "cap" && !(num(s.usableCap) > 0)) issues.push("可动用上限");
     if (s.minSignalOn && !(num(s.minSignal) > 0)) issues.push("最小信号金额");
-    if (s.sizing === "ratio" && s.ratioCapOn && !(num(s.ratioCap) > 0)) issues.push("单笔封顶金额");
     if (s.countOn && !(num(s.count) > 0)) issues.push("单场笔数");
     if (s.spendOn && !(num(s.spendMode === "fixed" ? s.spendFixed : s.spendPct) > 0)) issues.push("单场投入上限");
-    if (s.sizing === "balancePct" && !(avail > 0)) issues.push("可用余额");
     return issues;
   }
 

@@ -25,7 +25,13 @@ function backendErrors(s) {
   const fp = (v) => Number.isFinite(+v) && +v > 0;
   const fnn = (v) => Number.isFinite(+v) && +v >= 0;
   const sz = s.stake_sizing, lim = s.condition_limits, pre = s.prefilters, bal = s.balance;
-  if (!["proportional", "fixed", "balance_percent"].includes(sz.mode)) e.push("stake_sizing.mode");
+  if (!["kelly", "proportional", "fixed", "balance_percent"].includes(sz.mode)) e.push("stake_sizing.mode");
+  if (sz.mode === "kelly") {
+    if (!(fp(sz.kelly_fraction) && +sz.kelly_fraction <= 1)) e.push("stake_sizing.kelly_fraction");
+    if (!fp(sz.per_signal_cap_percent)) e.push("stake_sizing.per_signal_cap_percent");
+    if (!fp(sz.per_match_cap_percent)) e.push("stake_sizing.per_match_cap_percent");
+    if (!fp(sz.min_stake_usdc)) e.push("stake_sizing.min_stake_usdc");
+  }
   if (sz.mode === "proportional" && !fp(sz.ratio_percent)) e.push("stake_sizing.ratio_percent");
   if (sz.per_order_cap_enabled && !fp(sz.per_order_cap_usdc)) e.push("stake_sizing.per_order_cap_usdc");
   if (sz.mode === "fixed" && !fp(sz.fixed_usdc)) e.push("stake_sizing.fixed_usdc");
@@ -36,10 +42,23 @@ function backendErrors(s) {
   if (!["none", "fixed", "balance_percent"].includes(lim.stake_cap_mode)) e.push("condition_limits.stake_cap_mode");
   if (lim.stake_cap_mode === "fixed" && !fp(lim.stake_cap_usdc)) e.push("condition_limits.stake_cap_usdc");
   if (lim.stake_cap_mode === "balance_percent" && !fp(lim.stake_cap_balance_percent)) e.push("condition_limits.stake_cap_balance_percent");
-  const br = bal.required || sz.mode === "balance_percent" || lim.stake_cap_mode === "balance_percent";
+  const br = bal.required || sz.mode === "balance_percent" || sz.mode === "kelly" || lim.stake_cap_mode === "balance_percent";
   if (br && !fp(bal.usable_balance_usdc)) e.push("balance.usable_balance_usdc");
   return e;
 }
+
+// 0) kelly(默认引擎)round-trip + backend-valid
+const k0 = { usableMode: "cap", usableCap: "2000", minSignalOn: true, minSignal: "10", sizing: "kelly", kellyFraction: "0.25", perSignalPct: "5", perMatchPct: "10", minStake: "1", ratio: "10", ratioCapOn: false, ratioCap: "100", fixed: "50", balancePct: "1", countOn: false, countMode: "event", count: "10", spendOn: false, spendMode: "fixed", spendFixed: "200", spendPct: "5" };
+const s0 = A.strategyFromKit(k0, 2000);
+eq("k0.mode", s0.stake_sizing.mode, "kelly");
+eq("k0.kelly_fraction", s0.stake_sizing.kelly_fraction, 0.25);
+eq("k0.per_signal", s0.stake_sizing.per_signal_cap_percent, 5);
+eq("k0.per_match", s0.stake_sizing.per_match_cap_percent, 10);
+eq("k0.min_stake", s0.stake_sizing.min_stake_usdc, 1);
+eq("k0.balance_required", s0.balance.required, true);
+eq("k0.backend_valid", backendErrors(s0), []);
+const rtk0 = A.strategyToKit(s0, 2000);
+["sizing", "kellyFraction", "perSignalPct", "perMatchPct", "minStake"].forEach((f) => eq("k0.rt." + f, rtk0[f], k0[f]));
 
 // 1) proportional + per-order cap + condition count cap + fixed spend cap
 const k1 = { usableMode: "cap", usableCap: "5000", minSignalOn: true, minSignal: "10", sizing: "ratio", ratio: "10", ratioCapOn: true, ratioCap: "100", fixed: "50", balancePct: "1", countOn: true, countMode: "event", count: "10", spendOn: true, spendMode: "fixed", spendFixed: "200", spendPct: "5" };

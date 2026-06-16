@@ -857,7 +857,8 @@ const STRATEGY_DEFAULTS = {
   usableMode: "all", usableCap: "5000",
   minSignalOn: true, minSignal: "10",
   maxEntryOn: true, maxEntry: "0.85",
-  sizing: "ratio", ratio: "10", ratioCapOn: false, ratioCap: "100",
+  sizing: "kelly", kellyFraction: "0.25", perSignalPct: "5", perMatchPct: "10", minStake: "1",
+  ratio: "10", ratioCapOn: false, ratioCap: "100",
   fixed: "50", balancePct: "1",
   countOn: false, countMode: "event", count: "10",
   spendOn: false, spendMode: "fixed", spendFixed: "200", spendPct: "5",
@@ -867,7 +868,10 @@ const clampNum = (v) => String(v).replace(/[^\d.]/g, "");
 
 function strategyDigest(s) {
   const n = (v) => Number(v) || 0;
-  const sizing = s.sizing === "ratio"
+  const kellyLabel = { "0.125": "保守", "0.25": "标准", "0.5": "激进" }[String(s.kellyFraction)] || `×${s.kellyFraction}`;
+  const sizing = s.sizing === "kelly"
+    ? `Kelly ${kellyLabel}（单笔≤${s.perSignalPct || 0}% · 单场≤${s.perMatchPct || 0}%）`
+    : s.sizing === "ratio"
     ? `比例 ${s.ratio || 0}%${s.ratioCapOn ? `（封顶 ${usdInt(n(s.ratioCap))}）` : ""}`
     : s.sizing === "fixed" ? `固定 ${usdInt(n(s.fixed))}` : `余额 ${s.balancePct || 0}%`;
   const filter = `门槛 ${usdInt(n(s.minSignal))}`;
@@ -982,9 +986,20 @@ function StrategyEditor({ s, up, wallet, locked }) {
           </div>
         </div>
         <div className="cfg-head"><h3>单笔跟单金额</h3><Badge tone="up" outline>必填</Badge></div>
-        <p className="cfg-sub">每个有效信号买入多少 · 三选一，金额向下取整规避下单异常</p>
+        <p className="cfg-sub">每个有效信号买入多少 · 推荐 Kelly 智能（按 edge 自动定额）· 金额向下取整规避下单异常</p>
         <div className="opt-list">
-          <SizingOption id="fixed" active={s.sizing === "fixed"} onSelect={up("sizing")} title="固定金额（推荐）" desc="每笔买入固定金额，与目标下单额无关 · 稳定、不抄对方仓位">
+          <SizingOption id="kelly" active={s.sizing === "kelly"} onSelect={up("sizing")} title="Kelly 智能（推荐）" desc="按 edge（钱包胜率 − 现价）自动定额：越划算下越多、越薄越少 · 自带单场/单笔上限 + 最小单 · 与评分轴同口径">
+            <div className="ctrl-row">
+              <span className="rr-lead"><span className="rr-check-slot"></span>激进度</span>
+              <SegmentedControl value={s.kellyFraction} onChange={up("kellyFraction")} options={[{ value: "0.125", label: "保守" }, { value: "0.25", label: "标准" }, { value: "0.5", label: "激进" }]} />
+            </div>
+            <div className="ctrl-row">
+              <NumField value={s.perSignalPct} onChange={up("perSignalPct")} unit="%" lead="单笔上限（本金）" width={60} />
+              <NumField value={s.perMatchPct} onChange={up("perMatchPct")} unit="%" lead="单场上限（本金）" width={60} />
+              <NumField value={s.minStake} onChange={up("minStake")} unit="USDC" lead="单笔下限" width={72} />
+            </div>
+          </SizingOption>
+          <SizingOption id="fixed" active={s.sizing === "fixed"} onSelect={up("sizing")} title="固定金额（legacy）" desc="每笔买入固定金额，与 edge 无关 · 简单但不区分机会优劣">
             <div className="ctrl-row"><NumField value={s.fixed} onChange={up("fixed")} unit="USDC" lead="每笔买入" /></div>
           </SizingOption>
           <SizingOption id="balancePct" active={s.sizing === "balancePct"} onSelect={up("sizing")} title="按本金百分比" desc="按当前可动用余额的百分比动态买入">
