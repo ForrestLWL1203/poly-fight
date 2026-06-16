@@ -332,6 +332,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     status=status,
                     category=category,
                     follow_dir=follow_dir,
+                    client=self.dashboard_config.client,
                 )
             )
             return
@@ -1777,7 +1778,7 @@ def wallet_leaderboard_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str = "", category: str = "", follow_dir: Path | None = None) -> dict[str, Any]:
+def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str = "", category: str = "", follow_dir: Path | None = None, client: Any = None) -> dict[str, Any]:
     store = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir))
     result = store.load_dashboard_follow_rows(page=1, size=10_000)
     logo_cache = _load_team_logo_cache(data_dir)
@@ -1807,6 +1808,25 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
     size = max(1, int(size or 25))
     start = (page - 1) * size
     rows = rows[start : start + size]
+    # 浮盈现价:活跃缓存最多滞后 event_cache_ttl_minutes(默认60min)。对**进行中(open)**
+    # 的跟单,渲染时批量拉一次实时盘口价覆盖缓存价(只读内存覆盖,不写库);失败回退缓存。
+    live_prices_by_cid: dict[str, list[float]] = {}
+    if client is not None:
+        open_cids = list(dict.fromkeys(
+            str(row.get("condition_id") or "").lower()
+            for row in rows
+            if str(row.get("status") or "") in {"open", "insufficient_balance"} and row.get("condition_id")
+        ))
+        if open_cids:
+            try:
+                live = client.gamma("/markets", condition_ids=open_cids, limit=max(1, len(open_cids)))
+                for market_row in (live or []):
+                    record = _market_price_record(market_row)
+                    cid = record.get("condition_id")
+                    if cid and record.get("outcome_prices"):
+                        live_prices_by_cid[cid] = record["outcome_prices"]
+            except Exception:
+                live_prices_by_cid = {}
     # 脱榜标记:源钱包已不在当前 leaderboard(被刷新排除)。跟单仍跟至结算,但需清晰标出。
     active_leaderboard = {
         str(lb_row.get("wallet") or "").lower()
@@ -1824,6 +1844,10 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
         market = _active_market_by_condition(data_dir, str(row.get("condition_id") or ""), follow_dir=follow_dir)
         row["match_start_time"] = row.get("match_start_time") or market.get("match_start_time") or market.get("market_start_time")
         row["end_date"] = row.get("end_date") or market.get("end_date")
+        live = live_prices_by_cid.get(str(row.get("condition_id") or "").lower())
+        if live:
+            market = {**market, "outcome_prices": live}
+            row["price_live"] = True
         _attach_follow_unrealized_pnl(row, market)
         row["match_parts"] = _match_parts_for_row(row)
         row["team_logos"] = _team_logos_for_parts(row.get("match_parts"), logo_cache)

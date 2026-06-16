@@ -155,7 +155,9 @@
 .sb-chips { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; flex: 1; }
 .sb-chip { font-size: var(--fs-footnote); color: var(--text-secondary); background: var(--surface-inset); border-radius: var(--r-pill); padding: 3px var(--sp-3); white-space: nowrap; }
 
-.page-scroll { flex: 1; overflow-y: auto; padding: var(--page-pad); }
+/* scrollbar-gutter: stable 预留滚动条槽位 → 切页/加载时内容高度变化不再让滚动条闪入闪出
+   (短列表不显示滚动条,长列表照常滚动)。 */
+.page-scroll { flex: 1; overflow-y: auto; scrollbar-gutter: stable; padding: var(--page-pad); }
 .page-inner { max-width: var(--maxw-content); margin: 0 auto; display: flex; flex-direction: column; gap: var(--gutter); }
 
 /* ---- Section heads ---- */
