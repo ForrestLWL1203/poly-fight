@@ -199,10 +199,11 @@ class PolymarketClient:
         order: str = "endDate",
         min_end_date: datetime | None = None,
         max_end_date: datetime | None = None,
-        # Only the three in-scope games. The broad "esports" umbrella tag also returns
-        # Valorant/MLBB/Overwatch/CoD/etc. (~40% of its pages), so querying the specific
-        # game tags keeps the fetch matched to scope and gives deeper per-game history.
-        tag_slugs: tuple[str, ...] = ("counter-strike-2", "league-of-legends", "dota-2"),
+        # In-scope esports games. The broad "esports" umbrella tag also returns
+        # MLBB/Overwatch/CoD/etc. (~40% of its pages), so querying the specific game
+        # tags keeps the fetch matched to scope and gives deeper per-game history.
+        # Keep in sync with cli.CATEGORY_TAG_SLUGS["esports"].
+        tag_slugs: tuple[str, ...] = ("counter-strike-2", "league-of-legends", "dota-2", "valorant"),
     ) -> list[dict]:
         all_events: list[dict] = []
         limit = 100

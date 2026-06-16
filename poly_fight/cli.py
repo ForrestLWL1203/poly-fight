@@ -5836,6 +5836,7 @@ def find_active_market(client: PolymarketClient, args: argparse.Namespace) -> di
         active=True,
         max_pages=args.gamma_pages,
         order="volume24hr",
+        tag_slugs=CATEGORY_TAG_SLUGS["esports"],
     )
     records = []
     for event in active_events:
