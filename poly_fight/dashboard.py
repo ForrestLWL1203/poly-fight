@@ -28,7 +28,6 @@ from .core import (
     GAME_FAMILY_LABELS,
     LEAGUE_LABELS,
     MARKET_TYPE_LABELS,
-    MIN_A_POSITIVE_MARKET_RATE,
     bucket_label,
     parse_dt,
     parse_jsonish,
@@ -1578,12 +1577,8 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
         quarantine_key = f"{category}:{wallet}"
         is_quarantined = quarantine_key in quarantine or wallet in quarantine
         is_favorite = bool(favorite_row) and not is_quarantined
-        if (
-            "positive_market_rate" in metrics
-            and to_float(metrics.get("positive_market_rate")) < MIN_A_POSITIVE_MARKET_RATE
-            and not is_favorite
-        ):
-            continue
+        # v17:删展示层的「拉通整体胜率门」(positive_market_rate<0.63)。评分已是分桶 edge_lb 单轴,
+        # 专精钱包(某桶高 θ̂、整体胜率低)本就该上榜;此处再按整体胜率过滤会把它们藏掉(DB 有但不显示)。
         league = normalize_league(row.get("league"))
         row_league_label = str(row.get("league_label") or league_label(league)).strip()
         observed_source = result_observed_by_wallet.get(wallet) or performance.get(wallet, {})
@@ -2063,8 +2058,7 @@ def _leaderboard_rank_by_wallet(data_dir: Path, *, follow_dir: Path | None = Non
             category = normalize_category(str(row.get("category") or source_category or "")) or "esports"
             row = enrich_esports_bucket_scores(row, now_ts=int(time.time())) if category != "sports" else row
             metrics = _eligible_display_metrics(row)
-            if "positive_market_rate" in metrics and to_float(metrics.get("positive_market_rate")) < MIN_A_POSITIVE_MARKET_RATE:
-                continue
+            # v17:同上,删拉通整体胜率门(与分桶 edge_lb 评分轴一致)。
             quarantine_key = f"{category}:{wallet}"
             merged = {
                 **row,

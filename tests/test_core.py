@@ -11233,8 +11233,10 @@ class CoreTest(unittest.TestCase):
             wallets = build_wallets(data_dir)["wallets"]
             detail = build_follow_detail(data_dir, "m1")
 
-            self.assertEqual([row["wallet"] for row in wallets], [visible_a, visible_b])
-            self.assertEqual(detail["wallets"][0]["leaderboard_rank"], 2)
+            # v17:展示层不再按"拉通整体胜率"过滤 → 整体胜率 0.10 的专精钱包(grade A)照常显示;
+            # 三个都在,visible_b 排第 3。
+            self.assertEqual([row["wallet"] for row in wallets], [visible_a, hidden, visible_b])
+            self.assertEqual(detail["wallets"][0]["leaderboard_rank"], 3)
 
     def test_dashboard_follow_detail_rank_respects_quarantine_sorting(self):
         with TemporaryDirectory() as tmp:
