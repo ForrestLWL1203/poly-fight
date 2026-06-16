@@ -133,6 +133,7 @@ from poly_fight.core import (
     reconstruct_closed_positions,
     summarize_closed_positions,
     summarize_trade_reconstructed_positions,
+    wallet_is_followable,
     winning_outcome_index,
 )
 from poly_fight.follow import (
@@ -316,9 +317,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(default_args.profile_lookback_days, 14)
         self.assertEqual(default_args.seed_single_bucket_min_wins, 5)
         self.assertEqual(default_args.seed_multi_bucket_min_wins, 8)
-        self.assertEqual(default_args.seed_main_match_min_avg_cash, 500)
-        self.assertEqual(default_args.seed_game_winner_min_avg_cash, 500)
-        self.assertEqual(default_args.seed_map_winner_min_avg_cash, 300)
+        self.assertEqual(default_args.seed_main_match_min_avg_cash, 100)
+        self.assertEqual(default_args.seed_game_winner_min_avg_cash, 100)
+        self.assertEqual(default_args.seed_map_winner_min_avg_cash, 100)
         self.assertEqual(default_args.seed_min_weighted_roi, 0.30)
         self.assertEqual(default_args.seed_max_median_avg_price, 0.75)
 
@@ -1676,12 +1677,12 @@ class CoreTest(unittest.TestCase):
                 "avgPrice": 0.4,
                 "timestamp": 100 + i,
             }
-            for i in range(10)
+            for i in range(14)
         ]
         summary = summarize_closed_positions(
             positions,
-            {f"g{i}" for i in range(10)},
-            condition_type_by_id={f"g{i}": "game_winner" for i in range(10)},
+            {f"g{i}" for i in range(14)},
+            condition_type_by_id={f"g{i}": "game_winner" for i in range(14)},
             now_ts=200,
         )
 
@@ -1701,7 +1702,7 @@ class CoreTest(unittest.TestCase):
                 "avgPrice": 0.4,
                 "timestamp": 100 + i,
             }
-            for i in range(10)
+            for i in range(14)
         ] + [
             {
                 "conditionId": f"d{i}",
@@ -1710,7 +1711,7 @@ class CoreTest(unittest.TestCase):
                 "avgPrice": 0.4,
                 "timestamp": 200 + i,
             }
-            for i in range(10)
+            for i in range(14)
         ]
         condition_ids = {row["conditionId"] for row in positions}
         summary = summarize_closed_positions(
@@ -1718,8 +1719,8 @@ class CoreTest(unittest.TestCase):
             condition_ids,
             condition_type_by_id={condition_id: "main_match" for condition_id in condition_ids},
             condition_game_family_by_id={
-                **{f"cs{i}": "cs2" for i in range(10)},
-                **{f"d{i}": "dota2" for i in range(10)},
+                **{f"cs{i}": "cs2" for i in range(14)},
+                **{f"d{i}": "dota2" for i in range(14)},
             },
             now_ts=300,
         )
@@ -1734,8 +1735,8 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(rated["per_game_type_grades"]["cs2:main_match"]["grade"], "A")
         self.assertEqual(rated["per_game_type_grades"]["dota2:main_match"]["grade"], "A")
 
-    def test_effective_sample_floor_by_bucket_type(self):
-        # n_eff 下限按盘口分档:主盘(main_match)8,子盘(game/map winner)6。
+    def test_effective_sample_floor_is_uniform_twelve(self):
+        # v16:n_eff 下限统一 12(不再主盘/子盘分档)。
         def rate(count, market_type):
             positions = [
                 {"conditionId": f"g{i}", "totalBought": 2500, "realizedPnl": 1500,
@@ -1751,12 +1752,11 @@ class CoreTest(unittest.TestCase):
             )
             return classify_wallet(summary, now_ts=200)
 
-        # 子盘:5 不够、6 够
-        self.assertIn("thin_sample", rate(5, "game_winner")["per_game_type_grades"]["cs2:game_winner"]["reasons"])
-        self.assertEqual(rate(6, "game_winner")["per_game_type_grades"]["cs2:game_winner"]["grade"], "A")
-        # 主盘:7 不够、8 够
-        self.assertIn("thin_sample", rate(7, "main_match")["per_game_type_grades"]["cs2:main_match"]["reasons"])
-        self.assertEqual(rate(8, "main_match")["per_game_type_grades"]["cs2:main_match"]["grade"], "A")
+        # 子盘与主盘同一道 12 门:11 不够、13 够。
+        self.assertIn("thin_sample", rate(11, "game_winner")["per_game_type_grades"]["cs2:game_winner"]["reasons"])
+        self.assertEqual(rate(13, "game_winner")["per_game_type_grades"]["cs2:game_winner"]["grade"], "A")
+        self.assertIn("thin_sample", rate(11, "main_match")["per_game_type_grades"]["cs2:main_match"]["reasons"])
+        self.assertEqual(rate(13, "main_match")["per_game_type_grades"]["cs2:main_match"]["grade"], "A")
 
     def test_closed_position_wilson_uses_80_percent_confidence(self):
         positions = []
@@ -1821,7 +1821,7 @@ class CoreTest(unittest.TestCase):
         rated = classify_wallet(summary, now_ts=100 + 86400)
 
         self.assertEqual(rated["grade"], "C")
-        self.assertIn("low_win_rate", rated["reasons"])  # 胜率 0.45 < 0.58
+        self.assertIn("weak_wilson_lb", rated["reasons"])  # wilson_lb(0.45,20)≈0.31 < 0.65
 
     def test_low_frequency_perfect_wallet_is_not_a_grade(self):
         summary = {
@@ -1843,7 +1843,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(rated["grade"], "C")
         self.assertIn("thin_sample", rated["reasons"])
 
-    def test_effective_sample_floor_is_eight_markets(self):
+    def test_effective_sample_floor_is_twelve_markets(self):
         base_summary = {
             "esports_realized_pnl": 2_000,
             "median_market_roi": 0.40,
@@ -1857,8 +1857,8 @@ class CoreTest(unittest.TestCase):
             "bot_like_score": 0,
         }
 
-        thin = classify_wallet({**base_summary, "esports_closed_count": 7}, now_ts=100 + 86400)
-        qualified = classify_wallet({**base_summary, "esports_closed_count": 8}, now_ts=100 + 86400)
+        thin = classify_wallet({**base_summary, "esports_closed_count": 11}, now_ts=100 + 86400)
+        qualified = classify_wallet({**base_summary, "esports_closed_count": 12}, now_ts=100 + 86400)
 
         self.assertEqual(thin["grade"], "C")
         self.assertIn("thin_sample", thin["reasons"])
@@ -1887,7 +1887,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(rated["entry_edge"], 0.34)
 
     def test_marginal_win_rate_wallet_is_not_a_grade(self):
-        # 准确率轴 = 点估胜率 θ̂。赢一半的钱包 θ̂=0.52 < 0.58 → 不上 A(low_win_rate)。
+        # 准确率轴 = Wilson 下界。赢一半的钱包 wilson_lb(0.52,50)≈0.43 < 0.65 → 不上 A(weak_wilson_lb)。
         summary = {
             "esports_closed_count": 50,
             "esports_realized_pnl": 20_000,
@@ -1905,7 +1905,7 @@ class CoreTest(unittest.TestCase):
         rated = classify_wallet(summary, now_ts=100 + 86400)
 
         self.assertNotEqual(rated["grade"], "A")
-        self.assertIn("low_win_rate", rated["reasons"])
+        self.assertIn("weak_wilson_lb", rated["reasons"])
 
     def test_weak_capital_edge_no_longer_blocks_a_grade(self):
         # 资金加权边际(他的美元盈亏轴)不再是门槛。高胜率 + 正 copy 边际(θ̂−入场价) → A,
@@ -1953,7 +1953,7 @@ class CoreTest(unittest.TestCase):
         self.assertNotIn("low_win_rate", rated["reasons"])
         self.assertNotIn("weak_copy_edge", rated["reasons"])
 
-    def test_sports_wallet_rating_requires_ten_closed_markets_for_a_grade(self):
+    def test_sports_wallet_rating_requires_twelve_closed_markets_for_a_grade(self):
         base_summary = {
             "category": "sports",
             "esports_realized_pnl": 12_000,
@@ -1970,8 +1970,8 @@ class CoreTest(unittest.TestCase):
             "bot_like_score": 0,
         }
 
-        thin = classify_wallet({**base_summary, "esports_closed_count": 9}, now_ts=100 + 86400)
-        qualified = classify_wallet({**base_summary, "esports_closed_count": 10}, now_ts=100 + 86400)
+        thin = classify_wallet({**base_summary, "esports_closed_count": 11}, now_ts=100 + 86400)
+        qualified = classify_wallet({**base_summary, "esports_closed_count": 12}, now_ts=100 + 86400)
 
         self.assertEqual(thin["grade"], "C")
         self.assertIn("thin_sample", thin["reasons"])
@@ -2002,15 +2002,15 @@ class CoreTest(unittest.TestCase):
         self.assertNotIn("low_historical_roi", rated["reasons"])
 
     def test_zero_capital_edge_no_longer_excluded(self):
-        # capital_weighted_edge=0(他的大注资金恰好打平)与我们无关。等权 copy 边际为正
-        # (θ⁻=0.60 @ 入场 0.50 → E⁻=+0.20)→ 该钱包对固定注 copy 是好标的 → A,不再硬排除。
+        # capital_weighted_edge=0(他的大注资金恰好打平)与我们无关。θ̂=0.85 @ 入场 0.50,
+        # wilson_lb≈0.72、edge_lb≈0.22 → 对固定注 copy 是好标的 → A,capital edge 仅软 reason。
         summary = {
             "esports_closed_count": 20,
             "esports_realized_pnl": 100,
             "esports_roi": 0.30,
-            "positive_market_rate": 0.70,
+            "positive_market_rate": 0.85,
             "wilson_win_rate_lower_bound": 0.60,
-            "esports_loss_count": 6,
+            "esports_loss_count": 3,
             "esports_total_bought": 10_000,
             "median_entry_price": 0.50,
             "capital_weighted_edge": 0.0,
@@ -2155,7 +2155,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(rated["grade"], "A")
         self.assertEqual(rated["entry_edge"], 0.16)
 
-    def test_low_volume_wallet_is_not_a_grade_even_when_perfect(self):
+    def test_low_volume_is_soft_not_a_hard_exclude(self):
+        # v16:成交额不再是门槛(均仓跟单,目标下注大小与我们无关)。高胜率 + 够样本 → A,
+        # low_volume 仅作软 reason。
         summary = {
             "esports_closed_count": 20,
             "esports_realized_pnl": 200,
@@ -2173,8 +2175,8 @@ class CoreTest(unittest.TestCase):
 
         rated = classify_wallet(summary, now_ts=100 + 86400)
 
-        self.assertEqual(rated["grade"], "C")
-        self.assertIn("low_volume", rated["reasons"])
+        self.assertEqual(rated["grade"], "A")
+        self.assertIn("low_volume", rated["reasons"])  # 软 reason,不再阻挡
 
     def test_low_roi_is_soft_not_a_hard_exclude(self):
         # A high-win-rate favorite-buyer: roi 0.18 (< floor) but real edge (positive
@@ -2390,7 +2392,7 @@ class CoreTest(unittest.TestCase):
         self.assertNotEqual(result["grade"], "A")
         self.assertIn("negative_pnl", result["reasons"])
 
-    def test_high_frequency_only_candidate_gets_bot_like_penalty(self):
+    def test_high_frequency_only_candidate_gets_bot_like_score(self):
         positions = [
             {"conditionId": f"m{i}", "totalBought": 100, "realizedPnl": 50, "avgPrice": 0.5, "timestamp": 100 + i}
             for i in range(20)
@@ -2411,8 +2413,10 @@ class CoreTest(unittest.TestCase):
             now_ts=200,
         )
 
+        # v16:bot 门统一为单一阈值 70(>=70 才 excluded)。score 50 < 70 → 不再降级,
+        # 由 Wilson 双下界 + 双边门把关;此处仅验证 bot 评分逻辑本身。
         self.assertEqual(result["bot_like_score"], 50)
-        self.assertEqual(result["grade"], "C")
+        self.assertEqual(result["grade"], "A")
 
     def test_failed_retryable_profile_is_not_reused_by_long_ttl_cache(self):
         cached = {"wallet": "0xabc", "profile_state": "failed_retryable", "profiled_at": 100}
@@ -3655,10 +3659,9 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual([row["wallet"] for row in ranked], ["0xclean", "0xlossy"])
 
-    def test_leaderboard_positive_rate_floor_skips_sub_eligible_wallets(self):
-        # The blended-overall positive-rate floor must only gate legacy/overall grades.
-        # A per-type sub-specialist (strong on its eligible bucket, weak overall because of
-        # a different market type) already cleared the floor on its own type and must stay.
+    def test_leaderboard_no_longer_applies_legacy_positive_rate_floor(self):
+        # v16:legacy 整体 positive-rate / ROI 门已删。质量由 Wilson 双下界 + 分桶 eligible 把关,
+        # 不再用"拉通整体胜率"额外卡 grade-A 钱包。sub-specialist 保留,overall grade-A 也保留。
         now = 1_000_000
         candidate = {
             "participated_market_count": 16,
@@ -3698,7 +3701,51 @@ class CoreTest(unittest.TestCase):
 
         wallets = [row["wallet"] for row in ranked]
         self.assertIn("0xsubspec", wallets)  # sub-specialist kept
-        self.assertNotIn("0xlegacy", wallets)  # overall-graded wallet still gated
+        self.assertIn("0xlegacy", wallets)  # v16:grade-A 不再被整体胜率门卡掉
+
+    def test_grading_eligibility_is_single_source_across_consumers(self):
+        # 单一真相源回归护栏:同一份 profile,collector/observe/demote 共用的
+        # build_collector_leaderboard_v2,与 follow 的 eligible_follow_wallets / wallet_is_followable,
+        # 必须对"是否够格上榜/被跟"给出一致结论(不许各自为政)。
+        now = 1_000_000
+
+        def esports_summary(wallet, win_rate, count):
+            wins = round(win_rate * count)
+            positions = [
+                {"conditionId": f"{wallet}-w{i}", "totalBought": 1200,
+                 "realizedPnl": 600, "avgPrice": 0.5, "timestamp": now - 5000 + i}
+                for i in range(wins)
+            ] + [
+                {"conditionId": f"{wallet}-l{i}", "totalBought": 1200,
+                 "realizedPnl": -1200, "avgPrice": 0.5, "timestamp": now - 5000 + wins + i}
+                for i in range(count - wins)
+            ]
+            cids = {p["conditionId"] for p in positions}
+            summary = summarize_closed_positions(
+                positions, cids,
+                condition_type_by_id={c: "game_winner" for c in cids},
+                condition_game_family_by_id={c: "cs2" for c in cids},
+                now_ts=now,
+            )
+            return {**summary, "wallet": wallet, "category": "esports"}
+
+        strong = classify_wallet(esports_summary("0xstrong", 0.85, 16), now_ts=now)
+        weak = classify_wallet(esports_summary("0xweak", 0.50, 16), now_ts=now)
+        profiles = {"0xstrong": strong, "0xweak": weak}
+
+        # collector / observe-v2 / rescore-demote 共用入口
+        result = build_collector_leaderboard_v2(profiles, now_ts=now)
+        board = {normalize_wallet(r.get("wallet")) for r in result["leaderboard"]}
+
+        # follow 入口(同一份榜单 → 可跟集合)
+        follow_rows = eligible_follow_wallets(result["leaderboard"], now_ts=now, recency_days=365)
+        follow_set = {normalize_wallet(r.get("wallet")) for r in follow_rows}
+
+        self.assertIn("0xstrong", board)
+        self.assertNotIn("0xweak", board)
+        self.assertTrue(wallet_is_followable(strong))
+        self.assertFalse(wallet_is_followable(weak))
+        self.assertEqual(board, follow_set)  # 榜单成员 == follow 可跟集合
 
     def test_esports_leaderboard_requires_eligible_qualified_type_overlap(self):
         now = 1_000_000

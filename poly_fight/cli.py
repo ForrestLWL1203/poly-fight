@@ -27,11 +27,11 @@ from .core import (
     GAME_FAMILY_LABELS,
     LEAGUE_LABELS,
     MARKET_TYPE_LABELS,
-    MIN_A_POSITIVE_MARKET_RATE,
     SCORING_VERSION,
     SECONDS_PER_DAY,
     SWING_DEPENDENT_RATE,
     TRADE_BEHAVIOR_EXCLUDE_RATE,
+    wallet_is_followable,
     TRADE_BEHAVIOR_MIN_MARKETS,
     GAME_WINNER,
     MAIN_MATCH,
@@ -306,10 +306,11 @@ SEED_BUCKET_MIN_WIN_RATE = SEED_BUCKET_MIN_HIT_RATE
 SEED_BUCKET_MIN_WINS_FLOOR = 0
 SEED_SINGLE_BUCKET_MIN_WINS = 5
 SEED_MULTI_BUCKET_MIN_WINS = 8
-SEED_MAIN_MATCH_MIN_AVG_CASH = 500.0
-SEED_GAME_WINNER_MIN_AVG_CASH = 500.0
-SEED_MAP_WINNER_MIN_AVG_CASH = 300.0
-SEED_MIN_WEIGHTED_ROI = 0.30
+SEED_MAIN_MATCH_MIN_AVG_CASH = 100.0  # v16:统一 $100,只滤纯试水、不杀小注高手
+SEED_GAME_WINNER_MIN_AVG_CASH = 100.0
+SEED_MAP_WINNER_MIN_AVG_CASH = 100.0
+SEED_MIN_WEIGHTED_ROI = 0.30  # v16:seed ROI 门已删(美元口径,质量交给下游 Wilson);此常量仅留作 CLI/记录兼容
+SEED_MIN_MEDIAN_AVG_PRICE = 0.35  # v16:入场价下限(<0.35 多为安全垫/赌爆冷,胜率低)
 SEED_MAX_MEDIAN_AVG_PRICE = 0.75
 COLLECTOR_PROFILE_LOOKBACK_DAYS = 14
 COLLECTOR_BUCKETS = (
@@ -2294,20 +2295,10 @@ def build_leaderboard_from_profiles(
         eligible_market_types = profile.get("eligible_market_types") or []
         if profile.get("per_type_grades") is not None and not eligible_market_types:
             continue
-        if profile.get("grade") != "A" and not eligible_market_types:
+        if not wallet_is_followable(profile):
             continue
-        if not eligible_market_types and to_float(profile.get("esports_roi")) < 0.30:
-            continue
-        # Grading is per market_type: an eligible bucket already cleared the positive-rate
-        # floor on its own type, so only apply the blended-overall floor to legacy/overall
-        # grades. Otherwise a real sub-specialist (strong on its type, weak overall) is
-        # wrongly dropped here even though it qualified.
-        if (
-            not eligible_market_types
-            and "positive_market_rate" in profile
-            and to_float(profile.get("positive_market_rate")) < MIN_A_POSITIVE_MARKET_RATE
-        ):
-            continue
+        # v16:legacy ROI / positive-rate 门已删(美元/拉通整体口径,与分桶均仓跟单无关;
+        # 质量由 Wilson 双下界 + 分桶 eligible 把关)。
         behavior_market_count = int(profile.get("historical_trade_behavior_market_count") or 0)
         # Do NOT cut on sold_before_resolution rate: selling winners at ~0.99 to free capital
         # is smart-money behavior, not short-term noise. The copyability concern is captured by
@@ -2892,7 +2883,7 @@ def leaderboard_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
     score = row.get("best_bucket_score")
     if score is not None:
         return (
-            0 if row.get("grade") == "A" or row.get("eligible_market_types") else 1,
+            0 if wallet_is_followable(row) else 1,
             -to_float(score),
             -to_float(metrics.get("wilson_win_rate_lower_bound")),
             -to_float(metrics.get("capital_weighted_edge") or metrics.get("entry_edge")),
@@ -2902,7 +2893,7 @@ def leaderboard_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
         )
     loss_count = int(metrics.get("esports_loss_count") or 0)
     return (
-        0 if row.get("grade") == "A" or row.get("eligible_market_types") else 1,
+        0 if wallet_is_followable(row) else 1,
         loss_count > 0,
         loss_count,
         -to_float(metrics.get("positive_market_rate")),
@@ -3228,16 +3219,10 @@ def _leaderboard_reject_reasons_for_profile(
         reasons.append("old_scoring_version")
     if profile.get("per_type_grades") is not None and not eligible_market_types:
         reasons.append("no_eligible_per_type")
-    if profile.get("grade") != "A" and not eligible_market_types:
+    if not wallet_is_followable(profile):
         reasons.append("not_A_no_eligible_type")
-    if not eligible_market_types and to_float(profile.get("esports_roi")) < 0.30:
-        reasons.append("legacy_low_roi")
-    if (
-        not eligible_market_types
-        and "positive_market_rate" in profile
-        and to_float(profile.get("positive_market_rate")) < MIN_A_POSITIVE_MARKET_RATE
-    ):
-        reasons.append("legacy_low_positive_rate")
+    # v16:legacy_low_roi / legacy_low_positive_rate 已删(美元/拉通整体口径,且只在"无合格桶"时触发、
+    # 与 no_eligible_per_type 重叠,删后该类钱包仍被拒)。质量由 Wilson 双下界 + 分桶 eligible 把关。
     if to_float(profile.get("actual_minus_hold_pnl_rate")) > SWING_DEPENDENT_RATE:
         reasons.append("swing_dependent")
     behavior_market_count = int(profile.get("historical_trade_behavior_market_count") or 0)
@@ -3729,10 +3714,9 @@ def seed_bucket_quality_reject_reasons(
         reasons.append("seed_bucket_win_count_lt_min")
     if to_float(stats.get("avg_seed_cash")) < min_avg_cash:
         reasons.append("seed_bucket_avg_cash_lt_min")
-    if to_float(stats.get("seed_weighted_roi")) < float(min_weighted_roi):
-        reasons.append("seed_bucket_roi_lt_min")
+    # v16:seed ROI 门已删(美元口径,与均仓跟单无关,质量交给下游 Wilson)。min_weighted_roi 入参保留仅作兼容。
     median_avg_price = to_float(stats.get("median_avg_price"))
-    if median_avg_price <= 0 or median_avg_price > float(max_median_avg_price):
+    if median_avg_price < SEED_MIN_MEDIAN_AVG_PRICE or median_avg_price > float(max_median_avg_price):
         reasons.append("seed_bucket_median_avg_price_gt_max")
     return reasons
 
@@ -3937,8 +3921,7 @@ def seed_filter_reject_reasons(
         if not bucket_thresholds:
             if to_float(row.get("seed_cost_total")) < min_seed_cost_total:
                 reasons.append("seed_cost_total_lt_min")
-            if to_float(row.get("seed_weighted_roi")) < seed_min_weighted_roi:
-                reasons.append("seed_roi_lt_min")
+            # v16:ROI 门已删。
             if to_float(row.get("median_avg_price")) > max_avg_price:
                 reasons.append("median_avg_price_gt_max")
         if not reasons and wallet not in selected_wallets:
@@ -4378,7 +4361,7 @@ def resolve_collector_profile_wallet_limit(
     if explicit is None:
         explicit = getattr(args, "max_profiles_per_run", None)
     if explicit is None:
-        explicit = 700
+        explicit = 2000  # v16:扩漏斗,深采上限 700→2000
     return int(explicit or 0)
 
 

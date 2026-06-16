@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from statistics import median
 from typing import Any
 
-from .core import SECONDS_PER_DAY, bucket_key, bucket_label, normalize_wallet, parse_dt, to_float, to_int
+from .core import SECONDS_PER_DAY, bucket_key, bucket_label, normalize_wallet, parse_dt, to_float, to_int, wallet_is_followable
 from .follow_strategy import evaluate_follow_candidate, normalize_follow_strategy
 
 MIN_ADD_RATIO_TO_FIRST = 0.10
@@ -55,9 +55,10 @@ def eligible_follow_wallets(
             continue
         eligible_market_types = [str(value) for value in (row.get("eligible_market_types") or []) if value]
         eligible_buckets = [str(value) for value in (row.get("eligible_buckets") or []) if value]
-        if (row.get("grade") == "A" or is_favorite) and not eligible_market_types:
+        followable = wallet_is_followable(row)  # grade A 或有合格桶;favorite 是手动覆盖,另叠加
+        if (followable or is_favorite) and not eligible_market_types:
             eligible_market_types = ["main_match"]
-        if row.get("grade") != "A" and not eligible_market_types and not is_favorite:
+        if not followable and not is_favorite:
             continue
         last_trade = to_int(row.get("last_esports_trade_at"))
         if last_trade >= cutoff or is_favorite:

@@ -10,15 +10,12 @@ from typing import Any, Iterable
 SECONDS_PER_DAY = 86400
 # profile 复用以此为失效令牌:改任何评分口径(门槛/公式/n_eff 下限/basis)都要 +1,
 # 否则采集会复用旧口径的画像、新规则不生效。改完需全量重采一次,之后才走复用加速。
-SCORING_VERSION = 15
+SCORING_VERSION = 16
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
-TRADE_BEHAVIOR_EXCLUDE_RATE = 0.5
-# 有效样本 n_eff 下限(按盘口分档):主盘 8;子盘(单局/地图)6,赛事更密、放宽。
-ESPORTS_OVERALL_MIN_SAMPLE = 8
-ESPORTS_MAIN_MATCH_MIN_SAMPLE = 8
-ESPORTS_SUBMARKET_MIN_SAMPLE = 6
-SPORTS_MIN_SAMPLE = 10
+# v16:两边对冲(套利)门统一 0.20——bucket 排除(core)、systemic(cli)、v2 钱包级(V2_MAX_TWO_SIDED_RATE)同口径。
+TRADE_BEHAVIOR_EXCLUDE_RATE = 0.20
+# n_eff 下限统一(见下方 ESPORTS_N_EFF_FLOOR / SPORTS_N_EFF_FLOOR;v16 起不再按盘口分档)。
 # Thresholds recalibrated for the de-biased trade-reconstruction win rates (v11):
 # real top esports wallets win ~66-81%, not the survivorship-inflated ~90% the old
 # closed_positions floors assumed. See review/scoring analysis.
@@ -28,20 +25,22 @@ MIN_B_POSITIVE_MARKET_RATE = 0.55
 # roi 不再硬切（它是赔率结构副产品，会冤枉高胜率买热门的钱包），仅作软 reason。
 ESPORTS_MIN_ROI = 0.20  # 软信号 low_roi 的提示线，不再硬排除
 SPORTS_MIN_ROI = 0.15
-ESPORTS_MIN_A_WILSON = 0.57
-SPORTS_MIN_A_WILSON = 0.50
-ESPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE = 0.08
-SPORTS_MIN_A_CAPITAL_WEIGHTED_EDGE = 0.10
-# ── Copy 评分轴（固定注、持有到结算 copy；目标的美元盈亏/仓位大小与我们无关）──
-# 不用 Wilson(它对小样本过度惩罚、误杀真专家)。单层三条,全是点估、人话可讲:
-#   1) 胜率够高 + 够样本: θ̂(近期加权点估胜率) ≥ WIN_RATE_MIN 且 有效样本 n_eff ≥ 盘口分档下限(主10/子6)
-#   2) 价格不超线:        PRICE_LO ≤ 入场价 ≤ PRICE_HI
-#   3) 有 edge:           θ̂ − 入场价 ≥ EDGE_MIN  (固定注每股期望收益 = 胜率 − 价格)
-# 美元盈亏 / capital_weighted_edge 不再是门槛(降为软 reason)。n_eff 下限见 ESPORTS_*_MIN_SAMPLE。
-ESPORTS_COPY_WIN_RATE_MIN = 0.65      # θ̂ 点估胜率下限(精筛高胜率;尾部 q1≈70%,中位≈74%)
-ESPORTS_COPY_EDGE_MIN = 0.10          # θ̂ − 入场价 的加性 edge 下限(子盘自动放宽到 0.06)
-ESPORTS_COPY_PRICE_LO = 0.40          # 价格带下界(防极端 longshot;低胜率彩票已被胜率下限挡掉)
-ESPORTS_COPY_PRICE_HI = 0.68          # 价格带上界(避开 priced-in 大热门)
+# ── Copy 评分轴 v16(固定注、持有到结算 copy;目标美元盈亏/仓位与我们无关)──
+# 质量门 = 同一桶同时满足三条下界(点估 → 下界:薄样本自动惩罚,抗 6 桶 look-elsewhere):
+#   1) wilson_lb(θ̂, n_eff) ≥ WILSON_LB_MIN           对胜率有把握
+#   2) edge_lb = wilson_lb − 入场中位价 ≥ EDGE_LB_MIN  对"跟着能赚"有把握
+#   3) n_eff ≥ N_EFF_FLOOR                            数值兜底 + 抗多重比较
+# θ̂ = recency_weighted_win_rate;n_eff = effective_sample_size。价格不再单设带
+# (入场端靠 seed 0.35–0.75 预筛 + edge_lb 兜大热端);美元/PnL/ROI 仅作软 reason、不判定。
+ESPORTS_WILSON_LB_MIN = 0.65
+ESPORTS_EDGE_LB_MIN = 0.05
+ESPORTS_N_EFF_FLOOR = 12
+SPORTS_WILSON_LB_MIN = 0.55
+SPORTS_EDGE_LB_MIN = 0.03
+SPORTS_N_EFF_FLOOR = 12
+# B(留池不上榜,observe 观察用):比 A 各放一档
+GRADE_B_WILSON_RELAX = 0.05
+GRADE_B_EDGE_RELAX = 0.03
 # 近期活跃度:按时间半衰期对每盘加权(近期热度 > 陈旧战绩),折算 Kish 有效样本 n_eff,
 # 得到近期加权点估胜率 θ̂。让"钱包当前在打的桶"靠成熟分升级。
 ESPORTS_RECENCY_HALF_LIFE_DAYS = 21
@@ -1187,6 +1186,17 @@ def wilson_lower_bound(successes: int, n: int, z: float = WILSON_Z) -> float:
     return (centre - adjustment) / denominator
 
 
+def wilson_lower_bound_rate(p: float, n: float, z: float = WILSON_Z) -> float:
+    """Wilson 下界,直接吃点估率 p 和(可为浮点的有效样本)n。
+    用于桶级评分:p=θ̂(recency_weighted_win_rate),n=n_eff(Kish 有效样本)。"""
+    if n <= 0:
+        return 0.0
+    denominator = 1 + z * z / n
+    centre = p + z * z / (2 * n)
+    adjustment = z * sqrt((p * (1 - p) + z * z / (4 * n)) / n)
+    return (centre - adjustment) / denominator
+
+
 def summarize_closed_positions(
     positions: list[dict[str, Any]],
     esports_condition_ids: set[str],
@@ -1909,58 +1919,52 @@ def classify_wallet_bucket(
     # 注:不按"成交笔数"(high_churn)排除——分批建仓/分批止盈是单边方向性交易,合理。
     # 真正要排除的双边套利(同时买 A 和 B)已由上面的 two_sided 门槛精准抓住
     # (two_sided = 买了≥2个不同结果),与成交频率无关。
-    # Copy 轴(单层三条,无 Wilson):点估胜率持续(回测 corr≈0.49),Wilson 的小样本折扣
-    # 只会误杀真专家,故改用"近期加权点估胜率 θ̂ + 有效样本下限 n_eff"。
-    #   θ̂(win_rate) = recency_weighted_win_rate;缺则回退全历史 positive_market_rate。
-    #   n_eff        = effective_sample_size;缺则回退 count。
+    # Copy 轴 v16:点估 → 下界。质量门 = wilson_lb ≥ W_min 且 edge_lb ≥ E_min 且 n_eff ≥ floor。
+    #   θ̂(win_rate) = recency_weighted_win_rate(缺则回退 positive_market_rate);n_eff = effective_sample_size(缺则 count)。
+    #   薄样本 → Wilson 区间变宽 → 下界自动掉下去 → 蒙中者出局,不再单设 n_eff/价带硬门。
     win_rate = to_float(summary.get("recency_weighted_win_rate")) if summary.get("recency_weighted_win_rate") is not None else positive_rate
     eff_sample = to_float(summary.get("effective_sample_size")) if summary.get("effective_sample_size") is not None else float(count)
-    copy_edge = win_rate - median_entry if median_entry > 0 else None  # 每股期望收益 = 胜率 − 价格
-    in_price_band = ESPORTS_COPY_PRICE_LO <= median_entry <= ESPORTS_COPY_PRICE_HI
-    min_win_rate = ESPORTS_COPY_WIN_RATE_MIN
-    min_edge = ESPORTS_COPY_EDGE_MIN
-    min_eff = float(min_sample)   # 盘口分档的 n_eff 下限(主盘10/子盘6,来自 wallet_bucket_min_sample)
+    bucket_wilson_lb = wilson_lower_bound_rate(win_rate, eff_sample)
+    bucket_edge_lb = (bucket_wilson_lb - median_entry) if median_entry > 0 else None  # 悲观胜率下每股 edge
+    copy_edge = win_rate - median_entry if median_entry > 0 else None                 # 点估 edge,仅展示
+    min_wilson = SPORTS_WILSON_LB_MIN if is_sports else ESPORTS_WILSON_LB_MIN
+    min_edge_lb = SPORTS_EDGE_LB_MIN if is_sports else ESPORTS_EDGE_LB_MIN
+    min_eff = float(min_sample)   # n_eff 数值兜底(esports=12,见 wallet_bucket_min_sample)
 
     if eff_sample < min_eff:
         reasons.append("thin_sample")
-    if not in_price_band:
-        reasons.append("price_out_of_band")
+    if bucket_wilson_lb < min_wilson:
+        reasons.append("weak_wilson_lb")
+    if bucket_edge_lb is None or bucket_edge_lb < min_edge_lb:
+        reasons.append("weak_edge_lb")
+    # 以下全是软 reason(仅展示/观测,不参与判定):
     if loss_count > 0:
         reasons.append("has_losses")
-    if win_rate < min_win_rate:
-        reasons.append("low_win_rate")
-    if copy_edge is None or copy_edge < min_edge:
-        reasons.append("weak_copy_edge")
     if pnl <= 0:
-        reasons.append("negative_pnl")  # 软：目标自己亏钱(常因把大注押在输的盘),与我们无关
+        reasons.append("negative_pnl")  # 目标自己亏钱(常因把大注押在输的盘),均仓跟单与我们无关
     if capital_weighted_edge <= 0:
-        reasons.append(weak_edge_reason)  # 软
+        reasons.append(weak_edge_reason)
     if historical_roi < min_roi:
-        reasons.append("low_roi")  # soft/informational only — not an exclusion
+        reasons.append("low_roi")
     if actual_minus_hold_rate > SWING_DEPENDENT_RATE:
-        reasons.append("swing_dependent")  # profit leans on in-game selling we can't copy
-
+        reasons.append("swing_dependent")  # 利润靠盘中卖出,我们复制不了
     if total_bought < 1_000:
         reasons.append("low_volume")
-    edge_ok = copy_edge is not None
+
+    edge_ok = bucket_edge_lb is not None
+    # bot>=70 / 系统性双边已在上方提前 return excluded;此处只判 Wilson 双下界 + n_eff + 新鲜度。
     if (
         eff_sample >= min_eff
-        and in_price_band
-        and win_rate >= min_win_rate
-        and edge_ok and copy_edge >= min_edge
-        and total_bought >= 1_000
+        and bucket_wilson_lb >= min_wilson
+        and edge_ok and bucket_edge_lb >= min_edge_lb
         and not stale
-        and bot_score < 40
     ):
         grade = "A"
     elif (
         eff_sample >= min_eff
-        and in_price_band
-        and win_rate >= (min_win_rate - 0.05)
-        and edge_ok and copy_edge >= (min_edge - 0.04)
-        and total_bought >= 1_000
+        and bucket_wilson_lb >= (min_wilson - GRADE_B_WILSON_RELAX)
+        and edge_ok and bucket_edge_lb >= (min_edge_lb - GRADE_B_EDGE_RELAX)
         and not stale
-        and bot_score < 50
     ):
         grade = "B"
     elif stale:
@@ -1973,7 +1977,9 @@ def classify_wallet_bucket(
         "entry_edge": round(entry_edge, 8),
         "bucket_win_rate": round(win_rate, 8),                       # θ̂ 近期加权点估胜率
         "bucket_eff_sample": round(eff_sample, 4),                   # n_eff 有效样本
-        "bucket_copy_edge": round(copy_edge, 8) if copy_edge is not None else None,  # 胜率 − 价格
+        "bucket_wilson_lb": round(bucket_wilson_lb, 8),             # Wilson 下界(质量门 1)
+        "bucket_copy_edge": round(copy_edge, 8) if copy_edge is not None else None,        # 点估 edge(展示)
+        "bucket_edge_lb": round(bucket_edge_lb, 8) if bucket_edge_lb is not None else None,  # edge 下界(质量门 2)
         "grade": grade,
         "profile_state": state,
         "reasons": reasons,
@@ -1981,17 +1987,16 @@ def classify_wallet_bucket(
 
 
 def wallet_bucket_min_sample(category: str, market_type: str) -> int:
+    # v16:n_eff 下限统一(不再主盘/子盘分档)。
     if str(category or "").lower() == "sports":
-        return SPORTS_MIN_SAMPLE
-    if str(market_type or MAIN_MATCH) == MAIN_MATCH:
-        return ESPORTS_MAIN_MATCH_MIN_SAMPLE
-    return ESPORTS_SUBMARKET_MIN_SAMPLE
+        return SPORTS_N_EFF_FLOOR
+    return ESPORTS_N_EFF_FLOOR
 
 
 def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> dict[str, Any]:
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
     category = str(summary.get("category") or "").lower()
-    overall_min_sample = SPORTS_MIN_SAMPLE if category == "sports" else ESPORTS_OVERALL_MIN_SAMPLE
+    overall_min_sample = SPORTS_N_EFF_FLOOR if category == "sports" else ESPORTS_N_EFF_FLOOR
     classified = classify_wallet_bucket(summary, now_ts=now_ts, min_sample=overall_min_sample)
     per_type = summary.get("per_type") or {}
     per_game_type = summary.get("per_game_type") or {}
@@ -2040,7 +2045,7 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
         bucket_classified = classify_wallet_bucket(bucket_input, now_ts=now_ts, min_sample=min_sample)
         bucket_classified["min_sample"] = min_sample
         per_type_grades[market_type] = bucket_classified
-        if bucket_classified.get("grade") == "A":
+        if bucket_is_eligible(bucket_classified):
             bucket_classified["eligible_mode"] = "mature"
             eligible_market_types.append(market_type)
             eligible_market_type_modes[market_type] = "mature"
@@ -2100,7 +2105,7 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
                 }
             )
             per_game_type_grades[key] = bucket_classified
-            if bucket_classified.get("grade") == "A":
+            if bucket_is_eligible(bucket_classified):
                 bucket_classified["eligible_mode"] = "mature"
                 eligible_buckets.append(key)
                 eligible_bucket_modes[key] = "mature"
@@ -2168,6 +2173,20 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
         "observed_market_types": observed_market_types,
         "observed_market_type_labels": [MARKET_TYPE_LABELS.get(value, value) for value in observed_market_types],
     }
+
+
+def bucket_is_eligible(bucket: dict[str, Any]) -> bool:
+    """单个桶是否合格(grade A)。单一真相源,勿内联 grade=='A'。"""
+    return str(bucket.get("grade") or "") == "A"
+
+
+def wallet_is_followable(profile: dict[str, Any]) -> bool:
+    """钱包是否够格上榜/被跟:整体 grade A,或有任一合格桶(eligible_market_types)。
+    collector/observe/demote/follow 统一调它,勿在各处内联 grade=='A' 复制。
+    (follow 端的手动 favorite 覆盖是额外叠加,不在此谓词内。)"""
+    if str(profile.get("grade") or "") == "A":
+        return True
+    return bool(profile.get("eligible_market_types"))
 
 
 def bot_like_score_from_candidate(candidate: dict[str, Any]) -> int:
