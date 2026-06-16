@@ -43,8 +43,12 @@ from .core import (
     build_discovery_slate,
     bucket_key,
     bucket_label,
+    choose_main_market,
     classify_edge_type,
     classify_market_type,
+    CALIBRATION_WINDOW_DAYS,
+    derive_scope_params,
+    match_day_gaps,
     ESPORTS_DISCOVERY_GAME_MARKET_TYPE_LIMITS,
     event_to_market_record,
     event_to_market_records,
@@ -244,7 +248,15 @@ def build_client(args: argparse.Namespace) -> PolymarketClient:
 
 DATA_DIR = Path("data")
 CATEGORY_TAG_SLUGS = {
-    "esports": ("counter-strike-2", "league-of-legends", "dota-2"),
+    "esports": ("counter-strike-2", "league-of-legends", "dota-2", "valorant"),
+}
+# 每 scope(game_family)的 Gamma tag slug。校准器(及 P2 的 per-game 窗口/发现)按此逐游戏拉取。
+# 加新游戏在此登记即可被校准器自动测密度。valorant 已可测密度(分类注册是另一步)。
+ESPORTS_GAME_TAGS = {
+    "cs2": "counter-strike-2",
+    "lol": "league-of-legends",
+    "dota2": "dota-2",
+    "valorant": "valorant",
 }
 FOLLOW_SIGNAL_CATEGORIES = ("esports",)
 COLLECTOR_NAME = "wallet_collector"
@@ -321,6 +333,8 @@ COLLECTOR_BUCKETS = (
     ("dota2", GAME_WINNER),
     ("cs2", MAIN_MATCH),
     ("cs2", MAP_WINNER),
+    ("valorant", MAIN_MATCH),
+    ("valorant", MAP_WINNER),
 )
 ESPORTS_DEFAULT_CLASSIFICATION_LOOKBACK_DAYS = 60
 ESPORTS_DEFAULT_MIN_PROFILE_PARTICIPATED_MARKETS = 6
@@ -4366,6 +4380,162 @@ def resolve_collector_profile_wallet_limit(
     return int(explicit or 0)
 
 
+def measure_scope_density(
+    client: PolymarketClient,
+    tag_slug: str,
+    *,
+    window_days: int = CALIBRATION_WINDOW_DAYS,
+    min_volume: float = 10_000.0,
+    now: datetime | None = None,
+    max_pages: int = 24,
+) -> dict[str, Any]:
+    """量一个 scope 的供给侧密度:校准窗内"已结算、够流动性的主盘"市场数 + 其结算日(算间隙)。
+
+    只数主盘成交量 ≥ min_volume 的市场 —— 与 discovery 的流动性门对齐,反映**可打分**供给,
+    而非 Gamma tag 下成千上万的微型/无人盘(否则稀疏游戏会被噪声盘虚高、间隙恒为 1 天)。
+    game-agnostic(choose_main_market,不经 ALLOWED_GAME_FAMILIES 门),未注册的新游戏也能测;
+    只读 Gamma、不拉交易。
+    """
+    now = now or datetime.now(timezone.utc)
+    events = client.list_events_paginated(
+        closed=True, active=None, max_pages=max_pages,
+        min_end_date=now - timedelta(days=window_days), max_end_date=now,
+        tag_slugs=(tag_slug,),
+    )
+    # closed=True ⇒ 已结算;winning_outcome_index 在 list 端 stringified 价上不可靠,不依赖它。
+    end_timestamps: list[int] = []
+    for event in events:
+        market = choose_main_market(event)
+        if not market:
+            continue
+        volume = to_float(market.get("volume") or market.get("volumeNum") or event.get("volume"))
+        if volume < min_volume:
+            continue
+        end_dt = parse_dt(event.get("endDate") or event.get("end_date") or market.get("endDate"))
+        if end_dt and end_dt <= now:
+            end_timestamps.append(int(end_dt.timestamp()))
+    return {
+        "event_count": len(events),
+        "markets": len(end_timestamps),
+        "window_days": int(window_days),
+        "min_volume": float(min_volume),
+        "end_timestamps": end_timestamps,
+    }
+
+
+SCOPE_CALIBRATION_FILENAME = "scope_calibration.json"
+SCOPE_CALIBRATION_MAX_AGE_SECONDS = 24 * 3600
+
+
+def compute_scope_calibration(
+    client: PolymarketClient,
+    *,
+    window_days: int = CALIBRATION_WINDOW_DAYS,
+    min_volume: float = 10_000.0,
+    now: datetime | None = None,
+) -> dict[str, dict[str, Any]]:
+    """量各 game 密度 → 推每 scope 的 {lookback / n_eff / idle}。供 calibrate-scopes 命令与
+    collect 起步刷新共用(单一真相源)。"""
+    now = now or datetime.now(timezone.utc)
+    scopes: dict[str, dict[str, Any]] = {}
+    for game_family, tag_slug in ESPORTS_GAME_TAGS.items():
+        density = measure_scope_density(client, tag_slug, window_days=window_days, min_volume=min_volume, now=now)
+        gaps = match_day_gaps(density["end_timestamps"])
+        params = derive_scope_params(markets=density["markets"], window_days=density["window_days"], gaps=gaps)
+        params["event_count"] = density["event_count"]
+        params["tag_slug"] = tag_slug
+        scopes[game_family] = params
+    return scopes
+
+
+def load_scope_params(
+    data_dir: Path | str,
+    *,
+    category: str = "esports",
+    client: PolymarketClient | None = None,
+    now: datetime | None = None,
+    refresh: bool = False,
+    window_days: int = CALIBRATION_WINDOW_DAYS,
+    min_volume: float = 10_000.0,
+) -> dict[str, dict[str, Any]]:
+    """读 scope_calibration.json 的 per-game 参数(单一真相源,collect/observe/rescore 共用)。
+    过期/缺失且给了 client → 重算并落盘;无 client 且无缓存 → {}(消费方回退全局默认,不报错)。"""
+    now = now or datetime.now(timezone.utc)
+    now_ts = int(now.timestamp())
+    path = Path(data_dir) / SCOPE_CALIBRATION_FILENAME
+    cached = read_json(path, {}) if path.exists() else {}
+    fresh = bool(cached.get("scopes")) and (now_ts - int(cached.get("calibrated_at") or 0)) < SCOPE_CALIBRATION_MAX_AGE_SECONDS
+    if client is not None and (refresh or not fresh):
+        scopes = compute_scope_calibration(client, window_days=window_days, min_volume=min_volume, now=now)
+        payload = {"category": category, "calibration_window_days": window_days, "calibrated_at": now_ts, "scopes": scopes}
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        write_json(path, payload)
+        return scopes
+    return cached.get("scopes") or {}
+
+
+def scope_n_eff_floors(scopes: dict[str, Any]) -> dict[str, int]:
+    """{game_family: n_eff_floor} —— 传给 classify_wallet/profile_candidate_wallet。"""
+    return {g: int(p["n_eff_floor"]) for g, p in (scopes or {}).items() if isinstance(p, dict) and p.get("n_eff_floor")}
+
+
+def scope_lookback_by_game(scopes: dict[str, Any]) -> dict[str, int]:
+    """{game_family: lookback_days} —— 用于 per-game 打分窗口截断。"""
+    return {g: int(p["lookback_days"]) for g, p in (scopes or {}).items() if isinstance(p, dict) and p.get("lookback_days")}
+
+
+def scope_max_lookback_days(scopes: dict[str, Any], default_days: int) -> int:
+    """所有 game 的最长 lookback —— discovery 一次拉取用它(再按 per-game 窗口在打分 scope 收口)。"""
+    values = [int(p["lookback_days"]) for p in (scopes or {}).values() if isinstance(p, dict) and p.get("lookback_days")]
+    return max([default_days, *values]) if values else int(default_days)
+
+
+def filter_classification_set_by_game_window(
+    rows: list[dict[str, Any]],
+    *,
+    now: datetime,
+    lookback_by_game: dict[str, int],
+    default_days: int,
+) -> list[dict[str, Any]]:
+    """按每个市场所属 game 的打分窗口截断(per-game profile lookback)。无 per-game 配置的游戏用 default。"""
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        game = str(row.get("game_family") or "").lower()
+        days = int(lookback_by_game.get(game, default_days))
+        end_dt = parse_dt(row.get("end_date"))
+        if end_dt and end_dt >= now - timedelta(days=days):
+            out.append(row)
+    return out
+
+
+def command_calibrate_scopes(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
+    """[只读] 量 esports 各 game 的赛事密度 → 推导自适应 lookback/n_eff/idle,打印并落 json。"""
+    client = client or build_client(args)
+    now = datetime.now(timezone.utc)
+    window_days = int(getattr(args, "calibration_window_days", CALIBRATION_WINDOW_DAYS) or CALIBRATION_WINDOW_DAYS)
+    min_volume = float(getattr(args, "calibration_min_volume", 10_000.0) or 0.0)
+    scopes = compute_scope_calibration(client, window_days=window_days, min_volume=min_volume, now=now)
+    payload = {
+        "category": "esports",
+        "calibration_window_days": window_days,
+        "calibrated_at": int(now.timestamp()),
+        "scopes": scopes,
+    }
+    out_dir = resolve_data_dir(args)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_json(out_dir / SCOPE_CALIBRATION_FILENAME, payload)
+    # 人读表
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print("\n=== 推导参数(按密度自适应) ===")
+    print(f"{'game':10s} {'mkts':>5s} {'λ/day':>6s} {'gapP50':>6s} {'gapP90':>6s} {'gapMax':>6s} "
+          f"{'lookbk':>6s} {'n_eff':>5s} {'idle_h':>6s} {'idle_d':>6s}")
+    for game, p in scopes.items():
+        print(f"{game:10s} {p['markets']:>5d} {p['lambda_per_day']:>6.2f} {p['gap_p50_days']:>6.2f} "
+              f"{p['gap_p90_days']:>6.2f} {p['gap_max_days']:>6.2f} {p['lookback_days']:>6d} "
+              f"{p['n_eff_floor']:>5d} {p['idle_ceiling_hours']:>6d} {p['idle_ceiling_hours']/24:>6.1f}")
+    return 0
+
+
 def build_profile_candidate_from_trades(
     seed_candidate: dict[str, Any],
     raw_trades: list[dict[str, Any]],
@@ -4816,7 +4986,13 @@ def _command_collect_wallets(
     prefix = "collector_v2"
     now_dt = datetime.now(timezone.utc)
     now_ts = int(now_dt.timestamp())
-    lookback_days = int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS)
+    default_lookback_days = int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS)
+    # scope 自适应:collect 起步刷新校准(单一真相源),per-game lookback/n_eff 由此派生。
+    scope_params = load_scope_params(resolve_data_dir(args), client=client, now=now_dt, refresh=True)
+    n_eff_floors = scope_n_eff_floors(scope_params)
+    lookback_by_game = scope_lookback_by_game(scope_params)
+    # discovery 一次按"最长 per-game 窗口"拉取;打分 scope 再按 per-game 窗口收口(见下方 filter)。
+    lookback_days = scope_max_lookback_days(scope_params, default_lookback_days)
     min_end_date = now_dt - timedelta(days=lookback_days)
     stage_timings: dict[str, float] = {}
     stage_started_at = time.monotonic()
@@ -4930,10 +5106,12 @@ def _command_collect_wallets(
         if row.get("condition_id")
     }
     profile_lookback_days = int(getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS) or V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
-    profile_classification_set = filter_classification_set_by_lookback(
+    # 打分 scope 按 per-game 窗口收口(valorant 30d / cs2 14d…),无 per-game 配置回退全局默认。
+    profile_classification_set = filter_classification_set_by_game_window(
         classification_set,
         now=now_dt,
-        lookback_days=profile_lookback_days,
+        lookback_by_game=lookback_by_game,
+        default_days=profile_lookback_days,
     )
     condition_ids = {
         str(row.get("condition_id") or "").lower()
@@ -4983,7 +5161,7 @@ def _command_collect_wallets(
             force_refresh=False,
             use_cache=True,
             include_source=True,
-            retention_days=profile_lookback_days,
+            retention_days=lookback_days,  # 保留到最长 per-game 窗口,打分 scope 再按 per-game 收口
         )
         return wallet, trades, source
 
@@ -5029,6 +5207,7 @@ def _command_collect_wallets(
             current_positions_loader=lambda _wallet: [],
             now_ts=now_ts,
             scoring_basis=scoring_basis,
+            n_eff_floors=n_eff_floors,
         )
         return {
             **profile,
@@ -5355,16 +5534,22 @@ def rescore_demote_wallets(
     if not targets:
         return {"rescored": 0, "demoted": 0, "demoted_wallets": []}
 
-    # scope 分类集(与 observe-v2 一致)。
-    profile_lookback_days = int(getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS) or V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
-    lookback_days = int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS)
+    # scope 分类集(与 collect/observe 共用同一 scope 校准 → per-game lookback/n_eff 一致,不各自为政)。
+    # rescore 读**缓存**校准(refresh=False):用上一次 collect 定的同一套参数,避免被跟钱包入榜/重评窗口错配。
+    default_profile_lookback = int(getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS) or V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
+    default_lookback_days = int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS)
+    scope_params = load_scope_params(data_dir, client=None, now=now_dt, refresh=False)
+    n_eff_floors = scope_n_eff_floors(scope_params)
+    lookback_by_game = scope_lookback_by_game(scope_params)
+    lookback_days = scope_max_lookback_days(scope_params, default_lookback_days)
     closed_events = client.list_events_paginated(
         closed=True, active=None, max_pages=getattr(args, "gamma_pages", 10),
         min_end_date=now_dt - timedelta(days=lookback_days), max_end_date=now_dt,
         tag_slugs=CATEGORY_TAG_SLUGS["esports"],
     )
     classification_set = build_classification_set(closed_events, now=now_dt, lookback_days=lookback_days)
-    profile_cls = filter_classification_set_by_lookback(classification_set, now=now_dt, lookback_days=profile_lookback_days)
+    profile_cls = filter_classification_set_by_game_window(
+        classification_set, now=now_dt, lookback_by_game=lookback_by_game, default_days=default_profile_lookback)
     condition_ids = {str(r.get("condition_id") or "").lower() for r in profile_cls if r.get("condition_id")}
     market_records_by_id = {str(r.get("condition_id") or "").lower(): r for r in profile_cls if r.get("condition_id")}
     condition_type_by_id = {cid: str(r.get("market_type") or MAIN_MATCH) for cid, r in market_records_by_id.items()}
@@ -5380,7 +5565,7 @@ def rescore_demote_wallets(
                 max_esports_markets=getattr(args, "max_esports_markets_per_wallet", 100),
                 data_dir=output_dir, now_ts=now_ts,
                 cache_ttl_days=0, force_refresh=True, use_cache=False, include_source=True,
-                retention_days=profile_lookback_days,
+                retention_days=lookback_days,
             )
         except Exception:
             return None
@@ -5393,9 +5578,9 @@ def rescore_demote_wallets(
             condition_game_family_by_id=condition_game_family_by_id,
             user_trades_loader=lambda _w: trades,
             current_positions_loader=lambda _w: [],
-            now_ts=now_ts, scoring_basis="hold",
+            now_ts=now_ts, scoring_basis="hold", n_eff_floors=n_eff_floors,
         )
-        return {**profile, "profile_lookback_days": profile_lookback_days, "observed_at": now_ts}
+        return {**profile, "profile_lookback_days": default_profile_lookback, "observed_at": now_ts}
 
     reprofiled: dict[str, dict[str, Any]] = {}
     for result in run_ordered_io_tasks(sorted(targets), profile_one, max_workers=getattr(args, "max_workers", 8)):
@@ -5492,15 +5677,20 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
         seed_positions.extend(collect_seed_positions(market, response, positions_per_market=positions_per_market, include_losing_side=True))
     seed_wallets = aggregate_seed_wallets(seed_positions)
 
-    # 2) 分类集(15 天)给 profiling 提供 scope(发现/重评共用,总是构建)
-    lookback_days = int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS)
+    # 2) 分类集给 profiling 提供 scope(与 collect/rescore 共用同一 scope 校准 → per-game 一致)。
+    #    observe 每 tick 读缓存校准;缓存 >24h 过期才用 client 重算(daily 保鲜,不每 tick 重算)。
+    scope_params = load_scope_params(resolve_data_dir(args), client=client, now=now_dt, refresh=False)
+    n_eff_floors = scope_n_eff_floors(scope_params)
+    lookback_by_game = scope_lookback_by_game(scope_params)
+    lookback_days = scope_max_lookback_days(scope_params, int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS))
     closed_events = client.list_events_paginated(
         closed=True, active=None, max_pages=getattr(args, "gamma_pages", 10),
         min_end_date=now_dt - timedelta(days=lookback_days), max_end_date=now_dt,
         tag_slugs=CATEGORY_TAG_SLUGS["esports"],
     )
     classification_set = build_classification_set(closed_events, now=now_dt, lookback_days=lookback_days)
-    profile_classification_set = filter_classification_set_by_lookback(classification_set, now=now_dt, lookback_days=profile_lookback_days)
+    profile_classification_set = filter_classification_set_by_game_window(
+        classification_set, now=now_dt, lookback_by_game=lookback_by_game, default_days=profile_lookback_days)
     condition_ids = {str(row.get("condition_id") or "").lower() for row in profile_classification_set if row.get("condition_id")}
     market_records_by_id = {str(row.get("condition_id") or "").lower(): row for row in profile_classification_set if row.get("condition_id")}
     condition_type_by_id = {cid: str(row.get("market_type") or MAIN_MATCH) for cid, row in market_records_by_id.items()}
@@ -5521,7 +5711,7 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
             data_dir=output_dir, now_ts=now_ts,
             cache_ttl_days=ttl,
             force_refresh=False, use_cache=True, include_source=True,
-            retention_days=profile_lookback_days,
+            retention_days=lookback_days,
         )
         seed_candidate = build_profile_candidate_from_trades(collector_seed_candidate(seed_wallet), trades, market_records_by_id)
         profile = profile_candidate_wallet(
@@ -5531,7 +5721,7 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
             condition_game_family_by_id=condition_game_family_by_id,
             user_trades_loader=lambda _w: trades,
             current_positions_loader=lambda _w: [],
-            now_ts=now_ts, scoring_basis="hold",
+            now_ts=now_ts, scoring_basis="hold", n_eff_floors=n_eff_floors,
         )
         # observed_at:M4 发现并打分的时间 → dashboard 据此显示 2h "new" 标记
         return {**profile, "profile_lookback_days": profile_lookback_days, "seed": collector_seed_payload(seed_wallet), "observed_at": now_ts}
@@ -6912,6 +7102,14 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--snapshot-dir", default="data_vps/esports")
     snapshot.add_argument("--output-file")
     snapshot.set_defaults(func=command_analyze_collector_snapshot)
+
+    calibrate = subparsers.add_parser(
+        "calibrate-scopes",
+        help="[read-only] measure per-game event density and print derived adaptive params",
+    )
+    calibrate.add_argument("--calibration-window-days", type=int, default=CALIBRATION_WINDOW_DAYS)
+    calibrate.add_argument("--calibration-min-volume", type=float, default=10_000.0)
+    calibrate.set_defaults(func=command_calibrate_scopes)
 
     analyze = subparsers.add_parser("analyze-event")
     analyze.add_argument("--gamma-pages", type=int, default=3)

@@ -42,6 +42,92 @@ SPORTS_N_EFF_FLOOR = 12
 # (防 3–5 场侥幸过 edge_lb)。edge_lb 的 Wilson 仍在子集上算。
 ESPORTS_SUBSET_MIN_SAMPLE = 6
 SPORTS_SUBSET_MIN_SAMPLE = 6
+# ── Scope-adaptive calibration（按 game_family 实测赛事密度自适应 lookback / n_eff / idle）──
+# 见 review/scope-adaptive-calibration.md。供给侧信号(Gamma 已结算主盘,profiling 前即可算)→
+# 统一公式推每个 scope 一组门。新游戏接入即自校准、不手调。下列阈值为初值,P1 实测 4 游戏 λ 后再标定。
+CALIBRATION_WINDOW_DAYS = 90          # 测密度的校准窗(跨多个赛事周期,平滑爆发性)
+SCOPE_MARKET_TARGET = 180             # lookback 要装够多少 main 市场(稀疏游戏据此拿到 ~30d 窗口)
+SCOPE_LOOKBACK_MIN_DAYS = 14
+SCOPE_LOOKBACK_MAX_DAYS = 90
+SCOPE_NEFF_MIN = 8
+SCOPE_NEFF_MAX = 12
+# n_eff 地板按密度 λ(main 市场/天)线性插值到 [N_MIN, N_MAX]:λ≤LO→6,λ≥HI→12,中间线性。
+# 老三家也一起自适应(量级不同,同一套门不公平)。初值据实测 λ(cs2≈16 / lol≈12 / dota2/valo≈6)标定。
+SCOPE_NEFF_LAMBDA_LO = 5.0
+SCOPE_NEFF_LAMBDA_HI = 16.0
+SCOPE_IDLE_MIN_HOURS = 72
+SCOPE_IDLE_MAX_HOURS = 21 * 24
+SCOPE_IDLE_GAP_MULTIPLIER = 2.0       # idle 上限 ≈ 此倍 × 赛事干涸期(p90 gap)
+SCOPE_IDLE_GAP_PERCENTILE = 90        # 用 gap 分布的尾部(p90)而非中位数:中位被"天天有盘"淹没,
+#                                       尾部才是 VCT 赛事之间的真空档(VCL 无量赛区不算 in-scope)
+
+
+def _percentile(values: list[float], p: float) -> float:
+    """第 p 百分位(线性插值)。空列表返回 0。"""
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return float(ordered[0])
+    rank = (p / 100.0) * (n - 1)
+    lo = int(rank)
+    frac = rank - lo
+    if lo + 1 >= n:
+        return float(ordered[-1])
+    return ordered[lo] + frac * (ordered[lo + 1] - ordered[lo])
+
+
+def match_day_gaps(end_timestamps: Iterable[int]) -> list[float]:
+    """相邻"有赛日"间隔(天)的列表(只数 in-scope、够流动性的结算盘的日期)。<2 个有赛日 → []。"""
+    days = sorted({int(ts // 86400) for ts in end_timestamps if ts})
+    if len(days) < 2:
+        return []
+    return [float(days[i + 1] - days[i]) for i in range(len(days) - 1)]
+
+
+def derive_scope_params(
+    *,
+    markets: int,
+    window_days: int,
+    gaps: list[float] | None = None,
+    market_target: int = SCOPE_MARKET_TARGET,
+    subset_floor: int = ESPORTS_SUBSET_MIN_SAMPLE,
+) -> dict[str, Any]:
+    """从一个 scope 的密度信号推 {lookback / n_eff / idle}。纯函数、无 IO。
+    见 review/scope-adaptive-calibration.md。"""
+    window_days = max(1, int(window_days))
+    gaps = gaps or []
+    lam = float(markets) / window_days  # main 市场/天
+    # 1) lookback:装够 market_target 个 main 市场所需天数,clamp。
+    lookback = SCOPE_LOOKBACK_MAX_DAYS if lam <= 0 else int(round(market_target / lam))
+    lookback = max(SCOPE_LOOKBACK_MIN_DAYS, min(SCOPE_LOOKBACK_MAX_DAYS, lookback))
+    # 2) n_eff 地板:λ 线性插值到 [N_MIN, N_MAX]。
+    if lam <= SCOPE_NEFF_LAMBDA_LO:
+        n_eff = SCOPE_NEFF_MIN
+    elif lam >= SCOPE_NEFF_LAMBDA_HI:
+        n_eff = SCOPE_NEFF_MAX
+    else:
+        span = SCOPE_NEFF_LAMBDA_HI - SCOPE_NEFF_LAMBDA_LO
+        n_eff = SCOPE_NEFF_MIN + (SCOPE_NEFF_MAX - SCOPE_NEFF_MIN) * (lam - SCOPE_NEFF_LAMBDA_LO) / span
+    n_eff = max(SCOPE_NEFF_MIN, min(SCOPE_NEFF_MAX, int(round(n_eff))))
+    # 3) idle 上限:锚定赛事干涸期(p90 gap),clamp。中位数会被"天天有盘"淹没,故用尾部。
+    gap_p90 = _percentile(gaps, SCOPE_IDLE_GAP_PERCENTILE)
+    idle_hours = int(round(SCOPE_IDLE_GAP_MULTIPLIER * gap_p90 * 24))
+    idle_hours = max(SCOPE_IDLE_MIN_HOURS, min(SCOPE_IDLE_MAX_HOURS, idle_hours))
+    return {
+        "markets": int(markets),
+        "window_days": window_days,
+        "lambda_per_day": round(lam, 4),
+        "gap_p50_days": round(_percentile(gaps, 50), 3),
+        "gap_p90_days": round(gap_p90, 3),
+        "gap_max_days": round(max(gaps) if gaps else 0.0, 3),
+        "lookback_days": lookback,
+        "profile_lookback_days": lookback,
+        "n_eff_floor": int(n_eff),
+        "subset_floor": int(subset_floor),
+        "idle_ceiling_hours": int(idle_hours),
+    }
 # B(留池不上榜,observe 观察用):比 A 各放一档
 GRADE_B_WILSON_RELAX = 0.05
 GRADE_B_EDGE_RELAX = 0.03
@@ -66,12 +152,13 @@ MATERIAL_TWO_SIDED_MIN_MINORITY_FRAC = 0.20
 MAIN_MATCH = "main_match"
 GAME_WINNER = "game_winner"
 MAP_WINNER = "map_winner"
-ALLOWED_GAME_FAMILIES = {"cs2", "dota2", "lol"}
+ALLOWED_GAME_FAMILIES = {"cs2", "dota2", "lol", "valorant"}
 ESPORTS_CATEGORY_TAGS = {
     "dota-2",
     "counter-strike-2",
     "cs2",
     "league-of-legends",
+    "valorant",
 }
 SPORTS_LEAGUE_TAGS = {
     "nba": "nba",
@@ -93,6 +180,8 @@ ESPORTS_DISCOVERY_GAME_MARKET_TYPE_LIMITS = {
     "lol:game_winner": 50,
     "dota2:game_winner": 50,
     "cs2:map_winner": 50,
+    "valorant:main_match": 100,
+    "valorant:map_winner": 50,
 }
 MARKET_TYPE_ORDER = {
     MAIN_MATCH: 0,
@@ -103,6 +192,7 @@ GAME_FAMILY_LABELS = {
     "cs2": "CS2",
     "dota2": "Dota2",
     "lol": "LoL",
+    "valorant": "Valorant",
     # 跨游戏盘口专家:在某盘口上跨游戏合并后达标(per-type 合格),无单一游戏专精桶。
     "multi": "跨游戏",
 }
@@ -215,6 +305,8 @@ def game_family_from_event(event: dict[str, Any]) -> str:
         return "dota2"
     if "league-of-legends" in tags or title.startswith("lol:"):
         return "lol"
+    if "valorant" in tags or title.startswith("valorant:") or "valorant" in title:
+        return "valorant"
     return "other"
 
 
@@ -389,9 +481,9 @@ def classify_market_type(event: dict[str, Any], market: dict[str, Any]) -> str |
         and not re.search(r"\b(game|map)\s+[1-5]\b", question_norm)
     ):
         return MAIN_MATCH
-    if game_family in {"dota2", "lol"} and is_numbered_winner_question(question_norm, "game"):
+    if game_family in {"dota2", "lol", "valorant"} and is_numbered_winner_question(question_norm, "game"):
         return GAME_WINNER
-    if game_family == "cs2" and is_numbered_winner_question(question_norm, "map"):
+    if game_family in {"cs2", "valorant"} and is_numbered_winner_question(question_norm, "map"):
         return MAP_WINNER
     return None
 
@@ -2026,14 +2118,31 @@ def classify_wallet_bucket(
     }
 
 
-def wallet_bucket_min_sample(category: str, market_type: str) -> int:
-    # v16:n_eff 下限统一(不再主盘/子盘分档)。
+def wallet_bucket_min_sample(
+    category: str,
+    market_type: str,
+    *,
+    game_family: str | None = None,
+    n_eff_floors: dict[str, int] | None = None,
+) -> int:
+    """n_eff 下限。默认全局(esports=12 / sports=12);若给 per-game 校准 map 且该桶有 game_family,
+    用该游戏的自适应地板(scope-adaptive,见 review/scope-adaptive-calibration.md)。
+    per_type 跨游戏桶(无 game_family)仍用全局默认 —— 它聚合多游戏、样本充足,不放宽。"""
     if str(category or "").lower() == "sports":
         return SPORTS_N_EFF_FLOOR
+    if n_eff_floors and game_family and game_family in n_eff_floors:
+        return int(n_eff_floors[game_family])
     return ESPORTS_N_EFF_FLOOR
 
 
-def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> dict[str, Any]:
+def classify_wallet(
+    summary: dict[str, Any],
+    *,
+    now_ts: int | None = None,
+    n_eff_floors: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """n_eff_floors: per-game n_eff 地板 map(game_family→floor),来自 scope 校准;
+    None=全局默认。只影响 per_game_type 桶(boarding 路径);per_type 跨游戏桶仍用全局默认。"""
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
     category = str(summary.get("category") or "").lower()
     overall_min_sample = SPORTS_N_EFF_FLOOR if category == "sports" else ESPORTS_N_EFF_FLOOR
@@ -2103,7 +2212,9 @@ def classify_wallet(summary: dict[str, Any], *, now_ts: int | None = None) -> di
             ),
         ):
             game_family, market_type = split_bucket_key(key)
-            min_sample = wallet_bucket_min_sample(category, market_type)
+            min_sample = wallet_bucket_min_sample(
+                category, market_type, game_family=game_family, n_eff_floors=n_eff_floors,
+            )
             bucket_input = {
                 **bucket_summary,
                 "category": summary.get("category", bucket_summary.get("category")),
@@ -2285,6 +2396,7 @@ def profile_candidate_wallet(
     historical_trades_loader=None,
     now_ts: int | None = None,
     scoring_basis: str = "hold",
+    n_eff_floors: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     wallet = normalize_wallet(candidate.get("wallet"))
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
@@ -2324,7 +2436,7 @@ def profile_candidate_wallet(
             for market_type, behavior in per_type_behavior.items():
                 per_type[market_type] = {**(per_type.get(market_type) or {}), **behavior}
             summary["per_type"] = per_type
-        result = classify_wallet({**summary, "wallet": wallet, "candidate": candidate}, now_ts=now_ts)
+        result = classify_wallet({**summary, "wallet": wallet, "candidate": candidate}, now_ts=now_ts, n_eff_floors=n_eff_floors)
         # edge_type 标签恒在 profile 上(directional/technical/unknown),供 v2 导出/follow 按标签过滤。
         result["edge_type"] = classify_edge_type(result)
         result["scoring_basis"] = scoring_basis

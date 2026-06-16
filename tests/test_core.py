@@ -57,6 +57,11 @@ from poly_fight.storage import FollowStore
 from poly_fight.cli import (
     BuildLockUnavailable,
     acquire_build_lock,
+    load_scope_params,
+    scope_n_eff_floors,
+    scope_lookback_by_game,
+    scope_max_lookback_days,
+    filter_classification_set_by_game_window,
     build_leaderboard_from_profiles,
     build_collection_diagnostics,
     build_profile_candidate_from_trades,
@@ -117,6 +122,9 @@ from poly_fight.cli import (
 from poly_fight.core import (
     ALLOWED_GAME_FAMILIES,
     SCORING_VERSION,
+    derive_scope_params,
+    match_day_gaps,
+    wallet_bucket_min_sample,
     analyze_holders,
     build_candidate_wallets,
     build_candidate_wallets_from_holders,
@@ -348,11 +356,12 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(event_league(mlb_event), "other")
         self.assertEqual(event_category(cs_event), "esports")
         self.assertEqual(event_league(cs_event), "cs2")
-        self.assertIsNone(event_category(valorant_event))
-        self.assertEqual(event_league(valorant_event), "other")
-        self.assertNotIn("valorant", ALLOWED_GAME_FAMILIES)
+        # valorant 现为平级 in-scope 游戏(自适应采集参数落地后纳入)。
+        self.assertEqual(event_category(valorant_event), "esports")
+        self.assertEqual(event_league(valorant_event), "valorant")
+        self.assertIn("valorant", ALLOWED_GAME_FAMILIES)
 
-    def test_valorant_moneyline_is_out_of_scope(self):
+    def test_valorant_moneyline_is_in_scope(self):
         event = {
             "id": "valorant1",
             "slug": "valorant-nrg-leviatan-2026-06-08",
@@ -373,8 +382,10 @@ class CoreTest(unittest.TestCase):
 
         records = event_to_market_records(event)
 
-        self.assertIsNone(classify_market_type(event, event["markets"][0]))
-        self.assertEqual(records, [])
+        self.assertEqual(classify_market_type(event, event["markets"][0]), "main_match")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["game_family"], "valorant")
+        self.assertEqual(records[0]["market_type"], "main_match")
 
     def test_nba_and_ufc_moneylines_are_main_match_and_record_league(self):
         nba_event = {
@@ -623,7 +634,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(records["game1"]["market_type"], "game_winner")
         self.assertNotIn("kills", records)
 
-    def test_market_classifier_accepts_cs_map_winner_and_rejects_valorant(self):
+    def test_market_classifier_accepts_cs_and_valorant_map_winner(self):
         cs_event = {
             "title": "Counter-Strike: 9z vs FlyQuest (BO1) - IEM Cologne",
             "tags": [{"slug": "counter-strike-2"}],
@@ -651,8 +662,9 @@ class CoreTest(unittest.TestCase):
         }
 
         self.assertEqual(classify_market_type(cs_event, cs_market), "map_winner")
-        self.assertIsNone(classify_market_type(valorant_event, valorant_market))
-        self.assertIsNone(classify_market_type(valorant_event, valorant_map_market))
+        # valorant 现为平级游戏:主盘 = main_match,Map N Winner = map_winner(同 cs2)。
+        self.assertEqual(classify_market_type(valorant_event, valorant_market), "main_match")
+        self.assertEqual(classify_market_type(valorant_event, valorant_map_market), "map_winner")
 
     def test_market_classifier_accepts_winner_alias_outcomes_but_rejects_prop_outcomes(self):
         event = {
@@ -1118,7 +1130,8 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(counts["dota2:game_winner"], 50)
         self.assertEqual(counts["cs2:map_winner"], 50)
         self.assertEqual(meta["selected_by_game_market_type"], counts)
-        self.assertNotIn("valorant:main_match", meta["game_market_buckets"])
+        # valorant 现已是配置桶(本用例未提供 valorant 市场 → 选中 0,不进 counts)。
+        self.assertIn("valorant:main_match", meta["game_market_buckets"])
 
     def test_candidate_wallets_use_participation_or_large_size(self):
         trades_by_market = {
@@ -3302,7 +3315,7 @@ class CoreTest(unittest.TestCase):
             cached = read_json(cache_path, {})
 
         self.assertEqual(source, "api")
-        self.assertIn(("counter-strike-2", "league-of-legends", "dota-2"), client.tag_calls)
+        self.assertIn(("counter-strike-2", "league-of-legends", "dota-2", "valorant"), client.tag_calls)
         self.assertNotIn(("nba", "ufc"), client.tag_calls)
         self.assertEqual(markets["esports-m1"]["category"], "esports")
         self.assertNotIn("sports-m1", markets)
@@ -3834,6 +3847,106 @@ class CoreTest(unittest.TestCase):
         result = build_collector_leaderboard_v2({"0xslim": slim}, now_ts=now)
         board = {normalize_wallet(r["wallet"]) for r in result["leaderboard"]}
         self.assertIn("0xslim", board)
+
+    def test_derive_scope_params_adapts_to_density(self):
+        # 密集(λ 高、gap 小):短 lookback、n_eff 满档 12、idle 维持下限。
+        dense = derive_scope_params(markets=1440, window_days=90, gaps=[1.0] * 80)
+        self.assertEqual(dense["lookback_days"], 14)          # 180/16=11.25 → clamp 到下限 14
+        self.assertEqual(dense["n_eff_floor"], 12)            # λ=16 ≥ HI → 满档
+        self.assertEqual(dense["idle_ceiling_hours"], 72)     # p90 gap=1 → 2×1×24=48 → clamp 72
+        # 稀疏(λ 低):长 lookback、n_eff 落到地板 8。
+        sparse = derive_scope_params(markets=540, window_days=90, gaps=[1.0] * 40 + [9.0])
+        self.assertEqual(sparse["lookback_days"], 30)         # 180/6=30
+        self.assertEqual(sparse["n_eff_floor"], 8)            # λ=6 ≤ LO → 地板 8
+        # 极稀疏:lookback 封顶 90。
+        tiny = derive_scope_params(markets=90, window_days=90, gaps=[7.0, 14.0])
+        self.assertEqual(tiny["lookback_days"], 90)           # 180/1=180 → clamp 90
+        self.assertEqual(tiny["n_eff_floor"], 8)
+        # idle 锚 p90 gap(尾部),clamp 到 [72h, 21d]。
+        bursty = derive_scope_params(markets=200, window_days=90, gaps=[1.0, 1.0, 10.0, 10.0])
+        self.assertGreater(bursty["idle_ceiling_hours"], 72)  # p90≈10d → 放宽
+        self.assertLessEqual(bursty["idle_ceiling_hours"], 21 * 24)
+
+    def test_match_day_gaps_uses_distinct_days(self):
+        day = 86400
+        ts = [10 * day, 10 * day + 100, 11 * day, 15 * day]  # 有赛日 {10,11,15} → gaps [1,4]
+        self.assertEqual(match_day_gaps(ts), [1.0, 4.0])
+        self.assertEqual(match_day_gaps([5 * day]), [])
+
+    def test_wallet_bucket_min_sample_is_game_aware(self):
+        floors = {"valorant": 8, "cs2": 12}
+        # per_game_type 桶:用该游戏的自适应地板
+        self.assertEqual(wallet_bucket_min_sample("esports", "main_match", game_family="valorant", n_eff_floors=floors), 8)
+        self.assertEqual(wallet_bucket_min_sample("esports", "main_match", game_family="cs2", n_eff_floors=floors), 12)
+        # per_type 跨游戏桶(无 game_family)或无 map:全局默认 12
+        self.assertEqual(wallet_bucket_min_sample("esports", "main_match", n_eff_floors=floors), 12)
+        self.assertEqual(wallet_bucket_min_sample("esports", "main_match", game_family="valorant"), 12)
+
+    def test_scope_param_accessors_and_loader_roundtrip(self):
+        import tempfile, json as _json, os
+        scopes = {
+            "valorant": {"n_eff_floor": 8, "lookback_days": 30},
+            "cs2": {"n_eff_floor": 12, "lookback_days": 14},
+        }
+        self.assertEqual(scope_n_eff_floors(scopes), {"valorant": 8, "cs2": 12})
+        self.assertEqual(scope_lookback_by_game(scopes), {"valorant": 30, "cs2": 14})
+        self.assertEqual(scope_max_lookback_days(scopes, 15), 30)
+        self.assertEqual(scope_max_lookback_days({}, 15), 15)  # 空校准 → 回退默认
+        ts = 1_700_000_000
+        with tempfile.TemporaryDirectory() as d:
+            # 无文件 + 无 client → {}(消费方回退默认,不报错)
+            self.assertEqual(load_scope_params(d, client=None), {})
+            with open(os.path.join(d, "scope_calibration.json"), "w") as fh:
+                _json.dump({"calibrated_at": ts, "scopes": scopes}, fh)
+            loaded = load_scope_params(d, client=None, now=datetime.fromtimestamp(ts + 60, tz=timezone.utc))
+            self.assertEqual(scope_n_eff_floors(loaded), {"valorant": 8, "cs2": 12})
+
+    def test_per_game_window_filter_keeps_each_game_to_its_own_lookback(self):
+        now = datetime(2026, 6, 16, tzinfo=timezone.utc)
+
+        def row(cid, game, days_ago):
+            return {"condition_id": cid, "game_family": game,
+                    "end_date": (now - timedelta(days=days_ago)).isoformat()}
+        rows = [
+            row("v-fresh", "valorant", 25),   # valorant 30d 窗口内 → 留
+            row("c-stale", "cs2", 25),        # cs2 14d 窗口外 → 删
+            row("c-fresh", "cs2", 10),        # cs2 14d 窗口内 → 留
+        ]
+        kept = filter_classification_set_by_game_window(
+            rows, now=now, lookback_by_game={"valorant": 30, "cs2": 14}, default_days=15)
+        self.assertEqual({r["condition_id"] for r in kept}, {"v-fresh", "c-fresh"})
+
+    def test_valorant_thin_bucket_eligible_under_adaptive_neff(self):
+        # 同一份 valorant profile(单游戏 ~10 场):n_eff_floors={valorant:8} → 上榜路径合格;
+        # 全局默认 12 → 判薄样本不合格。锁住 per-game n_eff 自适应。
+        now = 1_000_000
+
+        def valorant_summary(n, win_rate):
+            wins = round(win_rate * n)
+            positions = [
+                {"conditionId": f"v-w{i}", "totalBought": 1000, "realizedPnl": 500,
+                 "avgPrice": 0.5, "timestamp": now - 1000 + i}
+                for i in range(wins)
+            ] + [
+                {"conditionId": f"v-l{i}", "totalBought": 1000, "realizedPnl": -1000,
+                 "avgPrice": 0.5, "timestamp": now - 1000 + wins + i}
+                for i in range(n - wins)
+            ]
+            cids = {p["conditionId"] for p in positions}
+            summary = summarize_closed_positions(
+                positions, cids,
+                condition_type_by_id={c: "main_match" for c in cids},
+                condition_game_family_by_id={c: "valorant" for c in cids},
+                now_ts=now,
+            )
+            return {**summary, "category": "esports"}
+
+        summary = valorant_summary(10, 0.8)
+        adaptive = classify_wallet(summary, now_ts=now, n_eff_floors={"valorant": 8})
+        default = classify_wallet(summary, now_ts=now)  # 全局 12
+        self.assertIn("valorant:main_match", adaptive.get("eligible_buckets") or [])
+        self.assertEqual(adaptive.get("grade"), "A")
+        self.assertNotIn("valorant:main_match", default.get("eligible_buckets") or [])
 
     def test_v2_board_recovers_per_type_eligible_wallets(self):
         # 跨游戏盘口专家:只有 per-type(跨游戏盘口)够格桶、无任何 per-game-type A 桶,
@@ -12987,17 +13100,19 @@ class CoreTest(unittest.TestCase):
             ]
         )
 
+        # valorant 纳入后桶限额求和变化:main 300→400(+valorant 100)、map 50→100(+valorant 50);
+        # game_winner 不变(valorant 无 game_winner 桶);submarket 是独立常量(150)不随桶和变。
         self.assertEqual(
             effective_discovery_defaults(esports),
             {
-                "target_markets": 300,
+                "target_markets": 400,
                 "submarket_target_markets": 150,
                 "game_winner_target_markets": 100,
-                "map_winner_target_markets": 50,
-                "max_markets_per_run": 300,
+                "map_winner_target_markets": 100,
+                "max_markets_per_run": 400,
                 "submarket_max_markets_per_run": 150,
                 "game_winner_max_markets_per_run": 100,
-                "map_winner_max_markets_per_run": 50,
+                "map_winner_max_markets_per_run": 100,
             },
         )
         self.assertEqual(
@@ -13128,7 +13243,8 @@ class CoreTest(unittest.TestCase):
             ],
         )
         self.assertEqual(meta["bucket_counts"]["lol:main_match"], 2)
-        self.assertNotIn("valorant:main_match", meta["bucket_counts"])
+        # valorant 现为配置桶,本用例无 valorant 市场 → 计 0(不再是"不存在")。
+        self.assertEqual(meta["bucket_counts"].get("valorant:main_match", 0), 0)
 
     def test_select_collector_target_markets_can_take_one_hundred_per_bucket(self):
         now = datetime(2026, 6, 9, tzinfo=timezone.utc)
@@ -13163,6 +13279,7 @@ class CoreTest(unittest.TestCase):
         )
 
         self.assertEqual(len(selected), 600)
+        # valorant 现为配置桶,本用例未提供 valorant 市场 → 计 0 + 满额缺口。
         self.assertEqual(
             meta["bucket_counts"],
             {
@@ -13172,9 +13289,14 @@ class CoreTest(unittest.TestCase):
                 "dota2:game_winner": 100,
                 "cs2:main_match": 100,
                 "cs2:map_winner": 100,
+                "valorant:main_match": 0,
+                "valorant:map_winner": 0,
             },
         )
-        self.assertEqual(meta["bucket_shortfalls"], {})
+        self.assertEqual(
+            meta["bucket_shortfalls"],
+            {"valorant:main_match": 100, "valorant:map_winner": 100},
+        )
 
     def test_seed_bucket_min_wins_uses_ten_percent_without_floor(self):
         self.assertEqual(
