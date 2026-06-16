@@ -66,6 +66,7 @@ from poly_fight.cli import (
     command_analyze_collector_snapshot,
     aggregate_seed_wallets,
     build_collector_leaderboard_v2,
+    slim_profile_for_storage,
     build_seeded_leaderboard,
     calculate_seed_bucket_min_wins,
     collect_seed_positions,
@@ -3782,6 +3783,57 @@ class CoreTest(unittest.TestCase):
         self.assertTrue(wallet_is_followable(strong))
         self.assertFalse(wallet_is_followable(weak))
         self.assertEqual(board, follow_set)  # 榜单成员 == follow 可跟集合
+
+    def test_slim_profile_for_storage_drops_redundant_blocks_only(self):
+        # 写盘瘦身:删原始 per_type/per_game_type + candidate 4 个大嵌套块;
+        # 保留评分产出(*_grades)、复用 key(scoring_version/esports_condition_ids)、所有扁平标量。
+        now = 1_000_000
+        profile = {
+            "wallet": "0xslim",
+            "category": "esports",
+            "grade": "A",
+            "scoring_version": 19,
+            "last_esports_trade_at": now - 3600,
+            "two_sided_trade_market_rate": 0.0,
+            "bot_like_score": 0,
+            "esports_condition_ids": ["0xabc", "0xdef"],
+            "actual_pnl": 100.0,
+            "hold_pnl": 80.0,
+            "esports_closed_count": 20,
+            "per_type": {"main_match": {"esports_closed_count": 20}},          # 原始,删
+            "per_game_type": {"cs2:main_match": {"esports_closed_count": 20}}, # 原始,删
+            "per_type_grades": {"main_match": {"grade": "A", "bucket_win_rate": 0.78}},
+            "per_game_type_grades": {"cs2:main_match": {"grade": "A", "bucket_win_rate": 0.80}},
+            "candidate": {
+                "participated_market_count": 30,
+                "tail_entry_market_count": 0,
+                "avg_market_cash": 1200.0,
+                "per_type_candidate": {"main_match": {"x": 1}},          # 大块,删
+                "per_game_type_candidate": {"cs2:main_match": {"x": 1}}, # 大块,删
+                "per_game_family_candidate": {"cs2": {"x": 1}},          # 大块,删
+                "participated_market_ids": ["0xabc", "0xdef", "0xghi"],  # 大块,删
+            },
+        }
+        slim = slim_profile_for_storage(profile)
+        # 删掉的
+        self.assertNotIn("per_type", slim)
+        self.assertNotIn("per_game_type", slim)
+        for key in ("per_type_candidate", "per_game_type_candidate", "per_game_family_candidate", "participated_market_ids"):
+            self.assertNotIn(key, slim["candidate"])
+        # 保留的:评分产出 + 复用 key + candidate 标量 + 扁平标量
+        for key in ("wallet", "grade", "scoring_version", "esports_condition_ids",
+                    "per_type_grades", "per_game_type_grades", "last_esports_trade_at",
+                    "actual_pnl", "hold_pnl", "esports_closed_count"):
+            self.assertIn(key, slim)
+        for key in ("participated_market_count", "tail_entry_market_count", "avg_market_cash"):
+            self.assertIn(key, slim["candidate"])
+        # 不改原对象;幂等
+        self.assertIn("per_type", profile)
+        self.assertEqual(slim_profile_for_storage(slim), slim)
+        # 瘦身后仍能上榜(build 只读 _grades + candidate 标量)
+        result = build_collector_leaderboard_v2({"0xslim": slim}, now_ts=now)
+        board = {normalize_wallet(r["wallet"]) for r in result["leaderboard"]}
+        self.assertIn("0xslim", board)
 
     def test_v2_board_recovers_per_type_eligible_wallets(self):
         # 跨游戏盘口专家:只有 per-type(跨游戏盘口)够格桶、无任何 per-game-type A 桶,

@@ -4526,6 +4526,37 @@ def _v2_candidate_metric(profile: dict[str, Any], key: str) -> Any:
     return candidate.get(key)
 
 
+# 写盘前 profile 瘦身:删掉只在采集/打分中间步骤用、后续 build/dashboard/复用都不读的重字段。
+#   - 原始 per_type / per_game_type:display 消费方全是 `_grades or 原始`,优先读 `_grades`,
+#     原始永远兜底不到;评分产出 *_grades 保留。
+#   - candidate 里 4 个大嵌套块(逐桶/逐游戏 candidate 镜像 + 全市场 id 列表):V2 上榜只经
+#     _v2_candidate_metric 读 candidate 的几个标量;这些大块仅 V1 build_leaderboard_from_profiles
+#     用(不在 v2 collect/observe 路径)。overlap 报表用的 participated_market_ids 有
+#     esports_condition_ids 作等价兜底(且后者保留)。
+# 重评(改 SCORING_VERSION)从交易缓存重算 → 不读这些块;复用判定要的 scoring_version /
+# esports_condition_ids / profile_lookback_days + 所有扁平标量全保留。幂等。约省 54% 体积。
+_PROFILE_STORAGE_DROP_KEYS = ("per_type", "per_game_type")
+_CANDIDATE_STORAGE_DROP_KEYS = (
+    "per_type_candidate",
+    "per_game_type_candidate",
+    "per_game_family_candidate",
+    "participated_market_ids",
+)
+
+
+def slim_profile_for_storage(profile: dict[str, Any]) -> dict[str, Any]:
+    """投影出写盘用的瘦身 profile(不改评分逻辑,只去冗余;见上方常量注释)。"""
+    if not isinstance(profile, dict):
+        return profile
+    slim = {key: value for key, value in profile.items() if key not in _PROFILE_STORAGE_DROP_KEYS}
+    candidate = slim.get("candidate")
+    if isinstance(candidate, dict):
+        slim["candidate"] = {
+            key: value for key, value in candidate.items() if key not in _CANDIDATE_STORAGE_DROP_KEYS
+        }
+    return slim
+
+
 _V2_GRADE_RANK = {"a": 4, "b": 3, "stale": 2, "c": 1}
 
 
@@ -5027,7 +5058,10 @@ def _command_collect_wallets(
         last_trade = to_int(cached.get("last_esports_trade_at"))
         if last_trade and last_trade >= prune_cutoff:
             profiles_by_wallet[wallet_key] = cached
-    write_json(output_dir / f"{prefix}_wallet_profiles.json", list(profiles_by_wallet.values()))
+    write_json(
+        output_dir / f"{prefix}_wallet_profiles.json",
+        [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
+    )
     mark_stage("wallet_profiles")
 
     collector_result = build_collector_leaderboard_v2(
@@ -5039,7 +5073,10 @@ def _command_collect_wallets(
         gate_kwargs=_v2_gate_kwargs_from_args(args),
     )
     leaderboard = collector_result["leaderboard"]
-    write_json(output_dir / f"{prefix}_leaderboard.json", leaderboard)
+    write_json(
+        output_dir / f"{prefix}_leaderboard.json",
+        [slim_profile_for_storage(row) for row in leaderboard],
+    )
     mark_stage("leaderboard")
 
     summary = {
@@ -5514,7 +5551,10 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
         wallet = normalize_wallet(profile.get("wallet"))
         if wallet:
             profiles_by_wallet[wallet] = profile
-    write_json(output_dir / "collector_v2_wallet_profiles.json", list(profiles_by_wallet.values()))
+    write_json(
+        output_dir / "collector_v2_wallet_profiles.json",
+        [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
+    )
 
     # 4) 整体重建 + 发布(发布期间暂停 follow)
     collector_result = build_collector_leaderboard_v2(
@@ -5525,7 +5565,10 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
         gate_kwargs=_v2_gate_kwargs_from_args(args),
     )
     leaderboard = collector_result["leaderboard"]
-    write_json(output_dir / "collector_v2_leaderboard.json", leaderboard)
+    write_json(
+        output_dir / "collector_v2_leaderboard.json",
+        [slim_profile_for_storage(row) for row in leaderboard],
+    )
 
     # M5 恢复:满冷却的隔离钱包重评回到 A 榜 → 解隔离。(降级已拆到 follow runner。)
     new_board_wallets = {normalize_wallet(r.get("wallet")) for r in leaderboard if normalize_wallet(r.get("wallet"))}
