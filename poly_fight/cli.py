@@ -6036,18 +6036,15 @@ def build_position_backfill_trades(
     max_entry_price: float,
     now_ts: int,
     existing_signal_ids: set[str] | None = None,
-    cost_ratio_cap: float = 1.15,
     positions_limit: int = 200,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
     """启动补单(只跑一次):逐 leaderboard 钱包查当前持仓,对**已经持有**且落在
     watch scope 的仓位,合成一笔 BUY trade 走同一条 process_follow_trades 管线建 paper
     leg —— 弥补"WS 只看订阅后新成交、漏掉启动前存量持仓"。
 
-    两道补单专属价格闸(在策略其它过滤之外):
-      1. 我们现价(CLOB ask,退化到持仓 curPrice)≤ 钱包成本 avgPrice × cost_ratio_cap
-         (默认 1.15,即不追高过钱包成本 15%);
-      2. 现价 ≤ max_entry_price(策略最高价,如 0.9)。
-    trade.price=avgPrice(钱包成本 → wallet_cash / 钱包入场价);并把市场 outcome_prices[idx]
+    价格决策**完全交给** process_follow_trades / 策略(唯一现价门 = θ̂×0.95 edge 闸,
+    + FOLLOWABLE_PRICE_CEILING 0.85 上限),补单不再自带"成本×1.15"闸(已删,曾把仍 +EV
+    的补单因钱包买得更便宜而误杀)。trade.price=avgPrice(钱包成本);并把市场 outcome_prices[idx]
     设为现价 → process_follow_trades 以现价作为我们的 our_entry_price。
     返回 ({wallet:[trade,...]}, stats)。
     """
@@ -6056,7 +6053,7 @@ def build_position_backfill_trades(
     by_wallet: dict[str, list[dict[str, Any]]] = {}
     stats: dict[str, int] = {
         "wallets_scanned": 0, "positions_in_scope": 0, "already_followed": 0,
-        "cost_gate_blocked": 0, "price_ceiling_blocked": 0, "candidates": 0,
+        "price_ceiling_blocked": 0, "candidates": 0,
     }
     for row in follow_wallets:
         wallet = normalize_wallet(row.get("wallet"))
@@ -6098,10 +6095,7 @@ def build_position_backfill_trades(
                 entry = to_float(pos.get("curPrice"))
             if entry <= 0:
                 continue
-            if entry > avg * cost_ratio_cap:                      # 闸1:不追高过成本 15%
-                stats["cost_gate_blocked"] += 1
-                continue
-            if max_entry_price > 0 and entry > max_entry_price:   # 闸2:策略最高价
+            if max_entry_price > 0 and entry > max_entry_price:   # 仅留现价上限(与 live 同),其余交策略 edge 闸
                 stats["price_ceiling_blocked"] += 1
                 continue
             prices = list(market.get("outcome_prices") or [])

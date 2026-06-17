@@ -9856,11 +9856,11 @@ class CoreTest(unittest.TestCase):
         }
         markets = {"0xabc": market}
         positions_by_wallet = {
-            # 现价 0.55 vs 成本 0.50 → 0.55 ≤ 0.575,且 < 0.9 → 命中
+            # 现价 0.55 < 0.9 → 候选(价格决策交给下游策略 edge 闸,补单不再自带成本闸)
             "0xw1": [{"conditionId": "0xabc", "asset": "111", "outcome": "Team A", "avgPrice": 0.50, "curPrice": 0.55, "size": 1000}],
-            # 现价 0.70 vs 成本 0.50 → > 15% → cost_gate_blocked
+            # 现价 0.70 < 0.9 → 也成候选(cost_ratio_cap 1.15 已删,不再因"比钱包成本高15%"被挡)
             "0xw2": [{"conditionId": "0xabc", "asset": "222", "outcome": "Team B", "avgPrice": 0.50, "curPrice": 0.70, "size": 1000}],
-            # 现价 0.92 在成本 0.88 的 15% 内,但 > max_entry 0.9 → price_ceiling_blocked
+            # 现价 0.92 > max_entry 0.9 → price_ceiling_blocked(唯一保留的补单价格上限,与 live 同)
             "0xw3": [{"conditionId": "0xabc", "asset": "111", "outcome": "Team A", "avgPrice": 0.88, "curPrice": 0.92, "size": 1000}],
             # 不在 watch scope
             "0xw4": [{"conditionId": "0xdef", "asset": "999", "outcome": "X", "avgPrice": 0.40, "curPrice": 0.40, "size": 1000}],
@@ -9875,15 +9875,15 @@ class CoreTest(unittest.TestCase):
             by_wallet, stats = cli_mod.build_position_backfill_trades(
                 FakeClient(), follow_wallets, markets, max_entry_price=0.9, now_ts=1000,
             )
-        self.assertEqual(set(by_wallet), {"0xw1"})
+        self.assertEqual(set(by_wallet), {"0xw1", "0xw2"})
         trade = by_wallet["0xw1"][0]
         self.assertEqual(trade["side"], "BUY")
         self.assertEqual(trade["outcomeIndex"], 0)
         self.assertEqual(trade["price"], 0.5)                  # 钱包成本
         self.assertEqual(trade["source"], "position_backfill")
         self.assertEqual(market["outcome_prices"][0], 0.55)    # 我们现价快照
-        self.assertEqual(stats["candidates"], 1)
-        self.assertEqual(stats["cost_gate_blocked"], 1)
+        self.assertEqual(stats["candidates"], 2)
+        self.assertNotIn("cost_gate_blocked", stats)           # 闸已删
         self.assertEqual(stats["price_ceiling_blocked"], 1)
 
     def test_build_position_backfill_trades_idempotent(self):
