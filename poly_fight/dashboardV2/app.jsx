@@ -497,8 +497,9 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                 Max seed
                 <input type="number" min="1" max="20000" step="100" value={maxSeed} disabled={refreshing}
                   onChange={(e) => setMaxSeed(e.target.value)}
-                  className="ps-input"
-                  style={{ width: 78, padding: "2px 6px", fontSize: 12, borderColor: maxSeedValid ? undefined : "var(--status-warn)" }} />
+                  style={{ width: 72, padding: "3px 8px", fontSize: 12, fontVariantNumeric: "tabular-nums",
+                    border: "1px solid " + (maxSeedValid ? "var(--border-strong, var(--border-hairline))" : "var(--status-warn)"),
+                    borderRadius: "var(--r-sm)", background: "var(--surface-inset)", color: "var(--text-primary)", outline: "none" }} />
               </label>
               <div className="sample-trigger">
                 <Button variant="primary" disabled={refreshing || !maxSeedValid} iconLeft={refreshing ? <Spinner sm /> : <Ico n="radar" />} onClick={startSample}>钱包采集</Button>
