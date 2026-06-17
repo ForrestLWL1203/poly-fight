@@ -95,9 +95,9 @@
 .modal-close { background: var(--surface-inset); border: 1px solid var(--border-hairline); border-radius: var(--r-pill); width: 34px; height: 34px; cursor: pointer; color: var(--text-secondary); display: inline-flex; align-items: center; justify-content: center; flex: none; }
 .modal-close:hover { color: var(--text-primary); border-color: var(--border-strong); }
 .modal-body { padding: var(--sp-5) var(--sp-6) var(--sp-6); display: flex; flex-direction: column; gap: var(--sp-5); }
-.modal-hero { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-5); flex-wrap: wrap; }
-.mh-match { min-width: 0; }
-.mh-prices { flex: 0 1 auto; align-self: flex-start; display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap; justify-content: flex-end; }
+.modal-hero { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-5); flex-wrap: nowrap; }
+.mh-match { flex: 1 1 auto; min-width: 0; }
+.mh-prices { flex: 0 0 auto; align-self: flex-start; display: flex; align-items: center; gap: var(--sp-4); flex-wrap: nowrap; justify-content: flex-end; }
 .mh-prices-label { font: var(--text-label); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--text-tertiary); }
 .mh-prices .price-cell { align-items: center; text-align: center; }
 .modal-times { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: var(--sp-3) var(--sp-5); }
