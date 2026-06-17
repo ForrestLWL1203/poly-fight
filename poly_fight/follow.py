@@ -751,6 +751,10 @@ def process_follow_trades(
                     stats["condition_stake_cap_blocked_count"] += 1
                 elif reason == "invalid_strategy":
                     stats["strategy_invalid_count"] += 1
+                else:
+                    # 其余策略 block(no_live_edge / match_cap_reached / no_bankroll / no_live_price …)
+                    # 也计数,便于诊断"候选过滤但没开仓"卡在哪一道。
+                    stats[f"{reason}_count"] = stats.get(f"{reason}_count", 0) + 1
                 funded_stake = 0.0
             if funding_status == "funded" and not slippage["would_follow"]:
                 funded_stake = 0.0

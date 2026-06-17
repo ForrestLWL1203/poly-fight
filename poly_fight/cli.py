@@ -6435,6 +6435,7 @@ def command_follow(
     closing_line_snapshot_count = 0
     cold_start_wallet_count = 0
     backfill_legs_opened = 0
+    backfill_block_breakdown: dict[str, int] = {}
     backfill_ran = False
     backfill_stats: dict[str, int] = {}
     trade_request_count = 0
@@ -6543,9 +6544,16 @@ def command_follow(
                     follow_strategy=follow_strategy,
                 )
                 backfill_legs_opened += len({signal.get("signal_id") for signal in open_signals} - before_ids)
+                # 汇总各候选未开仓的拦截原因(eligibility / low_entry / small_wallet / no_live_edge …),
+                # 便于诊断"candidates 多但 opened 少"卡在哪道闸。
+                for stat_key, stat_val in (_bf_pft_stats or {}).items():
+                    if (stat_key.endswith("_count") and stat_key not in ("funded_stake_usdc",)
+                            and not stat_key.startswith("new_leg")) and to_int(stat_val) > 0:
+                        backfill_block_breakdown[stat_key] = backfill_block_breakdown.get(stat_key, 0) + to_int(stat_val)
             backfill_ran = True
             if emit:
-                print(json.dumps({"status": "position_backfill", "opened_legs": backfill_legs_opened, **backfill_stats}, ensure_ascii=False), flush=True)
+                print(json.dumps({"status": "position_backfill", "opened_legs": backfill_legs_opened,
+                                  "block_breakdown": backfill_block_breakdown, **backfill_stats}, ensure_ascii=False), flush=True)
 
         def fetch_trades_for_wallet(row: dict[str, Any]) -> tuple[str, list[dict], dict[str, Any]]:
             wallet = normalize_wallet(row.get("wallet"))
