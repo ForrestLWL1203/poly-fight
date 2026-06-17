@@ -374,7 +374,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not category:
             self._error("invalid_category", status=HTTPStatus.BAD_REQUEST)
             return
-        extra_args = v2_refresh_extra_args(self._read_request_form()) if category == "esports" else None
+        form = self._read_request_form() if category == "esports" else {}
+        extra_args = v2_refresh_extra_args(form) if category == "esports" else None
+        full_recollect = str(form.get("full_recollect")).lower() in ("true", "1", "yes", "on")
         try:
             status = start_wallet_refresh(
                 self.dashboard_config.data_dir,
@@ -383,6 +385,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 runner=self.dashboard_config.wallet_refresh_runner,
                 timeout_seconds=self.dashboard_config.wallet_refresh_timeout_seconds,
                 extra_args=extra_args,
+                full_recollect=full_recollect,
             )
         except WalletRefreshAlreadyRunning as exc:
             self._json({"ok": False, "error": "wallet_refresh_running", "data": exc.status}, status=HTTPStatus.CONFLICT)
@@ -3141,6 +3144,22 @@ def v2_refresh_extra_args(form: dict[str, Any]) -> list[str]:
     return []
 
 
+def _wipe_collector_data(category_dir: Path) -> None:
+    """完整重采:清空该类目采集目录(profiles / leaderboard_v2.db / 交易缓存 collector_v2 / 校准),
+    从 0 重建。**保留 follow.db** —— 它在独立的 follow_dir(data/follow),不在 category_dir 下。"""
+    category_dir = Path(category_dir)
+    if category_dir.exists():
+        for child in category_dir.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                try:
+                    child.unlink()
+                except OSError:
+                    pass
+    category_dir.mkdir(parents=True, exist_ok=True)
+
+
 def start_wallet_refresh(
     data_dir: Path,
     *,
@@ -3149,6 +3168,7 @@ def start_wallet_refresh(
     runner: Any = None,
     timeout_seconds: int = 7200,
     extra_args: list[str] | None = None,
+    full_recollect: bool = False,
 ) -> dict[str, Any]:
     category = normalize_category(category)
     if not category:
@@ -3179,6 +3199,7 @@ def start_wallet_refresh(
         "category": category,
         "started_at": now_ts,
         "command": command,
+        "full_recollect": bool(full_recollect),
         "log_path": str(log_path),
         "owner_pid": os.getpid(),   # 监控线程所在的 serve;serve 死亡 → 孤儿 → 读时自愈为 failed
     }
@@ -3192,6 +3213,8 @@ def start_wallet_refresh(
     def worker() -> None:
         finished_at = int(time.time())
         try:
+            if full_recollect:
+                _wipe_collector_data(category_dir)  # 清采集库从 0 重建(保留 follow.db)
             prepare_category_refresh_dir(category_dir, max_lookback_days=30, now_ts=int(time.time()))
             if runner is not None:
                 try:

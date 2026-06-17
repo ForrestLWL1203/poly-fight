@@ -36,6 +36,7 @@ from poly_fight.dashboard import (
     create_server,
     make_session_token,
     reset_dashboard_data,
+    _wipe_collector_data,
     short_addr,
     start_runner,
     stop_runner,
@@ -10206,6 +10207,26 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(list((data_dir / "esports").iterdir()), [])
             self.assertEqual(list(follow_dir.iterdir()), [])
             self.assertEqual(list((log_dir / "follow").iterdir()), [])
+
+    def test_wipe_collector_data_clears_category_keeps_sibling_follow(self):
+        # 完整重采:清空类目采集目录(profiles/db/交易缓存),但 follow.db(独立 follow 目录)保留。
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cat = root / "esports"
+            (cat / "collector_v2").mkdir(parents=True)
+            (cat / "leaderboard_v2.db").write_text("db")
+            (cat / "wallet_profiles_v2.json").write_text("[]")
+            (cat / "collector_v2" / "trades.json").write_text("{}")
+            follow = root / "follow"
+            follow.mkdir()
+            (follow / "follow.db").write_text("paper-history")
+
+            _wipe_collector_data(cat)
+
+            self.assertTrue(cat.is_dir())
+            self.assertEqual(list(cat.iterdir()), [])          # 采集库清空
+            self.assertTrue((follow / "follow.db").exists())   # follow.db 保留
+            self.assertEqual((follow / "follow.db").read_text(), "paper-history")
 
     def test_dashboard_reset_data_blocks_running_runner(self):
         with TemporaryDirectory() as tmp:

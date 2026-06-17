@@ -395,6 +395,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
   const [gameFilter, setGameFilter] = React.useState("all");
   const [pg, setPg] = React.useState(1);
   const [busy, setBusy] = React.useState({});
+  const [fullRecollect, setFullRecollect] = React.useState(false);
   React.useEffect(() => { setPg(1); }, [view, gameFilter]);
   React.useEffect(() => { window.lucide && window.lucide.createIcons(); });
 
@@ -437,7 +438,12 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
   const updatedLabel = lb.updatedAt ? Adapt.timeAgo(lb.updatedAt) : "—";
   // 门槛(胜率/edge/n_eff/价格带)现在全在 core.py 评分常量里,采集无需前端传参。
   const startSample = () => {
-    onSample && onSample("esports", {});
+    if (!onSample) return;
+    if (fullRecollect) {
+      const ok = window.confirm("完整重采会清空采集库(钱包画像 / 榜单 / 交易缓存)从 0 重建,耗时较久(约 20-30 分钟)。\nfollow.db(模拟跟单历史)会保留。确定?");
+      if (!ok) return;
+    }
+    onSample("esports", fullRecollect ? { full_recollect: true } : {});
   };
 
   return (
@@ -459,6 +465,10 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                 <option value="multi">跨游戏</option>
               </select>
               <span className="lb-updated" style={{ marginRight: 4 }}>最后更新 {updatedLabel} · {lb.activeCount} 个活跃</span>
+              <label className="full-recollect-toggle" title="勾选后点击采集会清空采集库从 0 完整重建(保留 follow.db);不勾选走缓存增量采集" style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--text-secondary)", cursor: refreshing ? "default" : "pointer", marginRight: 4 }}>
+                <input type="checkbox" checked={fullRecollect} disabled={refreshing} onChange={(e) => setFullRecollect(e.target.checked)} />
+                完整重采
+              </label>
               <div className="sample-trigger">
                 <Button variant="primary" disabled={refreshing} iconLeft={refreshing ? <Spinner sm /> : <Ico n="radar" />} onClick={startSample}>钱包采集</Button>
               </div>
