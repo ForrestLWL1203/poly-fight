@@ -409,6 +409,36 @@ function OverviewPage({ data, onNav, onOpenFollow }) {
 /* ============================================================
    Leaderboard
    ============================================================ */
+// 专精列:每行高度统一,最多显示 2 个专精;超出在第 2 行末尾加「+N」胶囊,
+// 悬浮/聚焦弹出完整专精列表(实底弹层,z-index 高于后续行,不撑高行)。
+function scopeIcon(s) {
+  return s.game === "multi"
+    ? <span className="ps-gameicon sz-sm" title="跨游戏盘口专家(跨游戏合并达标,无单一游戏专精)" style={{ fontSize: 10, fontWeight: 600, color: "var(--text-secondary)" }}>跨</span>
+    : <GameIcon game={s.game} base={ASSET_BASE} size="sm" />;
+}
+function ScopeCell({ scope }) {
+  const items = scope || [];
+  if (!items.length) return <span className="muted">–</span>;
+  const visible = items.slice(0, 2);
+  const extra = items.length - visible.length;
+  return (
+    <div className="scope-list">
+      {visible.map((s, j) => (
+        <span key={j} className="scope-item">
+          {scopeIcon(s)}<span>{s.market}</span>
+          {j === visible.length - 1 && extra > 0 && (
+            <span className="scope-more" tabIndex={0} aria-label={"还有 " + extra + " 个专精,共 " + items.length + " 个"} onClick={(e) => e.stopPropagation()}>
+              +{extra}
+              <div className="scope-pop">
+                {items.map((p, k) => <span key={k} className="scope-item">{scopeIcon(p)}<span>{p.market}</span></span>)}
+              </div>
+            </span>
+          )}
+        </span>
+      ))}
+    </div>
+  );
+}
 function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
   const [view, setView] = React.useState("active");
   const [gameFilter, setGameFilter] = React.useState("all");
@@ -501,8 +531,8 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                 onKeyDown={(e) => { if ((e.key === "Enter" || e.key === " ") && !refreshing && maxSeedValid) { e.preventDefault(); startSample(); } }}>
                 <label className="cs-opt" title="勾选后点击采集会清空采集库从 0 完整重建(保留 follow.db);不勾选走缓存增量采集"
                   onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
-                  <input type="checkbox" checked={fullRecollect} disabled={refreshing} onChange={(e) => setFullRecollect(e.target.checked)} />
-                  完整重采
+                  <span>完整重采</span>
+                  <span className="cs-box"><input type="checkbox" checked={fullRecollect} disabled={refreshing} onChange={(e) => setFullRecollect(e.target.checked)} /></span>
                 </label>
                 <label className="cs-opt cs-seed" title="本轮深采的钱包上限(seed 候选按主游戏 round-robin 取此数)。必填。"
                   onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
@@ -531,7 +561,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                   <td><div className="cell-stack"><span className="strong">{w.score != null ? w.score : "—"}</span><span className="muted">满分100</span></div></td>
                   <td><div className="cell-stack"><span className="strong">{w.winRate != null ? w.winRate + "%" : "—"}</span>{w.closedCount > 0 && <span className="muted">{w.closedCount} 场</span>}</div></td>
                   <td className="num" title={money(w.avgCash)}>{compactMoney(w.avgCash)}</td>
-                  <td><div className="scope-list">{w.scope.map((s, j) => <span key={j} className="scope-item">{s.game === "multi" ? <span className="ps-gameicon sz-sm" title="跨游戏盘口专家(跨游戏合并达标,无单一游戏专精)" style={{ fontSize: 10, fontWeight: 600, color: "var(--text-secondary)" }}>跨</span> : <GameIcon game={s.game} base={ASSET_BASE} size="sm" />}<span>{s.market}</span></span>)}{!w.scope.length && <span className="muted">–</span>}</div></td>
+                  <td><ScopeCell scope={w.scope} /></td>
                   {!q && <td className="strong">{w.followRec}</td>}
                   {!q && <td className={pnlClass(w.followPnl) + " num strong"}>{w.settled ? signedMoney(w.followPnl) : "—"}</td>}
                   <td className="muted">{w.lastTrade || "—"}</td>

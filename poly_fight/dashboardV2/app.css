@@ -295,12 +295,12 @@
 .mask-pct { margin-top: var(--sp-3); font: var(--fw-semibold) var(--fs-footnote) var(--font-mono); color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
 
 /* 列表卡(flush Card)统一工具栏内距:顶部收窄,左右保持,各视图一致 */
-.card-toolbar { padding: var(--sp-4) var(--sp-6); }
+.card-toolbar { padding: var(--sp-3) var(--sp-6); }
 
 /* 采集:圆角方形大按钮,内含「完整重采 / Max seed / 钱包采集」自上而下 */
 .collect-square {
-  display: flex; flex-direction: column; gap: var(--sp-2);
-  width: 156px; padding: var(--sp-4) var(--sp-4) var(--sp-3); border: none;
+  display: flex; flex-direction: column; gap: 5px;
+  width: 156px; padding: var(--sp-3); border: none;
   border-radius: var(--r-lg); background: var(--gradient-brand); color: var(--text-on-accent);
   box-shadow: var(--shadow-accent); cursor: pointer;
   transition: transform var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out), opacity var(--dur-fast) var(--ease-out);
@@ -308,16 +308,16 @@
 .collect-square:hover { transform: translateY(-2px); box-shadow: var(--shadow-md), var(--shadow-accent); }
 .collect-square:active { transform: translateY(0); }
 .collect-square.is-disabled { opacity: .55; cursor: default; transform: none; box-shadow: var(--shadow-accent); }
-.collect-square .cs-opt { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: var(--fw-semibold); color: var(--text-on-accent); cursor: pointer; }
-.collect-square .cs-opt input[type="checkbox"] { width: 14px; height: 14px; accent-color: #fff; cursor: pointer; flex: none; }
-.collect-square .cs-seed { justify-content: space-between; }
+.collect-square .cs-opt { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 12px; font-weight: var(--fw-semibold); color: var(--text-on-accent); cursor: pointer; }
+.collect-square .cs-box { width: 58px; display: inline-flex; justify-content: center; flex: none; }
+.collect-square .cs-opt input[type="checkbox"] { width: 14px; height: 14px; margin: 0; accent-color: #fff; cursor: pointer; flex: none; }
 .collect-square .cs-seed input {
   width: 58px; padding: 2px 6px; font-size: 12px; font-variant-numeric: tabular-nums; text-align: right;
   border: 1px solid rgba(255,255,255,0.5); border-radius: var(--r-sm);
   background: rgba(255,255,255,0.18); color: #fff; outline: none;
 }
 .collect-square .cs-seed input.invalid { border-color: #ffe08a; background: rgba(255,255,255,0.30); }
-.collect-square .cs-divider { height: 1px; background: rgba(255,255,255,0.30); margin: 1px 0; }
-.collect-square .cs-action { display: flex; align-items: center; justify-content: center; gap: var(--sp-2); font-size: var(--fs-body); font-weight: var(--fw-bold); padding-top: 1px; }
+.collect-square .cs-divider { height: 1px; background: rgba(255,255,255,0.30); margin: 0; }
+.collect-square .cs-action { display: flex; align-items: center; justify-content: center; gap: var(--sp-2); font-size: var(--fs-body); font-weight: var(--fw-bold); padding-top: 0; }
 .collect-square .cs-action svg, .collect-square .cs-action [data-lucide] { width: 18px; height: 18px; }
 .collect-square .cs-action .ps-spinner { border-color: rgba(255,255,255,0.45); border-top-color: #fff; }

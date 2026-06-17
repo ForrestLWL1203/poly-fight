@@ -342,6 +342,24 @@ table.ps-table { width: 100%; border-collapse: collapse; font-variant-numeric: t
 
 .scope-list { display: flex; flex-direction: column; gap: 4px; }
 .scope-item { display: flex; align-items: center; gap: 6px; font-size: var(--fs-footnote); color: var(--text-secondary); }
+/* 专精「+N」胶囊 + 悬浮完整列表弹层(行高统一,最多 2 行) */
+.scope-more {
+  position: relative; margin-left: 6px; display: inline-flex; align-items: center;
+  height: 18px; padding: 0 7px; border-radius: var(--r-pill);
+  background: var(--surface-inset); border: 1px solid var(--border-hairline);
+  font-size: 11px; font-weight: var(--fw-semibold); color: var(--text-secondary);
+  line-height: 1; white-space: nowrap; cursor: default;
+}
+.scope-more:hover, .scope-more:focus-visible { color: var(--text-primary); border-color: var(--border-strong); outline: none; }
+.scope-pop {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 30;
+  display: none; flex-direction: column; gap: 7px; min-width: 124px;
+  padding: 10px 12px; border-radius: var(--r-md);
+  background: var(--surface-solid); border: 1px solid var(--border-hairline);
+  box-shadow: var(--shadow-lg), var(--inner-highlight); white-space: nowrap;
+}
+.scope-more:hover .scope-pop, .scope-more:focus .scope-pop, .scope-more:focus-within .scope-pop { display: flex; }
+.scope-pop .scope-item { font-size: var(--fs-footnote); color: var(--text-secondary); }
 
 /* ---- Team line / match cell (helper parts) ---- */
 .team-mono {
