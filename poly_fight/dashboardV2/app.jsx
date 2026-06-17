@@ -238,7 +238,7 @@ function OverviewPage({ data, onNav, onOpenFollow }) {
         <Card pad="lg" className="ov-herocard">
           <div className="ov-hero">
             <div className="ov-hero-top">
-              <StatTile size="lg" tone="up" label="已结算盈亏" value={signedMoney(o.realizedPnl)} delta={<TrendValue value={o.realizedRoi} percent chip />} sub={`累计投入 ${money(o.totalStake)}`} />
+              <StatTile size="lg" tone={o.realizedPnl > 0 ? "up" : o.realizedPnl < 0 ? "down" : "default"} label="已结算盈亏" value={signedMoney(o.realizedPnl)} delta={<TrendValue value={o.realizedRoi} percent chip />} sub={`累计投入 ${money(o.totalStake)}`} />
             </div>
             <div className="ov-metricbar">
               <div className="m"><span>已结算 ROI</span><b className={pnlClass(o.realizedPnl)}>{o.realizedRoi > 0 ? "+" : ""}{o.realizedRoi}%</b></div>
