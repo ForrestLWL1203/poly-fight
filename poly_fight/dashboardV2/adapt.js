@@ -336,11 +336,15 @@
     const pnl = num(row.display_pnl);
     const open = row.status === "open";
     const settlement = open ? "未结算" : (pnl > 0 ? "盈利" : pnl < 0 ? "亏损" : "未结算");
+    // BO 系列的单局盘共用系列标题,靠 market_question 里的 "Game N" 区分(否则两局看起来一样)。
+    const mtLabel = row.market_type_label || row.market_type || "";
+    const gm = /game\s*(\d+)/i.exec(String(row.question || row.market_question || ""));
+    const marketType = gm ? (mtLabel ? `${mtLabel} · 第${gm[1]}局` : `第${gm[1]}局`) : mtLabel;
     return {
       cid: row.condition_id,
       game: info.game, teamA: info.teamA, teamB: info.teamB, meta: info.meta,
       teamLogos: teamLogoMap(row, info),
-      marketType: row.market_type_label || row.market_type || "",
+      marketType,
       // 我们买入哪一边(可能两边:对手盘 / 自对冲)。
       sides: (row.sides || []).map((s) => ({ outcome: String(s.outcome || ""), index: num(s.outcome_index), legs: num(s.leg_count) })),
       status: open ? "open" : "settled",

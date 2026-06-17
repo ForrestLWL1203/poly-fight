@@ -833,7 +833,11 @@ function FollowDetailModal({ cid, onClose, toast }) {
   const stop = (e) => e.stopPropagation();
   const mp = (detail && detail.match_parts) || {};
   const titleGame = detail ? Adapt.normalizeGame(mp.game) : "";
-  const titleText = detail ? (stripGamePrefix(detail.title || "") || (mp.teamA ? `${mp.teamA} vs ${mp.teamB}` : "跟单详情")) : "跟单详情";
+  // BO 系列单局盘共用系列标题,从 market_question 的 "Game N" 补出局号区分。
+  const titleGameNo = detail ? ((/game\s*(\d+)/i.exec(String(detail.question || "")) || [])[1] || "") : "";
+  const titleText = detail
+    ? ((stripGamePrefix(detail.title || "") || (mp.teamA ? `${mp.teamA} vs ${mp.teamB}` : "跟单详情")) + (titleGameNo ? ` · 第${titleGameNo}局` : ""))
+    : "跟单详情";
   const titleInner = detail
     ? <>{titleGame ? <img className="modal-title-logo" src={`${ASSET_BASE}/games/${titleGame}.png`} alt={titleGame} onError={(e) => { e.currentTarget.style.display = "none"; }} /> : null}<span className="modal-title-text">{titleText}</span></>
     : "跟单详情";
