@@ -418,6 +418,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
   const [maxSeed, setMaxSeed] = React.useState("2000");
   const maxSeedNum = parseInt(maxSeed, 10);
   const maxSeedValid = Number.isFinite(maxSeedNum) && maxSeedNum >= 1 && maxSeedNum <= 20000;
+  const [confirmRecollect, setConfirmRecollect] = React.useState(false);
   React.useEffect(() => { setPg(1); }, [view, gameFilter]);
   React.useEffect(() => { window.lucide && window.lucide.createIcons(); });
 
@@ -459,15 +460,16 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
   const refreshing = JSON.stringify(data.refresh || {}).includes('"running"');
   const updatedLabel = lb.updatedAt ? Adapt.timeAgo(lb.updatedAt) : "—";
   // 门槛(胜率/edge/n_eff/价格带)现在全在 core.py 评分常量里,采集无需前端传参。
-  const startSample = () => {
+  const submitSample = () => {
     if (!onSample || !maxSeedValid) return;
-    if (fullRecollect) {
-      const ok = window.confirm("完整重采会清空采集库(钱包画像 / 榜单 / 交易缓存)从 0 重建,耗时较久(约 20-30 分钟)。\nfollow.db(模拟跟单历史)会保留。确定?");
-      if (!ok) return;
-    }
     const body = { max_profile_wallets: maxSeedNum };
     if (fullRecollect) body.full_recollect = true;
     onSample("esports", body);
+  };
+  const startSample = () => {
+    if (!onSample || !maxSeedValid) return;
+    if (fullRecollect) { setConfirmRecollect(true); return; }  // 自定义弹窗确认,不用浏览器原生 confirm
+    submitSample();
   };
 
   return (
@@ -540,6 +542,10 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
           <Pager total={rows.length} pageSize={PAGE} page={cur} onChange={setPg} unit="钱包" />
         </div>
       </Card>
+      {confirmRecollect && <ConfirmModal title="完整重采" danger confirmLabel="清库重采"
+        body={<>完整重采会清空采集库(钱包画像 / 榜单 / 交易缓存)从 0 重建,耗时较久(约 20-30 分钟)。follow.db(模拟跟单历史)会保留。<br /><br />Max seed = <b style={{ color: "var(--text-primary)" }}>{maxSeedNum}</b>。确定?</>}
+        onConfirm={() => { setConfirmRecollect(false); submitSample(); }}
+        onClose={() => setConfirmRecollect(false)} />}
     </div>
   );
 }
