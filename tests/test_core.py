@@ -3850,19 +3850,22 @@ class CoreTest(unittest.TestCase):
         self.assertIn("0xslim", board)
 
     def test_derive_scope_params_adapts_to_density(self):
-        # 密集(λ 高、gap 小):短 lookback、n_eff 满档 12、idle 维持下限。
+        # 密集(λ≈16 ≥ T2=14):短 lookback、n_eff dense 档 10。
         dense = derive_scope_params(markets=1440, window_days=90, gaps=[1.0] * 80)
         self.assertEqual(dense["lookback_days"], 14)          # 180/16=11.25 → clamp 到下限 14
-        self.assertEqual(dense["n_eff_floor"], 12)            # λ=16 ≥ HI → 满档
+        self.assertEqual(dense["n_eff_floor"], 10)            # λ=16 ≥ T2 → dense=10
         self.assertEqual(dense["idle_ceiling_hours"], 72)     # p90 gap=1 → 2×1×24=48 → clamp 72
-        # 稀疏(λ 低):长 lookback、n_eff 落到地板 8。
+        # 中档(T1=9 ≤ λ≈11.7 < T2=14):n_eff mid 档 8。
+        mid = derive_scope_params(markets=1053, window_days=90, gaps=[1.0] * 60)
+        self.assertEqual(mid["n_eff_floor"], 8)               # λ≈11.7 ∈ [9,14) → mid=8
+        # 稀疏(λ≈6 < T1=9):长 lookback、n_eff sparse 档 7。
         sparse = derive_scope_params(markets=540, window_days=90, gaps=[1.0] * 40 + [9.0])
         self.assertEqual(sparse["lookback_days"], 30)         # 180/6=30
-        self.assertEqual(sparse["n_eff_floor"], 8)            # λ=6 ≤ LO → 地板 8
-        # 极稀疏:lookback 封顶 90。
+        self.assertEqual(sparse["n_eff_floor"], 7)            # λ=6 < T1 → sparse=7
+        # 极稀疏:lookback 封顶 90,n_eff 仍 sparse 档 7。
         tiny = derive_scope_params(markets=90, window_days=90, gaps=[7.0, 14.0])
         self.assertEqual(tiny["lookback_days"], 90)           # 180/1=180 → clamp 90
-        self.assertEqual(tiny["n_eff_floor"], 8)
+        self.assertEqual(tiny["n_eff_floor"], 7)
         # idle 锚 p90 gap(尾部),clamp 到 [72h, 21d]。
         bursty = derive_scope_params(markets=200, window_days=90, gaps=[1.0, 1.0, 10.0, 10.0])
         self.assertGreater(bursty["idle_ceiling_hours"], 72)  # p90≈10d → 放宽

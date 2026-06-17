@@ -10,7 +10,7 @@ from typing import Any, Iterable
 SECONDS_PER_DAY = 86400
 # profile 复用以此为失效令牌:改任何评分口径(门槛/公式/n_eff 下限/basis)都要 +1,
 # 否则采集会复用旧口径的画像、新规则不生效。改完需全量重采一次,之后才走复用加速。
-SCORING_VERSION = 20
+SCORING_VERSION = 21
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 # v16:两边对冲(套利)门统一 0.20——bucket 排除(core)、systemic(cli)、v2 钱包级(V2_MAX_TWO_SIDED_RATE)同口径。
@@ -53,12 +53,14 @@ CALIBRATION_WINDOW_DAYS = 90          # 测密度的校准窗(跨多个赛事周
 SCOPE_MARKET_TARGET = 180             # lookback 要装够多少 main 市场(稀疏游戏据此拿到 ~30d 窗口)
 SCOPE_LOOKBACK_MIN_DAYS = 14
 SCOPE_LOOKBACK_MAX_DAYS = 90
-SCOPE_NEFF_MIN = 8
-SCOPE_NEFF_MAX = 12
-# n_eff 地板按密度 λ(main 市场/天)线性插值到 [N_MIN, N_MAX]:λ≤LO→6,λ≥HI→12,中间线性。
-# 老三家也一起自适应(量级不同,同一套门不公平)。初值据实测 λ(cs2≈16 / lol≈12 / dota2/valo≈6)标定。
-SCOPE_NEFF_LAMBDA_LO = 5.0
-SCOPE_NEFF_LAMBDA_HI = 16.0
+# n_eff 地板按密度 λ(main 市场/天)分三档(老三家也一起自适应,量级不同同门不公平)。
+# 分档而非线性:目标值(cs2=10 / lol=8 / dota2·valorant=7)落不到一条直线(两段斜率不同),
+# 分档能精确命中且各游戏 λ 离阈值有 2-3 余量、不在边界抖动。实测 λ:cs2≈16 / lol≈12 / dota2·valo≈6。
+SCOPE_NEFF_DENSE = 10                 # λ ≥ λ_T2(密集,如 cs2)
+SCOPE_NEFF_MID = 8                    # λ_T1 ≤ λ < λ_T2(中,如 lol)
+SCOPE_NEFF_SPARSE = 7                 # λ < λ_T1(稀疏,如 dota2 / valorant)
+SCOPE_NEFF_LAMBDA_T1 = 9.0
+SCOPE_NEFF_LAMBDA_T2 = 14.0
 SCOPE_IDLE_MIN_HOURS = 72
 SCOPE_IDLE_MAX_HOURS = 21 * 24
 SCOPE_IDLE_GAP_MULTIPLIER = 2.0       # idle 上限 ≈ 此倍 × 赛事干涸期(p90 gap)
@@ -106,15 +108,13 @@ def derive_scope_params(
     # 1) lookback:装够 market_target 个 main 市场所需天数,clamp。
     lookback = SCOPE_LOOKBACK_MAX_DAYS if lam <= 0 else int(round(market_target / lam))
     lookback = max(SCOPE_LOOKBACK_MIN_DAYS, min(SCOPE_LOOKBACK_MAX_DAYS, lookback))
-    # 2) n_eff 地板:λ 线性插值到 [N_MIN, N_MAX]。
-    if lam <= SCOPE_NEFF_LAMBDA_LO:
-        n_eff = SCOPE_NEFF_MIN
-    elif lam >= SCOPE_NEFF_LAMBDA_HI:
-        n_eff = SCOPE_NEFF_MAX
+    # 2) n_eff 地板:按 λ 分三档(dense / mid / sparse)。
+    if lam >= SCOPE_NEFF_LAMBDA_T2:
+        n_eff = SCOPE_NEFF_DENSE
+    elif lam >= SCOPE_NEFF_LAMBDA_T1:
+        n_eff = SCOPE_NEFF_MID
     else:
-        span = SCOPE_NEFF_LAMBDA_HI - SCOPE_NEFF_LAMBDA_LO
-        n_eff = SCOPE_NEFF_MIN + (SCOPE_NEFF_MAX - SCOPE_NEFF_MIN) * (lam - SCOPE_NEFF_LAMBDA_LO) / span
-    n_eff = max(SCOPE_NEFF_MIN, min(SCOPE_NEFF_MAX, int(round(n_eff))))
+        n_eff = SCOPE_NEFF_SPARSE
     # 3) idle 上限:锚定赛事干涸期(p90 gap),clamp。中位数会被"天天有盘"淹没,故用尾部。
     gap_p90 = _percentile(gaps, SCOPE_IDLE_GAP_PERCENTILE)
     idle_hours = int(round(SCOPE_IDLE_GAP_MULTIPLIER * gap_p90 * 24))
