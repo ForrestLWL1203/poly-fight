@@ -1570,6 +1570,21 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
         # (e.g. game_winner) while its blended overall record looks weak. Display the
         # eligible bucket's own stats so the shown numbers match the grade + type label.
         metrics = _eligible_display_metrics(row)
+        # 胜率列 = "我们会跟的专精桶"的 θ̂:1 桶=该桶,多桶=各桶平均(与评分胜率门同口径)。
+        # 不用整体 positive_market_rate(口径不对)。前端拿不到 eligible_bucket_details,故在后端算好。
+        _bucket_details = row.get("eligible_bucket_details") or []
+        _bucket_wrs = [to_float(d.get("win_rate")) for d in _bucket_details if d.get("win_rate") is not None]
+        followed_win_rate = (
+            sum(_bucket_wrs) / len(_bucket_wrs) if _bucket_wrs
+            else row.get("best_bucket_win_rate") if row.get("best_bucket_win_rate") is not None
+            else metrics.get("bucket_win_rate")
+        )
+        # 场均交易额是钱包级,在顶层或 candidate 里(best-bucket metrics 没有 → 之前显示 $0)。
+        resolved_avg_market_cash = (
+            row.get("avg_market_cash")
+            or (row.get("candidate") or {}).get("avg_market_cash")
+            or metrics.get("avg_market_cash")
+        )
         wallet = str(row.get("wallet") or "").lower()
         category = normalize_category(str(row.get("category") or "")) or "esports"
         favorite_key = f"{category}:{wallet}"
@@ -1618,7 +1633,7 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
                 "esports_roi": metrics.get("esports_roi"),
                 "median_market_roi": metrics.get("median_market_roi"),
                 "median_entry_price": metrics.get("median_entry_price"),
-                "avg_market_cash": metrics.get("avg_market_cash"),
+                "avg_market_cash": resolved_avg_market_cash,
                 "participated_market_count": metrics.get("participated_market_count"),
                 "total_cash_volume": metrics.get("total_cash_volume"),
                 "best_bucket_last_trade_at": row.get("best_bucket_last_trade_at"),
@@ -1638,6 +1653,7 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
                 "esports_loss_count": metrics.get("esports_loss_count"),
                 "esports_closed_count": metrics.get("esports_closed_count"),
                 "positive_market_rate": metrics.get("positive_market_rate"),
+                "followed_win_rate": followed_win_rate,  # 会跟桶的 θ̂(1 桶=该桶,多桶=平均)
                 "sold_before_resolution_market_rate": row.get("sold_before_resolution_market_rate"),
                 "two_sided_trade_market_rate": row.get("two_sided_trade_market_rate"),
                 "eligible_market_types": row.get("eligible_market_types") or [],
