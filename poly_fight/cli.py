@@ -975,6 +975,22 @@ def _fetch_user_trade_pages(
     return collected
 
 
+# 交易缓存(raw_user_trades)瘦身:删每条交易里打分/增量游标都不读的展示字段
+# (头像/昵称/标题/slug/asset 等)。打分只用 conditionId/outcomeIndex/outcome/price/side/size/
+# timestamp/transactionHash/proxyWallet(已逐字段核对 summarize_trade_reconstructed_positions)。
+# 用黑名单(只删已验证无用的大字段、保留其余)更安全。约省 ~55% 体积。
+_USER_TRADE_DROP_KEYS = frozenset({
+    "asset", "bio", "icon", "name", "profileImage", "profileImageOptimized",
+    "pseudonym", "slug", "eventSlug", "title",
+})
+
+
+def _slim_user_trade(trade: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(trade, dict):
+        return trade
+    return {key: value for key, value in trade.items() if key not in _USER_TRADE_DROP_KEYS}
+
+
 def fetch_recent_esports_user_trades_for_wallet(
     client: PolymarketClient,
     wallet: str,
@@ -1039,6 +1055,7 @@ def fetch_recent_esports_user_trades_for_wallet(
         if retention_days is not None and int(retention_days) > 0:
             cutoff = now_ts - int(retention_days) * 86400
             cached_trades = [t for t in cached_trades if int(t.get("timestamp") or 0) >= cutoff]
+        cached_trades = [_slim_user_trade(t) for t in cached_trades]  # 写盘前删无用展示字段(~55%)
         source = "api"
         if use_cache and cache_path:
             write_json(

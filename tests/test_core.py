@@ -59,6 +59,7 @@ from poly_fight.cli import (
     BuildLockUnavailable,
     acquire_build_lock,
     load_scope_params,
+    _slim_user_trade,
     scope_n_eff_floors,
     scope_lookback_by_game,
     scope_max_lookback_days,
@@ -3848,6 +3849,22 @@ class CoreTest(unittest.TestCase):
         result = build_collector_leaderboard_v2({"0xslim": slim}, now_ts=now)
         board = {normalize_wallet(r["wallet"]) for r in result["leaderboard"]}
         self.assertIn("0xslim", board)
+
+    def test_slim_user_trade_drops_display_fields_keeps_scoring(self):
+        # 交易缓存瘦身:删头像/标题/slug/asset 等展示字段,保留打分/游标用的字段。
+        trade = {
+            "conditionId": "0xabc", "outcomeIndex": 0, "outcome": "TeamA",
+            "price": 0.48, "side": "BUY", "size": 20000, "timestamp": 1781492655,
+            "transactionHash": "0xdead", "proxyWallet": "0xwallet",
+            "asset": "112820...", "icon": "https://...png", "title": "UFC: A vs B",
+            "slug": "ufc-a-b", "eventSlug": "ufc-a-b", "pseudonym": "Foo", "name": "bar",
+            "bio": "", "profileImage": "", "profileImageOptimized": "",
+        }
+        slim = _slim_user_trade(trade)
+        for k in ("asset", "icon", "title", "slug", "eventSlug", "pseudonym", "name", "bio", "profileImage", "profileImageOptimized"):
+            self.assertNotIn(k, slim)
+        for k in ("conditionId", "outcomeIndex", "outcome", "price", "side", "size", "timestamp", "transactionHash", "proxyWallet"):
+            self.assertEqual(slim[k], trade[k])
 
     def test_derive_scope_params_adapts_to_density(self):
         # 密集(λ≈16 ≥ T2=14):短 lookback、n_eff dense 档 10。
