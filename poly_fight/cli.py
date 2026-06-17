@@ -6780,15 +6780,26 @@ def command_follow(
 
     exited_signals = [signal for signal in open_signals if signal.get("status") == "exited"]
     open_signals = [signal for signal in open_signals if signal.get("status") != "exited"]
-    resolutions = fetch_resolutions_for_open_signals(
-        client,
-        open_signals,
-        state=state,
-        store=store,
-        now_ts=now_ts,
-        gamma_pages=args.resolution_gamma_pages,
-        ttl_seconds=args.resolution_cache_ttl_seconds,
-    )
+    # 结算轮询降频:已跟进行中赛事的结算结果不敏感(打几小时;提前卖出已即时结算;自动结算也不急)。
+    # 每 --resolution-poll-seconds(默认 300s)均匀拉一次所有在跟赛事的结算,而非随 5s drain 频繁查。
+    # 游标用每信号 resolution_checked_at 持久化(随 open_signals 落库),全局闸 = max(stamp)。
+    resolution_poll_interval = int(getattr(args, "resolution_poll_seconds", 300) or 0)
+    resolutions: dict[str, int] = {}
+    if open_signals and (
+        resolution_poll_interval <= 0
+        or now_ts - max((to_int(s.get("resolution_checked_at")) for s in open_signals), default=0) >= resolution_poll_interval
+    ):
+        for signal in open_signals:
+            signal["resolution_checked_at"] = now_ts
+        resolutions = fetch_resolutions_for_open_signals(
+            client,
+            open_signals,
+            state=state,
+            store=store,
+            now_ts=now_ts,
+            gamma_pages=args.resolution_gamma_pages,
+            ttl_seconds=args.resolution_cache_ttl_seconds,
+        )
     open_signals, settled = settle_open_signals(open_signals, resolutions, now_ts=now_ts)
     result_events = [*exited_signals, *settled]
     if result_events:
@@ -7238,6 +7249,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--observe-window-hours", type=float, default=24)
         subparser.add_argument("--event-cache-ttl-minutes", type=int, default=60)
         subparser.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
+        subparser.add_argument("--resolution-poll-seconds", type=int, default=300, help="已跟进行中赛事结算结果的轮询周期(秒);300s 均匀拉一次")
         subparser.add_argument("--resolution-gamma-pages", type=int, default=2)
         subparser.add_argument("--max-slippage-over-entry", type=float, default=0.10)
         subparser.add_argument("--max-entry-price", type=float, default=0.85)
@@ -7396,6 +7408,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--observe-window-hours", type=float, default=24)
     run.add_argument("--event-cache-ttl-minutes", type=int, default=60)
     run.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
+    run.add_argument("--resolution-poll-seconds", type=int, default=300, help="已跟进行中赛事结算结果的轮询周期(秒);300s 均匀拉一次,降低 Gamma 调用")
+    run.add_argument("--reconcile-interval-seconds", type=int, default=60, help="持仓对账兜底周期(秒);每周期核对最久未核对的若干笔")
+    run.add_argument("--reconcile-batch-size", type=int, default=20, help="每个对账周期核对的 open 跟单数上限(分批轮转)")
     run.add_argument("--resolution-gamma-pages", type=int, default=2)
     run.add_argument("--max-slippage-over-entry", type=float, default=0.10)
     run.add_argument("--max-entry-price", type=float, default=0.85)
