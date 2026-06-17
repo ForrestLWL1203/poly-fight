@@ -495,24 +495,23 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                 <option value="valorant">Valorant</option>
               </select>
               <span className="lb-updated" style={{ marginRight: 4 }}>最后更新 {updatedLabel} · {lb.activeCount} 个活跃</span>
-              <div style={{ display: "inline-flex", alignItems: "center", gap: "var(--sp-3)" }}>
-                <div style={{ display: "flex", flexDirection: "column", gap: 5, alignItems: "flex-start" }}>
-                  <label className="full-recollect-toggle" title="勾选后点击采集会清空采集库从 0 完整重建(保留 follow.db);不勾选走缓存增量采集" style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--text-secondary)", cursor: refreshing ? "default" : "pointer" }}>
-                    <input type="checkbox" checked={fullRecollect} disabled={refreshing} onChange={(e) => setFullRecollect(e.target.checked)} />
-                    完整重采
-                  </label>
-                  <label title="本轮深采的钱包上限(seed 候选按主游戏 round-robin 取此数)。必填。" style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--text-secondary)" }}>
-                    Max seed
-                    <input type="number" min="1" max="20000" step="100" value={maxSeed} disabled={refreshing}
-                      onChange={(e) => setMaxSeed(e.target.value)}
-                      style={{ width: 72, padding: "3px 8px", fontSize: 12, fontVariantNumeric: "tabular-nums",
-                        border: "1px solid " + (maxSeedValid ? "var(--border-strong, var(--border-hairline))" : "var(--status-warn)"),
-                        borderRadius: "var(--r-sm)", background: "var(--surface-inset)", color: "var(--text-primary)", outline: "none" }} />
-                  </label>
-                </div>
-                <div className="sample-trigger">
-                  <Button variant="primary" disabled={refreshing || !maxSeedValid} iconLeft={refreshing ? <Spinner sm /> : <Ico n="radar" />} onClick={startSample}>钱包采集</Button>
-                </div>
+              <div className={"collect-square" + (refreshing || !maxSeedValid ? " is-disabled" : "")}
+                role="button" tabIndex={0} aria-disabled={refreshing || !maxSeedValid} title="点击开始钱包采集"
+                onClick={() => { if (refreshing || !maxSeedValid) return; startSample(); }}
+                onKeyDown={(e) => { if ((e.key === "Enter" || e.key === " ") && !refreshing && maxSeedValid) { e.preventDefault(); startSample(); } }}>
+                <label className="cs-opt" title="勾选后点击采集会清空采集库从 0 完整重建(保留 follow.db);不勾选走缓存增量采集"
+                  onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+                  <input type="checkbox" checked={fullRecollect} disabled={refreshing} onChange={(e) => setFullRecollect(e.target.checked)} />
+                  完整重采
+                </label>
+                <label className="cs-opt cs-seed" title="本轮深采的钱包上限(seed 候选按主游戏 round-robin 取此数)。必填。"
+                  onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+                  Max seed
+                  <input type="number" className={maxSeedValid ? "" : "invalid"} min="1" max="20000" step="100" value={maxSeed} disabled={refreshing}
+                    onChange={(e) => setMaxSeed(e.target.value)} />
+                </label>
+                <span className="cs-divider" />
+                <span className="cs-action">{refreshing ? <Spinner sm /> : <Ico n="radar" />}钱包采集</span>
               </div>
             </div>
           </div>
