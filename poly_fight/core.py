@@ -10,7 +10,7 @@ from typing import Any, Iterable
 SECONDS_PER_DAY = 86400
 # profile 复用以此为失效令牌:改任何评分口径(门槛/公式/n_eff 下限/basis)都要 +1,
 # 否则采集会复用旧口径的画像、新规则不生效。改完需全量重采一次,之后才走复用加速。
-SCORING_VERSION = 19
+SCORING_VERSION = 20
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 # v16:两边对冲(套利)门统一 0.20——bucket 排除(core)、systemic(cli)、v2 钱包级(V2_MAX_TWO_SIDED_RATE)同口径。
@@ -35,9 +35,13 @@ SPORTS_MIN_ROI = 0.15
 ESPORTS_WILSON_LB_MIN = 0.65
 ESPORTS_EDGE_LB_MIN = 0.05
 ESPORTS_N_EFF_FLOOR = 12
+# 桶内胜率硬门(v20):进榜/跟单的专精桶,近期加权胜率 θ̂ 必须 ≥ 此值,否则判 C —— 不进榜、不跟单。
+# 推翻 v17"只看 edge"的取舍:极低胜率靠单场低价冷门拉 edge 的钱包,等比跟单大概率亏、方差过大,排除。
+ESPORTS_MIN_BUCKET_WIN_RATE = 0.68
 SPORTS_WILSON_LB_MIN = 0.55
 SPORTS_EDGE_LB_MIN = 0.03
 SPORTS_N_EFF_FLOOR = 12
+SPORTS_MIN_BUCKET_WIN_RATE = 0.60
 # v19:可跟价区(≤ceiling)子集最小厚度。全样本地板(12)管"真活跃",此项管"别拿太薄的可跟切片下判断"
 # (防 3–5 场侥幸过 edge_lb)。edge_lb 的 Wilson 仍在子集上算。
 ESPORTS_SUBSET_MIN_SAMPLE = 6
@@ -2055,6 +2059,7 @@ def classify_wallet_bucket(
     copy_edge = win_rate - median_entry if median_entry > 0 else None                 # 点估 edge,仅展示
     min_wilson = SPORTS_WILSON_LB_MIN if is_sports else ESPORTS_WILSON_LB_MIN
     min_edge_lb = SPORTS_EDGE_LB_MIN if is_sports else ESPORTS_EDGE_LB_MIN
+    min_win_rate = SPORTS_MIN_BUCKET_WIN_RATE if is_sports else ESPORTS_MIN_BUCKET_WIN_RATE  # v20:桶内胜率硬门
     min_eff = float(min_sample)   # n_eff 数值兜底(esports=12),作用于全样本 eff_sample_full
     min_sub = float(SPORTS_SUBSET_MIN_SAMPLE if is_sports else ESPORTS_SUBSET_MIN_SAMPLE)  # v19:可跟价区子集最小厚度
 
@@ -2064,6 +2069,8 @@ def classify_wallet_bucket(
         reasons.append("thin_followable_subset")  # v19:可跟价区子集太薄,不据此判桶
     if bucket_edge_lb is None or bucket_edge_lb < min_edge_lb:
         reasons.append("weak_edge_lb")
+    if win_rate < min_win_rate:
+        reasons.append("win_rate_below_floor")  # v20:桶内 θ̂ < 门(默认 0.68)→ 硬排除
     # 以下全是软 reason(仅展示/观测,不参与判定):
     # v17:胜率门已删。实证 edge 在 0.55–0.85 ≈ +5% 平线,胜率不预测盈利、edge 才预测;
     # 胜率门只会偏袒大热、误杀中价专家(盈利一样)。wilson_lb 仅留作展示。
@@ -2089,6 +2096,7 @@ def classify_wallet_bucket(
         eff_sample_full >= min_eff   # v18:地板用全样本(活跃度);edge_lb 已含子集 Wilson 置信
         and eff_sample >= min_sub    # v19:可跟价区子集 ≥6,防太薄切片侥幸
         and edge_ok and bucket_edge_lb >= min_edge_lb
+        and win_rate >= min_win_rate  # v20:桶内胜率硬门(默认 0.68)
         and not stale
     ):
         grade = "A"
@@ -2096,6 +2104,7 @@ def classify_wallet_bucket(
         eff_sample_full >= min_eff
         and eff_sample >= min_sub
         and edge_ok and bucket_edge_lb >= (min_edge_lb - GRADE_B_EDGE_RELAX)
+        and win_rate >= min_win_rate  # v20:B 同样要过胜率门(只放宽 edge,不放宽胜率)
         and not stale
     ):
         grade = "B"

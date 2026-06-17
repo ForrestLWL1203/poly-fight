@@ -4883,6 +4883,10 @@ def build_collector_leaderboard_v2(
                 "best_bucket": best["bucket_key"],
                 "best_market_type": best["market_type"],
                 "best_bucket_score": best["score"],   # 0-100 新轴展示分(dashboard 显示)
+                # 顶层提升 avg_market_cash(dashboard 读顶层;它原只在 candidate 里 → 显示 0)。
+                "avg_market_cash": _v2_candidate_metric(profile, "avg_market_cash"),
+                # 进榜桶内胜率 θ̂(dashboard 显示用 —— 比整体 positive_market_rate 更准、且与胜率门同口径)。
+                "best_bucket_win_rate": best["win_rate"],
                 "edge_type": best["edge_type"],
                 "eligible_buckets": [item["bucket_key"] for item in eligible],
                 # follow 循环按 eligible_market_types 判定可跟盘口;从够格桶派生,否则 v2 钱包会被跳过。

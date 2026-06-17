@@ -233,9 +233,17 @@
       score: Math.round(num(row.best_bucket_score)),
       roi: Math.round(pct(row.esports_roi) * 10) / 10,
       overallRoi: row.overall_esports_roi != null ? Math.round(pct(row.overall_esports_roi) * 10) / 10 : null,
-      winRate: row.positive_market_rate != null ? Math.round(pct(row.positive_market_rate)) : null,
+      // 显示"我们会跟的专精桶"胜率 θ̂:1 个桶=该桶胜率,多个桶=各桶平均(与胜率门同口径)。
+      // 不显示整体 positive_market_rate(口径不对)。老 row 无桶明细时回退 best_bucket_win_rate。
+      winRate: (() => {
+        const wrs = (row.eligible_bucket_details || []).map((d) => d.win_rate).filter((x) => x != null);
+        if (wrs.length) return Math.round(pct(wrs.reduce((a, b) => a + b, 0) / wrs.length));
+        if (row.best_bucket_win_rate != null) return Math.round(pct(row.best_bucket_win_rate));
+        return null;
+      })(),
       closedCount: num(row.esports_closed_count),
-      avgCash: num(row.avg_market_cash),
+      // 场均交易额在顶层或嵌套 candidate 里(与后端 _v2_candidate_metric 同口径);老/瘦身 row 只在 candidate。
+      avgCash: num(row.avg_market_cash != null ? row.avg_market_cash : (row.candidate && row.candidate.avg_market_cash)),
       recent: row.recent_bucket_roi != null ? Math.round(pct(row.recent_bucket_roi) * 10) / 10 : null,
       scope: scopeList(row),
       settled,

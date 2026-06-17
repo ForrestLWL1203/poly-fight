@@ -3916,6 +3916,39 @@ class CoreTest(unittest.TestCase):
             rows, now=now, lookback_by_game={"valorant": 30, "cs2": 14}, default_days=15)
         self.assertEqual({r["condition_id"] for r in kept}, {"v-fresh", "c-fresh"})
 
+    def test_win_rate_floor_excludes_low_winrate_high_edge_bucket(self):
+        # v20:桶内 θ̂ < 0.68 即使买得便宜、edge 充足,也判 C —— 不进榜、不跟单。
+        now = 1_000_000
+
+        def summary(n, win_rate, avg_price):
+            wins = round(win_rate * n)
+            pos = [
+                {"conditionId": f"w{i}", "totalBought": 1000, "realizedPnl": 500,
+                 "avgPrice": avg_price, "timestamp": now - 500 + i} for i in range(wins)
+            ] + [
+                {"conditionId": f"l{i}", "totalBought": 1000, "realizedPnl": -1000,
+                 "avgPrice": avg_price, "timestamp": now - 500 + wins + i} for i in range(n - wins)
+            ]
+            cids = {p["conditionId"] for p in pos}
+            s = summarize_closed_positions(
+                pos, cids,
+                condition_type_by_id={c: "main_match" for c in cids},
+                condition_game_family_by_id={c: "cs2" for c in cids},
+                now_ts=now,
+            )
+            return {**s, "category": "esports"}
+
+        # θ̂≈0.60、买在 0.25(edge 充足)→ 胜率门拦下,不合格 + 明确拒因
+        low = classify_wallet(summary(20, 0.60, 0.25), now_ts=now)
+        self.assertNotIn("cs2:main_match", low.get("eligible_buckets") or [])
+        self.assertIn(
+            "win_rate_below_floor",
+            (low.get("per_game_type_grades") or {}).get("cs2:main_match", {}).get("reasons") or [],
+        )
+        # θ̂≈0.75 同样买便宜 → 过胜率门 → 合格
+        high = classify_wallet(summary(20, 0.75, 0.25), now_ts=now)
+        self.assertIn("cs2:main_match", high.get("eligible_buckets") or [])
+
     def test_valorant_thin_bucket_eligible_under_adaptive_neff(self):
         # 同一份 valorant profile(单游戏 ~10 场):n_eff_floors={valorant:8} → 上榜路径合格;
         # 全局默认 12 → 判薄样本不合格。锁住 per-game n_eff 自适应。
