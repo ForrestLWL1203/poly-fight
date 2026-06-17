@@ -22,9 +22,15 @@
   /* Signature gradient — soft coral, used sparingly on CTAs / hero */
   --gradient-brand: linear-gradient(135deg, #ff8a5f 0%, #ff6b4a 55%, #f0512f 100%); /* @kind color */
   --gradient-brand-soft: linear-gradient(135deg, rgba(255,138,95,0.16), rgba(240,81,47,0.10)); /* @kind color */
-  --gradient-mesh: radial-gradient(120% 120% at 0% 0%, rgba(255,107,74,0.16) 0%, rgba(255,107,74,0) 46%),
-                   radial-gradient(120% 120% at 100% 0%, rgba(255,176,120,0.18) 0%, rgba(255,176,120,0) 50%),
-                   radial-gradient(140% 140% at 100% 100%, rgba(44,140,132,0.12) 0%, rgba(44,140,132,0) 55%); /* @kind color */
+  /* 散布的暖色圆斑(像颜料滴入水中雾化散开):多个小 radial blob,斑点之间留底色,
+     而非从角落蔓延满屏。玻璃 backdrop-filter 把它们雾化成毛玻璃质感。 */
+  --gradient-mesh: radial-gradient(circle at 13% 24%, rgba(255,107,74,0.52) 0%, rgba(255,107,74,0) 23%),
+                   radial-gradient(circle at 83% 15%, rgba(255,184,128,0.54) 0%, rgba(255,184,128,0) 21%),
+                   radial-gradient(circle at 49% 46%, rgba(255,150,105,0.40) 0%, rgba(255,150,105,0) 25%),
+                   radial-gradient(circle at 71% 70%, rgba(255,138,95,0.48) 0%, rgba(255,138,95,0) 23%),
+                   radial-gradient(circle at 27% 80%, rgba(44,140,132,0.32) 0%, rgba(44,140,132,0) 23%),
+                   radial-gradient(circle at 93% 82%, rgba(255,176,120,0.44) 0%, rgba(255,176,120,0) 21%),
+                   radial-gradient(circle at 3% 60%, rgba(255,120,90,0.34) 0%, rgba(255,120,90,0) 21%); /* @kind color */
 
   /* ---- Warm cream surface ladder (light) ---- */
   --ink-base: #f0eadf;           /* canvas */
@@ -37,11 +43,11 @@
 
   /* Glass surfaces (translucent, sit over the warm mesh) — lower alpha + stronger
      blur(effects.css) = a more pronounced frosted-glass read. */
-  --glass-1: rgba(255, 253, 248, 0.50);
-  --glass-2: rgba(255, 255, 255, 0.56);
-  --glass-3: rgba(244, 238, 227, 0.48);
-  --glass-hairline: rgba(58, 46, 32, 0.10);
-  --glass-hairline-strong: rgba(58, 46, 32, 0.15);
+  --glass-1: rgba(255, 253, 248, 0.22);
+  --glass-2: rgba(255, 255, 255, 0.28);
+  --glass-3: rgba(244, 238, 227, 0.16);
+  --glass-hairline: rgba(58, 46, 32, 0.12);
+  --glass-hairline-strong: rgba(58, 46, 32, 0.18);
 
   /* ---- Text (warm charcoal) ---- */
   --text-primary: rgba(33, 28, 21, 0.94);
@@ -76,12 +82,12 @@
   --shadow-c-3: rgba(74, 56, 36, 0.12); /* @kind shadow */
   --shadow-c-4: rgba(74, 56, 36, 0.16); /* @kind shadow */
   --shadow-accent-c: rgba(255, 107, 74, 0.30); /* @kind shadow */
-  --highlight-c: rgba(255, 255, 255, 0.72); /* @kind shadow */
+  --highlight-c: rgba(255, 255, 255, 0.28); /* @kind shadow */ /* 玻璃顶部微光,降至不显白缝 */
 
   /* ---- Semantic aliases (use these in components) ---- */
   --bg-canvas: var(--ink-base);
   --bg-app: var(--ink-900);
-  --surface-sidebar: rgba(251, 247, 240, 0.80);
+  --surface-sidebar: rgba(251, 247, 240, 0.44);
   --surface-panel: var(--glass-1);
   --surface-card: var(--glass-2);
   --surface-inset: var(--glass-3);
@@ -111,9 +117,13 @@
 
   --gradient-brand: linear-gradient(135deg, #ff9a72 0%, #ff7a5c 55%, #f0512f 100%); /* @kind color */
   --gradient-brand-soft: linear-gradient(135deg, rgba(255,154,114,0.20), rgba(240,81,47,0.14)); /* @kind color */
-  --gradient-mesh: radial-gradient(120% 120% at 0% 0%, rgba(255,122,92,0.16) 0%, rgba(255,122,92,0) 46%),
-                   radial-gradient(120% 120% at 100% 0%, rgba(255,154,114,0.12) 0%, rgba(255,154,114,0) 50%),
-                   radial-gradient(140% 140% at 100% 100%, rgba(56,179,166,0.10) 0%, rgba(56,179,166,0) 55%); /* @kind color */
+  --gradient-mesh: radial-gradient(circle at 13% 24%, rgba(255,122,92,0.34) 0%, rgba(255,122,92,0) 23%),
+                   radial-gradient(circle at 83% 15%, rgba(255,154,114,0.30) 0%, rgba(255,154,114,0) 21%),
+                   radial-gradient(circle at 49% 46%, rgba(255,130,95,0.24) 0%, rgba(255,130,95,0) 25%),
+                   radial-gradient(circle at 71% 70%, rgba(255,107,74,0.28) 0%, rgba(255,107,74,0) 23%),
+                   radial-gradient(circle at 27% 80%, rgba(56,179,166,0.24) 0%, rgba(56,179,166,0) 23%),
+                   radial-gradient(circle at 93% 82%, rgba(255,154,114,0.26) 0%, rgba(255,154,114,0) 21%),
+                   radial-gradient(circle at 3% 60%, rgba(255,122,92,0.22) 0%, rgba(255,122,92,0) 21%); /* @kind color */
 
   /* Warm charcoal ladder */
   --ink-base: #16120d;
@@ -124,11 +134,11 @@
   --ink-500: #41382c;
   --ink-400: #4f4537;
 
-  --glass-1: rgba(34, 28, 21, 0.40);
-  --glass-2: rgba(43, 36, 28, 0.46);
-  --glass-3: rgba(52, 44, 34, 0.38);
-  --glass-hairline: rgba(255, 244, 230, 0.09);
-  --glass-hairline-strong: rgba(255, 244, 230, 0.15);
+  --glass-1: rgba(34, 28, 21, 0.20);
+  --glass-2: rgba(43, 36, 28, 0.26);
+  --glass-3: rgba(52, 44, 34, 0.16);
+  --glass-hairline: rgba(255, 244, 230, 0.10);
+  --glass-hairline-strong: rgba(255, 244, 230, 0.17);
 
   --text-primary: rgba(250, 246, 240, 0.96);
   --text-secondary: rgba(245, 238, 228, 0.60);
@@ -163,10 +173,10 @@
 
   --bg-canvas: var(--ink-base);
   --bg-app: var(--ink-900);
-  --surface-sidebar: rgba(27, 22, 16, 0.58);
-  --surface-panel: rgba(34, 28, 21, 0.40);
-  --surface-card: rgba(43, 36, 28, 0.46);
-  --surface-inset: rgba(52, 44, 34, 0.38);
+  --surface-sidebar: rgba(27, 22, 16, 0.34);
+  --surface-panel: rgba(34, 28, 21, 0.20);
+  --surface-card: rgba(43, 36, 28, 0.26);
+  --surface-inset: rgba(52, 44, 34, 0.16);
   --surface-solid: var(--ink-700);
   --border-hairline: rgba(255, 244, 230, 0.09);
   --border-strong: rgba(255, 244, 230, 0.15);

@@ -16,7 +16,10 @@
   background-clip: border-box !important;
 }
 
-.app-shell { display: flex; height: 100vh; overflow: hidden; }
+.app-shell { display: flex; height: 100vh; overflow: hidden; position: relative; background-color: var(--bg-app); }
+/* 彩色暖背板:玻璃面板的 backdrop-filter 透视模糊它,才有毛玻璃质感(固定不随内容滚动)。 */
+.app-shell::before { content: ""; position: fixed; inset: 0; z-index: 0; background: var(--gradient-mesh); pointer-events: none; }
+.app-shell > * { position: relative; z-index: 1; }
 .app-main { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
 
 /* ---- Topbar ---- */
