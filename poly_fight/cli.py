@@ -6024,6 +6024,92 @@ def build_position_backfill_trades(
     return by_wallet, stats
 
 
+def build_position_exit_reconcile_trades(
+    client: PolymarketClient,
+    open_signals: list[dict[str, Any]],
+    markets_by_condition: dict[str, dict[str, Any]],
+    *,
+    now_ts: int,
+    min_exit_price: float = 0.1,
+    positions_limit: int = 500,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
+    """运行期持仓对账(每 tick):WS/轮询可能漏抓目标钱包的卖出(重连窗口/订阅时序/
+    兜底未覆盖已开仓单子)。逐"有 open 跟单"的钱包查当前持仓,**目标已清仓而我们仍持有**
+    → 合成一笔全量 SELL 走 process_follow_trades → apply_follow_sell 镜像补平。
+
+    安全闸:
+      1. 持仓查询返回空 → 跳过该钱包(防 API 抖动把"全清仓"误判,导致错误全平);
+      2. 现价 < min_exit_price(默认 0.1)→ 跳过,大概率已无盘口,留到结算认亏;
+      3. 按 (condition_id, outcome 名) 匹配持仓,size>0 视为仍持有。
+    返回 ({wallet:[sell_trade]}, stats)。是 build_position_backfill_trades 的对称操作。
+    """
+    by_wallet_sigs: dict[str, list[dict[str, Any]]] = {}
+    for signal in open_signals:
+        if (signal.get("status") or "open") != "open":
+            continue
+        wallet = normalize_wallet(signal.get("wallet"))
+        if wallet:
+            by_wallet_sigs.setdefault(wallet, []).append(signal)
+
+    out: dict[str, list[dict[str, Any]]] = {}
+    stats: dict[str, int] = {
+        "wallets_checked": 0, "still_holding": 0, "exited_detected": 0,
+        "synth_sells": 0, "low_price_skipped": 0, "no_price_skipped": 0, "empty_positions_skipped": 0,
+    }
+    for wallet, sigs in by_wallet_sigs.items():
+        try:
+            positions = client.positions(wallet, limit=positions_limit)
+        except Exception:
+            continue
+        if not positions:  # 闸1:空响应不当作"全清仓",跳过避免误平
+            stats["empty_positions_skipped"] += 1
+            continue
+        stats["wallets_checked"] += 1
+        held: dict[tuple[str, str], float] = {}
+        for pos in positions:
+            cid = str(pos.get("conditionId") or pos.get("condition_id") or "").lower()
+            name = str(pos.get("outcome") or "").strip().lower()
+            held[(cid, name)] = held.get((cid, name), 0.0) + to_float(pos.get("size"))
+        for signal in sigs:
+            cid = str(signal.get("condition_id") or "").lower()
+            name = str(signal.get("outcome") or "").strip().lower()
+            idx = to_int(signal.get("outcome_index"), -1)
+            if idx < 0:
+                continue
+            bought = sum(to_float(leg.get("wallet_trade_size")) for leg in signal.get("legs") or [])
+            remaining = bought - to_float(signal.get("wallet_sell_size"))
+            if held.get((cid, name), 0.0) > 1e-6 or remaining <= 1e-6:
+                stats["still_holding"] += 1
+                continue
+            stats["exited_detected"] += 1
+            market = markets_by_condition.get(cid)
+            if not market:
+                continue
+            prices = market.get("outcome_prices") or []
+            price = to_float(prices[idx]) if idx < len(prices) else 0.0
+            if price <= 0:  # 闸:无现价,本 tick 不补卖(下 tick 有价再说)
+                stats["no_price_skipped"] += 1
+                continue
+            if price < min_exit_price:  # 闸2:价格极低,大概率无盘口 → 留到结算
+                stats["low_price_skipped"] += 1
+                continue
+            out.setdefault(wallet, []).append({
+                "conditionId": cid,
+                "outcomeIndex": idx,
+                "outcome_index": idx,
+                "outcome": signal.get("outcome"),
+                "side": "SELL",
+                "size": round(max(remaining, 0.0), 8),
+                "price": round(price, 8),
+                "timestamp": int(now_ts),
+                "id": f"reconcile-exit:{signal.get('signal_id')}:{int(now_ts)}",
+                "transactionHash": f"reconcile-exit:{signal.get('signal_id')}:{int(now_ts)}",
+                "source": "position_exit_reconcile",
+            })
+            stats["synth_sells"] += 1
+    return out, stats
+
+
 def command_follow(
     args: argparse.Namespace,
     client: PolymarketClient | None = None,
@@ -6554,6 +6640,39 @@ def command_follow(
 
     state["wallet_trade_state"] = wallet_trade_state
     state["updated_at"] = now_ts
+
+    # 运行期持仓对账:目标钱包已清仓而我们漏抓其卖出(WS 重连窗口/订阅时序/兜底未覆盖)
+    # → 直接查持仓,合成全量 SELL 镜像补平(现价<0.1 留到结算)。不依赖重启,每 tick 兜底。
+    if open_signals:
+        markets_for_reconcile = active_markets_for_follow or watched
+        exit_by_wallet, exit_reconcile_stats = build_position_exit_reconcile_trades(
+            client, open_signals, markets_for_reconcile, now_ts=now_ts,
+        )
+        for reconcile_wallet, exit_trades in exit_by_wallet.items():
+            open_signals, _exit_pft_stats = process_follow_trades(
+                open_signals,
+                wallet=reconcile_wallet,
+                trades=exit_trades,
+                markets_by_condition=markets_for_reconcile,
+                now_ts=now_ts,
+                stake_usdc=args.stake_usdc,
+                max_follow_legs=args.max_follow_legs,
+                max_slippage=1.0,
+                min_wallet_entry_price=args.min_wallet_entry_price,
+                max_entry_price=effective_max_entry_price,
+                stake_ratio_percent=args.stake_ratio_percent,
+                require_pre_match=args.require_pre_match,
+                post_start_grace_seconds=args.post_start_trade_grace_seconds,
+                quarantine_sell_frac=args.quarantine_sell_frac,
+                conflict_policy="dual_follow",
+                bankroll_usdc=bankroll_usdc,
+                max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
+                max_signal_stake_usdc=max_signal_stake_usdc,
+                follow_strategy=follow_strategy,
+            )
+            exited_signal_count += _exit_pft_stats.get("exited_signal_count", 0)
+        if emit and exit_reconcile_stats.get("synth_sells"):
+            print(json.dumps({"status": "position_exit_reconcile", **exit_reconcile_stats}, ensure_ascii=False), flush=True)
 
     settlement_started_mono = time.monotonic()
     open_signals, clv_stats = apply_closing_line_snapshots(open_signals, active_markets, now_ts=now_ts)
