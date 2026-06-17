@@ -378,6 +378,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         extra_args = v2_refresh_extra_args(form) if category == "esports" else None
         full_recollect = str(form.get("full_recollect")).lower() in ("true", "1", "yes", "on")
         try:
+            max_profile_wallets = int(form.get("max_profile_wallets") or 2000)
+        except (TypeError, ValueError):
+            max_profile_wallets = 2000
+        try:
             status = start_wallet_refresh(
                 self.dashboard_config.data_dir,
                 category=category,
@@ -386,6 +390,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 timeout_seconds=self.dashboard_config.wallet_refresh_timeout_seconds,
                 extra_args=extra_args,
                 full_recollect=full_recollect,
+                max_profile_wallets=max_profile_wallets,
             )
         except WalletRefreshAlreadyRunning as exc:
             self._json({"ok": False, "error": "wallet_refresh_running", "data": exc.status}, status=HTTPStatus.CONFLICT)
@@ -3169,6 +3174,7 @@ def start_wallet_refresh(
     timeout_seconds: int = 7200,
     extra_args: list[str] | None = None,
     full_recollect: bool = False,
+    max_profile_wallets: int = 2000,
 ) -> dict[str, Any]:
     category = normalize_category(category)
     if not category:
@@ -3189,9 +3195,10 @@ def start_wallet_refresh(
     log_path = follow_dir / f"wallet-refresh-{category}-{now_ts}.out"
     # v2 是唯一管线:刷新走 collect-v2(esports;sports 已退役)。可透传胜率/买入价阈值。
     base = [sys.executable, "-u", "-m", "poly_fight.cli", "--data-dir", str(category_dir)]
+    max_profile_wallets = max(1, min(20000, int(max_profile_wallets or 2000)))  # 钳到 [1, 20000]
     command = [
         *base, "collect-v2", "--category", category,
-        "--refresh-classification", "--max-profile-wallets", "2000",  # v16:扩漏斗,与 CLI 默认一致
+        "--refresh-classification", "--max-profile-wallets", str(max_profile_wallets),  # 由 dashboard 输入
         *(extra_args or []),
     ]
     status = {
@@ -3200,6 +3207,7 @@ def start_wallet_refresh(
         "started_at": now_ts,
         "command": command,
         "full_recollect": bool(full_recollect),
+        "max_profile_wallets": max_profile_wallets,
         "log_path": str(log_path),
         "owner_pid": os.getpid(),   # 监控线程所在的 serve;serve 死亡 → 孤儿 → 读时自愈为 failed
     }

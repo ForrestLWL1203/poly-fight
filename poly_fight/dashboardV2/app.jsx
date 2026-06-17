@@ -415,6 +415,9 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
   const [pg, setPg] = React.useState(1);
   const [busy, setBusy] = React.useState({});
   const [fullRecollect, setFullRecollect] = React.useState(false);
+  const [maxSeed, setMaxSeed] = React.useState("2000");
+  const maxSeedNum = parseInt(maxSeed, 10);
+  const maxSeedValid = Number.isFinite(maxSeedNum) && maxSeedNum >= 1 && maxSeedNum <= 20000;
   React.useEffect(() => { setPg(1); }, [view, gameFilter]);
   React.useEffect(() => { window.lucide && window.lucide.createIcons(); });
 
@@ -457,12 +460,14 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
   const updatedLabel = lb.updatedAt ? Adapt.timeAgo(lb.updatedAt) : "—";
   // 门槛(胜率/edge/n_eff/价格带)现在全在 core.py 评分常量里,采集无需前端传参。
   const startSample = () => {
-    if (!onSample) return;
+    if (!onSample || !maxSeedValid) return;
     if (fullRecollect) {
       const ok = window.confirm("完整重采会清空采集库(钱包画像 / 榜单 / 交易缓存)从 0 重建,耗时较久(约 20-30 分钟)。\nfollow.db(模拟跟单历史)会保留。确定?");
       if (!ok) return;
     }
-    onSample("esports", fullRecollect ? { full_recollect: true } : {});
+    const body = { max_profile_wallets: maxSeedNum };
+    if (fullRecollect) body.full_recollect = true;
+    onSample("esports", body);
   };
 
   return (
@@ -488,8 +493,15 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                 <input type="checkbox" checked={fullRecollect} disabled={refreshing} onChange={(e) => setFullRecollect(e.target.checked)} />
                 完整重采
               </label>
+              <label title="本轮深采的钱包上限(seed 候选按主游戏 round-robin 取此数)。必填。" style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--text-secondary)", marginRight: 4 }}>
+                Max seed
+                <input type="number" min="1" max="20000" step="100" value={maxSeed} disabled={refreshing}
+                  onChange={(e) => setMaxSeed(e.target.value)}
+                  className="ps-input"
+                  style={{ width: 78, padding: "2px 6px", fontSize: 12, borderColor: maxSeedValid ? undefined : "var(--status-warn)" }} />
+              </label>
               <div className="sample-trigger">
-                <Button variant="primary" disabled={refreshing} iconLeft={refreshing ? <Spinner sm /> : <Ico n="radar" />} onClick={startSample}>钱包采集</Button>
+                <Button variant="primary" disabled={refreshing || !maxSeedValid} iconLeft={refreshing ? <Spinner sm /> : <Ico n="radar" />} onClick={startSample}>钱包采集</Button>
               </div>
             </div>
           </div>
