@@ -6087,6 +6087,17 @@ def build_position_backfill_trades(
     return by_wallet, stats
 
 
+def _market_outcome_token(market: dict[str, Any], idx: int) -> str | None:
+    raw = market.get("clobTokenIds") or market.get("clob_token_ids")
+    if not raw:
+        return None
+    try:
+        tokens = json.loads(raw) if isinstance(raw, str) else list(raw)
+    except (ValueError, TypeError):
+        return None
+    return str(tokens[idx]) if 0 <= idx < len(tokens) else None
+
+
 def build_position_exit_reconcile_trades(
     client: PolymarketClient,
     open_signals: list[dict[str, Any]],
@@ -6095,17 +6106,21 @@ def build_position_exit_reconcile_trades(
     now_ts: int,
     min_exit_price: float = 0.1,
     positions_limit: int = 500,
+    price_loader=None,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
-    """运行期持仓对账(每 tick):WS/轮询可能漏抓目标钱包的卖出(重连窗口/订阅时序/
-    兜底未覆盖已开仓单子)。逐"有 open 跟单"的钱包查当前持仓,**目标已清仓而我们仍持有**
-    → 合成一笔全量 SELL 走 process_follow_trades → apply_follow_sell 镜像补平。
+    """运行期持仓对账(独立兜底,非每 tick):WS 可能漏抓目标钱包的卖出(重连窗口/订阅时序)。
+    对传入的这批 open 跟单查目标钱包当前持仓,**目标已清仓而我们仍持有** → 查 CLOB 卖一价 →
+    合成一笔全量 SELL 走 process_follow_trades → apply_follow_sell 镜像补平 → 该单结算。
 
-    安全闸:
+    现价取 CLOB 卖一价(price_loader,默认 clob_price(...,"sell"),可注入便于测试),
+    退化到市场快照 outcome_prices。安全闸:
       1. 持仓查询返回空 → 跳过该钱包(防 API 抖动把"全清仓"误判,导致错误全平);
       2. 现价 < min_exit_price(默认 0.1)→ 跳过,大概率已无盘口,留到结算认亏;
       3. 按 (condition_id, outcome 名) 匹配持仓,size>0 视为仍持有。
-    返回 ({wallet:[sell_trade]}, stats)。是 build_position_backfill_trades 的对称操作。
+    返回 ({wallet:[sell_trade]}, stats)。是 build_position_backfill_trades 的对称操作;
+    调用方负责按 60s/批量 节流,不放进每 5s 主循环。
     """
+    fetch_price = price_loader or (lambda token: clob_price(token, "sell"))
     by_wallet_sigs: dict[str, list[dict[str, Any]]] = {}
     for signal in open_signals:
         if (signal.get("status") or "open") != "open":
@@ -6148,9 +6163,18 @@ def build_position_exit_reconcile_trades(
             market = markets_by_condition.get(cid)
             if not market:
                 continue
-            prices = market.get("outcome_prices") or []
-            price = to_float(prices[idx]) if idx < len(prices) else 0.0
-            if price <= 0:  # 闸:无现价,本 tick 不补卖(下 tick 有价再说)
+            # 现价:优先 CLOB 卖一价(实盘要真实可成交价),退化到市场快照
+            price = 0.0
+            token = _market_outcome_token(market, idx)
+            if token:
+                try:
+                    price = to_float(fetch_price(token))
+                except Exception:
+                    price = 0.0
+            if price <= 0:
+                prices = market.get("outcome_prices") or []
+                price = to_float(prices[idx]) if idx < len(prices) else 0.0
+            if price <= 0:  # 闸:无现价,本轮不补卖(下轮再说)
                 stats["no_price_skipped"] += 1
                 continue
             if price < min_exit_price:  # 闸2:价格极低,大概率无盘口 → 留到结算
@@ -6704,12 +6728,22 @@ def command_follow(
     state["wallet_trade_state"] = wallet_trade_state
     state["updated_at"] = now_ts
 
-    # 运行期持仓对账:目标钱包已清仓而我们漏抓其卖出(WS 重连窗口/订阅时序/兜底未覆盖)
-    # → 直接查持仓,合成全量 SELL 镜像补平(现价<0.1 留到结算)。不依赖重启,每 tick 兜底。
-    if open_signals:
+    # 独立持仓对账兜底(非每 5s 主循环):WS 可能漏抓目标钱包卖出。每 reconcile_interval(默认
+    # 60s)只对**最久未核对的最多 reconcile_batch(默认 20)笔** open 跟单查目标持仓 —— 目标已清仓
+    # → 查 CLOB 卖价镜像平仓、该单结算。跟很多单时分批轮转,避免把 data-api 打爆。
+    # 节流游标用每信号 position_reconcile_at 持久化(随 open_signals 落库),全局闸 = max(stamp)。
+    reconcile_interval = int(getattr(args, "reconcile_interval_seconds", 60) or 0)
+    reconcile_batch = int(getattr(args, "reconcile_batch_size", 20) or 0)
+    open_for_reconcile = [s for s in open_signals if (s.get("status") or "open") == "open"]
+    if open_for_reconcile and reconcile_interval > 0 and reconcile_batch > 0 and (
+        now_ts - max((to_int(s.get("position_reconcile_at")) for s in open_for_reconcile), default=0) >= reconcile_interval
+    ):
+        due = sorted(open_for_reconcile, key=lambda s: to_int(s.get("position_reconcile_at")))[:reconcile_batch]
+        for signal in due:
+            signal["position_reconcile_at"] = now_ts
         markets_for_reconcile = active_markets_for_follow or watched
         exit_by_wallet, exit_reconcile_stats = build_position_exit_reconcile_trades(
-            client, open_signals, markets_for_reconcile, now_ts=now_ts,
+            client, due, markets_for_reconcile, now_ts=now_ts,
         )
         for reconcile_wallet, exit_trades in exit_by_wallet.items():
             open_signals, _exit_pft_stats = process_follow_trades(
@@ -7225,6 +7259,10 @@ def build_parser() -> argparse.ArgumentParser:
         # instead of the slow data-api tick (the WS already detected fills sub-second;
         # this bounds how soon we act on them). Ignored when WS is unavailable.
         subparser.add_argument("--ws-drain-seconds", type=int, default=5)
+        # 独立持仓对账兜底:每 N 秒只核对最久未核对的 M 笔 open 跟单的目标持仓(分批轮转,
+        # 不放进每 5s 主循环)。目标已清仓 → 镜像平仓。0 关闭。
+        subparser.add_argument("--reconcile-interval-seconds", type=int, default=60)
+        subparser.add_argument("--reconcile-batch-size", type=int, default=20)
         subparser.add_argument("--quarantine-sell-frac", type=float, default=0.2)
         subparser.add_argument("--max-workers", type=int, default=8)
         subparser.add_argument("--max-requests-per-second", type=float, default=10)

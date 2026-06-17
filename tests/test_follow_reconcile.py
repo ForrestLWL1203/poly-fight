@@ -31,8 +31,14 @@ class FakeClient:
 
 
 def _markets(price):
-    # 二元市场,KOLESIE=idx0 现价 price
-    return {CID: {"category": "esports", "outcome_prices": [price, round(1 - price, 8)]}}
+    # 二元市场,KOLESIE=idx0 现价 price;带 clobTokenIds 供 CLOB 取价路径
+    return {CID: {"category": "esports", "outcome_prices": [price, round(1 - price, 8)],
+                  "clobTokenIds": ["tokA", "tokB"]}}
+
+
+# 注入式 price_loader:CLOB 卖价桩,返回 idx0 token 的价(测试不打网络)
+def _price_loader(price):
+    return lambda token: price if token == "tokA" else round(1 - price, 8)
 
 
 class ExitReconcileTest(unittest.TestCase):
@@ -40,7 +46,7 @@ class ExitReconcileTest(unittest.TestCase):
         # 钱包持仓里没有该 (cid, outcome)(已清仓),但持仓非空(还有别的仓)
         client = FakeClient([{"conditionId": "0xother", "outcome": "TeamX", "size": 50.0}])
         out, stats = build_position_exit_reconcile_trades(
-            client, [_signal(bought=100.0)], _markets(0.45), now_ts=1000,
+            client, [_signal(bought=100.0)], _markets(0.45), now_ts=1000, price_loader=_price_loader(0.45),
         )
         self.assertEqual(stats["exited_detected"], 1)
         self.assertEqual(stats["synth_sells"], 1)
@@ -54,7 +60,7 @@ class ExitReconcileTest(unittest.TestCase):
     def test_wallet_still_holding_no_sell(self):
         client = FakeClient([{"conditionId": CID, "outcome": "KOLESIE", "size": 80.0}])
         out, stats = build_position_exit_reconcile_trades(
-            client, [_signal()], _markets(0.45), now_ts=1000,
+            client, [_signal()], _markets(0.45), now_ts=1000, price_loader=_price_loader(0.45),
         )
         self.assertEqual(stats["still_holding"], 1)
         self.assertEqual(stats["synth_sells"], 0)
@@ -64,7 +70,7 @@ class ExitReconcileTest(unittest.TestCase):
         # 已清仓但现价 < 0.1 → 不补卖,留到结算
         client = FakeClient([{"conditionId": "0xother", "outcome": "TeamX", "size": 50.0}])
         out, stats = build_position_exit_reconcile_trades(
-            client, [_signal()], _markets(0.05), now_ts=1000,
+            client, [_signal()], _markets(0.05), now_ts=1000, price_loader=_price_loader(0.05),
         )
         self.assertEqual(stats["exited_detected"], 1)
         self.assertEqual(stats["low_price_skipped"], 1)
@@ -75,7 +81,7 @@ class ExitReconcileTest(unittest.TestCase):
         # 持仓查询返回空 → 不当作全清仓(防 API 抖动误平)
         client = FakeClient([])
         out, stats = build_position_exit_reconcile_trades(
-            client, [_signal()], _markets(0.45), now_ts=1000,
+            client, [_signal()], _markets(0.45), now_ts=1000, price_loader=_price_loader(0.45),
         )
         self.assertEqual(stats["empty_positions_skipped"], 1)
         self.assertEqual(stats["synth_sells"], 0)
@@ -85,7 +91,7 @@ class ExitReconcileTest(unittest.TestCase):
         # 已记录卖出 40/100,钱包现已清仓 → 合成剩余 60 的卖出
         client = FakeClient([{"conditionId": "0xother", "outcome": "TeamX", "size": 1.0}])
         out, stats = build_position_exit_reconcile_trades(
-            client, [_signal(bought=100.0, sold=40.0)], _markets(0.45), now_ts=1000,
+            client, [_signal(bought=100.0, sold=40.0)], _markets(0.45), now_ts=1000, price_loader=_price_loader(0.45),
         )
         self.assertEqual(stats["synth_sells"], 1)
         self.assertAlmostEqual(out[WALLET][0]["size"], 60.0)
@@ -93,7 +99,7 @@ class ExitReconcileTest(unittest.TestCase):
     def test_closed_signal_ignored(self):
         client = FakeClient([{"conditionId": "0xother", "outcome": "TeamX", "size": 1.0}])
         out, stats = build_position_exit_reconcile_trades(
-            client, [_signal(status="settled")], _markets(0.45), now_ts=1000,
+            client, [_signal(status="settled")], _markets(0.45), now_ts=1000, price_loader=_price_loader(0.45),
         )
         self.assertEqual(stats["synth_sells"], 0)
         self.assertEqual(stats["wallets_checked"], 0)
