@@ -1429,6 +1429,36 @@ def _observed_buckets(row: dict[str, Any]) -> list[str]:
     return sorted(str(value) for value in per_game_type if value)
 
 
+def _split_bucket(b: Any) -> tuple[str, str]:
+    s = str(b or "")
+    if ":" in s:
+        g, mt = s.split(":", 1)
+        return g, (mt or "main_match")
+    return "", (s or "main_match")
+
+
+def _leaderboard_scope(row: dict[str, Any]) -> list[dict[str, str]]:
+    """专精列:每个会跟的桶 → {game, market_type}。跨游戏(multi/per-type)桶展开成它在该盘口
+    实际玩过的各游戏(从 per_game_type_grades 推),列表才显示真实游戏 logo 而非笼统"跨"。"""
+    buckets = row.get("eligible_buckets") or _observed_buckets(row)
+    pgt = row.get("per_game_type_grades") if isinstance(row.get("per_game_type_grades"), dict) else {}
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for bucket in buckets:
+        game, market_type = _split_bucket(bucket)
+        if game and game != "multi":
+            games = [game]
+        else:  # 跨游戏:展开成它在该盘口实际有过的各游戏
+            games = sorted({_split_bucket(k)[0] for k in pgt if _split_bucket(k)[1] == market_type and _split_bucket(k)[0]})
+            games = games or ["multi"]  # 推不出就保留 multi 兜底
+        for g in games:
+            key = (g, market_type)
+            if key not in seen:
+                seen.add(key)
+                out.append({"game": g, "market_type": market_type})
+    return out
+
+
 def _category_leaderboards(root: Path) -> list[tuple[str, Path, list[dict[str, Any]], int]]:
     rows: list[tuple[str, Path, list[dict[str, Any]], int]] = []
     for category, data_dir in category_data_dirs(root).items():
@@ -1668,6 +1698,8 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
                 "eligible_market_type_labels": row.get("eligible_market_type_labels") or [],
                 "eligible_buckets": row.get("eligible_buckets") or [],
                 "eligible_bucket_labels": row.get("eligible_bucket_labels") or [],
+                "scope": _leaderboard_scope(row),  # 专精列:跨游戏桶已展开成真实游戏 + 盘口
+
                 "eligible_game_families": row.get("eligible_game_families") or [],
                 "eligible_game_family_labels": row.get("eligible_game_family_labels") or [],
                 "observed_market_types": observed_market_types,

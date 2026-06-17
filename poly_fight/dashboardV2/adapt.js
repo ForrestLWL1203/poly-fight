@@ -240,7 +240,10 @@
       closedCount: num(row.esports_closed_count),
       avgCash: num(row.avg_market_cash),  // 后端已从 candidate 解析好顶层 avg_market_cash
       recent: row.recent_bucket_roi != null ? Math.round(pct(row.recent_bucket_roi) * 10) / 10 : null,
-      scope: scopeList(row),
+      // 后端已展开好 scope(跨游戏桶 → 真实游戏 + 盘口);旧后端无此字段时回退 scopeList。
+      scope: (row.scope && row.scope.length)
+        ? row.scope.map((s) => ({ game: normalizeGame(s.game) || s.game, market: MARKET_TYPE_LABELS[s.market_type] || s.market_type || "主盘" }))
+        : scopeList(row),
       settled,
       open: num(obs.open),
       followRec: settled > 0 ? `${num(obs.wins)}-${num(obs.losses)}` : "—",

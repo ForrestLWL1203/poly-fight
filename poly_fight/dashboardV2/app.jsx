@@ -488,6 +488,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                 <option value="dota2">Dota 2</option>
                 <option value="cs2">CS2</option>
                 <option value="lol">LoL</option>
+                <option value="valorant">Valorant</option>
                 <option value="multi">跨游戏</option>
               </select>
               <span className="lb-updated" style={{ marginRight: 4 }}>最后更新 {updatedLabel} · {lb.activeCount} 个活跃</span>
