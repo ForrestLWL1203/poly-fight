@@ -300,8 +300,19 @@ def start_remote(cfg: dict, emit) -> bool:
     if not r.get("vps_host"):
         emit("ERROR: remote.vps_host 未设置")
         return False
-    emit("启动 VPS dashboard (systemctl restart)…")
+    port = int(r.get("port", 8787))
+    emit("重启 VPS dashboard (清端口 + systemctl restart)…")
+    # 先停 systemd 单元,再杀掉任何仍占用端口的残留进程(历史手动/孤儿进程会让 systemd
+    # 撞端口 Address already in use 起不来),最后重启。重复点也能收敛到唯一 systemd 实例。
     sh = ("set +e\n"
+          "systemctl stop poly-fight-dashboard 2>/dev/null\n"
+          f"PORT={port}\n"
+          'for sig in TERM KILL; do\n'
+          '  pids=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -oE "pid=[0-9]+" | cut -d= -f2 | sort -u)\n'
+          '  [ -z "$pids" ] && break\n'
+          '  for p in $pids; do kill -$sig "$p" 2>/dev/null && echo "  清理残留进程 $p (SIG$sig)"; done\n'
+          '  sleep 1\n'
+          'done\n'
           "systemctl restart poly-fight-dashboard\n"
           "sleep 1\n"
           'echo "状态: $(systemctl is-active poly-fight-dashboard)"\n')
@@ -328,8 +339,20 @@ def stop_local(cfg: dict, emit) -> None:
 
 
 def stop_remote(cfg: dict, emit) -> None:
-    emit("停止 VPS dashboard (systemctl stop)…")
-    rc = _stream(ssh_base(cfg) + ["systemctl", "stop", "poly-fight-dashboard"], emit)
+    port = int(cfg.get("remote", {}).get("port", 8787))
+    emit("停止 VPS dashboard (systemctl stop + 清端口残留)…")
+    # systemctl stop 只停 systemd 托管的实例;再杀掉任何仍占端口的孤儿进程,确保真停干净。
+    sh = ("set +e\n"
+          "systemctl stop poly-fight-dashboard 2>/dev/null\n"
+          f"PORT={port}\n"
+          'for sig in TERM KILL; do\n'
+          '  pids=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -oE "pid=[0-9]+" | cut -d= -f2 | sort -u)\n'
+          '  [ -z "$pids" ] && break\n'
+          '  for p in $pids; do kill -$sig "$p" 2>/dev/null && echo "  清理残留进程 $p (SIG$sig)"; done\n'
+          '  sleep 1\n'
+          'done\n'
+          'echo "状态: $(systemctl is-active poly-fight-dashboard)"\n')
+    rc = _stream(ssh_base(cfg) + ["bash", "-s"], emit, stdin_data=sh)
     emit("RESULT_OK dashboard 已停" if rc == 0 else f"RESULT_FAIL (exit {rc})")
 
 
