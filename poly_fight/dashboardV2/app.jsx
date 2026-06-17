@@ -119,6 +119,16 @@ function TeamLine({ ev, size = 26, held }) {
     </div>
   );
 }
+// 跟单状态徽标:区分"进行中 / 提前卖出(镜像清仓,非市场结算) / 已结算(市场结算)"。
+// 提前卖出沿用 warn 色徽标(同 源已脱榜),让列表一眼看出是我们主动平的还是等到结算。
+function FollowStatusBadge({ f }) {
+  if (f.status === "open") return <Badge tone="up" dot>进行中</Badge>;
+  if (f.settlementType === "manual_exit")
+    return <Badge tone="warn" title="目标钱包在比赛结算前清仓(或对账兜底补平),我们已镜像平仓 — 非市场结算">提前卖出</Badge>;
+  if (f.settlementType === "auto_and_manual")
+    return <Badge tone="warn" title="多个信号:部分提前镜像平仓、部分等到市场结算">部分提前卖出</Badge>;
+  return <Badge tone="neutral">已结算</Badge>;
+}
 function MatchCell({ ev, tag, held }) {
   const dual = held && held.length >= 2;
   return (
@@ -389,7 +399,7 @@ function OverviewPage({ data, onNav, onOpenFollow }) {
                 return (
                   <tr key={f.cid} className="clickable" onClick={() => onOpenFollow && onOpenFollow(f.cid)}>
                     <td><MatchCell ev={f} tag={f.marketType} held={(f.sides || []).map((s) => s.outcome)} /></td>
-                    <td>{f.status === "open" ? <Badge tone="up" dot>进行中</Badge> : <Badge tone="neutral">已结算</Badge>}</td>
+                    <td><FollowStatusBadge f={f} /></td>
                     <td className="strong">{f.wallets}</td>
                     <td className="num">{money(f.stake)}</td>
                     <td className={pnlClass(f.pnl)}><div className="cell-stack"><span className="strong">{signedMoney(f.pnl)}</span>{f.pnlKind === "unrealized" && <span className="muted">未实现</span>}</div></td>
@@ -692,7 +702,7 @@ function FollowsPage({ data, goStrategy, onOpenFollow }) {
               {pageRows.map((f) => (
                 <tr key={f.cid} className="clickable" onClick={() => onOpenFollow(f.cid)}>
                   <td><MatchCell ev={f} tag={f.marketType} held={(f.sides || []).map((s) => s.outcome)} /></td>
-                  <td><div className="evt-status">{f.status === "open" ? <Badge tone="up" dot>进行中</Badge> : <Badge tone="neutral">已结算</Badge>}{f.sourceOffLeaderboard && <Badge tone="warn" title="源钱包已不在最新榜单 — 此跟单继续跟至结算，但不再新开仓">源已脱榜</Badge>}</div></td>
+                  <td><div className="evt-status"><FollowStatusBadge f={f} />{f.sourceOffLeaderboard && <Badge tone="warn" title="源钱包已不在最新榜单 — 此跟单继续跟至结算，但不再新开仓">源已脱榜</Badge>}</div></td>
                   <td>{f.settlement === "盈利" ? <span className="pnl-up strong">盈利</span> : f.settlement === "亏损" ? <span className="pnl-down strong">亏损</span> : <span className="muted">未结算</span>}</td>
                   <td className="strong">{f.wallets}</td>
                   <td className="num">{f.legs}</td>

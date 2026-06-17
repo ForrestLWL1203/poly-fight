@@ -138,12 +138,13 @@
     current_price: m.outcome_prices[0], sides: [],
   }, over);
   const follows = {
-    page: 1, size: 25, total: 4, status: "", category: "esports", db_ready: true,
+    page: 1, size: 25, total: 5, status: "", category: "esports", db_ready: true,
     follows: [
       mkFollow(M.cs2_main, { wallet_count: 5, leg_count: 11, stake: 880, display_pnl: 142.6, display_pnl_kind: "unrealized", status: "open", quality_label: "one_way", sides: [{ outcome: "PARIVISION", outcome_index: 0, leg_count: 11 }] }),
       mkFollow(M.dota_main, { wallet_count: 4, leg_count: 8, stake: 640, display_pnl: -38.2, display_pnl_kind: "unrealized", status: "open", quality_two_sided: true, quality_label: "two_sided", market_type: "map_winner", market_type_label: "地图", sides: [{ outcome: "Team Spirit", outcome_index: 0, leg_count: 5 }, { outcome: "Falcons", outcome_index: 1, leg_count: 3 }] }),
       mkFollow(M.lol_main, { wallet_count: 6, leg_count: 14, stake: 1200, our_realized_pnl: 502.7, display_pnl: 502.7, display_pnl_kind: "realized", status: "settled", sides: [{ outcome: "Gen.G", outcome_index: 1, leg_count: 14 }] }),
       mkFollow({ ...M.cs2_main, condition_id: "0xmockarchcs2faze0009", title: "Counter-Strike: FaZe vs G2 (BO3) - 八强", match_parts: { game: "Counter-Strike", teamA: "FaZe", teamB: "G2", meta: "(BO3) 八强" } }, { wallet_count: 3, leg_count: 6, stake: 480, our_realized_pnl: -86.2, display_pnl: -86.2, display_pnl_kind: "realized", status: "settled", quality_disagreement: true, quality_label: "disagreement", sides: [{ outcome: "FaZe", outcome_index: 0, leg_count: 4 }, { outcome: "G2", outcome_index: 1, leg_count: 2 }] }),
+      mkFollow({ ...M.cs2_main, condition_id: "0xmockchaosexit0042", title: "Counter-Strike: CHAOS vs Alpha Dominion Nation (BO3) - United21 Group C", match_parts: { game: "Counter-Strike", teamA: "CHAOS", teamB: "Alpha Dominion Nation", meta: "(BO3) United21 Group C" } }, { wallet_count: 1, leg_count: 4, stake: 200, our_realized_pnl: 0, display_pnl: 0, display_pnl_kind: "realized", status: "settled", settlement_type: "manual_exit", quality_label: "one_way", sides: [{ outcome: "CHAOS", outcome_index: 0, leg_count: 4 }] }),
     ],
   };
 

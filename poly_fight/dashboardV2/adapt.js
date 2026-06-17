@@ -344,6 +344,9 @@
       // 我们买入哪一边(可能两边:对手盘 / 自对冲)。
       sides: (row.sides || []).map((s) => ({ outcome: String(s.outcome || ""), index: num(s.outcome_index), legs: num(s.leg_count) })),
       status: open ? "open" : "settled",
+      // 已平仓的细分:manual_exit=目标清仓/对账兜底,我们提前镜像平仓;
+      // auto_settlement=等到市场结算;auto_and_manual=多信号混合。用于区分"提前卖出 vs 自动结算"。
+      settlementType: open ? "" : String(row.settlement_type || ""),
       settlement,
       wallets: num(row.wallet_count),
       legs: num(row.leg_count),
