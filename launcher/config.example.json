@@ -17,6 +17,7 @@
   "remote": {
     "vps_host": "",
     "vps_user": "root",
+    "vps_password": "",
     "ssh_key": "~/.ssh/id_ed25519",
     "vps_password_file": "secret/vps-password",
     "repo_dir": "/opt/poly-fight/repo",

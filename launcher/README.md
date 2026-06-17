@@ -18,12 +18,21 @@ open launcher/launcher.command        # or double-click it in Finder
 The UI opens at `http://127.0.0.1:8799`.
 
 - **本地**: fills creds from config, click 启动 → runs `serve` locally on the port shown.
-- **远程 VPS**: fill VPS host / SSH key / domain, click 启动 → over SSH it:
-  1. clones or `git pull`s the repo (aborts if the VPS worktree is dirty — policy),
-  2. writes `secret/rpc` + `secret/dashboard.env` on the VPS (chmod 600),
-  3. installs/enables a `poly-fight-dashboard` **systemd** unit (auto-restart, boot-start),
-  4. adds a Caddy `reverse_proxy` block for the domain (idempotent) + reloads Caddy,
-  5. reports `https://<domain>`.
+- **远程 VPS**: fill VPS host / user / **VPS password** (first time only) / domain,
+  click **环境准备** → it bootstraps a bare box end-to-end:
+  0. if key auth doesn't work yet, generates a local ed25519 key (if missing) and
+     uses the **VPS password** to install your pubkey into the box's
+     `authorized_keys` (SSH pairing) — every later run is passwordless,
+  then over SSH:
+  1. installs missing deps (`git` / `python3` / `caddy`) — idempotent, skipped if present,
+  2. clones or `git pull`s the repo (aborts if the VPS worktree is dirty — policy),
+  3. writes `secret/rpc` + `secret/dashboard.env` on the VPS (chmod 600),
+  4. installs/enables a `poly-fight-dashboard` **systemd** unit (auto-restart, boot-start),
+  5. if `ufw` is active, opens 80/443 (keeping 22) so Let's Encrypt's ACME
+     challenge can reach the box — otherwise the cert never issues and HTTPS hangs,
+     then adds a Caddy `reverse_proxy` block for the domain (idempotent) + reloads Caddy.
+
+  Then click **启动** to bring the dashboard up; it reports `https://<domain>`.
 
 Secrets travel to the VPS over the encrypted SSH channel via **stdin** — never as
 command-line args (so they don't show up in the VPS process table) and never in git.
@@ -35,8 +44,11 @@ Secrets are only ever stored in this one local file. The follow runner reads
 added later (currently the tool is read-only / paper).
 
 ## Notes
-- SSH uses key auth (`remote.ssh_key`); set it up once with
-  `ssh-copy-id -i ~/.ssh/id_ed25519.pub <user>@<vps>`.
+- SSH uses key auth (`remote.ssh_key`). On a **fresh box** you don't need to run
+  `ssh-copy-id` yourself — fill the **VPS 密码** field once and 环境准备 pairs the
+  key for you (needs `sshpass` locally: `brew install hudochenkov/sshpass/sshpass`).
+  The password is sent over SSH via the `SSHPASS` env var (never argv / process
+  table); clear the field after the first successful run.
 - The dashboard binds `127.0.0.1` on the VPS — it's reachable only through Caddy
   over HTTPS, never exposed directly.
 - The launcher never broad-`pkill`s; it stops the systemd unit (remote) or the

@@ -86,6 +86,7 @@ def masked(cfg: dict) -> dict:
     mark(out.get("rpc", {}), "https")
     mark(out.get("rpc", {}), "wss")
     mark(out.get("polymarket", {}), "private_key")
+    mark(out.get("remote", {}), "vps_password")
     return out
 
 
@@ -116,7 +117,27 @@ PORT=@@PORT@@
 DOMAIN=@@DOMAIN@@
 CADDYFILE=@@CADDYFILE@@
 
-echo "[1/5] ensure repo at $REPO"
+echo "[1/6] 确保依赖 (git / python3 / caddy) — 裸机首跑会装,已装则跳过"
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v git >/dev/null 2>&1; then
+  apt-get update -qq && apt-get install -y -qq git
+  echo "    installed git"
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  apt-get update -qq && apt-get install -y -qq python3
+  echo "    installed python3"
+fi
+if ! command -v caddy >/dev/null 2>&1; then
+  apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+    | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+    > /etc/apt/sources.list.d/caddy-stable.list
+  apt-get update -qq && apt-get install -y -qq caddy
+  echo "    installed caddy"
+fi
+
+echo "[2/6] ensure repo at $REPO"
 if [ ! -d "$REPO/.git" ]; then
   git clone "$GITHUB" "$REPO"
 else
@@ -134,7 +155,7 @@ fi
 cd "$REPO"
 echo "    at $(git rev-parse --short HEAD)"
 
-echo "[2/5] write secrets (chmod 600)"
+echo "[3/6] write secrets (chmod 600)"
 mkdir -p secret
 # secret vars (RPC_HTTPS/RPC_WSS/DASH_PW/DASH_SECRET) are injected at the top of
 # this script by the launcher — only ever travels over SSH stdin, never argv.
@@ -143,7 +164,7 @@ chmod 600 secret/rpc
 printf 'POLY_FIGHT_DASH_PASSWORD=%s\nPOLY_FIGHT_DASH_COOKIE_SECRET=%s\n' "${DASH_PW:-}" "${DASH_SECRET:-}" > secret/dashboard.env
 chmod 600 secret/dashboard.env
 
-echo "[3/5] systemd unit (dashboard 托管模式 — runner 由面板「启动跟单」spawn)"
+echo "[4/6] systemd unit (dashboard 托管模式 — runner 由面板「启动跟单」spawn)"
 mkdir -p "$DATADIR"
 # 旧版把 runner 当独立常驻服务;现模型是 dashboard spawn runner，停用旧 runner 服务避免冲突。
 if systemctl list-unit-files 2>/dev/null | grep -q '^poly-fight-runner.service'; then
@@ -171,7 +192,19 @@ UNIT
 systemctl daemon-reload
 systemctl enable poly-fight-dashboard
 
-echo "[4/5] caddy reverse_proxy for $DOMAIN"
+echo "[5/6] caddy reverse_proxy for $DOMAIN"
+# 防火墙:ufw 默认 deny incoming,只放 22 会挡死 80/443 → Let's Encrypt ACME 验证连不进来,
+# 证书签不下来,HTTPS 不可用。所以在装反代前先放行 80/443(先确保 22,绝不把自己锁在外面)。
+# 只在 ufw 已启用时动它;未启用就不碰(裸机 ufw 默认 inactive,端口本就开放)。
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  ufw allow 22/tcp  >/dev/null 2>&1 || true
+  ufw allow 80/tcp  >/dev/null 2>&1 || true
+  ufw allow 443/tcp >/dev/null 2>&1 || true
+  ufw reload >/dev/null 2>&1 || true
+  echo "    ufw active — 已放行 22/80/443"
+else
+  echo "    ufw 未启用/未安装 — 跳过(端口默认开放)"
+fi
 if [ -f "$CADDYFILE" ] && ! grep -q "$DOMAIN" "$CADDYFILE"; then
   printf '\n%s {\n    reverse_proxy 127.0.0.1:%s\n}\n' "$DOMAIN" "$PORT" >> "$CADDYFILE"
   systemctl reload caddy || caddy reload --config "$CADDYFILE" || true
@@ -180,7 +213,7 @@ else
   echo "    caddy block already present (or no Caddyfile) — skipped"
 fi
 
-echo "[5/5] 环境就绪"
+echo "[6/6] 环境就绪"
 echo "PREPARED — 代码/密钥/服务/反代已就绪，点「启动」拉起 dashboard"
 """
 
@@ -224,6 +257,84 @@ def ssh_base(cfg: dict) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
+# SSH bootstrap (fresh box: no key paired yet — install our pubkey via password)
+# --------------------------------------------------------------------------- #
+def _have(cmd: str) -> bool:
+    return subprocess.run(["which", cmd], capture_output=True).returncode == 0
+
+
+def _key_auth_ok(cfg: dict) -> bool:
+    """Non-interactive probe: does passwordless key auth already work?"""
+    r = cfg.get("remote", {})
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+           "-o", "ConnectTimeout=10", "-o", "PasswordAuthentication=no"]
+    key = os.path.expanduser(str(r.get("ssh_key") or ""))
+    if key and Path(key).exists():
+        cmd += ["-i", key]
+    cmd.append(f"{r.get('vps_user','root')}@{r.get('vps_host','')}")
+    cmd.append("true")
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=25).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def _ensure_local_key(cfg: dict, emit) -> tuple[str, str]:
+    """Return (private_key_path, pubkey_path), generating an ed25519 key if missing."""
+    r = cfg.get("remote", {})
+    key = os.path.expanduser(str(r.get("ssh_key") or "~/.ssh/id_ed25519"))
+    pub = key + ".pub"
+    if Path(key).exists() and Path(pub).exists():
+        return key, pub
+    Path(key).parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(Path(key).parent, 0o700)
+    emit(f"本地未找到 SSH key,生成 {key} (ed25519, 无口令) …")
+    subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-f", key], check=True)
+    return key, pub
+
+
+def _vps_password(cfg: dict) -> str:
+    pw = (cfg.get("remote", {}) or {}).get("vps_password") or ""
+    return pw or _read_text(ROOT / "secret" / "vps-password")
+
+
+def install_pubkey(cfg: dict, emit) -> bool:
+    """Ensure our pubkey is in the VPS authorized_keys, using password auth once."""
+    r = cfg.get("remote", {})
+    host, user = r.get("vps_host", ""), r.get("vps_user", "root")
+    key, pub = _ensure_local_key(cfg, emit)
+    pubtext = Path(pub).read_text(encoding="utf-8").strip()
+    password = _vps_password(cfg)
+    if not password:
+        emit("ERROR: key 认证不通且无 VPS 密码 — 在面板填「VPS 密码」或写入 secret/vps-password")
+        return False
+    if not _have("sshpass"):
+        emit("ERROR: 需要 sshpass 用密码装公钥 (macOS: brew install hudochenkov/sshpass/sshpass)")
+        return False
+    # reused-IP guard: drop any stale host key so accept-new can re-pin the new box.
+    subprocess.run(["ssh-keygen", "-R", host], capture_output=True)
+    emit(f"用密码登录 {user}@{host} 安装公钥(SSH 配对)…")
+    remote_cmd = (
+        "set -e; umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; "
+        f"grep -qxF {shlex.quote(pubtext)} ~/.ssh/authorized_keys || "
+        f"echo {shlex.quote(pubtext)} >> ~/.ssh/authorized_keys; echo KEY_INSTALLED"
+    )
+    # password via SSHPASS env (never argv / process table); pubkey is not secret.
+    cmd = ["sshpass", "-e", "ssh", "-o", "StrictHostKeyChecking=accept-new",
+           "-o", "ConnectTimeout=15", "-o", "PreferredAuthentications=password",
+           "-o", "PubkeyAuthentication=no", f"{user}@{host}", remote_cmd]
+    rc = _stream(cmd, emit, env={"SSHPASS": password})
+    if rc != 0:
+        emit(f"ERROR: 密码登录/装公钥失败 (exit {rc}) — 检查 IP / 用户 / 密码")
+        return False
+    if not _key_auth_ok(cfg):
+        emit("ERROR: 公钥已写入但 key 认证仍不通 — 检查 VPS sshd PubkeyAuthentication 是否开启")
+        return False
+    emit("公钥安装成功,后续免密登录 ✓")
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # orchestration (streams log lines to a callback)
 # --------------------------------------------------------------------------- #
 def _stream(cmd: list[str], emit, *, stdin_data: str | None = None, env: dict | None = None) -> int:
@@ -261,7 +372,15 @@ def prepare_remote(cfg: dict, emit) -> bool:
     if not cfg.get("dashboard", {}).get("password"):
         emit("ERROR: dashboard.password 未设置")
         return False
-    emit(f"SSH → {r.get('vps_user','root')}@{r.get('vps_host')}  环境准备(拉代码/密钥/服务/反代)…")
+    # 裸机引导:key 认证不通时,用密码登录把本地公钥装进 VPS(SSH 配对),之后全程免密。
+    if _key_auth_ok(cfg):
+        emit("SSH key 认证已通过 ✓")
+    else:
+        emit("SSH key 认证不通 — 进入裸机引导(SSH 配对)…")
+        if not install_pubkey(cfg, emit):
+            emit("RESULT_FAIL SSH 配对失败")
+            return False
+    emit(f"SSH → {r.get('vps_user','root')}@{r.get('vps_host')}  环境准备(装依赖/拉代码/密钥/服务/反代)…")
     rc = _stream(ssh_base(cfg) + ["bash", "-s"], emit, stdin_data=build_remote_payload(cfg))
     if rc == 0:
         emit("RESULT_OK 环境就绪 — 点「启动」拉起 dashboard")
