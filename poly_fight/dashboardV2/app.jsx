@@ -780,6 +780,7 @@ function WalletLegBlock({ w, prices, ev }) {
         <div className="wallet-block-meta">
           <span>投入 <b>{money(w.follow_total_stake)}</b></span>
           <span>均价 <b>{priceStr(w.follow_avg_entry_price)}</b></span>
+          {w.follow_exit_price != null && <span title="提前卖出的加权卖出价">卖出价 <b>{priceStr(w.follow_exit_price)}</b></span>}
           <span>盈亏 <b className={pnlClass(pnlValue || 0)}>{pnlValue != null ? signedMoney(pnlValue) : "—"}</b></span>
         </div>
       </div>
@@ -929,7 +930,10 @@ function WalletFollowsModal({ wallet, onClose }) {
                         <td><div className="cell-stack"><span className="strong">{s.event_title || s.market_question || Adapt.matchInfo(s).teamA + " vs " + Adapt.matchInfo(s).teamB}</span><span className="muted">{Adapt.fmtClock(s.match_start_time)}</span></div></td>
                         <td>{s.outcome || "—"}</td>
                         <td>{s.status === "open" ? <Badge tone="up" dot>进行中</Badge> : <Badge tone="neutral">{s.status === "settled" ? "已结算" : s.status === "exited" ? "已退出" : s.status}</Badge>}</td>
-                        <td className="num">{priceStr(s.follow_avg_entry_price)}</td>
+                        <td className="num"><div className="cell-stack">
+                          <span>{priceStr(s.follow_avg_entry_price)}</span>
+                          {s.status === "exited" && s.follow_exit_price != null && <span className="muted" title="提前卖出的加权卖出价">→ {priceStr(s.follow_exit_price)}</span>}
+                        </div></td>
                         <td className={"num " + pnlClass(s.our_pnl)}>{(s.status === "settled" || s.status === "exited") && s.our_pnl != null ? signedMoney(s.our_pnl) : "—"}</td>
                       </tr>
                     ))}

@@ -1980,6 +1980,25 @@ def _signal_follow_entry_summary(signal: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _signal_follow_exit_price(signal: dict[str, Any]) -> float | None:
+    """提前卖出的加权卖出价:按各次 partial_exits 的 sold_stake 加权;
+    无 partial_exits 退化到 exit_price。仅对镜像平仓(提前卖出)有意义,等结算的为 None。"""
+    weighted = 0.0
+    stake = 0.0
+    for record in signal.get("partial_exits") or []:
+        if not isinstance(record, dict):
+            continue
+        price = to_float(record.get("price"))
+        sold = to_float(record.get("sold_stake"))
+        if price > 0 and sold > 0:
+            weighted += price * sold
+            stake += sold
+    if stake > 0:
+        return round(weighted / stake, 8)
+    price = to_float(signal.get("exit_price"))
+    return round(price, 8) if price > 0 else None
+
+
 def _signal_follow_outcome_key(signal: dict[str, Any]) -> str:
     condition_id = str(signal.get("condition_id") or "").lower()
     outcome_index = signal.get("outcome_index")
@@ -2030,11 +2049,23 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
                 "_follow_outcome_keys": set(),
                 "_follow_realized_pnl": 0.0,
                 "_follow_realized_count": 0,
+                "_follow_exit_stake": 0.0,
+                "_follow_weighted_exit": 0.0,
             },
         )
         entry_summary = _signal_follow_entry_summary(signal)
         signal["follow_total_stake"] = entry_summary["follow_total_stake"]
         signal["follow_avg_entry_price"] = entry_summary["follow_avg_entry_price"]
+        exit_price = _signal_follow_exit_price(signal)
+        signal["follow_exit_price"] = exit_price
+        exit_stake = sum(
+            to_float(record.get("sold_stake"))
+            for record in (signal.get("partial_exits") or [])
+            if isinstance(record, dict)
+        )
+        if exit_price is not None and exit_stake > 0:
+            bucket["_follow_exit_stake"] += exit_stake
+            bucket["_follow_weighted_exit"] += exit_price * exit_stake
         if str(signal.get("status") or "") in {"settled", "exited"}:
             realized_pnl = _signal_our_pnl(signal)
             signal["follow_realized_pnl"] = round(realized_pnl, 8)
@@ -2061,6 +2092,11 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
         bucket["follow_mixed_outcomes"] = mixed_outcomes
         bucket["follow_avg_entry_price"] = (
             round(weighted_entry / priced_stake, 8) if priced_stake > 0 and not mixed_outcomes else None
+        )
+        exit_stake = to_float(bucket.pop("_follow_exit_stake", 0.0))
+        weighted_exit = to_float(bucket.pop("_follow_weighted_exit", 0.0))
+        bucket["follow_exit_price"] = (
+            round(weighted_exit / exit_stake, 8) if exit_stake > 0 and not mixed_outcomes else None
         )
         bucket["follow_realized_pnl"] = round(realized_pnl, 8) if realized_count else None
     title = title or str(market.get("title") or "")
@@ -2170,8 +2206,9 @@ def build_wallet_follow_detail(
     _annotate_signal_quality(signals)
     for signal in signals:
         signal["settlement_type"] = _signal_settlement_type(signal)
-        # 简易跟单列表用:均价(我们的加权入场价)+ 结算(已结算/已退出的已实现 PnL)。
+        # 简易跟单列表用:均价(我们的加权入场价)+ 卖出价(提前卖出的加权出场价)+ 结算 PnL。
         signal["follow_avg_entry_price"] = _signal_follow_entry_summary(signal).get("follow_avg_entry_price")
+        signal["follow_exit_price"] = _signal_follow_exit_price(signal)
         signal["our_pnl"] = _signal_our_pnl(signal)
     total = len(signals)
     page = max(1, int(page or 1))
