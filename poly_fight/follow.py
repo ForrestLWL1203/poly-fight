@@ -706,6 +706,9 @@ def process_follow_trades(
                 continue
 
         slippage = evaluate_slippage(wallet_fill_price, current_price, max_slippage=max_slippage)
+        # 滑点不再作为跟单门:现价是否值得跟,统一由策略 edge 闸(θ̂×0.95 − 现价)裁定。
+        # 仍保留 slippage_over_wallet_entry 指标供展示/CLV。下面的 high/low/small 闸照常生效。
+        slippage["would_follow"] = True
         follow_block_reasons = []
         min_wallet_trade_cash = to_float(min_wallet_trade_cash_usdc)
         if min_wallet_entry_price > 0 and wallet_fill_price < min_wallet_entry_price:
@@ -720,8 +723,6 @@ def process_follow_trades(
             slippage["would_follow"] = False
             follow_block_reasons.append("small_wallet_trade")
             stats["small_wallet_trade_blocked_count"] += 1
-        if not slippage["would_follow"] and slippage["slippage_over_wallet_entry"] > max_slippage:
-            follow_block_reasons.append("slippage_over_entry")
         stake_mode = None
         stake_ratio = None
         available_balance = bankroll_usdc - _open_signals_exposure(open_signals)
