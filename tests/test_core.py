@@ -5510,6 +5510,43 @@ class CoreTest(unittest.TestCase):
             store.apply_account_ledger([credit])
             self.assertEqual(store.load_account_balance()["balance_usdc"], 115)
 
+    def test_account_result_ledger_credits_each_reentry_episode(self):
+        # 回归:信号 exit→再入场→再 exit 复用同一 signal_id。旧 per-signal keying
+        # (exit:{signal_id})只能落一条 → 第二段回笼撞主键被吞 → 本金不回笼(CHAOS 丢 $200)。
+        # per-leg keying(result:{signal_id}:{trade_id})两段各自贷记。
+        from poly_fight.cli import account_buy_ledger_entries, account_result_ledger_entries
+
+        sid = "0xw:0xc:0"
+        ep1 = {
+            "signal_id": sid, "status": "exited", "wallet": "0xw", "condition_id": "0xc",
+            "exit_at": 100, "exit_price": 0.5,
+            "legs": [{"funded_stake": 50, "our_entry_price": 0.5, "trade_id": "buy1"}],
+        }
+        ep2 = {
+            "signal_id": sid, "status": "exited", "wallet": "0xw", "condition_id": "0xc",
+            "exit_at": 200, "exit_price": 0.44,
+            "legs": [{"funded_stake": 50, "our_entry_price": 0.44, "trade_id": t} for t in ("b2", "b3", "b4", "b5")],
+        }
+        e1 = account_result_ledger_entries([ep1], created_at=100)
+        e2 = account_result_ledger_entries([ep2], created_at=200)
+        self.assertAlmostEqual(sum(e["amount_usdc"] for e in e1), 50.0, places=6)
+        self.assertAlmostEqual(sum(e["amount_usdc"] for e in e2), 200.0, places=6)
+        # 两段 ledger_id 不相交,否则 apply 会把第二段当重复吞掉
+        self.assertEqual({e["ledger_id"] for e in e1} & {e["ledger_id"] for e in e2}, set())
+
+        # 端到端:5 笔买入扣 $250,两段退出各回笼 → 净 0,余额回到初始
+        with TemporaryDirectory() as tmp2:
+            store = FollowStore(Path(tmp2) / "follow.db")
+            store.set_account_balance(1000, ts=1, source="manual")
+            store.apply_account_ledger(account_buy_ledger_entries([ep1, ep2], created_at=1))
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 750.0)  # -250
+            store.apply_account_ledger(e1)
+            store.apply_account_ledger(e2)
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 1000.0)  # 两段都回笼
+            # 幂等:重放不重复贷记
+            store.apply_account_ledger(e1 + e2)
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 1000.0)
+
     def test_follow_store_persists_follow_strategy_and_balance(self):
         with TemporaryDirectory() as tmp:
             store = FollowStore(Path(tmp) / "follow.db")

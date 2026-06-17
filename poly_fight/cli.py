@@ -2097,13 +2097,28 @@ def account_buy_ledger_entries(signals: list[dict[str, Any]], *, created_at: int
 
 
 def account_result_ledger_entries(results: list[dict[str, Any]], *, created_at: int) -> list[dict[str, Any]]:
+    """退出/结算时把每条已注资的腿按 funded_stake + 盈亏贷记回余额。
+
+    ledger_id 与买入**对称**(`result:{signal_id}:{trade_id}`,每条腿一条),而不是按
+    signal_id 一次性。signal_id = 钱包:市场:方向 是稳定复用的:一个信号"进→出→再进
+    →再出"时,旧的 `exit:{signal_id}` 只能落一条,第二段的回笼会撞主键被 apply_account_ledger
+    当重复吞掉 → 第二段本金永远不回笼(实测 CHAOS 丢 $200,见 review)。统一 `result:` 前缀
+    确保一条腿无论走 exit 还是 settle 都只贷记一次,再入场的新腿是新 trade_id、不撞键。
+    """
     entries: list[dict[str, Any]] = []
     for result in results:
         signal_id = str(result.get("signal_id") or "")
         if not signal_id:
             continue
-        payout = 0.0
         status = str(result.get("status") or "")
+        if status not in ("exited", "settled"):
+            continue
+        ledger_kind = "exit" if status == "exited" else "settle"
+        ts = int(result.get("settled_at") or result.get("exit_at") or created_at)
+        wallet = normalize_wallet(result.get("wallet"))
+        condition_id = str(result.get("condition_id") or "").lower()
+        exit_price = to_float(result.get("exit_price"))
+        outcome_won = bool(result.get("outcome_won"))
         for leg in result.get("legs") or []:
             if not isinstance(leg, dict) or leg.get("funded_stake") is None:
                 continue
@@ -2112,24 +2127,24 @@ def account_result_ledger_entries(results: list[dict[str, Any]], *, created_at: 
                 continue
             entry_price = to_float(leg.get("our_entry_price"))
             if status == "exited":
-                exit_price = to_float(result.get("exit_price"))
-                payout += funded_stake + paper_exit_pnl(entry_price, exit_price, funded_stake)
-            elif status == "settled":
-                payout += funded_stake + paper_pnl(entry_price, bool(result.get("outcome_won")), funded_stake)
-        if payout <= 0:
-            continue
-        ledger_kind = "exit" if status == "exited" else "settle"
-        entries.append(
-            {
-                "ledger_id": f"{ledger_kind}:{signal_id}",
-                "kind": ledger_kind,
-                "amount_usdc": round(payout, 8),
-                "created_at": int(result.get("settled_at") or result.get("exit_at") or created_at),
-                "signal_id": signal_id,
-                "wallet": normalize_wallet(result.get("wallet")),
-                "condition_id": str(result.get("condition_id") or "").lower(),
-            }
-        )
+                payout = funded_stake + paper_exit_pnl(entry_price, exit_price, funded_stake)
+            else:
+                payout = funded_stake + paper_pnl(entry_price, outcome_won, funded_stake)
+            if payout <= 0:
+                continue
+            trade_id = str(leg.get("trade_id") or leg.get("leg_at") or "")
+            entries.append(
+                {
+                    "ledger_id": f"result:{signal_id}:{trade_id}",
+                    "kind": ledger_kind,
+                    "amount_usdc": round(payout, 8),
+                    "created_at": ts,
+                    "signal_id": signal_id,
+                    "trade_id": trade_id,
+                    "wallet": wallet,
+                    "condition_id": condition_id,
+                }
+            )
     return entries
 
 
