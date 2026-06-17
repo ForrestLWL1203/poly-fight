@@ -86,8 +86,9 @@
 }
 @keyframes modalIn { from { opacity: 0; transform: translateY(14px) scale(0.985); } to { opacity: 1; transform: none; } }
 .modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-4); padding: var(--sp-6) var(--sp-6) var(--sp-4); border-bottom: 1px solid var(--border-hairline); }
-.modal-title { font: var(--text-section); margin: 0; letter-spacing: var(--ls-title); }
-.modal-title-link { color: inherit; text-decoration: none; display: inline-flex; align-items: center; gap: var(--sp-2); transition: color var(--dur-fast) var(--ease-out); }
+.modal-title { font: var(--fw-semibold) 16px / var(--lh-snug) var(--font-sans); margin: 0; letter-spacing: var(--ls-title); }
+.modal-title-logo { width: 36px; height: 36px; object-fit: contain; flex: none; display: block; }
+.modal-title-link { color: inherit; text-decoration: none; display: inline-flex; align-items: center; gap: var(--sp-3); transition: color var(--dur-fast) var(--ease-out); }
 .modal-title-link:hover { color: var(--accent); }
 .modal-title-link [data-lucide] { width: 16px; height: 16px; color: var(--text-tertiary); flex: none; transition: color var(--dur-fast) var(--ease-out); }
 .modal-title-link:hover [data-lucide] { color: var(--accent); }

@@ -785,7 +785,7 @@ function FollowDetailModal({ cid, onClose, toast }) {
   const titleGame = detail ? Adapt.normalizeGame(mp.game) : "";
   const titleText = detail ? (stripGamePrefix(detail.title || "") || (mp.teamA ? `${mp.teamA} vs ${mp.teamB}` : "跟单详情")) : "跟单详情";
   const titleInner = detail
-    ? <>{titleGame ? <GameIcon game={titleGame} base={ASSET_BASE} chip /> : null}<span>{titleText}</span></>
+    ? <>{titleGame ? <img className="modal-title-logo" src={`${ASSET_BASE}/games/${titleGame}.png`} alt={titleGame} onError={(e) => { e.currentTarget.style.display = "none"; }} /> : null}<span className="modal-title-text">{titleText}</span></>
     : "跟单详情";
   let body;
   if (err) body = <div className="empty-cell">加载失败</div>;
@@ -884,7 +884,7 @@ function WalletFollowsModal({ wallet, onClose }) {
                         <td>{s.outcome || "—"}</td>
                         <td>{s.status === "open" ? <Badge tone="up" dot>进行中</Badge> : <Badge tone="neutral">{s.status === "settled" ? "已结算" : s.status === "exited" ? "已退出" : s.status}</Badge>}</td>
                         <td className="num">{priceStr(s.follow_avg_entry_price)}</td>
-                        <td className="num">{s.settlement_price != null ? priceStr(s.settlement_price) : "—"}</td>
+                        <td className={"num " + pnlClass(s.our_pnl)}>{(s.status === "settled" || s.status === "exited") && s.our_pnl != null ? signedMoney(s.our_pnl) : "—"}</td>
                       </tr>
                     ))}
                     {!sigs.length && <tr><td colSpan="5" className="empty-cell">暂无跟单记录</td></tr>}

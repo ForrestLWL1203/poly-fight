@@ -2170,6 +2170,9 @@ def build_wallet_follow_detail(
     _annotate_signal_quality(signals)
     for signal in signals:
         signal["settlement_type"] = _signal_settlement_type(signal)
+        # 简易跟单列表用:均价(我们的加权入场价)+ 结算(已结算/已退出的已实现 PnL)。
+        signal["follow_avg_entry_price"] = _signal_follow_entry_summary(signal).get("follow_avg_entry_price")
+        signal["our_pnl"] = _signal_our_pnl(signal)
     total = len(signals)
     page = max(1, int(page or 1))
     size = max(1, int(size or 20))
