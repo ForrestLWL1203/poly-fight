@@ -5246,9 +5246,13 @@ def _command_collect_wallets(
     refresh_profile_wallets = profile_refresh["refresh_plan"]
     skipped_due_budget = profile_refresh["skipped_due_budget"]
 
-    def fetch_raw_user_trades(seed_wallet: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str]:
+    # 拉取阶段只负责把逐钱包原始交易**落盘**(缓存),不在内存里保留 trades。
+    # 旧实现把全部钱包的交易攒进 raw_user_trades_by_wallet 大 dict、贯穿整个评分阶段,
+    # 内存 = O(钱包数 × 各自交易),2k+ 钱包就把小内存机顶爆(还会用 swap)。改成流式:
+    # 盘是唯一数据源,评分时 profile_one 按需读单个钱包、用完即弃,峰值降到 ~max_workers 份。
+    def fetch_raw_user_trades(seed_wallet: dict[str, Any]) -> tuple[str, str]:
         wallet = normalize_wallet(seed_wallet.get("wallet"))
-        trades, source = fetch_recent_esports_user_trades_for_wallet(
+        _trades, source = fetch_recent_esports_user_trades_for_wallet(
             client,
             wallet,
             condition_ids,
@@ -5263,14 +5267,14 @@ def _command_collect_wallets(
             include_source=True,
             retention_days=lookback_days,  # 保留到最长 per-game 窗口,打分 scope 再按 per-game 收口
         )
-        return wallet, trades, source
+        del _trades  # 已落盘,不保留在内存(流式削峰的关键)
+        return wallet, source
 
     raw_trade_results = run_ordered_io_tasks(
         refresh_profile_wallets,
         fetch_raw_user_trades,
         max_workers=getattr(args, "max_workers", 8),
     )
-    raw_user_trades_by_wallet: dict[str, list[dict[str, Any]]] = {}
     raw_user_trade_errors: dict[str, str] = {}
     raw_user_trade_cache_hits = 0
     raw_user_trade_api_fetches = 0
@@ -5279,22 +5283,37 @@ def _command_collect_wallets(
         if isinstance(result, Exception):
             if fallback_wallet:
                 raw_user_trade_errors[fallback_wallet] = str(result)
-                raw_user_trades_by_wallet[fallback_wallet] = []
             continue
-        wallet, trades, source = result
-        raw_user_trades_by_wallet[normalize_wallet(wallet)] = trades
+        wallet, source = result
         if source == "cache":
             raw_user_trade_cache_hits += 1
         elif source == "api":
             raw_user_trade_api_fetches += 1
     mark_stage("raw_user_trades")
 
+    def load_cached_user_trades(wallet: str) -> list[dict[str, Any]]:
+        """评分阶段逐钱包从盘读 scope 过滤后的交易(缓存已由拉取阶段写好),不走 API。
+        复用 fetch 路径同一套 _filter_esports_user_trades(同 max_esports_markets),
+        产出与旧的内存 dict 完全一致。"""
+        cache_path = user_trades_cache_path(output_dir, wallet)
+        if not cache_path.exists():
+            return []
+        trades, ok = _load_raw_user_trade_cache(cache_path)
+        if not ok:
+            return []
+        return _filter_esports_user_trades(
+            trades,
+            condition_ids,
+            max_esports_markets=getattr(args, "max_esports_markets_per_wallet", 100),
+        )
+
     def profile_one(seed_wallet: dict[str, Any]) -> dict[str, Any]:
         seed_candidate = collector_seed_candidate(seed_wallet)
         wallet = normalize_wallet(seed_candidate.get("wallet"))
+        wallet_trades = load_cached_user_trades(wallet)  # 单钱包从盘读,profile_one 返回即释放
         seed_candidate = build_profile_candidate_from_trades(
             seed_candidate,
-            raw_user_trades_by_wallet.get(wallet, []),
+            wallet_trades,
             market_records_by_id,
         )
         profile = profile_candidate_wallet(
@@ -5303,7 +5322,7 @@ def _command_collect_wallets(
             market_records_by_id=market_records_by_id,
             condition_type_by_id=condition_type_by_id,
             condition_game_family_by_id=condition_game_family_by_id,
-            user_trades_loader=lambda _wallet: raw_user_trades_by_wallet.get(wallet, []),
+            user_trades_loader=lambda _wallet: wallet_trades,
             current_positions_loader=lambda _wallet: [],
             now_ts=now_ts,
             scoring_basis=scoring_basis,
