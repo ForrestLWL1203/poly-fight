@@ -5823,29 +5823,31 @@ class CoreTest(unittest.TestCase):
         # 0 falls back to the adaptive curve
         self.assertEqual(desired_tick_interval([far], [], now_ts=now, fixed_tick_seconds=0), 900)
 
-    def test_watched_markets_only_include_future_starts(self):
+    def test_watched_markets_includes_upcoming_and_in_play(self):
+        # 已开赛但未结算的盘持续 watch(盘中也能跟,由 edge 闸决定);太远的未来暂不纳入。
         now = 1000
         markets = {
-            "past": {"condition_id": "past", "match_start_time": datetime.fromtimestamp(now - 60, timezone.utc).isoformat()},
+            "in_play": {"condition_id": "in_play", "match_start_time": datetime.fromtimestamp(now - 1200, timezone.utc).isoformat()},
             "future": {"condition_id": "future", "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat()},
             "far": {"condition_id": "far", "match_start_time": datetime.fromtimestamp(now + 30 * 3600, timezone.utc).isoformat()},
         }
 
         watched = watched_markets(markets, now_ts=now, observe_window_hours=24)
 
-        self.assertEqual(list(watched), ["future"])
+        self.assertEqual(set(watched), {"in_play", "future"})
 
-    def test_watched_markets_can_include_recently_started_for_delayed_trades(self):
+    def test_watched_markets_excludes_resolved(self):
+        # 已结算(outcome_prices 已定盘)的盘剔除,即使仍在窗口内。
         now = 1000
         markets = {
-            "recent": {"condition_id": "recent", "match_start_time": datetime.fromtimestamp(now - 120, timezone.utc).isoformat()},
-            "old": {"condition_id": "old", "match_start_time": datetime.fromtimestamp(now - 1200, timezone.utc).isoformat()},
-            "future": {"condition_id": "future", "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat()},
+            "live": {"condition_id": "live", "match_start_time": datetime.fromtimestamp(now - 300, timezone.utc).isoformat()},
+            "resolved": {"condition_id": "resolved", "match_start_time": datetime.fromtimestamp(now - 300, timezone.utc).isoformat(),
+                          "outcome_prices": [1.0, 0.0]},
         }
 
-        watched = watched_markets(markets, now_ts=now, observe_window_hours=24, post_start_grace_seconds=300)
+        watched = watched_markets(markets, now_ts=now, observe_window_hours=24)
 
-        self.assertEqual(list(watched), ["recent", "future"])
+        self.assertEqual(set(watched), {"live"})
 
     def test_follow_v2_trade_cursor_cold_start_then_incremental(self):
         trades = [

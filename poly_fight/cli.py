@@ -1957,16 +1957,22 @@ def watched_markets(
     observe_window_hours: float,
     post_start_grace_seconds: int = 0,
 ) -> dict[str, dict[str, Any]]:
+    # Watchlist:未来 observe_window 内将开赛的盘 + 已开赛但**尚未结算**的盘。盘中持续 watch,
+    # 让目标钱包的盘中新成交也能进入跟单评估;要不要跟、跟多少由策略的 edge 闸决定
+    # (Kelly:edge_lb = 被跟桶 wilson_lb − 现价;≤0 即 no_live_edge 不跟 → 天然挡住"追已涨过把握的局")。
+    # 已结算的盘剔除。post_start_grace_seconds 保留仅为签名兼容,不再用于截断 in-play 盘。
     window_end = now_ts + int(observe_window_hours * 3600)
-    grace_start = now_ts - max(0, int(post_start_grace_seconds))
     watched = {}
     for condition_id, market in active_markets.items():
         start_dt = parse_dt(market.get("match_start_time") or market.get("market_start_time"))
         if not start_dt:
             continue
         start_ts = int(start_dt.timestamp())
-        if grace_start <= start_ts <= window_end and (now_ts < start_ts or post_start_grace_seconds > 0):
-            watched[condition_id] = market
+        if start_ts > window_end:
+            continue                                  # 太远的未来,暂不纳入
+        if winning_outcome_index(market) is not None:
+            continue                                  # 已结算 → 不再跟
+        watched[condition_id] = market
     return watched
 
 
