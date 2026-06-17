@@ -13634,21 +13634,25 @@ class CoreTest(unittest.TestCase):
         out2 = build_collector_leaderboard_v2(profiles, now_ts=now, include_technical=True)
         self.assertEqual({row["wallet"] for row in out2["leaderboard"]}, {"0xdir", "0xtech"})
 
-    def test_v2_leaderboard_excludes_wallets_idle_over_72h(self):
+    def test_v2_leaderboard_excludes_wallets_idle_over_limit(self):
         now = 1_700_000_000
         fresh = self._v2_profile("0xfresh", "lol", wilson=0.70, now=now)   # last trade 24h ago
+        # 低频但 14d 内(8 天前):72h 旧门会误杀,336h 新门保留 → 应上榜。
+        infrequent = self._v2_profile("0xinfreq", "lol", wilson=0.70, now=now)
+        infrequent["last_esports_trade_at"] = now - 8 * 24 * 3600           # 8d ago < 14d
         stale = self._v2_profile("0xstale", "lol", wilson=0.70, now=now)
-        stale["last_esports_trade_at"] = now - 80 * 3600                    # 80h ago > 72h
-        out = build_collector_leaderboard_v2({"0xfresh": fresh, "0xstale": stale}, now_ts=now)
-        self.assertEqual({row["wallet"] for row in out["leaderboard"]}, {"0xfresh"})
-        self.assertEqual(out["rejected_counts"].get("idle_over_limit"), 1)
+        stale["last_esports_trade_at"] = now - 20 * 24 * 3600               # 20d ago > 14d
+        out = build_collector_leaderboard_v2(
+            {"0xfresh": fresh, "0xinfreq": infrequent, "0xstale": stale}, now_ts=now)
+        self.assertEqual({row["wallet"] for row in out["leaderboard"]}, {"0xfresh", "0xinfreq"})
+        self.assertEqual(out["rejected_counts"].get("idle_over_limit"), 1)  # 只砍 20d 的
         # 一笔交易记录都没有 → 同样排除
         no_trade = self._v2_profile("0xnone", "lol", wilson=0.70, now=now)
         no_trade["last_esports_trade_at"] = 0
         out_n = build_collector_leaderboard_v2({"0xnone": no_trade}, now_ts=now)
         self.assertEqual(out_n["leaderboard"], [])
         # 可配置:放宽阈值 / 关闭(0)后沉寂钱包可入榜
-        out_loose = build_collector_leaderboard_v2({"0xstale": stale}, now_ts=now, gate_kwargs={"max_idle_hours": 96})
+        out_loose = build_collector_leaderboard_v2({"0xstale": stale}, now_ts=now, gate_kwargs={"max_idle_hours": 30 * 24})
         self.assertEqual({row["wallet"] for row in out_loose["leaderboard"]}, {"0xstale"})
         out_off = build_collector_leaderboard_v2({"0xstale": stale}, now_ts=now, gate_kwargs={"max_idle_hours": 0})
         self.assertEqual({row["wallet"] for row in out_off["leaderboard"]}, {"0xstale"})

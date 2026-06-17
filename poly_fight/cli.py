@@ -297,7 +297,7 @@ V2_MAX_BOT_SCORE = 70              # bot 评分硬排除阈
 V2_MAX_TAIL_ENTRY_RATE = 0.25      # 尾盘追高市场占比 ≤ 0.25
 # 钱包级硬门:最后一笔(scoped)交易超过这么多小时 → 直接不入榜(比逐桶 14 天门紧得多)。
 # 跟单要钱包当下活跃;沉寂 >72h 的不再上榜(collector 发现 + observer 重评共用)。
-V2_MAX_LEADERBOARD_IDLE_HOURS = 72
+V2_MAX_LEADERBOARD_IDLE_HOURS = 336  # 14d:打分窗口(14-30d)已管"是否活跃",72h 过紧会误杀低频高手
 V2_PER_GAME_QUOTA = 0              # 0 = 不设每游戏上限(榜单=全部够格);>0 时才强制每游戏封顶
 V2_MAX_LEADERBOARD_WALLETS = 200   # 仅作安全上限(质量门已把关,大小不重要)
 # 技术型(低买高卖/靠出场)默认不纳入:占比极低 + 我们 follow 延迟高跟不准卖点,风险大。
@@ -319,9 +319,12 @@ SEED_BUCKET_MIN_WIN_RATE = SEED_BUCKET_MIN_HIT_RATE
 SEED_BUCKET_MIN_WINS_FLOOR = 0
 SEED_SINGLE_BUCKET_MIN_WINS = 5
 SEED_MULTI_BUCKET_MIN_WINS = 8
-SEED_MAIN_MATCH_MIN_AVG_CASH = 100.0  # v16:统一 $100,只滤纯试水、不杀小注高手
-SEED_GAME_WINNER_MIN_AVG_CASH = 100.0
-SEED_MAP_WINNER_MIN_AVG_CASH = 100.0
+# 唯一的 seed 现金门:单场均额(seed_cost_total/seed_market_count)≥ 此值才做数。
+# v2 profiling 预筛(filter_profile_seed_wallets_v2)与诊断拒因统计共用此单一来源。
+SEED_MIN_AVG_CASH = 100.0
+SEED_MAIN_MATCH_MIN_AVG_CASH = SEED_MIN_AVG_CASH  # 旧 per-bucket 名保留为别名,统一指向单一门
+SEED_GAME_WINNER_MIN_AVG_CASH = SEED_MIN_AVG_CASH
+SEED_MAP_WINNER_MIN_AVG_CASH = SEED_MIN_AVG_CASH
 SEED_MIN_WEIGHTED_ROI = 0.30  # v16:seed ROI 门已删(美元口径,质量交给下游 Wilson);此常量仅留作 CLI/记录兼容
 SEED_MIN_MEDIAN_AVG_PRICE = 0.35  # 入场价下限(<0.35 多为安全垫/赌爆冷,胜率低);floor,不参与上限收口
 SEED_MAX_MEDIAN_AVG_PRICE = FOLLOWABLE_PRICE_CEILING  # 高价上限 = 全系统唯一分水岭(0.85)
@@ -3859,7 +3862,7 @@ def filter_profile_seed_wallets_v2(
     *,
     max_wallets: int,
     min_seed_markets: int = 1,
-    min_avg_seed_cash: float = 150.0,
+    min_avg_seed_cash: float = SEED_MIN_AVG_CASH,
 ) -> list[dict[str, Any]]:
     """v2 种子预筛:廉价召回 + per-game round-robin 分配 profiling 预算。
 
@@ -5116,7 +5119,7 @@ def _command_collect_wallets(
         seed_wallets,
         max_wallets=max_profile_wallets,
         min_seed_markets=getattr(args, "v2_min_seed_markets", 1),
-        min_avg_seed_cash=getattr(args, "v2_min_seed_avg_cash", 150.0),
+        min_avg_seed_cash=getattr(args, "v2_min_seed_avg_cash", SEED_MIN_AVG_CASH),
     )
     write_json(output_dir / f"{prefix}_profile_wallets.json", profile_wallets)
     mark_stage("seed_wallet_filter")
@@ -5719,14 +5722,14 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
 
     # 3) 合并累积 profiles;只 profile "新" 候选(已有的保留,含其 observed_at)
     existing = load_collector_existing_profiles(output_dir, resolve_data_dir(args), prefix="collector_v2")
-    # 与 collect-v2 同口径:新种子先过 dust 现金门(min_avg_seed_cash,默认 150),否则小额交易者
+    # 与 collect-v2 同口径:新种子先过 dust 现金门(min_avg_seed_cash,默认 100),否则小额交易者
     # 会从 observer 溜进榜(collect 有这道门、observer 没有 → 口径不一致)。
     new_seed_pool = {wallet: sw for wallet, sw in seed_wallets.items() if wallet not in existing}
     new_seed_wallets = filter_profile_seed_wallets_v2(
         new_seed_pool,
         max_wallets=resolve_collector_profile_wallet_limit(args),
         min_seed_markets=getattr(args, "v2_min_seed_markets", 1),
-        min_avg_seed_cash=getattr(args, "v2_min_seed_avg_cash", 150.0),
+        min_avg_seed_cash=getattr(args, "v2_min_seed_avg_cash", SEED_MIN_AVG_CASH),
     )
 
     def profile_one(seed_wallet: dict[str, Any], *, cache_ttl_days: int | None = None) -> dict[str, Any]:
@@ -7092,7 +7095,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--follow-dir")
         # v2 种子预筛(廉价召回;质量在导出门把控)
         subparser.add_argument("--v2-min-seed-markets", type=int, default=1)
-        subparser.add_argument("--v2-min-seed-avg-cash", type=float, default=150.0)
+        subparser.add_argument("--v2-min-seed-avg-cash", type=float, default=SEED_MIN_AVG_CASH)
         # M4 observe-v2:结算检测窗口(应 ≥ tick 间隔 + buffer)
         subparser.add_argument("--observe-lookback-hours", type=float, default=4.0)
         subparser.add_argument("--observe-gamma-pages", type=int, default=2)
