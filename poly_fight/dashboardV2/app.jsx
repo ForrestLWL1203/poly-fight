@@ -1531,6 +1531,10 @@ function Dashboard({ onLogout, toast }) {
       pollTimer = setInterval(() => {
         Api.overview().then((o) => alive && merge({ overview: o })).catch(() => {});
         Api.runner().then((r) => alive && merge({ runner: r })).catch(() => {});
+        // SSE 断线兜底也必须覆盖 refresh / health,否则一次长采集(>代理空闲超时)期间
+        // SSE 掉线后 data.refresh 永远停在 "running" → 采集按钮 loading 卡死(后端早已 succeeded)。
+        Api.walletRefreshStatus().then((rf) => alive && merge({ refresh: rf })).catch(() => {});
+        Api.health().then((h) => alive && merge({ health: h })).catch(() => {});
       }, 15000);
     };
     const stream = Api.openStream(onFrame, (status) => { if (status === "error") startPolling(); });
