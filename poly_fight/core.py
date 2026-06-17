@@ -10,7 +10,7 @@ from typing import Any, Iterable
 SECONDS_PER_DAY = 86400
 # profile 复用以此为失效令牌:改任何评分口径(门槛/公式/n_eff 下限/basis)都要 +1,
 # 否则采集会复用旧口径的画像、新规则不生效。改完需全量重采一次,之后才走复用加速。
-SCORING_VERSION = 21
+SCORING_VERSION = 22
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 # v16:两边对冲(套利)门统一 0.20——bucket 排除(core)、systemic(cli)、v2 钱包级(V2_MAX_TWO_SIDED_RATE)同口径。
@@ -1763,6 +1763,20 @@ def summarize_trade_reconstructed_positions(
         markets,
         material_sell_frac=material_sell_frac,
     )
+    # 待结算市场:钱包买过、且在册(in scope),但市场尚无 outcome_prices(未结算)→
+    # reconstruct 会因 winner_index is None 跳过它。这类市场结算后会改变评分(可能新增亏损),
+    # 故画像此刻是"不完整"的。surfacing 这个计数,让缓存层据此拒绝复用、下轮重评 —— 修复
+    # "钱包在结算落库前一刻被打分、清仓亏损被永久漏计"的时间竞态。
+    bought_conditions = {
+        str(trade.get("conditionId") or trade.get("condition_id") or "").lower()
+        for trade in (trades or [])
+        if str(trade.get("side") or trade.get("type") or "").upper() == "BUY"
+    }
+    pending_resolution_market_count = sum(
+        1
+        for condition_id in bought_conditions
+        if condition_id in markets and winning_outcome_index(markets[condition_id]) is None
+    )
     esports_condition_ids = set(markets)
     condition_type_by_id = {
         condition_id: str(record.get("market_type") or MAIN_MATCH)
@@ -1877,6 +1891,7 @@ def summarize_trade_reconstructed_positions(
         if behavior_market_count
         else 0.0,
         "per_game_type": per_game_type,
+        "pending_resolution_market_count": pending_resolution_market_count,
     }
 
 

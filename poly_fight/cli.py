@@ -2085,6 +2085,13 @@ def account_result_ledger_entries(results: list[dict[str, Any]], *, created_at: 
     return entries
 
 
+# 画像里钱包买过、但当时尚未结算(无 outcome_prices)的在册市场数 → 画像"不完整":
+# 这些市场结算后会改变评分(可能新增清仓亏损)。把这类画像的复用 TTL 收紧到 1h,确保
+# 市场结算后(esports 通常数小时内)的下一轮采集会重评、补计该亏损 —— 修复"钱包在结算
+# 落库前一刻被打分、提前止损卖出的亏损被长期(默认 24h TTL)漏计"的时间竞态。
+PENDING_PROFILE_REUSE_TTL_SECONDS = 3600
+
+
 def should_use_cached_profile(cached: dict[str, Any] | None, *, now_ts: int, ttl_seconds: int) -> bool:
     if not cached:
         return False
@@ -2094,7 +2101,10 @@ def should_use_cached_profile(cached: dict[str, Any] | None, *, now_ts: int, ttl
         return False
     if int(cached.get("scoring_version") or 0) != SCORING_VERSION:
         return False
-    return now_ts - int(cached.get("profiled_at", 0)) < ttl_seconds
+    age = now_ts - int(cached.get("profiled_at", 0))
+    if int(cached.get("pending_resolution_market_count") or 0) > 0:
+        return age < min(ttl_seconds, PENDING_PROFILE_REUSE_TTL_SECONDS)
+    return age < ttl_seconds
 
 
 def should_refresh_file_cache(
