@@ -703,7 +703,10 @@ function FollowsPage({ data, goStrategy, onOpenFollow }) {
                 <tr key={f.cid} className="clickable" onClick={() => onOpenFollow(f.cid)}>
                   <td><MatchCell ev={f} tag={f.marketType} held={(f.sides || []).map((s) => s.outcome)} /></td>
                   <td><div className="evt-status"><FollowStatusBadge f={f} />{f.sourceOffLeaderboard && <Badge tone="warn" title="源钱包已不在最新榜单 — 此跟单继续跟至结算，但不再新开仓">源已脱榜</Badge>}</div></td>
-                  <td>{f.settlement === "盈利" ? <span className="pnl-up strong">盈利</span> : f.settlement === "亏损" ? <span className="pnl-down strong">亏损</span> : <span className="muted">未结算</span>}</td>
+                  <td><div className="cell-stack">
+                    {f.settlement === "盈利" ? <span className="pnl-up strong">盈利</span> : f.settlement === "亏损" ? <span className="pnl-down strong">亏损</span> : <span className="muted">未结算</span>}
+                    {f.exitPrice != null && <span className="muted" title="提前卖出的加权卖出价">卖出 {priceStr(f.exitPrice)}</span>}
+                  </div></td>
                   <td className="strong">{f.wallets}</td>
                   <td className="num">{f.legs}</td>
                   <td className="num">{money(f.stake)}</td>

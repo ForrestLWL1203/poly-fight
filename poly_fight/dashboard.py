@@ -3367,6 +3367,8 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                 "quality_signals": [],
                 "clv_sum": 0.0,
                 "clv_count": 0,
+                "_exit_stake": 0.0,
+                "_weighted_exit": 0.0,
             },
         )
         bucket["match_start_time"] = bucket.get("match_start_time") or signal.get("match_start_time") or signal.get("market_start_time")
@@ -3422,6 +3424,15 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                     )
         bucket["our_realized_pnl"] += _signal_our_pnl(signal)
         bucket["wallet_basis_realized_pnl"] += _signal_wallet_pnl(signal)
+        _exit_price = _signal_follow_exit_price(signal)
+        _exit_stake = sum(
+            to_float(record.get("sold_stake"))
+            for record in (signal.get("partial_exits") or [])
+            if isinstance(record, dict)
+        )
+        if _exit_price is not None and _exit_stake > 0:
+            bucket["_exit_stake"] += _exit_stake
+            bucket["_weighted_exit"] += _exit_price * _exit_stake
         if signal.get("wallet_clv") is not None:
             bucket["clv_sum"] += _to_float(signal.get("wallet_clv"))
             bucket["clv_count"] += 1
@@ -3453,6 +3464,9 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
             bucket["settlement_type"] = "auto_settlement"
         else:
             bucket["settlement_type"] = ""
+        _exit_stake = to_float(bucket.pop("_exit_stake", 0.0))
+        _weighted_exit = to_float(bucket.pop("_weighted_exit", 0.0))
+        bucket["follow_exit_price"] = round(_weighted_exit / _exit_stake, 8) if _exit_stake > 0 else None
         bucket["roi"] = bucket["our_realized_pnl"] / bucket["stake"] if bucket["stake"] else None
         bucket["avg_wallet_clv"] = bucket["clv_sum"] / bucket["clv_count"] if bucket["clv_count"] else None
         quality_flags = _signal_quality_flags(bucket.get("quality_signals") or [])

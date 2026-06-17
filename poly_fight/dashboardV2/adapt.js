@@ -348,6 +348,7 @@
       // auto_settlement=等到市场结算;auto_and_manual=多信号混合。用于区分"提前卖出 vs 自动结算"。
       settlementType: open ? "" : String(row.settlement_type || ""),
       settlement,
+      exitPrice: row.follow_exit_price != null ? num(row.follow_exit_price) : null,
       wallets: num(row.wallet_count),
       legs: num(row.leg_count),
       stake: num(row.stake),
