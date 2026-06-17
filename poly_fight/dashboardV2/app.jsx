@@ -376,7 +376,7 @@ function OverviewPage({ data, onNav, onOpenFollow }) {
         </div>
       </Card>
       <Card pad="flush">
-        <div style={{ padding: "var(--sp-6) var(--sp-6) var(--sp-4)" }}>
+        <div className="card-toolbar">
           <div className="sec-head" style={{ marginBottom: 0 }}><h2 style={{ fontSize: "var(--fs-h4)" }}>最近跟单</h2><Badge tone="accent">最近 {RECENT_FOLLOWS} 笔</Badge></div>
         </div>
         <div className="tbl-wrap">
@@ -479,7 +479,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
   return (
     <div className="page-inner">
       <Card pad="flush">
-        <div style={{ padding: "var(--sp-6) var(--sp-6) var(--sp-5)" }}>
+        <div className="card-toolbar">
           <div className="panel-toolbar" style={{ marginBottom: 0 }}>
             <SegmentedControl value={view} onChange={setView} options={[
               { value: "active", label: "活跃", count: lb.activeCount },
@@ -580,7 +580,7 @@ function EventsPage({ data }) {
   return (
     <div className="page-inner">
       <Card pad="flush">
-        <div style={{ padding: "var(--sp-6) var(--sp-6) var(--sp-5)" }}>
+        <div className="card-toolbar">
           <div className="panel-toolbar" style={{ marginBottom: 0 }}>
             <Tabs value={tab} onChange={setTab} tabs={[{ id: "active", label: "进行中 / 未开始", count: ev.events.length }, { id: "archive", label: "已结算", count: ev.archive.length }]} />
             <div className="filter-group">
@@ -644,7 +644,7 @@ function FollowsPage({ data, goStrategy, onOpenFollow }) {
   return (
     <div className="page-inner">
       <Card pad="flush">
-        <div style={{ padding: "var(--sp-6) var(--sp-6) var(--sp-5)" }}>
+        <div className="card-toolbar">
           <div className="panel-toolbar" style={{ marginBottom: 0 }}>
             <div className="filter-group">
               <label htmlFor="st-f">状态</label>

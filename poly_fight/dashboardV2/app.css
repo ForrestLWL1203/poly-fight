@@ -85,7 +85,7 @@
   animation: modalIn var(--dur-base) var(--ease-spring);
 }
 @keyframes modalIn { from { opacity: 0; transform: translateY(14px) scale(0.985); } to { opacity: 1; transform: none; } }
-.modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-4); padding: var(--sp-6) var(--sp-6) var(--sp-4); border-bottom: 1px solid var(--border-hairline); }
+.modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-4); padding: var(--sp-4) var(--sp-6); border-bottom: 1px solid var(--border-hairline); }
 .modal-title { font: var(--fw-semibold) 16px / var(--lh-snug) var(--font-sans); margin: 0; letter-spacing: var(--ls-title); }
 .modal-title-logo { width: 36px; height: 36px; object-fit: contain; flex: none; display: block; }
 .modal-title-link { color: inherit; text-decoration: none; display: inline-flex; align-items: center; gap: var(--sp-3); transition: color var(--dur-fast) var(--ease-out); }
@@ -293,6 +293,9 @@
 .mask-bar-fill.filling { transition: width 3s cubic-bezier(0.16, 0.84, 0.36, 1); }
 .mask-bar-fill.err { background: var(--pnl-down); box-shadow: none; }
 .mask-pct { margin-top: var(--sp-3); font: var(--fw-semibold) var(--fs-footnote) var(--font-mono); color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+
+/* 列表卡(flush Card)统一工具栏内距:顶部收窄,左右保持,各视图一致 */
+.card-toolbar { padding: var(--sp-4) var(--sp-6); }
 
 /* 采集:圆角方形大按钮,内含「完整重采 / Max seed / 钱包采集」自上而下 */
 .collect-square {
