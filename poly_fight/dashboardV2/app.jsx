@@ -25,6 +25,25 @@ const hms = (sec) => {
   return p(h) + ":" + p(m) + ":" + p(s);
 };
 
+/* 连续秒级计时:后端 uptime_seconds 只随轮询(~15s)更新会跳变;这里每秒本地 tick,
+   并在每次拿到新 uptime 时重新锚定(锚定值 + 自锚定起的本地秒数)→ 平滑且不累积漂移。
+   独立小组件,只它每秒重渲染,不拖累整页。live=false 时不计时也不显示。 */
+function LiveUptime({ uptimeSeconds, live }) {
+  const [, setTick] = React.useState(0);
+  const anchor = React.useRef({ base: 0, at: Date.now() });
+  React.useEffect(() => {
+    anchor.current = { base: Math.max(0, Math.floor(Number(uptimeSeconds) || 0)), at: Date.now() };
+    setTick((t) => t + 1);
+  }, [uptimeSeconds]);
+  React.useEffect(() => {
+    if (!live) return undefined;
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [live]);
+  if (!live) return null;
+  return hms(anchor.current.base + Math.floor((Date.now() - anchor.current.at) / 1000));
+}
+
 /* ---------- Pager ---------- */
 function pageList(cur, total) {
   if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
@@ -1491,7 +1510,7 @@ function Dashboard({ onLogout, toast }) {
                     <Button variant="primary" size="sm" className="tb-runbtn" disabled={!strategyReady} iconLeft={<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M7 4.5v15a1 1 0 0 0 1.5.87l13-7.5a1 1 0 0 0 0-1.74l-13-7.5A1 1 0 0 0 7 4.5z" /></svg>} onClick={() => runStart()}>启动跟单</Button>
                   </span>
                 </React.Fragment>}
-            <StatusPill status={runnerLive ? "live" : "idle"} label={runnerLive ? "运行中" : runnerStatus === "stopping" ? "停止中" : "已停止"} extra={runnerLive ? hms(data.health && data.health.uptime_seconds) : undefined} />
+            <StatusPill status={runnerLive ? "live" : "idle"} label={runnerLive ? "运行中" : runnerStatus === "stopping" ? "停止中" : "已停止"} extra={runnerLive ? <LiveUptime uptimeSeconds={data.health && data.health.uptime_seconds} live={runnerLive} /> : undefined} />
             <Button variant="ghost" size="sm" iconLeft={ico("log-out")} onClick={onLogout}>退出</Button>
           </div>
         </header>
