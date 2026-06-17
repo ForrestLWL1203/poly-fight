@@ -3,7 +3,11 @@
 import unittest
 
 from poly_fight.core import SCORING_VERSION, summarize_trade_reconstructed_positions
-from poly_fight.cli import should_use_cached_profile, PENDING_PROFILE_REUSE_TTL_SECONDS
+from poly_fight.cli import (
+    should_use_cached_profile,
+    PENDING_PROFILE_REUSE_TTL_SECONDS,
+    backfill_market_resolutions,
+)
 
 
 def _market(prices):
@@ -64,6 +68,63 @@ class CachedProfileTtlTest(unittest.TestCase):
         prof = self._profile(pending=2, profiled_at=now - 600)  # 10min 前,< 1h
         self.assertLess(600, PENDING_PROFILE_REUSE_TTL_SECONDS)
         self.assertTrue(should_use_cached_profile(prof, now_ts=now, ttl_seconds=ttl))
+
+
+class FakeResolutionClient:
+    """markets_by_condition_ids 返回 gamma 风格市场(conditionId + outcomePrices)。"""
+    def __init__(self, resolved):
+        self._resolved = resolved  # {cid: outcomePrices or None}
+
+    def markets_by_condition_ids(self, cids, *, limit=None):
+        out = []
+        for cid in cids:
+            prices = self._resolved.get(cid)
+            if prices is None:
+                continue  # gamma 侧也还没结算
+            out.append({"conditionId": cid, "outcomePrices": prices, "closed": True})
+        return out
+
+
+class BackfillResolutionTest(unittest.TestCase):
+    NOW = 2_000_000  # now_ts
+    PAST = "2026-06-16T21:18:00Z"     # 已过结束时间(用相对久远的过去更稳:见下)
+    FUTURE_TS = 9_999_999_999
+
+    def _rec(self, cid, *, end_ts, prices=None):
+        # end_date 用 ISO;这里用 epoch 转 ISO 避免时区歧义
+        import datetime
+        end_iso = datetime.datetime.fromtimestamp(end_ts, tz=datetime.timezone.utc).isoformat()
+        rec = {"condition_id": cid, "end_date": end_iso, "outcomes": ["A", "B"]}
+        if prices is not None:
+            rec["outcome_prices"] = prices
+        return rec
+
+    def test_fills_closed_unresolved_market(self):
+        cset = [self._rec("0xa", end_ts=self.NOW - 3600)]  # 1h 前结束,无结果
+        client = FakeResolutionClient({"0xa": ["0", "1"]})  # gamma 已结算
+        stats = backfill_market_resolutions(client, cset, now_ts=self.NOW)
+        self.assertEqual(stats, {"checked": 1, "filled": 1})
+        self.assertEqual(cset[0]["outcome_prices"], [0.0, 1.0])
+
+    def test_skips_already_resolved(self):
+        cset = [self._rec("0xa", end_ts=self.NOW - 3600, prices=[1.0, 0.0])]
+        client = FakeResolutionClient({"0xa": ["0", "1"]})
+        stats = backfill_market_resolutions(client, cset, now_ts=self.NOW)
+        self.assertEqual(stats["checked"], 0)
+        self.assertEqual(cset[0]["outcome_prices"], [1.0, 0.0])  # 未被改
+
+    def test_skips_not_yet_ended(self):
+        cset = [self._rec("0xa", end_ts=self.NOW + 3600)]  # 还没结束
+        client = FakeResolutionClient({"0xa": ["0", "1"]})
+        stats = backfill_market_resolutions(client, cset, now_ts=self.NOW)
+        self.assertEqual(stats, {"checked": 0, "filled": 0})
+
+    def test_gamma_still_unresolved_not_filled(self):
+        cset = [self._rec("0xa", end_ts=self.NOW - 3600)]
+        client = FakeResolutionClient({"0xa": None})  # gamma 也没结果
+        stats = backfill_market_resolutions(client, cset, now_ts=self.NOW)
+        self.assertEqual(stats, {"checked": 1, "filled": 0})
+        self.assertNotIn("outcome_prices", cset[0])
 
 
 if __name__ == "__main__":

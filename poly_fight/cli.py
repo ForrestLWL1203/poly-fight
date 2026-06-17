@@ -1456,6 +1456,54 @@ def resolution_market_records_from_markets(markets: list[dict[str, Any]]) -> dic
     return records
 
 
+def backfill_market_resolutions(
+    client: PolymarketClient,
+    classification_set: list[dict[str, Any]],
+    *,
+    now_ts: int,
+    batch_size: int = 50,
+) -> dict[str, int]:
+    """打分前补拉结算结果:对分类集里**已过结束时间、但记录还没结算结果**的在册市场,
+    用 Gamma 定向批量查(markets_by_condition_ids)拉到 outcome_prices 并就地回填。
+
+    关闭"市场已在 Polymarket 结算、但本地分类记录还没刷到 → reconstruct 因无 winner 跳过该场
+    → 钱包清仓亏损被漏计"的时序窗口。复用跟单侧结算轮询同一条定向查询;原地改 classification_set,
+    使紧随其后的打分(及 observer/M5 重评)拿到最新结算结果。返回 {checked, filled}。"""
+    pending: dict[str, dict[str, Any]] = {}
+    for record in classification_set:
+        if not isinstance(record, dict):
+            continue
+        if winning_outcome_index(record) is not None:
+            continue  # 已有结算结果
+        end_dt = parse_dt(record.get("end_date"))
+        if not end_dt or int(end_dt.timestamp()) > now_ts:
+            continue  # 还没到结束时间,不该有结果
+        condition_id = str(record.get("condition_id") or "").lower()
+        if condition_id and condition_id not in pending:
+            pending[condition_id] = record
+    if not pending:
+        return {"checked": 0, "filled": 0}
+    filled = 0
+    cids = list(pending)
+    for index in range(0, len(cids), max(1, batch_size)):
+        chunk = cids[index : index + batch_size]
+        try:
+            markets = client.markets_by_condition_ids(chunk, limit=len(chunk))
+        except Exception:
+            continue
+        for condition_id, fetched in resolution_market_records_from_markets(markets or []).items():
+            prices = fetched.get("outcome_prices") or []
+            if winning_outcome_index({"outcome_prices": prices}) is None:
+                continue  # Gamma 侧也还没结算
+            record = pending.get(condition_id)
+            if record is None:
+                continue
+            record["outcome_prices"] = list(prices)
+            record["updated_at"] = datetime.now(timezone.utc).isoformat()
+            filled += 1
+    return {"checked": len(pending), "filled": filled}
+
+
 def active_cache_market_rows(cached: dict[str, Any]) -> list[dict[str, Any]]:
     markets = cached.get("markets") if isinstance(cached, dict) else []
     if isinstance(markets, dict):
@@ -5050,6 +5098,9 @@ def _command_collect_wallets(
         now=now_dt,
         lookback_days=lookback_days,
     )
+    # 打分前补拉结算:已结束但记录还没结算结果的在册市场,定向补拉 outcome_prices,
+    # 关闭"已在 Polymarket 结算但本地未刷到 → 打分跳过该场漏计亏损"的时序窗口。
+    resolution_backfill = backfill_market_resolutions(client, classification_set, now_ts=int(now_dt.timestamp()))
     write_json(output_dir / f"{prefix}_classification_set.json", classification_set)
     mark_stage("classification")
 
@@ -5582,6 +5633,8 @@ def rescore_demote_wallets(
         tag_slugs=CATEGORY_TAG_SLUGS["esports"],
     )
     classification_set = build_classification_set(closed_events, now=now_dt, lookback_days=lookback_days)
+    # 降级重评前同样补拉结算:确保刚结算的赛事被计入,自动降级判定不被陈旧结算结果误判。
+    backfill_market_resolutions(client, classification_set, now_ts=now_ts)
     profile_cls = filter_classification_set_by_game_window(
         classification_set, now=now_dt, lookback_by_game=lookback_by_game, default_days=default_profile_lookback)
     condition_ids = {str(r.get("condition_id") or "").lower() for r in profile_cls if r.get("condition_id")}
