@@ -5702,7 +5702,15 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
 
     # 3) 合并累积 profiles;只 profile "新" 候选(已有的保留,含其 observed_at)
     existing = load_collector_existing_profiles(output_dir, resolve_data_dir(args), prefix="collector_v2")
-    new_seed_wallets = [sw for wallet, sw in seed_wallets.items() if wallet not in existing]
+    # 与 collect-v2 同口径:新种子先过 dust 现金门(min_avg_seed_cash,默认 150),否则小额交易者
+    # 会从 observer 溜进榜(collect 有这道门、observer 没有 → 口径不一致)。
+    new_seed_pool = {wallet: sw for wallet, sw in seed_wallets.items() if wallet not in existing}
+    new_seed_wallets = filter_profile_seed_wallets_v2(
+        new_seed_pool,
+        max_wallets=resolve_collector_profile_wallet_limit(args),
+        min_seed_markets=getattr(args, "v2_min_seed_markets", 1),
+        min_avg_seed_cash=getattr(args, "v2_min_seed_avg_cash", 150.0),
+    )
 
     def profile_one(seed_wallet: dict[str, Any], *, cache_ttl_days: int | None = None) -> dict[str, Any]:
         wallet = normalize_wallet(seed_wallet.get("wallet"))
