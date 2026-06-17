@@ -563,7 +563,7 @@ def process_follow_trades(
     quarantine_sell_frac: float = 0.2,
     eligible_market_types: set[str] | None = None,
     eligible_buckets: set[str] | None = None,
-    bucket_wilson_lb: dict[str, float] | None = None,   # kelly:桶 → wilson_lb,供按 edge 定额
+    bucket_theta: dict[str, float] | None = None,   # kelly:桶 → θ̂(近期加权点估胜率),策略内 ×0.95 作现价门
     eligible_category: str | None = None,
     eligible_leagues: set[str] | None = None,
     conflict_policy: str = "dual_follow",
@@ -696,7 +696,7 @@ def process_follow_trades(
                 condition_funded_order_count=to_int(condition_counts["condition_funded_order_count"]),
                 wallet_condition_funded_order_count=to_int(condition_counts["wallet_condition_funded_order_count"]),
                 # kelly:被跟桶 wilson_lb + 实时价 → 按 edge 定额(其它 mode 忽略这俩)
-                bucket_win_rate=to_float((bucket_wilson_lb or {}).get(market_bucket) or (bucket_wilson_lb or {}).get(market_type) or 0.0),
+                bucket_win_rate=to_float((bucket_theta or {}).get(market_bucket) or (bucket_theta or {}).get(market_type) or 0.0),
                 entry_price=to_float(current_price),
                 bankroll_usdc=to_float(bankroll_usdc) if bankroll_usdc != float("inf") else 0.0,
             )

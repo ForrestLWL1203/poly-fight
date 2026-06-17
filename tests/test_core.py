@@ -5584,25 +5584,26 @@ class CoreTest(unittest.TestCase):
             self.assertFalse(store.load_follow_strategy()["configured"])
 
     def test_kelly_stake_sizing_engine(self):
-        # v18 默认 = kelly;按 edge_lb=wilson_lb−p 的 ¼Kelly 定额,落到 单笔5%/单场10%/最小$1 边界。
+        # v18 默认 = kelly;有效胜率 = θ̂×0.95(THETA_FOLLOW_DISCOUNT),edge = θ̂×0.95 − p 的 ¼Kelly
+        # 定额,落到 单笔5%/单场10%/最小$1 边界。现价门 = edge≤0(即 现价 ≥ θ̂×0.95)→ no_live_edge。
         s = default_follow_strategy(balance_usdc=2000)
         self.assertEqual(s["stake_sizing"]["mode"], "kelly")
 
-        def ev(wlb, p, cond=0.0, avail=2000):
+        def ev(theta, p, cond=0.0, avail=2000):
             return evaluate_follow_candidate(
                 strategy=s, target_wallet_order_cash_usdc=500, available_balance_usdc=avail,
                 condition_funded_stake_usdc=cond, condition_funded_order_count=0,
                 wallet_condition_funded_order_count=0,
-                bucket_win_rate=wlb, entry_price=p, bankroll_usdc=2000,
+                bucket_win_rate=theta, entry_price=p, bankroll_usdc=2000,
             )
 
-        # 高 edge → 撞单笔上限 5%×2000=$100
+        # 高 edge(0.76−0.50)→ 撞单笔上限 5%×2000=$100
         r = ev(0.80, 0.50)
         self.assertTrue(r["would_follow"]); self.assertEqual(r["funded_stake"], 100); self.assertEqual(r["stake_mode"], "kelly")
-        # 中 edge → Kelly 原值($42)
-        self.assertEqual(ev(0.68, 0.65)["funded_stake"], 42)
-        # 价涨过把握 → 不跟
-        self.assertEqual(ev(0.80, 0.82)["block_reason"], "no_live_edge")
+        # 中 edge(0.703−0.66)→ Kelly 原值($63)
+        self.assertEqual(ev(0.74, 0.66)["funded_stake"], 63)
+        # 现价 0.77 < θ̂ 0.80,但 ≥ θ̂×0.95=0.76 → 不跟(5% 惩罚生效)
+        self.assertEqual(ev(0.80, 0.77)["block_reason"], "no_live_edge")
         # 单场近满(已下 $190,cap $200)→ capped 到剩余 $10
         self.assertEqual(ev(0.78, 0.55, cond=190)["funded_stake"], 10)
         # 单场已满 → match_cap_reached

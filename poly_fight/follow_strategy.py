@@ -17,6 +17,9 @@ DEFAULT_KELLY_FRACTION = 0.25           # ¼ Kelly(UI:保守0.125/标准0.25/激
 DEFAULT_PER_SIGNAL_CAP_PERCENT = 5.0    # 单笔上限 = 本金 5%
 DEFAULT_PER_MATCH_CAP_PERCENT = 10.0    # 单场(condition)上限 = 本金 10%,防一场亏光
 DEFAULT_MIN_STAKE_USDC = 1.0            # Polymarket CLOB 最小单(INVALID_ORDER_MIN_SIZE)
+# 跟单现价门:有效胜率 = θ̂(近期加权点估) × 此折扣,现价需 < 该值才跟(留 5% 相对安全边际)。
+# 比纯 wilson_lb 宽(与入榜的 θ̂ 轴一致),又不至于按头版胜率满价追。
+THETA_FOLLOW_DISCOUNT = 0.95
 
 
 def _finite_positive(value: Any) -> bool:
@@ -243,7 +246,7 @@ def evaluate_follow_candidate(
     condition_funded_stake_usdc: float,
     condition_funded_order_count: int,
     wallet_condition_funded_order_count: int,
-    bucket_win_rate: float = 0.0,      # kelly:被跟桶 wilson_lb(置信下界胜率)
+    bucket_win_rate: float = 0.0,      # kelly:被跟桶 θ̂(近期加权点估胜率);内部再 ×0.95 折扣
     entry_price: float = 0.0,          # kelly:跟单时实时价 p
     bankroll_usdc: float = 0.0,        # kelly:本金(Kelly 缩放 + %上限基准);缺则回退 available
 ) -> dict[str, Any]:
@@ -268,7 +271,7 @@ def evaluate_follow_candidate(
         bankroll = to_float(normalized["balance"].get("usable_balance_usdc"))
         if bankroll <= 0:
             bankroll = to_float(bankroll_usdc) if to_float(bankroll_usdc) > 0 else to_float(available_balance_usdc)
-        win_rate = to_float(bucket_win_rate)   # wilson_lb
+        win_rate = to_float(bucket_win_rate) * THETA_FOLLOW_DISCOUNT   # θ̂ 点估 × 0.95(留 5% 边际)
         p = to_float(entry_price)
         if bankroll <= 0:
             return _block("no_bankroll", strategy=normalized)
@@ -276,7 +279,7 @@ def evaluate_follow_candidate(
             return _block("no_live_price", strategy=normalized)
         edge_lb = win_rate - p
         if edge_lb <= 0:
-            return _block("no_live_edge", strategy=normalized)   # 价已涨过把握 → 不跟
+            return _block("no_live_edge", strategy=normalized)   # 现价 ≥ θ̂×0.95 → 不跟(价已涨过把握)
         raw_stake = to_float(sizing.get("kelly_fraction")) * (edge_lb / (1.0 - p)) * bankroll
         per_signal_cap = bankroll * to_float(sizing.get("per_signal_cap_percent")) / 100.0
         if per_signal_cap > 0:
