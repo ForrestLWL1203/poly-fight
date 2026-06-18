@@ -6496,6 +6496,7 @@ def command_follow(
     collector: "WSFollowCollector | None" = None,
     backfill_positions: bool = False,
     backfilled_wallets: set[str] | None = None,
+    refresh_logos: bool = True,
 ) -> dict[str, Any]:
     client = client or build_client(args)
     data_dir = resolve_dashboard_root(args)
@@ -6639,22 +6640,31 @@ def command_follow(
         for condition_id, market in active_markets.items()
         if str(market.get("category") or "esports").lower() in FOLLOW_SIGNAL_CATEGORIES
     }
-    logo_started_mono = time.monotonic()
-    try:
-        refresh_team_logo_cache_from_active_markets(
-            data_dir,
-            active_markets=list(active_markets.values()),
-            store=store,
-            timeout_seconds=4,
-            max_workers=min(max(1, int(args.max_workers)), 4),
-            max_events=40,
-            observe_window_hours=args.observe_window_hours,
-            now_ts=now_ts,
-        )
-    except Exception:
-        pass
-    finally:
-        stage_seconds["team_logo_refresh"] = round(time.monotonic() - logo_started_mono, 3)
+    # 队标抓取:Polymarket 对电竞对阵盘多数只给通用游戏图、无队标(已核实),所以未缓存的
+    # 队每 tick 重抓也只会空手而归 → 由 command_run 节流到约 30min 一次(refresh_logos),
+    # 避免每 tick 白花 ~1.3s。静默失败改为记一行日志,便于观测。
+    if refresh_logos:
+        logo_started_mono = time.monotonic()
+        try:
+            logo_stats = refresh_team_logo_cache_from_active_markets(
+                data_dir,
+                active_markets=list(active_markets.values()),
+                store=store,
+                timeout_seconds=4,
+                max_workers=min(max(1, int(args.max_workers)), 4),
+                max_events=40,
+                observe_window_hours=args.observe_window_hours,
+                now_ts=now_ts,
+            )
+            if emit and isinstance(logo_stats, dict) and to_int(logo_stats.get("updated_logo_key_count")):
+                print(json.dumps({"status": "team_logo_refresh", **{
+                    k: logo_stats.get(k) for k in ("watched_event_count", "fetched_event_count", "updated_logo_key_count", "total_logo_key_count")
+                }}, ensure_ascii=False), flush=True)
+        except Exception as exc:
+            if emit:
+                print(json.dumps({"status": "team_logo_refresh_error", "error": str(exc)[:200]}, ensure_ascii=False), flush=True)
+        finally:
+            stage_seconds["team_logo_refresh"] = round(time.monotonic() - logo_started_mono, 3)
     watched = watched_markets(
         active_markets_for_follow,
         now_ts=now_ts,
@@ -7255,6 +7265,9 @@ def command_run(args: argparse.Namespace) -> int:
     # 增量补单:已补过持仓的钱包集合,跨 tick 持有。startup 全量补,之后 live-seed 中途
     # 晋升进 leaderboard 的新钱包随到随补(每钱包一次)。空集兜底使首 tick 因暂停/异常漏补时下 tick 重试。
     backfilled_wallets: set[str] = set()
+    # 队标抓取节流:对阵盘多无队标,每 tick 重抓是空转 → 约 30min 才跑一次(WS 健康时 tick ~5s)。
+    last_logo_refresh_at = 0.0
+    LOGO_REFRESH_INTERVAL_SECONDS = 1800
     stop_requested = {"value": False, "reason": ""}
     collection_root = resolve_dashboard_root(args)
     follow_dir = resolve_follow_dir(args, collection_root)
@@ -7358,11 +7371,16 @@ def command_run(args: argparse.Namespace) -> int:
             iteration_started_mono = time.monotonic()
             try:
                 maybe_build(force=False)
+                # 复用 tick 起点的 monotonic(不额外调用),节流队标抓取约 30min 一次。
+                _do_logos = (iteration_started_mono - last_logo_refresh_at) >= LOGO_REFRESH_INTERVAL_SECONDS
                 summary = command_follow(
                     args, client=client, emit=True, collector=collector,
                     backfill_positions=True,
                     backfilled_wallets=backfilled_wallets,
+                    refresh_logos=_do_logos,
                 )
+                if _do_logos:
+                    last_logo_refresh_at = iteration_started_mono
             except Exception as exc:
                 now = time.time()
                 if first_error_at is None:
