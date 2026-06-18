@@ -1554,8 +1554,13 @@ def active_market_cache_in_follow_scope(
         return False
     start_ts = int(start_dt.timestamp())
     window_end = now_ts + int(max(1.0, float(observe_window_hours)) * 3600)
-    grace_start = now_ts - max(0, int(post_start_grace_seconds))
-    return grace_start <= start_ts <= window_end
+    if start_ts > window_end:
+        return False                              # 太远的未来,暂不纳入
+    # 与 watched_markets 一致:未结算的盘(含已开赛的 in-play 子盘)一律保留,只剔除已结算的。
+    # 不再用 post_start_grace_seconds 按开始时间下界截断 in-play 盘——否则同一系列赛里我们只能
+    # 跟"开赛前就建过仓"的那个子盘(靠 preserve_condition_ids 豁免),Game2-5 / Match Winner /
+    # 后续 map 全部被剪掉,目标钱包盘中加注的子盘就永远进不了 watchlist。grace 仅保留签名兼容。
+    return winning_outcome_index(market) is None
 
 
 def scoped_active_market_cache_rows(

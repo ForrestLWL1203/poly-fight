@@ -115,6 +115,7 @@ from poly_fight.cli import (
     should_refresh_file_cache,
     should_use_cached_profile,
     watched_markets,
+    active_market_cache_in_follow_scope,
     write_json,
     write_jsonl,
     prepare_category_refresh_dir,
@@ -5850,6 +5851,34 @@ class CoreTest(unittest.TestCase):
         watched = watched_markets(markets, now_ts=now, observe_window_hours=24)
 
         self.assertEqual(set(watched), {"live"})
+
+    def test_active_cache_scope_keeps_in_play_unresolved_submarkets(self):
+        # 回归:活跃缓存纳入门必须与 watched_markets 一致——已开赛但未结算的子盘(Game2-5/
+        # Match Winner/后续 map)即使开赛已久、且没有开放信号,也要保留;否则同一系列赛只能跟
+        # 第一个建过仓的子盘。grace 不再用于按开始时间下界截断 in-play 盘。
+        now = 1_000_000
+        common = dict(now_ts=now, observe_window_hours=24, post_start_grace_seconds=0,
+                      allowed_categories={"esports"})
+        # 开赛 3 小时(远超任何 grace),未结算 → 仍应保留
+        in_play = {"condition_id": "g3", "category": "esports",
+                   "match_start_time": datetime.fromtimestamp(now - 3 * 3600, timezone.utc).isoformat(),
+                   "outcome_prices": [0.5, 0.5]}
+        self.assertTrue(active_market_cache_in_follow_scope(in_play, **common))
+        # 已结算(官方定盘 1/0)→ 剔除。注:0.9995/0.0005 这种"近乎确定但未官方结算"算 in-play,
+        # 仍保留(与 watched_markets 一致),直到 Polymarket 正式定盘。
+        resolved = {**in_play, "condition_id": "g1", "outcome_prices": [1.0, 0.0]}
+        self.assertFalse(active_market_cache_in_follow_scope(resolved, **common))
+        # 太远的未来 → 暂不纳入
+        far = {"condition_id": "far", "category": "esports",
+               "match_start_time": datetime.fromtimestamp(now + 30 * 3600, timezone.utc).isoformat(),
+               "outcome_prices": [0.5, 0.5]}
+        self.assertFalse(active_market_cache_in_follow_scope(far, **common))
+        # 类目不在范围 → 剔除
+        offscope = {**in_play, "condition_id": "x", "category": "politics"}
+        self.assertFalse(active_market_cache_in_follow_scope(offscope, **common))
+        # 已结算但在 preserve 名单(有开放信号)→ 仍保留(供结算)
+        self.assertTrue(active_market_cache_in_follow_scope(
+            resolved, **common, preserve_condition_ids={"g1"}))
 
     def test_follow_v2_trade_cursor_cold_start_then_incremental(self):
         trades = [
