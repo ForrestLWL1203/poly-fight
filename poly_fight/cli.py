@@ -6397,6 +6397,7 @@ def build_position_exit_reconcile_trades(
     now_ts: int,
     min_exit_price: float = 0.1,
     positions_limit: int = 500,
+    recent_buy_grace_seconds: int = 300,
     price_loader=None,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
     """运行期持仓对账(独立兜底,非每 tick):WS 可能漏抓目标钱包的卖出(重连窗口/订阅时序)。
@@ -6407,7 +6408,11 @@ def build_position_exit_reconcile_trades(
     退化到市场快照 outcome_prices。安全闸:
       1. 持仓查询返回空 → 跳过该钱包(防 API 抖动把"全清仓"误判,导致错误全平);
       2. 现价 < min_exit_price(默认 0.1)→ 跳过,大概率已无盘口,留到结算认亏;
-      3. 按 (condition_id, outcome 名) 匹配持仓,size>0 视为仍持有。
+      3. 按 (condition_id, outcome 名) 匹配持仓,size>0 视为仍持有;
+      4. 最近一笔买入/加仓在 recent_buy_grace_seconds 宽限期内 → 跳过(data-api positions
+         对刚成交、尤其 maker 成交有索引延迟,开仓同 tick 查不到≠清仓;真实卖出靠链上 WS 兜);
+      5. 该 (cid,outcome) 从没在 positions 里出现过(position_seen_at 未置)→ 跳过:
+         区分"索引后消失=真清仓"与"还没被索引=延迟",杜绝开仓即被误平。
     返回 ({wallet:[sell_trade]}, stats)。是 build_position_backfill_trades 的对称操作;
     调用方负责按 60s/批量 节流,不放进每 5s 主循环。
     """
@@ -6424,6 +6429,7 @@ def build_position_exit_reconcile_trades(
     stats: dict[str, int] = {
         "wallets_checked": 0, "still_holding": 0, "exited_detected": 0,
         "synth_sells": 0, "low_price_skipped": 0, "no_price_skipped": 0, "empty_positions_skipped": 0,
+        "recent_buy_skipped": 0, "unseen_skipped": 0,
     }
     for wallet, sigs in by_wallet_sigs.items():
         try:
@@ -6447,8 +6453,23 @@ def build_position_exit_reconcile_trades(
                 continue
             bought = sum(to_float(leg.get("wallet_trade_size")) for leg in signal.get("legs") or [])
             remaining = bought - to_float(signal.get("wallet_sell_size"))
-            if held.get((cid, name), 0.0) > 1e-6 or remaining <= 1e-6:
+            if held.get((cid, name), 0.0) > 1e-6:
+                # 这一刻 positions 里确实查到该仓位 → 记一笔"见过",供闸5"见过才信失踪"判据(随信号落库)。
+                signal["position_seen_at"] = int(now_ts)
                 stats["still_holding"] += 1
+                continue
+            if remaining <= 1e-6:  # 我们记录里已全部卖出 → 无需补卖
+                stats["still_holding"] += 1
+                continue
+            # positions 查不到该仓位、而我们仍持有 → 可能真清仓,也可能 data-api 尚未索引(maker 成交尤甚)。
+            # 闸4:最近买入/加仓还在宽限期内 → 大概率没索引到 → 跳过(开仓同 tick 误平的直接根因)。
+            last_buy_at = max((to_int(leg.get("wallet_trade_at")) for leg in signal.get("legs") or []), default=0)
+            if last_buy_at and now_ts - last_buy_at < max(0, int(recent_buy_grace_seconds)):
+                stats["recent_buy_skipped"] += 1
+                continue
+            # 闸5:从没在 positions 见过该仓位 → 是"还没被索引"而非"索引后消失" → 不当清仓。
+            if not to_int(signal.get("position_seen_at")):
+                stats["unseen_skipped"] += 1
                 continue
             stats["exited_detected"] += 1
             market = markets_by_condition.get(cid)
@@ -7064,6 +7085,7 @@ def command_follow(
         markets_for_reconcile = active_markets_for_follow or watched
         exit_by_wallet, exit_reconcile_stats = build_position_exit_reconcile_trades(
             client, due, markets_for_reconcile, now_ts=now_ts,
+            recent_buy_grace_seconds=int(getattr(args, "reconcile_recent_buy_grace_seconds", 300) or 0),
         )
         for reconcile_wallet, exit_trades in exit_by_wallet.items():
             open_signals, _exit_pft_stats = process_follow_trades(
