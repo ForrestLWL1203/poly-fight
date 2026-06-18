@@ -984,6 +984,24 @@ class FollowStore:
             rows = conn.execute("SELECT raw_json FROM follow_signals WHERE status = 'open' ORDER BY created_at, signal_id").fetchall()
         return [_loads(row["raw_json"], {}) for row in rows]
 
+    def load_pending_small_buys(self) -> dict[str, dict[str, Any]]:
+        """小单累加器:键 "wallet|condition_id|outcome_index" -> {cash,size,wsum,first_ts,last_ts}。
+        目标钱包在可跟桶上的 BUY 未达最小下单额时缓存累加,凑够即跟、清零;卖出/结算亦清。
+        存 meta JSON blob(仅 runner 读写,跨 tick 持久;每 tick load→更新→save)。"""
+        self.init_db()
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = 'pending_small_buys'").fetchone()
+        out = _loads(row["value"], {}) if row else {}
+        return out if isinstance(out, dict) else {}
+
+    def save_pending_small_buys(self, pending: dict[str, Any]) -> None:
+        self.init_db()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('pending_small_buys', ?)",
+                (_dumps(pending or {}),),
+            )
+
     def load_results(self) -> list[dict[str, Any]]:
         self.init_db()
         with self.connect() as conn:

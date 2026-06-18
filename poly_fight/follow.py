@@ -542,6 +542,17 @@ def leg_hypothetical_stake(leg: dict[str, Any]) -> float:
     return max(0.0, to_float(leg.get("stake")))
 
 
+def _follow_min_order_cash(strategy: dict[str, Any] | None, fallback_usdc: float) -> float:
+    """跟单最小下单额门槛 = 策略 prefilter min_target_wallet_order_cash_usdc 与 $floor 取大;
+    小单累加器据此判定"凑够没"。无策略(legacy)时退回 floor。"""
+    fallback = to_float(fallback_usdc)
+    if isinstance(strategy, dict):
+        v = to_float((strategy.get("prefilters") or {}).get("min_target_wallet_order_cash_usdc"))
+        if v > 0:
+            return max(v, fallback)
+    return fallback
+
+
 def process_follow_trades(
     open_signals: list[dict[str, Any]],
     *,
@@ -571,6 +582,7 @@ def process_follow_trades(
     max_stake_usdc: float = 0.0,
     max_signal_stake_usdc: float = 0.0,
     follow_strategy: dict[str, Any] | None = None,
+    pending_small_buys: dict[str, dict[str, Any]] | None = None,   # 小单累加器(跨 tick 持久,由调用方 load/save)
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     wallet = normalize_wallet(wallet)
     active_strategy = normalize_follow_strategy(follow_strategy) if isinstance(follow_strategy, dict) else None
@@ -599,6 +611,8 @@ def process_follow_trades(
         "condition_stake_cap_blocked_count": 0,
         "funded_stake_usdc": 0.0,
         "unfunded_intent_count": 0,
+        "small_buy_cached_count": 0,
+        "small_buy_triggered_count": 0,
         "quarantine_events": [],
     }
     for trade in sorted(trades, key=lambda row: _trade_tuple(row)):
@@ -618,6 +632,9 @@ def process_follow_trades(
         existing = _open_signal_by_id(open_signals, sid)
 
         if side == "SELL":
+            # 钱包卖出该 (cond,outcome):若有未凑够门槛的小单缓存,说明它没建够仓就跑了 → 清缓存,不补跟。
+            if pending_small_buys is not None:
+                pending_small_buys.pop(f"{wallet}|{condition_id}|{outcome_index}", None)
             if existing:
                 # 等比例跟卖:目标累计卖到仓位 x% → 我们也卖到 x%(min $1,不够攒着;dust 全平)。
                 state = apply_follow_sell(existing, trade, current_price, now_ts)
@@ -685,6 +702,31 @@ def process_follow_trades(
 
         wallet_fill_price = trade_price(trade)
         wallet_cash = round(trade_size(trade) * wallet_fill_price, 8)
+        # 小单累加器:可跟桶上的 BUY(开仓或加仓)未达最小下单额 → 缓存累加,不立即跟;
+        # 多笔凑够门槛 → 用累计量(总股数 + 加权价)合成一笔,清缓存,落入正常跟单流程。
+        # 触发后清零(不留余量)。卖出/结算清缓存在别处处理。
+        if pending_small_buys is not None:
+            acc_key = f"{wallet}|{condition_id}|{outcome_index}"
+            min_order_cash = _follow_min_order_cash(active_strategy, min_wallet_trade_cash_usdc)
+            prior = pending_small_buys.get(acc_key)
+            if prior or wallet_cash < min_order_cash:
+                acc_size = to_float((prior or {}).get("size")) + trade_size(trade)
+                acc_cash = to_float((prior or {}).get("cash")) + wallet_cash
+                acc_first = to_int((prior or {}).get("first_ts")) or trade_timestamp(trade)
+                if acc_cash + 1e-9 < min_order_cash:                       # 没凑够 → 缓存,先不跟
+                    pending_small_buys[acc_key] = {
+                        "size": round(acc_size, 8), "cash": round(acc_cash, 8),
+                        "first_ts": acc_first, "last_ts": trade_timestamp(trade),
+                    }
+                    stats["small_buy_cached_count"] += 1
+                    continue
+                # 凑够 → 用累计量合成一笔(加权价),清缓存,继续正常流程
+                pending_small_buys.pop(acc_key, None)
+                agg_price = round(acc_cash / acc_size, 8) if acc_size > 0 else wallet_fill_price
+                trade = {**trade, "size": round(acc_size, 8), "price": agg_price}
+                wallet_fill_price = agg_price
+                wallet_cash = round(acc_cash, 8)
+                stats["small_buy_triggered_count"] += 1
         condition_counts = _condition_strategy_counts(open_signals, condition_id=condition_id, wallet=wallet)
         strategy_decision: dict[str, Any] | None = None
         if active_strategy is not None:

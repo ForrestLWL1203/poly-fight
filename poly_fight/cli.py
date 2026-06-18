@@ -6317,6 +6317,7 @@ def command_follow(
     }
     wallet_trade_state = store.load_wallet_trade_state()
     open_signals = prune_unfollowed_signals(store.load_open_signals())
+    pending_small_buys = store.load_pending_small_buys()   # 小单累加器(跨 tick 持久)
     performance = store.load_performance()
     account_balance = store.load_account_balance()
     account_balance_configured = bool(account_balance.get("configured"))
@@ -6734,6 +6735,7 @@ def command_follow(
                 max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
                 max_signal_stake_usdc=max_signal_stake_usdc,
                 follow_strategy=follow_strategy,
+                pending_small_buys=pending_small_buys,
             )
             after_ids = {signal.get("signal_id") for signal in open_signals}
             new_signal_count += len(after_ids - before_ids)
@@ -6845,6 +6847,15 @@ def command_follow(
         )
     open_signals, settled = settle_open_signals(open_signals, resolutions, now_ts=now_ts)
     result_events = [*exited_signals, *settled]
+    # 小单累加器清理:① 已结算/已离场的赛事 cid;② 已不在 watchlist 的赛事(结束/出范围,
+    # 不会再有新 fill 触发)。凑够即跟时已就地清键,这里只兜底清理"凑不够就结束/卖光"的残留。
+    if pending_small_buys:
+        _settled_cids = {str(s.get("condition_id") or "").lower() for s in result_events}
+        _watched_cids = {str(cid).lower() for cid in (watched or {})}
+        for _key in list(pending_small_buys):
+            _cid = _key.split("|", 2)[1] if "|" in _key else ""
+            if _cid in _settled_cids or _cid not in _watched_cids:
+                pending_small_buys.pop(_key, None)
     if result_events:
         performance = aggregate_follow_performance(performance, result_events)
     else:
@@ -6944,6 +6955,7 @@ def command_follow(
             for category in ("esports", "sports")
         },
     }
+    store.save_pending_small_buys(pending_small_buys)
     store.save_follow_snapshot(
         wallet_trade_state=wallet_trade_state,
         open_signals=open_signals,
