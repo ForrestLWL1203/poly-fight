@@ -11171,7 +11171,7 @@ class CoreTest(unittest.TestCase):
 
             self.assertEqual(row["wallet"], wallet)
             self.assertEqual(row["rank"], 1)
-            self.assertEqual(row["esports_win_count"], 10)
+            self.assertNotIn("esports_win_count", row)  # 已从 /api/wallets 瘦身剔除(前端不展示)
             self.assertEqual(row["observed"]["open"], 1)
             self.assertEqual(row["observed"]["signals"], 3)
             self.assertNotIn("bucket_scores", row)
@@ -12351,11 +12351,9 @@ class CoreTest(unittest.TestCase):
             row = wallets["wallets"][0]
             self.assertEqual(row["grade"], "A")
             self.assertEqual(row["rank"], 1)
-            self.assertEqual(row["esports_win_count"], 11)
             self.assertEqual(row["esports_loss_count"], 1)
             self.assertEqual(row["wilson_win_rate_lower_bound"], 0.72)
-            self.assertEqual(row["eligible_market_types"], ["game_winner"])
-            self.assertEqual(row["observed_market_types"], ["main_match", "game_winner"])
+            # eligible/observed market_types 已从 /api/wallets 瘦身剔除(前端不展示,信息由 buckets 承载)
 
     def test_dashboard_wallets_expose_multiple_game_bucket_fields(self):
         with TemporaryDirectory() as tmp:
@@ -12421,7 +12419,6 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(wallets["count"], 1)
             row = wallets["wallets"][0]
             self.assertEqual(row["eligible_buckets"], ["cs2:main_match", "dota2:main_match"])
-            self.assertEqual(row["eligible_game_families"], ["cs2", "dota2"])
             self.assertEqual(row["observed_buckets"], ["cs2:main_match", "dota2:main_match"])
             self.assertEqual(row["best_bucket"], "cs2:main_match")
             self.assertEqual(row["wilson_win_rate_lower_bound"], 0.83)
@@ -12472,7 +12469,6 @@ class CoreTest(unittest.TestCase):
             self.assertEqual([row["wallet"] for row in wallets["wallets"]], ["0xloser", "0xclean"])
             self.assertEqual([row["rank"] for row in wallets["wallets"]], [1, 2])
             loser = wallets["wallets"][0]
-            self.assertEqual(loser["esports_win_count"], 8)
             self.assertEqual(loser["esports_loss_count"], 0)
             self.assertEqual(loser["observed"]["signals"], 1)
             self.assertEqual(loser["observed"]["losses"], 1)
