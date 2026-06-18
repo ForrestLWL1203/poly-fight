@@ -2808,6 +2808,10 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
             "observe_pid": recorded.get("observe_pid") if source == "dashboard" else None,
             "observe_pgid": recorded.get("observe_pgid") if source == "dashboard" else None,
             "observe_log_path": recorded.get("observe_log_path") if source == "dashboard" else None,
+            "observe_live_running": bool(source == "dashboard" and _pid_alive(int(recorded.get("observe_live_pid") or 0))),
+            "observe_live_pid": recorded.get("observe_live_pid") if source == "dashboard" else None,
+            "observe_live_pgid": recorded.get("observe_live_pgid") if source == "dashboard" else None,
+            "observe_live_log_path": recorded.get("observe_live_log_path") if source == "dashboard" else None,
             "data_dir": str(config.data_dir),
             "follow_dir": str(follow_dir),
         }
@@ -2922,6 +2926,9 @@ def start_runner(
     observe_pid = 0
     observe_pgid = 0
     observe_log_path = ""
+    observe_live_pid = 0
+    observe_live_pgid = 0
+    observe_live_log_path = ""
     if realtime_refresh:
         observe_data_dir = category_data_dirs(config.data_dir)["esports"]
         observe_command = [
@@ -2939,6 +2946,21 @@ def start_runner(
             observe_command, observe_log, config.runner_process_starter
         )
         observe_log_path = str(observe_log)
+        # observe-live(3.1):分钟级快循环,从活跃(未结算)watchlist 盘提前发现优质钱包
+        # 并晋升,发布到同一 leaderboard_v2.db(与 observe-v2 用 build lock 串行化防竞争)。
+        observe_live_command = [
+            sys.executable, "-u", "-m", "poly_fight.cli",
+            "--data-dir", str(observe_data_dir),
+            "observe-live", "--category", "esports",
+            "--loop-minutes", "10",
+            "--defer-first-tick",
+            "--follow-dir", str(follow_dir),
+        ]
+        observe_live_log = log_dir / f"dashboard-observe-live-{now_ts}.out"
+        observe_live_pid, observe_live_pgid = _spawn_detached_process(
+            observe_live_command, observe_live_log, config.runner_process_starter
+        )
+        observe_live_log_path = str(observe_live_log)
     status = {
         "status": "running",
         "source": "dashboard",
@@ -2948,6 +2970,9 @@ def start_runner(
         "observe_pid": observe_pid or None,
         "observe_pgid": observe_pgid or None,
         "observe_log_path": observe_log_path or None,
+        "observe_live_pid": observe_live_pid or None,
+        "observe_live_pgid": observe_live_pgid or None,
+        "observe_live_log_path": observe_live_log_path or None,
         "started_at": now_ts,
         "command": command,
         "stake_usdc": min_stake,
@@ -3160,10 +3185,8 @@ def _terminate_runner_process(status: dict[str, Any]) -> None:
             return
 
 
-def _terminate_observe_process(status: dict[str, Any]) -> None:
-    """停掉实时刷新挂的 observe-v2 子进程(best-effort,进程不在直接忽略)。"""
-    pgid = int(status.get("observe_pgid") or 0)
-    pid = int(status.get("observe_pid") or 0)
+def _terminate_pgid_or_pid(pgid: int, pid: int) -> None:
+    """best-effort 杀进程组(失败回退单 pid),进程不在直接忽略。"""
     if pgid:
         try:
             os.killpg(pgid, signal.SIGTERM)
@@ -3177,6 +3200,12 @@ def _terminate_observe_process(status: dict[str, Any]) -> None:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             return
+
+
+def _terminate_observe_process(status: dict[str, Any]) -> None:
+    """停掉实时刷新挂的 sidecar 子进程(observe-v2 + observe-live;best-effort)。"""
+    _terminate_pgid_or_pid(int(status.get("observe_pgid") or 0), int(status.get("observe_pid") or 0))
+    _terminate_pgid_or_pid(int(status.get("observe_live_pgid") or 0), int(status.get("observe_live_pid") or 0))
 
 
 def _reap_child_process(pid: int) -> None:

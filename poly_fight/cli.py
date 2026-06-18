@@ -322,6 +322,10 @@ SEED_MULTI_BUCKET_MIN_WINS = 8
 # 唯一的 seed 现金门:单场均额(seed_cost_total/seed_market_count)≥ 此值才做数。
 # v2 profiling 预筛(filter_profile_seed_wallets_v2)与诊断拒因统计共用此单一来源。
 SEED_MIN_AVG_CASH = 100.0
+# observe-live:活跃盘种子发现的市场活跃度门(volume 达此值才扫,控成本);读 follow
+# runner 维护的 active 市场缓存,缓存可稍陈(best-effort,只读)。
+LIVE_SEED_MIN_VOLUME = 5000.0
+LIVE_SEED_CACHE_TTL_SECONDS = 24 * 3600
 SEED_MAIN_MATCH_MIN_AVG_CASH = SEED_MIN_AVG_CASH  # 旧 per-bucket 名保留为别名,统一指向单一门
 SEED_GAME_WINNER_MIN_AVG_CASH = SEED_MIN_AVG_CASH
 SEED_MAP_WINNER_MIN_AVG_CASH = SEED_MIN_AVG_CASH
@@ -3668,6 +3672,69 @@ def collect_seed_positions(
     return rows
 
 
+def collect_live_seed_positions(
+    market: dict[str, Any],
+    market_positions_response: list[dict[str, Any]],
+    *,
+    positions_per_market: int = 20,
+) -> list[dict[str, Any]]:
+    """活跃(**未结算**)盘的种子抽取 —— collect_seed_positions 的 live 对称版。
+
+    与闭市版的关键差异(observe-live 用):
+    - **无 winner**:未结算盘没有 winning_outcome_index,双侧全取,`seed_outcome_won=None`。
+    - **不按当前盈亏硬筛**:totalPnl 是未实现盈亏,只作软排序/诊断(seed_in_profit),
+      不当准入闸 —— 押对/押错交给钱包级历史 profiling 判定(用户决策:软排序非硬闸)。
+    - **按持仓名义额(seed_cost)排序**,每侧(outcome_index)各取 top-K;名义额相同时
+      ITM(seed_in_profit)优先打破平局。
+    """
+    cid = str(market.get("condition_id") or "").lower()
+    by_outcome: dict[int, list[dict[str, Any]]] = {}
+    for token_index, token_block in enumerate(market_positions_response or []):
+        for position in token_block.get("positions") or []:
+            wallet = normalize_wallet(position.get("proxyWallet") or position.get("wallet"))
+            if not wallet:
+                continue
+            outcome_index = to_int(position.get("outcomeIndex"), token_index)
+            total_bought = to_float(position.get("totalBought"))
+            avg_price = to_float(position.get("avgPrice"))
+            seed_cost = total_bought * avg_price
+            if total_bought <= 0 or avg_price <= 0 or seed_cost <= 0:   # 仅要求有效持仓,不筛盈亏
+                continue
+            seed_pnl = to_float(position.get("totalPnl"))
+            if seed_pnl == 0:
+                seed_pnl = to_float(position.get("realizedPnl"))
+            by_outcome.setdefault(outcome_index, []).append({
+                "wallet": wallet,
+                "condition_id": cid,
+                "question": market.get("question") or market.get("title") or "",
+                "game_family": str(market.get("game_family") or "").lower(),
+                "market_type": str(market.get("market_type") or MAIN_MATCH),
+                "bucket_key": str(market.get("bucket_key") or bucket_key(market.get("game_family"), market.get("market_type"))),
+                "outcome_index": outcome_index,
+                "outcome": position.get("outcome"),
+                "seed_outcome_won": None,                # 未结算,未知
+                "avg_price": round(avg_price, 8),
+                "total_bought": round(total_bought, 8),
+                "seed_cost": round(seed_cost, 8),
+                "seed_pnl": round(seed_pnl, 8),
+                "seed_roi": round(seed_pnl / seed_cost, 8) if seed_cost > 0 else 0.0,
+                "seed_edge": round(max(0.0, 1.0 - avg_price), 8),
+                "seed_in_profit": seed_pnl > 0,          # 软排序信号
+                "market_volume": to_float(market.get("volume")),
+                "timestamp": 0,                          # 未结算,无 end_date
+            })
+    cap = max(0, int(positions_per_market))
+    rows: list[dict[str, Any]] = []
+    for outcome_index in sorted(by_outcome):
+        side_rows = by_outcome[outcome_index]
+        side_rows.sort(key=lambda r: (r["seed_cost"], r["seed_in_profit"]), reverse=True)
+        side_rows = side_rows[:cap]
+        for rank, row in enumerate(side_rows, start=1):
+            row["seed_rank"] = rank
+        rows.extend(side_rows)
+    return rows
+
+
 def aggregate_seed_wallets(seed_positions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in seed_positions:
@@ -5448,6 +5515,9 @@ def _command_collect_wallets(
             "v2_per_game_quota": getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
         }
     )
+    # 注:collect-v2 跑在 run-loop maybe_build 里(已 pause follow)、频率以小时计,且每次是
+    #     从共享 profiles 全量重建 → 与 sidecar(observe-v2/observe-live)的 publish 竞争窗口极小
+    #     且自愈;故此处暂未包 build lock(两个 sidecar 已互相串行化)。TODO 若未来观测到丢更新再补。
     dashboard_publish = publish_collector_dashboard_outputs(
         output_dir,
         resolve_data_dir(args),
@@ -5871,51 +5941,53 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
         ) if not isinstance(r, Exception)
     ]
 
-    profiles_by_wallet = dict(existing)
-    for profile in [*new_profiles, *rescore_profiles]:   # 重评 profile 覆盖旧的
-        wallet = normalize_wallet(profile.get("wallet"))
-        if wallet:
-            profiles_by_wallet[wallet] = profile
-    write_json(
-        output_dir / "collector_v2_wallet_profiles.json",
-        [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
-    )
-
-    # 4) 整体重建 + 发布(发布期间暂停 follow)
-    collector_result = build_collector_leaderboard_v2(
-        profiles_by_wallet, now_ts=now_ts,
-        per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
-        max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
-        include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
-        gate_kwargs=_v2_gate_kwargs_from_args(args),
-    )
-    leaderboard = collector_result["leaderboard"]
-    write_json(
-        output_dir / "collector_v2_leaderboard.json",
-        [slim_profile_for_storage(row) for row in leaderboard],
-    )
-
-    # M5 恢复:满冷却的隔离钱包重评回到 A 榜 → 解隔离。(降级已拆到 follow runner。)
-    new_board_wallets = {normalize_wallet(r.get("wallet")) for r in leaderboard if normalize_wallet(r.get("wallet"))}
+    # 4) 整体重建 + 发布。临界区(merge→写 profiles→build→publish)加 build lock 与
+    #    collect-v2 / observe-live 串行化,避免并发 publish 的 lost-update。publish 函数本身
+    #    不再取锁(避免同进程二次 flock 自死锁)。
     demoted: list[str] = []
     recovered: list[str] = []
-    for wallet in sorted(recovery_targets):
-        if wallet in new_board_wallets:
-            follow_store.clear_wallet_quarantine_wallets({wallet})
-            recovered.append(wallet)
-
-    for category in FOLLOW_SIGNAL_CATEGORIES:
-        set_pause_new_signals(follow_dir, category, {"status": "paused", "reason": "observe_v2", "started_at": now_ts})
-    try:
-        publish_collector_dashboard_outputs(
-            output_dir, resolve_data_dir(args),
-            summary={"collector": V2_COLLECTOR_NAME, "category": "esports", "source": "observe_v2"},
-            now_ts=now_ts, prefix="collector_v2", db_filename="leaderboard_v2.db",
-            profiles_publish_name="wallet_profiles_v2.json", collector_name=V2_COLLECTOR_NAME,
+    with acquire_build_lock(resolve_data_dir(args), blocking=True):
+        profiles_by_wallet = dict(existing)
+        for profile in [*new_profiles, *rescore_profiles]:   # 重评 profile 覆盖旧的
+            wallet = normalize_wallet(profile.get("wallet"))
+            if wallet:
+                profiles_by_wallet[wallet] = profile
+        write_json(
+            output_dir / "collector_v2_wallet_profiles.json",
+            [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
         )
-    finally:
+        collector_result = build_collector_leaderboard_v2(
+            profiles_by_wallet, now_ts=now_ts,
+            per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
+            max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
+            include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
+            gate_kwargs=_v2_gate_kwargs_from_args(args),
+        )
+        leaderboard = collector_result["leaderboard"]
+        write_json(
+            output_dir / "collector_v2_leaderboard.json",
+            [slim_profile_for_storage(row) for row in leaderboard],
+        )
+
+        # M5 恢复:满冷却的隔离钱包重评回到 A 榜 → 解隔离。(降级已拆到 follow runner。)
+        new_board_wallets = {normalize_wallet(r.get("wallet")) for r in leaderboard if normalize_wallet(r.get("wallet"))}
+        for wallet in sorted(recovery_targets):
+            if wallet in new_board_wallets:
+                follow_store.clear_wallet_quarantine_wallets({wallet})
+                recovered.append(wallet)
+
         for category in FOLLOW_SIGNAL_CATEGORIES:
-            set_pause_new_signals(follow_dir, category, None)
+            set_pause_new_signals(follow_dir, category, {"status": "paused", "reason": "observe_v2", "started_at": now_ts})
+        try:
+            publish_collector_dashboard_outputs(
+                output_dir, resolve_data_dir(args),
+                summary={"collector": V2_COLLECTOR_NAME, "category": "esports", "source": "observe_v2"},
+                now_ts=now_ts, prefix="collector_v2", db_filename="leaderboard_v2.db",
+                profiles_publish_name="wallet_profiles_v2.json", collector_name=V2_COLLECTOR_NAME,
+            )
+        finally:
+            for category in FOLLOW_SIGNAL_CATEGORIES:
+                set_pause_new_signals(follow_dir, category, None)
 
     observe_store.record_observe_analyzed(
         [str(market.get("condition_id") or "").lower() for market in new_markets],
@@ -5953,6 +6025,191 @@ def command_observe_v2(args: argparse.Namespace, client: PolymarketClient | None
             return 0
         except Exception as exc:
             print(json.dumps({"event": "observe_v2_loop_error", "error": str(exc)}))
+            wait = min(interval, retry)
+        iterations += 1
+        if max_iter and iterations >= max_iter:
+            return 0
+        time.sleep(wait)
+
+
+def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
+    """observe-live 一次 tick:**活跃(未结算)** watchlist 盘 → 双侧持仓者 → 用其历史
+    交易评分 → grade-A **提前**写进 leaderboard(source=observe_live),让跟单侧增量补单
+    看到其 live 持仓即补跟,不等结算。与 observe-v2 共用评分管线 + 同一 leaderboard.db;
+    差异只在种子来源(live 盘,无 winner)。控量四道:volume 门 + top-K + 钱包级去重
+    early-exit + profiles 持久化天然负缓存。发布临界区与 observe-v2/collect 用 build lock
+    串行化(非阻塞,占用即跳过本轮,分钟级下轮再来)。"""
+    client = client or build_client(args)
+    output_dir = resolve_collector_output_dir(args) / "collector_v2"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    now_dt = datetime.now(timezone.utc)
+    now_ts = int(now_dt.timestamp())
+    data_dir = resolve_data_dir(args)
+    follow_dir = resolve_follow_dir(args, data_dir)
+    positions_per_market = getattr(args, "positions_per_market", 20)
+    min_volume = to_float(getattr(args, "min_market_volume", LIVE_SEED_MIN_VOLUME) or 0.0)
+
+    # 1) 只读 follow runner 维护的 active 市场缓存(不重复 Gamma 拉取、不写 follow.db);
+    #    只留未结算(winning_outcome_index None)且 volume 达门的盘。
+    store = FollowStore(follow_dir / "follow.db")
+    active_markets, _updated_at, _fresh = store.load_market_cache_readonly(
+        cache_kind="active", now_ts=now_ts, ttl_seconds=LIVE_SEED_CACHE_TTL_SECONDS,
+    )
+    live_markets = [
+        market for market in active_markets.values()
+        if isinstance(market, dict)
+        and winning_outcome_index(market) is None
+        and to_float(market.get("volume")) >= min_volume
+    ]
+    if not live_markets:
+        print(json.dumps({"event": "observe_live_tick", "live_markets": 0, "reason": "no_active_market_over_volume"}))
+        return 0
+
+    # 2) 每场双侧持仓者 → 种子(无 winner;当前盈亏只软排序不硬筛)
+    seed_positions: list[dict[str, Any]] = []
+    for market in live_markets:
+        condition_id = str(market.get("condition_id") or market.get("conditionId") or "").lower()
+        if not condition_id:
+            continue
+        try:
+            response = client.market_positions(condition_id, limit=positions_per_market, sort_by="CASHPNL", sort_direction="DESC")
+        except Exception:
+            continue
+        seed_positions.extend(collect_live_seed_positions(market, response, positions_per_market=positions_per_market))
+    seed_wallets = aggregate_seed_wallets(seed_positions)
+
+    # 3) 钱包级去重:只 profile 既有 collector_v2 profiles 没有的新钱包(已打过分的进 profiles
+    #    持久化 → 天然负缓存,后续轮次只是集合查找)。无新候选 → early-exit(常态,廉价)。
+    existing = load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2")
+    new_seed_pool = {wallet: sw for wallet, sw in seed_wallets.items() if wallet not in existing}
+    new_seed_wallets = filter_profile_seed_wallets_v2(
+        new_seed_pool,
+        max_wallets=resolve_collector_profile_wallet_limit(args),
+        min_seed_markets=getattr(args, "v2_min_seed_markets", 1),
+        min_avg_seed_cash=getattr(args, "v2_min_seed_avg_cash", SEED_MIN_AVG_CASH),
+    )
+    if not new_seed_wallets:
+        print(json.dumps({"event": "observe_live_tick", "live_markets": len(live_markets),
+                          "seed_wallets": len(seed_wallets), "new_candidates": 0}))
+        return 0
+
+    # 4) 评分(与 observe-v2 同口径 scope/profile —— 复用同样的模块级函数,保证 grade 一致)
+    profile_lookback_days = int(getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS) or V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
+    scope_params = load_scope_params(data_dir, client=client, now=now_dt, refresh=False)
+    n_eff_floors = scope_n_eff_floors(scope_params)
+    lookback_by_game = scope_lookback_by_game(scope_params)
+    lookback_days = scope_max_lookback_days(scope_params, int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS))
+    closed_events = client.list_events_paginated(
+        closed=True, active=None, max_pages=getattr(args, "gamma_pages", 10),
+        min_end_date=now_dt - timedelta(days=lookback_days), max_end_date=now_dt,
+        tag_slugs=CATEGORY_TAG_SLUGS["esports"],
+    )
+    classification_set = build_classification_set(closed_events, now=now_dt, lookback_days=lookback_days)
+    profile_classification_set = filter_classification_set_by_game_window(
+        classification_set, now=now_dt, lookback_by_game=lookback_by_game, default_days=profile_lookback_days)
+    condition_ids = {str(row.get("condition_id") or "").lower() for row in profile_classification_set if row.get("condition_id")}
+    market_records_by_id = {str(row.get("condition_id") or "").lower(): row for row in profile_classification_set if row.get("condition_id")}
+    condition_type_by_id = {cid: str(row.get("market_type") or MAIN_MATCH) for cid, row in market_records_by_id.items()}
+    condition_game_family_by_id = {cid: str(row.get("game_family") or "unknown") for cid, row in market_records_by_id.items()}
+
+    def profile_one(seed_wallet: dict[str, Any]) -> dict[str, Any]:
+        wallet = normalize_wallet(seed_wallet.get("wallet"))
+        trades, _source = fetch_recent_esports_user_trades_for_wallet(
+            client, wallet, condition_ids,
+            page_limit=getattr(args, "user_history_trades_limit", 500),
+            max_pages=getattr(args, "user_history_trades_max_pages", 3),
+            max_esports_markets=getattr(args, "max_esports_markets_per_wallet", 100),
+            data_dir=output_dir, now_ts=now_ts,
+            cache_ttl_days=getattr(args, "user_trades_cache_ttl_days", 1),
+            force_refresh=False, use_cache=True, include_source=True,
+            retention_days=lookback_days,
+        )
+        seed_candidate = build_profile_candidate_from_trades(collector_seed_candidate(seed_wallet), trades, market_records_by_id)
+        profile = profile_candidate_wallet(
+            seed_candidate, condition_ids,
+            market_records_by_id=market_records_by_id,
+            condition_type_by_id=condition_type_by_id,
+            condition_game_family_by_id=condition_game_family_by_id,
+            user_trades_loader=lambda _w: trades,
+            current_positions_loader=lambda _w: [],
+            now_ts=now_ts, scoring_basis="hold", n_eff_floors=n_eff_floors,
+        )
+        return {**profile, "profile_lookback_days": profile_lookback_days,
+                "seed": collector_seed_payload(seed_wallet), "observed_at": now_ts, "seed_source": "observe_live"}
+
+    new_profiles = [r for r in run_ordered_io_tasks(new_seed_wallets, profile_one, max_workers=getattr(args, "max_workers", 8)) if not isinstance(r, Exception)]
+
+    # 5) 合并 + 重建 A-only 榜 + 发布;临界区加 build lock(非阻塞)与 observe-v2/collect 串行化。
+    #    锁内重读 existing → 不丢其它 writer 期间新增的 profile(防 lost-update)。
+    try:
+        with acquire_build_lock(data_dir, blocking=False):
+            profiles_by_wallet = dict(load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2"))
+            for profile in new_profiles:
+                wallet = normalize_wallet(profile.get("wallet"))
+                if wallet:
+                    profiles_by_wallet[wallet] = profile
+            write_json(
+                output_dir / "collector_v2_wallet_profiles.json",
+                [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
+            )
+            collector_result = build_collector_leaderboard_v2(
+                profiles_by_wallet, now_ts=now_ts,
+                per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
+                max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
+                include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
+                gate_kwargs=_v2_gate_kwargs_from_args(args),
+            )
+            leaderboard = collector_result["leaderboard"]
+            write_json(
+                output_dir / "collector_v2_leaderboard.json",
+                [slim_profile_for_storage(row) for row in leaderboard],
+            )
+            for category in FOLLOW_SIGNAL_CATEGORIES:
+                set_pause_new_signals(follow_dir, category, {"status": "paused", "reason": "observe_live", "started_at": now_ts})
+            try:
+                publish_collector_dashboard_outputs(
+                    output_dir, data_dir,
+                    summary={"collector": V2_COLLECTOR_NAME, "category": "esports", "source": "observe_live"},
+                    now_ts=now_ts, prefix="collector_v2", db_filename="leaderboard_v2.db",
+                    profiles_publish_name="wallet_profiles_v2.json", collector_name=V2_COLLECTOR_NAME,
+                )
+            finally:
+                for category in FOLLOW_SIGNAL_CATEGORIES:
+                    set_pause_new_signals(follow_dir, category, None)
+    except BuildLockUnavailable:
+        print(json.dumps({"event": "observe_live_tick", "skipped": "build_lock_busy",
+                          "new_candidates": len(new_seed_wallets), "profiled": len(new_profiles)}))
+        return 0
+
+    new_on_board = sum(1 for row in leaderboard if str(row.get("seed_source") or "") == "observe_live"
+                       and to_int(row.get("observed_at")) >= now_ts)
+    print(json.dumps({
+        "event": "observe_live_tick", "live_markets": len(live_markets),
+        "seed_wallets": len(seed_wallets), "new_candidates": len(new_seed_wallets),
+        "profiled": len(new_profiles), "leaderboard": len(leaderboard), "new_live_on_board": new_on_board,
+    }))
+    return 0
+
+
+def command_observe_live(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
+    if float(getattr(args, "loop_minutes", 0) or 0) <= 0:
+        return _command_observe_live(args, client=client)
+    cli_client = client or build_client(args)
+    interval = max(60, int(float(getattr(args, "loop_minutes", 0) or 0) * 60))
+    retry = max(30, int(getattr(args, "loop_error_retry_seconds", 120) or 120))
+    max_iter = int(getattr(args, "loop_max_iterations", 0) or 0)
+    iterations = 0
+    if getattr(args, "defer_first_tick", False):
+        print(json.dumps({"event": "observe_live_deferred", "first_tick_in_seconds": interval}))
+        time.sleep(interval)
+    while True:
+        try:
+            _command_observe_live(args, client=cli_client)
+            wait = interval
+        except KeyboardInterrupt:
+            return 0
+        except Exception as exc:
+            print(json.dumps({"event": "observe_live_loop_error", "error": str(exc)}))
             wait = min(interval, retry)
         iterations += 1
         if max_iter and iterations >= max_iter:
@@ -7421,6 +7678,28 @@ def build_parser() -> argparse.ArgumentParser:
                             help="作为 follow sidecar 时先睡满一轮再跑(避免刚采集完立即重算覆盖)")
     observe_v2.set_defaults(
         func=command_observe_v2,
+        max_leaderboard_wallets=V2_MAX_LEADERBOARD_WALLETS,
+        lookback_days=V2_DEFAULT_LOOKBACK_DAYS,
+        profile_lookback_days=V2_DEFAULT_PROFILE_LOOKBACK_DAYS,
+    )
+
+    observe_live = subparsers.add_parser(
+        "observe-live",
+        help="3.1: 活跃(未结算)watchlist 盘提前发现优质钱包并晋升(loop: --loop-minutes 10)",
+    )
+    add_build_arguments(observe_live, include_category=True)
+    add_collector_arguments(observe_live)
+    add_collector_v2_arguments(observe_live)
+    # 分钟级快循环(与 observe-v2 的 2h 闭市深采解耦;0=一次性)。market_positions 持仓时效
+    # 要新,故按分钟跑。--follow-dir 指向 follow 循环的同一 follow 目录(读其 active 市场缓存)。
+    observe_live.add_argument("--loop-minutes", type=float, default=0)
+    observe_live.add_argument("--defer-first-tick", action="store_true",
+                              help="作为 follow sidecar 时先睡满一轮再跑")
+    # --min-market-volume 已由 add_build_arguments 提供(活跃度门);observe-live 默认降到
+    # LIVE_SEED_MIN_VOLUME(发现端比建榜的发现窗更宽松,要早抓活跃盘参与者)。
+    observe_live.set_defaults(
+        func=command_observe_live,
+        min_market_volume=LIVE_SEED_MIN_VOLUME,
         max_leaderboard_wallets=V2_MAX_LEADERBOARD_WALLETS,
         lookback_days=V2_DEFAULT_LOOKBACK_DAYS,
         profile_lookback_days=V2_DEFAULT_PROFILE_LOOKBACK_DAYS,

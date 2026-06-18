@@ -77,6 +77,7 @@ from poly_fight.cli import (
     build_seeded_leaderboard,
     calculate_seed_bucket_min_wins,
     collect_seed_positions,
+    collect_live_seed_positions,
     command_collect,
     filter_profile_seed_wallets_v2,
     ESPORTS_CANDIDATE_MARKET_TYPE_THRESHOLDS,
@@ -10079,12 +10080,12 @@ class CoreTest(unittest.TestCase):
                 "--v2-min-positive-rate", "0.7500", "--v2-max-median-entry", "0.7500",
             ]}}})
 
-            # 策略勾上实时刷新 → runner + observe-v2 两个进程
+            # 策略勾上实时刷新 → runner + observe-v2 + observe-live 三个进程
             strat_on = default_follow_strategy(balance_usdc=100)
             strat_on["realtime_refresh"] = True
             store.save_follow_strategy(strat_on, ts=200)
             on = start_runner(config)
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(calls), 3)
             observe_cmd = calls[1]
             self.assertIn("observe-v2", observe_cmd)
             self.assertEqual(observe_cmd[observe_cmd.index("--loop-hours") + 1], "2")
@@ -10097,6 +10098,13 @@ class CoreTest(unittest.TestCase):
             self.assertNotIn("--v2-max-median-entry", observe_cmd)
             self.assertTrue(on["realtime_refresh"])
             self.assertEqual(on["observe_pid"], 4321)
+            # observe-live(3.1):分钟级快循环,同一 esports data 目录,发布同一 leaderboard_v2.db
+            observe_live_cmd = calls[2]
+            self.assertIn("observe-live", observe_live_cmd)
+            self.assertEqual(observe_live_cmd[observe_live_cmd.index("--loop-minutes") + 1], "10")
+            self.assertIn(str(data_dir / "esports"), observe_live_cmd)
+            self.assertIn("--defer-first-tick", observe_live_cmd)
+            self.assertEqual(on["observe_live_pid"], 4321)
 
     def test_dashboard_runner_start_requires_saved_follow_strategy(self):
         with TemporaryDirectory() as tmp:
@@ -13602,6 +13610,45 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(len([r for r in rows if r["seed_outcome_won"]]), 2)
         self.assertEqual(len([r for r in rows if not r["seed_outcome_won"]]), 2)
         self.assertEqual(kept, {"0xw0", "0xw1", "0xl0", "0xl1"})
+
+    def test_live_seed_positions_winner_free_dual_side_no_profit_gate(self):
+        # 未结算盘:无 winner,双侧全取,亏损者也保留(软排序非硬闸),按名义额排序每侧 top-K。
+        market = {
+            "condition_id": "m1", "game_family": "lol", "market_type": "main_match",
+            "bucket_key": "lol:main_match", "volume": 8000,
+            # 注意:无 outcome_prices winner、无 end_date —— live 盘特征
+        }
+        side0 = [
+            {"proxyWallet": "0xBIG", "outcomeIndex": 0, "avgPrice": 0.6,
+             "totalBought": 1000, "totalPnl": 50},      # 名义额 600,ITM
+            {"proxyWallet": "0xSMALL", "outcomeIndex": 0, "avgPrice": 0.5,
+             "totalBought": 100, "totalPnl": -20},      # 名义额 50,亏损也保留
+        ]
+        side1 = [
+            {"proxyWallet": "0xLOSS", "outcomeIndex": 1, "avgPrice": 0.4,
+             "totalBought": 500, "totalPnl": -80},      # 负方 + 亏损,仍保留
+        ]
+        rows = collect_live_seed_positions(
+            market, [{"positions": side0}, {"positions": side1}], positions_per_market=20,
+        )
+        by_wallet = {r["wallet"]: r for r in rows}
+        # 亏损者 0xsmall / 0xloss 都没被盈亏门筛掉
+        self.assertEqual(set(by_wallet), {"0xbig", "0xsmall", "0xloss"})
+        self.assertIsNone(by_wallet["0xbig"]["seed_outcome_won"])   # 未结算
+        self.assertTrue(by_wallet["0xbig"]["seed_in_profit"])
+        self.assertFalse(by_wallet["0xsmall"]["seed_in_profit"])
+        # 同侧按名义额排序:0xbig(600) 在 0xsmall(50) 前
+        self.assertEqual(by_wallet["0xbig"]["seed_rank"], 1)
+        self.assertEqual(by_wallet["0xsmall"]["seed_rank"], 2)
+        self.assertEqual(by_wallet["0xbig"]["seed_cost"], 600)
+
+    def test_live_seed_positions_caps_each_side_by_notional(self):
+        market = {"condition_id": "m1", "game_family": "lol", "market_type": "main_match", "volume": 9000}
+        side0 = [{"proxyWallet": f"0xA{i}", "outcomeIndex": 0, "avgPrice": 0.5,
+                  "totalBought": (i + 1) * 100, "totalPnl": 10} for i in range(3)]
+        rows = collect_live_seed_positions(market, [{"positions": side0}], positions_per_market=2)
+        # 取名义额最大的两个:0xa2(150*... 即 totalBought 300)与 0xa1(200)
+        self.assertEqual([r["wallet"] for r in rows], ["0xa2", "0xa1"])
 
     def test_classify_edge_type(self):
         # directional: 持有到结算也盈利,且 swing 占比低
