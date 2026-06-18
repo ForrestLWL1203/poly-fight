@@ -8393,6 +8393,61 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(snapshot["open_signals"], [])
             self.assertNotIn("position_cursor_by_key", state)
 
+    def test_incremental_backfill_queries_each_wallet_once(self):
+        # 增量补单:backfilled_wallets 跨 tick 持有,每个钱包只查一次 positions——
+        # startup 全量补,之后中途晋升的新钱包随到随补,已补过的不再重复查。
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now = datetime.now(timezone.utc)
+            start = now + timedelta(hours=2)
+            _seed_leaderboard(
+                data_dir / "smart_wallet_leaderboard.json",
+                [{"wallet": "0xa", "category": "esports", "grade": "A",
+                  "last_esports_trade_at": int(now.timestamp())}],
+            )
+
+            class FakeClient:
+                def __init__(self):
+                    self.position_calls = []
+
+                def list_events_paginated(self, **_kwargs):
+                    return [{
+                        "id": "event1", "slug": "event1",
+                        "title": "Dota 2: Team A vs Team B (BO3)",
+                        "tags": [{"slug": "dota-2"}], "startTime": start.isoformat(),
+                        "markets": [{
+                            "conditionId": "m1", "question": "Dota 2: Team A vs Team B (BO3)",
+                            "outcomes": ["Team A", "Team B"], "outcomePrices": ["0.50", "0.50"],
+                            "active": True, "closed": False, "volume": 100000,
+                            "startTime": start.isoformat(),
+                        }],
+                    }]
+
+                def trades_for_user(self, _wallet, **_kwargs):
+                    return []
+
+                def positions(self, wallet, *, limit=100):
+                    self.position_calls.append(wallet)
+                    return []
+
+            parser = build_parser()
+            args = parser.parse_args([
+                "--data-dir", str(data_dir), "follow", "--stake-usdc", "1",
+                "--gamma-pages", "1", "--user-trades-max-pages", "1", "--max-workers", "1",
+            ])
+            client = FakeClient()
+            backfilled: set[str] = set()
+
+            command_follow(args, client=client, emit=False,
+                           backfill_positions=True, backfilled_wallets=backfilled)
+            self.assertEqual(client.position_calls, ["0xa"])   # tick1 全量补
+            self.assertIn("0xa", backfilled)
+
+            client.position_calls.clear()
+            command_follow(args, client=client, emit=False,
+                           backfill_positions=True, backfilled_wallets=backfilled)
+            self.assertEqual(client.position_calls, [])        # tick2 已补过 → 不再查
+
     def test_follow_tick_trade_follow_does_not_depend_on_positions(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)

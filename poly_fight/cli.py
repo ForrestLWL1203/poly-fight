@@ -6238,6 +6238,7 @@ def command_follow(
     emit: bool = True,
     collector: "WSFollowCollector | None" = None,
     backfill_positions: bool = False,
+    backfilled_wallets: set[str] | None = None,
 ) -> dict[str, Any]:
     client = client or build_client(args)
     data_dir = resolve_dashboard_root(args)
@@ -6498,18 +6499,25 @@ def command_follow(
     tracked_condition_ids = {str(condition_id).lower() for condition_id in watched}
     tracked_condition_ids.update(str(signal.get("condition_id") or "").lower() for signal in open_signals)
     if gate_open and follow_wallets:
-        # 启动补单(每个 runner 进程只跑一次):把 leaderboard 钱包**启动前已有**的、落在
-        # watch scope 的持仓,按现价补成 paper leg(同一套策略过滤 + signal_id 判重,所以
-        # WS 之后看到同一钱包加仓也不会重复开)。
-        if backfill_positions:
+        # 增量补单:把钱包**进入跟单集合前已有**的、落在 watch scope 的持仓,按现价补成
+        # paper leg(同一套策略过滤 + signal_id 判重,所以 WS 之后看到同一钱包加仓也不会重复开)。
+        # 每个钱包只补一次——startup 全量补,之后 live-seed 中途晋升的新钱包随到随补
+        # (其入榜前的存量持仓 WS 看不到)。已补集合(backfilled_wallets)跨 tick 由 command_run 持有。
+        bf_seen = backfilled_wallets if backfilled_wallets is not None else set()
+        wallets_to_backfill = [
+            row for row in follow_wallets
+            if normalize_wallet(row.get("wallet")) and normalize_wallet(row.get("wallet")) not in bf_seen
+        ]
+        if backfill_positions and wallets_to_backfill:
             markets_for_bf = active_markets_for_follow or watched
             bf_by_wallet, backfill_stats = build_position_backfill_trades(
-                client, follow_wallets, markets_for_bf,
+                client, wallets_to_backfill, markets_for_bf,
                 max_entry_price=effective_max_entry_price, now_ts=now_ts,
                 existing_signal_ids={str(s.get("signal_id") or "") for s in open_signals},
             )
-            for row in follow_wallets:
+            for row in wallets_to_backfill:
                 wallet = normalize_wallet(row.get("wallet"))
+                bf_seen.add(wallet)   # 标记已补(无论有没有存量持仓),避免每 tick 重查 positions
                 bf_trades = bf_by_wallet.get(wallet)
                 if not bf_trades:
                     continue
@@ -6987,8 +6995,9 @@ def command_run(args: argparse.Namespace) -> int:
     last_build_at = now_init if args.skip_initial_build else 0
     tick_count = 0
     first_error_at: float | None = None
-    # 启动补单只在第一个**成功执行了补单**的 tick 后置位(避免首 tick 因暂停/异常而漏补)。
-    backfill_done = False
+    # 增量补单:已补过持仓的钱包集合,跨 tick 持有。startup 全量补,之后 live-seed 中途
+    # 晋升进 leaderboard 的新钱包随到随补(每钱包一次)。空集兜底使首 tick 因暂停/异常漏补时下 tick 重试。
+    backfilled_wallets: set[str] = set()
     stop_requested = {"value": False, "reason": ""}
     collection_root = resolve_dashboard_root(args)
     follow_dir = resolve_follow_dir(args, collection_root)
@@ -7094,10 +7103,9 @@ def command_run(args: argparse.Namespace) -> int:
                 maybe_build(force=False)
                 summary = command_follow(
                     args, client=client, emit=True, collector=collector,
-                    backfill_positions=not backfill_done,
+                    backfill_positions=True,
+                    backfilled_wallets=backfilled_wallets,
                 )
-                if summary.get("backfill_ran"):
-                    backfill_done = True
             except Exception as exc:
                 now = time.time()
                 if first_error_at is None:
