@@ -93,6 +93,23 @@ python3 -m poly_fight.cli collect --classification-lookback-days 15 --market-bat
 python3 -m poly_fight.cli collect --classification-lookback-days 15 --market-batch-size 50 --market-batch-index 1
 ```
 
+Continuous discovery (sidecars to the runner; the dashboard's "realtime refresh"
+toggle starts both):
+
+```bash
+# ~2h: incremental discovery from newly-SETTLED matches + score-freshness refresh
+python3 -m poly_fight.cli observe-v2 --loop-hours 2 --follow-dir data/follow
+
+# ~10min: discover from ACTIVE (unsettled) watched markets over a volume gate and
+# promote grade-A wallets EARLY so the follow loop can act before settlement
+python3 -m poly_fight.cli observe-live --loop-minutes 10 --follow-dir data/follow
+```
+
+Both publish into the same per-category `leaderboard.db`; their publish critical
+sections serialize via a build lock. `observe-live` reads the runner's active
+market cache read-only and only profiles wallets not already known (dedup), so
+most ticks are cheap.
+
 ### Analyze an event
 
 ```bash
@@ -111,20 +128,28 @@ python3 -m poly_fight.cli follow --stake-usdc 1 --stake-ratio-percent 10 --bankr
 python3 -m poly_fight.cli run --stake-usdc 1 --stake-ratio-percent 10 --bankroll-usdc 1000
 ```
 
-Stake sizing:
+Stake sizing: the runner sizes by a follow strategy stored in `follow.db`
+(**Kelly-on-edge**: `edge = θ̂×0.95 − price`, ¼-Kelly, bounded by per-signal /
+per-match caps and a min-stake floor). The flags below are the legacy fallback
+when no strategy is configured:
 
 - `--stake-usdc` — minimum paper stake per BUY leg.
-- `--stake-ratio-percent` — target-wallet cash replication ratio. The leg size is
+- `--stake-ratio-percent` — target-wallet cash replication ratio:
   `max(--stake-usdc, wallet_trade_cash * ratio_percent / 100)`.
 - `--bankroll-usdc` — caps total open paper exposure. If the bankroll cannot
   cover the proportional stake it is capped to the minimum (flagged), or skipped.
 
-Each tick pulls recent `trades?user=<wallet>` pages, advances a local per-wallet
-cursor (the Data API has no documented time-range parameter for `/trades`), and
-ignores historical trades on cold start. BUY trades in watched markets create
-paper legs; SELL trades mirror-exit the open position. Material same-market
-SELLs (cumulative size over `--quarantine-sell-frac`, default 0.2) and
-opposite-side BUYs quarantine a wallet until the next clean leaderboard cycle.
+Fills are detected on-chain via WebSocket (sub-second) when an RPC is configured,
+falling back to `trades?user=<wallet>` polling otherwise. BUY trades in watched
+markets create paper legs; sub-minimum BUY fills accumulate per
+`(wallet, condition, outcome)` until they clear the minimum order, then follow
+(small-buy accumulator). The sole live price gate is the edge gate — current
+price must be `< θ̂×0.95`, else `no_live_edge`. Each newly-eligible wallet's
+pre-existing positions are backfilled into legs once (startup and mid-run, when a
+wallet is promoted onto the leaderboard live). SELL trades mirror-exit
+proportionally. Material same-market SELLs (cumulative size over
+`--quarantine-sell-frac`, default 0.2) and opposite-side BUYs quarantine a wallet
+until the next clean leaderboard cycle.
 
 The loop keeps tracking markets that already have open signals. Strict wallets
 appearing on opposite outcomes of the same `conditionId` mark both sides
@@ -148,8 +173,11 @@ users can trigger a background smart-wallet refresh, start/stop the runner, set
 a manual paper balance cap, manage favorites, and reset generated data — nothing
 that writes follow-signal state directly.
 
-- **VPS / TLS:** put the service behind nginx + TLS and run with
-  `--host 0.0.0.0 --cookie-secure`. Leave `--cookie-secure` off for local HTTP.
+- **VPS / TLS:** deploy via the launcher (`launcher/launcher.py` → 远程 VPS →
+  环境准备), which clones the repo, installs a `poly-fight-dashboard` systemd unit
+  (bound to `127.0.0.1`), and fronts it with **Caddy** for automatic HTTPS. The
+  dashboard is reachable only through Caddy, never exposed directly. See
+  `launcher/README.md`.
 - **Static assets:** the UI defaults to `poly_fight/dashboardV2/`. Override with
   `--static-dir <dir>`.
 - **Mock mode:** append `?mock=1` to the dashboard URL to render the UI from

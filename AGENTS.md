@@ -42,13 +42,25 @@ python3 -m poly_fight.cli collect --classification-lookback-days 15 --market-bat
 ## Current Workflow
 
 ```text
-collect / build-leaderboard:
-  closed in-scope markets -> discovery slate -> trades -> candidate wallets
-  -> scoped wallet history -> smart_wallet_leaderboard
+collect-v2 / build-leaderboard (periodic full rebuild):
+  closed in-scope markets -> dual-side discovery -> trades -> candidate wallets
+  -> scoped wallet history -> score -> A-only leaderboard.db (per category)
+
+observe-v2 (sidecar, ~2h): newly-SETTLED markets -> top-PnL dual-side holders
+  -> score on history -> merge into leaderboard; also M5 quarantine recovery +
+  resolution/score freshness refresh. Covers matches not seen live.
+
+observe-live (sidecar, ~10min): ACTIVE (unsettled) watched markets over a volume
+  gate -> dual-side current holders -> score on history -> grade-A promoted into
+  leaderboard EARLY (seed_source=observe_live). Lets follow act before settlement.
+  (observe-v2 + observe-live share leaderboard.db; their publish critical sections
+  serialize via acquire_build_lock.)
 
 follow / run:
-  leaderboard wallets -> upcoming watched markets -> wallet trade polling
-  -> paper legs -> CLV / settlement / performance
+  leaderboard wallets -> upcoming/in-progress watched markets -> on-chain WS fill
+  detection (data-api fallback) -> paper legs -> CLV / settlement / performance.
+  Incremental backfill synthesizes each newly-eligible wallet's pre-existing
+  positions into legs (startup + mid-run live-seed promotions).
 
 serve:
   read-only dashboard (all data from SQLite) + wallet refresh / runner controls
@@ -109,19 +121,16 @@ Default discovery source is `trades?market=<conditionId>&takerOnly=false`.
 Closed-market holders are experimental only; after resolution holder balances can
 be biased.
 
-Rating signals:
+Rating signals (copy-edge axis; Wilson lower-bound and dollar gates removed —
+entry/leaderboard axes are unified on θ̂):
 
 ```text
-realized PnL
-win/loss count excluding pnl=0 neutral markets
-Wilson lower bound at 80% confidence (z=1.28)
-edge against breakeven entry price
-entry price
-capital size
-positive market rate / flat win rate
-sample count
-recency
-bot-like / two-sided / tail-entry behavior
+θ̂  = recency-weighted point win-rate (half-life ~21d) on followable (<=0.85) subset
+n_eff floor (>= ~10, per-game scope-calibrated)
+copy-edge (θ̂ vs entry price; only +EV-to-copy wallets qualify)
+edge-type: directional vs technical (hold-to-settle pnl vs swing) — see classify_edge_type
+win/loss count excluding pnl=0 neutral markets; recency; capital size
+bot-like / two-sided / tail-entry behavior (hard exclusions)
 ```
 
 `realizedPnl == 0` positions are neutral and excluded from win rate, ROI, and
@@ -135,11 +144,11 @@ The exported leaderboard (persisted to `leaderboard.db`) is stricter than raw
 scoring:
 
 ```text
-grade == A
-recent category activity
+grade == A (B stays in pool, not on the board)
+recent category activity (idle hard cut, default 72h)
 meaningful discovery participation / cash
 same-condition two-sided behavior excluded
-max exported wallets = 30 by default
+max exported wallets = 200 safety cap (quality gate is the real limiter)
 ```
 
 Do not re-apply old raw win-rate, median-entry, or zero-tolerance late-entry
@@ -202,18 +211,18 @@ If Polymarket returns 429/503, lower `--max-requests-per-second` first.
 Per tick:
 
 ```text
-read category leaderboards
+read category leaderboards (reloaded every tick; live-seed promotions picked up next tick)
 filter by follow recency and wallet_quarantine
-build watched markets from start_time within observe window
-poll trades?user= for follow wallets and wallets with open signals
-cold-start wallets set cursor only
-optional bootstrap current positions once
-new BUY trades create paper legs
-SELL mirrors exit wallet-market-outcome legs
+build watched markets: upcoming within observe window OR started-but-unresolved
+detect fills via on-chain WS (drain ~5s when healthy); data-api polling fallback
+incremental backfill: each NEWLY-eligible wallet's pre-existing positions -> legs once
+new BUY trades create paper legs (open or add)
+sub-min BUY fills accumulate per (wallet,cond,outcome) until >= min order, then follow (small-buy accumulator)
+SELL mirrors exit proportionally (cumulative wallet_sold_frac; >= $1 min, hold/accumulate else, dust full-clear)
 material SELL or opposite-side BUY writes wallet_quarantine
 post-start snapshot records CLV once
 same conditionId with both outcomes open marks contested
-settled markets move open signals to results
+settled markets move open signals to results; M5 demotion re-scores followed wallets every 10 settle events
 ```
 
 Do not rely on `/trades` time-range params. Use local cursor `{timestamp, id}`
@@ -222,18 +231,22 @@ and recent pages (`--user-trades-limit` default 100,
 
 Stake sizing:
 
+The active runner sizes by a configurable follow strategy persisted in
+`follow.db` (Kelly-on-edge): `edge = θ̂×0.95 − price`; stake ≈ ¼-Kelly ×
+edge/(1−price) × bankroll, bounded by per-signal cap (5%), per-match cap (10%),
+and a `min_stake` floor. `θ̂` is the followed bucket's recency-weighted point
+win-rate. Each BUY leg (incl. adds) is sized independently.
+
 ```text
+# legacy / no-strategy fallback only:
 wallet_trade_cash = wallet BUY size * wallet BUY price
 stake = max(--stake-usdc, wallet_trade_cash * --stake-ratio-percent / 100)
 ```
 
-`--stake-usdc` is the minimum paper stake. Dashboard default is 1.  
-`--stake-ratio-percent` is the target-wallet replication ratio. Dashboard
-default is 10. Each BUY leg, including later adds, is sized independently.
-
-If `--bankroll-usdc` cannot cover desired proportional stake but can cover the
-minimum, cap to available balance and mark the leg capped. If it cannot cover
-the minimum, skip.
+`--stake-usdc` (dashboard default 1) is the minimum paper stake;
+`--stake-ratio-percent` (default 10) the replication ratio. If `--bankroll-usdc`
+cannot cover the desired stake but can cover the minimum, cap to available
+balance and mark the leg capped; if it cannot cover the minimum, skip.
 
 Follow eligibility:
 
@@ -251,10 +264,15 @@ if sports follow is later enabled.
 NBA wallets follow NBA only. UFC wallets follow UFC only. Wallets no longer
 eligible can only affect already-open signal markets.
 
-`--max-slippage-over-entry` defaults to 0.10 and sets `would_follow`; paper
-signals are still recorded for learning. `--max-entry-price` defaults to 0.85
-and blocks funded follow when our observed buy price is already higher.
-Contested signals are recorded but not live-followable.
+Live price gate: the **sole** funded-follow price gate is the edge gate —
+current price must be `< θ̂×0.95` (`THETA_FOLLOW_DISCOUNT`), else blocked
+`no_live_edge`. `--max-entry-price` (default 0.85, or strategy
+`max_follow_entry_price`) is a hard ceiling on our observed buy price;
+`--min-wallet-entry-price` floors the target's fill price. The old
+`slippage_over_entry` and `cost_ratio_cap` (cost×1.15) gates were removed so the
+entry axis matches the leaderboard axis (θ̂); `--max-slippage-over-entry` remains
+as an accepted but non-blocking flag. Contested signals are recorded but not
+live-followable.
 
 Failure policy:
 
@@ -433,22 +451,26 @@ Operational notes:
 - Do not edit live code directly on the VPS unless explicitly asked. Prefer
   local commit/push, then pull/deploy on the VPS.
 
-VPS deploy/restart checklist:
+VPS deploy/restart (launcher-driven):
+
+Deployment is driven by the local launcher (`launcher/launcher.py`), not by
+hand-editing live processes. The dashboard runs as a `poly-fight-dashboard`
+systemd unit bound to `127.0.0.1`, fronted by Caddy for HTTPS; the **paper runner
+and observe processes are spawned by the dashboard panel**, not as a separate
+systemd unit or manual argv.
 
 ```text
-1. Read local private ops notes outside git for the login method.
+1. Read local private ops notes outside git for the host + login method.
 2. Commit and push local changes to GitHub first.
-3. On the VPS, inspect the existing poly_fight runner/dashboard processes and
-   their cwd/argv before changing anything.
-4. In the live repo directory, fetch origin/main and fast-forward only.
-5. Restart the long-running paper runner with the same data/log/follow dirs,
-   stake settings, and --skip-initial-build shape used by the existing process.
-6. Restart the dashboard serve process with the same data dir, host/port,
-   dashboard user, cookie-secure setting, and runner stake setting.
-7. Update existing pid files to the new live PIDs if the manual restart path
-   owns them.
-8. Verify the repo HEAD, process cwd/argv, dashboard HTTP response, and the
-   latest `run_ticks` row in `follow.db` before reporting success.
+3. Launcher → 远程 VPS → 环境准备: pairs SSH key (first run), installs
+   git/python3/caddy, opens ufw 80/443, git-resets the live repo to origin/main
+   (aborts if the worktree is dirty), writes secrets, installs/enables the
+   poly-fight-dashboard systemd unit + Caddy block.
+4. Launcher → 启动: systemctl restart poly-fight-dashboard.
+5. Start the runner / realtime refresh from the dashboard panel, not by argv.
+6. Verify: VPS repo HEAD matches local, `systemctl is-active
+   poly-fight-dashboard caddy`, the HTTPS domain returns 200, and the latest
+   `run_ticks` row in `follow.db` looks current.
 ```
 
 When debugging follower latency on the VPS, check the latest run log for
