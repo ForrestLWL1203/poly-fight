@@ -284,9 +284,14 @@
 
   function event(row, nowMs) {
     const info = matchInfo(row);
+    const now = nowMs || Date.now();
     const start = toDate(row.match_start_time);
-    const live = start ? start.getTime() <= (nowMs || Date.now()) : false;
-    const status = live ? "live" : "upcoming";
+    const end = toDate(row.end_date);
+    const started = start ? start.getTime() <= now : false;
+    // 原定结束时间已过、却仍在活跃(未结算)列表 → 延期/超时,而非真"进行中"。
+    // Polymarket 改期常不更新 gameStartTime/endDate,旧档期会把延期盘错判成已开赛。
+    const delayed = end ? end.getTime() <= now : false;
+    const status = delayed ? "delayed" : started ? "live" : "upcoming";
     const outs = row.outcomes || [];
     const sc = row.side_counts || {};
     return {
@@ -297,7 +302,8 @@
       start: fmtClock(row.match_start_time, nowMs),
       end: fmtClock(row.end_date, nowMs),
       status,
-      countdown: countdown(row.match_start_time, status, nowMs),
+      delayed,
+      countdown: status === "delayed" ? "延期中" : countdown(row.match_start_time, status, nowMs),
       followA: num(sc[outs[0]]),
       followB: num(sc[outs[1]]),
       openSignals: num(row.open_signal_count),

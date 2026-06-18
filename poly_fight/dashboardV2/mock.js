@@ -119,6 +119,8 @@
       mkEvent(M.cs2_main, { open_signal_count: 5, signal_count: 5, side_counts: { PARIVISION: 4, Monte: 1 } }),
       mkEvent(M.dota_main, { open_signal_count: 2, signal_count: 2, side_counts: { "Team Spirit": 2 } }),
       mkEvent({ ...M.lol_main, match_start_time: iso(6), end_date: iso(10) }, { side_counts: {} }),
+      // 延期盘:原定结束已过、仍未结算(Polymarket 改期未更新档期)→ 应显示「延期中 / 原定截止」
+      mkEvent({ ...M.dota_main, condition_id: "0xmockdelayed0001", match_start_time: iso(-30), end_date: iso(-6) }, { open_signal_count: 1, signal_count: 1, side_counts: { "Team Spirit": 1 } }),
     ],
     archived_events: [
       { condition_id: M.lol_main.condition_id, match_parts: M.lol_main.match_parts, team_logos: M.lol_main.team_logos, match_start_time: iso(-30), end_date: iso(-26), market_type: "main_match", market_type_label: "主盘", our_realized_pnl: 502.7, wallet_basis_realized_pnl: 480, last_activity_at: ago(90000), status: null },

@@ -135,7 +135,7 @@ function MatchCell({ ev, tag, held }) {
     <div className="match-cell">
       <div className="match-game">{ev.game ? <GameIcon game={ev.game} base={ASSET_BASE} chip /> : null}<span className="match-meta">{ev.meta}</span>{tag ? <span className="mkt-tag">{tag}</span> : null}{dual ? <span className="dual-tag">双边</span> : null}</div>
       <TeamLine ev={ev} held={held} />
-      {(ev.start || ev.end) && <div className="match-times"><span>开始 {ev.start || "—"}</span><span className="dot-sep">·</span><span>截止 {ev.end || "—"}</span></div>}
+      {(ev.start || ev.end) && <div className="match-times"><span>开始 {ev.start || "—"}</span><span className="dot-sep">·</span><span>{ev.delayed ? "原定截止 " : "截止 "}{ev.end || "—"}</span></div>}
     </div>
   );
 }
@@ -640,9 +640,10 @@ function EventsPage({ data }) {
                   <td>{e.eventUrl ? <a className="evt-link" href={e.eventUrl} target="_blank" rel="noopener noreferrer" title="在 Polymarket 打开该赛事"><MatchCell ev={e} /></a> : <MatchCell ev={e} />}</td>
                   <td><div className="evt-status">
                     {e.status === "live" && <Badge tone="up" dot>进行中</Badge>}
+                    {e.status === "delayed" && <Badge tone="warn" dot>延期中</Badge>}
                     {e.status === "upcoming" && <Badge tone="accent" dot>未开始</Badge>}
                     {e.status === "settled" && <Badge tone="neutral">已结算</Badge>}
-                    {e.countdown && !archive && e.status !== "live" && <span className="evt-count">{e.countdown}</span>}
+                    {e.countdown && !archive && e.status !== "live" && e.status !== "delayed" && <span className="evt-count">{e.countdown}</span>}
                   </div></td>
                   <td>{archive
                     ? <span className={pnlClass(e.pnl) + " strong num"} style={{ fontSize: "var(--fs-h4)" }}>{signedMoney(e.pnl)}</span>
