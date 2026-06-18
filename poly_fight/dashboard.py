@@ -1695,17 +1695,11 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
                 "sold_before_resolution_market_rate": row.get("sold_before_resolution_market_rate"),
                 "two_sided_trade_market_rate": row.get("two_sided_trade_market_rate"),
                 "eligible_market_types": row.get("eligible_market_types") or [],
-                "eligible_market_type_labels": row.get("eligible_market_type_labels") or [],
                 "eligible_buckets": row.get("eligible_buckets") or [],
-                "eligible_bucket_labels": row.get("eligible_bucket_labels") or [],
-                "scope": _leaderboard_scope(row),  # 专精列:跨游戏桶已展开成真实游戏 + 盘口
-
+                "scope": _leaderboard_scope(row),  # 专精列:跨游戏桶已展开成真实游戏 + 盘口(label 前端 scopeList 自推)
                 "eligible_game_families": row.get("eligible_game_families") or [],
-                "eligible_game_family_labels": row.get("eligible_game_family_labels") or [],
                 "observed_market_types": observed_market_types,
-                "observed_market_type_labels": row.get("observed_market_type_labels") or _market_type_labels(observed_market_types),
                 "observed_buckets": observed_buckets,
-                "observed_bucket_labels": row.get("observed_bucket_labels") or [bucket_label(value) for value in observed_buckets],
                 "participation_rate": row.get("participation_rate"),
                 "participated_events": row.get("participated_events"),
                 "eligible_event_count": row.get("eligible_event_count"),
@@ -2427,26 +2421,8 @@ def build_events(
         market, condition_id, _start_ts, _open_signals, _results = ordered_group[0]
         open_signals = [signal for _market, _condition_id, _start, signals, _results in ordered_group for signal in signals]
         results = [result for _market, _condition_id, _start, _signals, group_results in ordered_group for result in group_results]
-        condition_ids = [row_condition_id for _market, row_condition_id, _start, _signals, _results in ordered_group if row_condition_id]
         market_types = _unique_nonempty(str(row_market.get("market_type") or "") for row_market, *_rest in ordered_group)
         market_type_labels = _unique_nonempty(str(row_market.get("market_type_label") or "") for row_market, *_rest in ordered_group)
-        market_breakdown = []
-        for row_market, row_condition_id, _row_start, row_signals, row_results in ordered_group:
-            row_follow_items = [*row_signals, *row_results]
-            market_breakdown.append(
-                {
-                    "condition_id": row_condition_id,
-                    "title": row_market.get("title"),
-                    "question": row_market.get("question"),
-                    "market_type": row_market.get("market_type"),
-                    "market_type_label": row_market.get("market_type_label"),
-                    "outcomes": row_market.get("outcomes"),
-                    "open_signal_count": len(row_signals),
-                    "result_count": len(row_results),
-                    "signal_count": len(row_follow_items),
-                    "side_counts": _signal_side_counts(row_follow_items),
-                }
-            )
         match_parts = _match_parts_for_row(market)
         category = normalize_category(str(market.get("category") or "")) or "esports"
         league = normalize_league(market.get("league"))
@@ -2455,7 +2431,6 @@ def build_events(
         events.append(
             {
                 "condition_id": condition_id,
-                "condition_ids": condition_ids,
                 "event_slug": event_slug,
                 "event_url": _polymarket_event_url(event_slug),
                 "category": category,
@@ -2476,7 +2451,6 @@ def build_events(
                 "market_count": len(ordered_group),
                 "market_types": market_types,
                 "market_type_labels": market_type_labels,
-                "market_breakdown": market_breakdown,
                 "open_signal_count": len(open_signals),
                 "result_count": len(results),
                 "signal_count": len(open_signals) + len(results),

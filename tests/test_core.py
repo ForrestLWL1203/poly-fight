@@ -12354,10 +12354,8 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(row["esports_win_count"], 11)
             self.assertEqual(row["esports_loss_count"], 1)
             self.assertEqual(row["wilson_win_rate_lower_bound"], 0.72)
-            self.assertEqual(row["eligible_market_type_labels"], ["单局"])
             self.assertEqual(row["eligible_market_types"], ["game_winner"])
             self.assertEqual(row["observed_market_types"], ["main_match", "game_winner"])
-            self.assertEqual(row["observed_market_type_labels"], ["主盘", "单局"])
 
     def test_dashboard_wallets_expose_multiple_game_bucket_fields(self):
         with TemporaryDirectory() as tmp:
@@ -12425,7 +12423,6 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(row["eligible_buckets"], ["cs2:main_match", "dota2:main_match"])
             self.assertEqual(row["eligible_game_families"], ["cs2", "dota2"])
             self.assertEqual(row["observed_buckets"], ["cs2:main_match", "dota2:main_match"])
-            self.assertEqual(row["observed_bucket_labels"], ["CS2 主盘", "Dota2 主盘"])
             self.assertEqual(row["best_bucket"], "cs2:main_match")
             self.assertEqual(row["wilson_win_rate_lower_bound"], 0.83)
 
@@ -12684,16 +12681,14 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(events["count"], 2)
             grouped = events["events"][0]
             self.assertEqual(grouped["condition_id"], "main")
-            self.assertEqual(grouped["condition_ids"], ["main", "map1", "map2"])
             self.assertEqual(grouped["market_count"], 3)
             self.assertEqual(grouped["market_types"], ["main_match", "map_winner"])
             self.assertEqual(grouped["market_type_label"], "3盘口")
-            self.assertEqual([row["condition_id"] for row in grouped["market_breakdown"]], ["main", "map1", "map2"])
-            breakdown = {row["condition_id"]: row for row in grouped["market_breakdown"]}
-            self.assertEqual(breakdown["main"]["signal_count"], 0)
-            self.assertEqual(breakdown["map1"]["signal_count"], 1)
-            self.assertEqual(breakdown["map1"]["side_counts"], {"0": 1})
-            self.assertEqual(breakdown["map2"]["signal_count"], 0)
+            # 逐子盘明细(market_breakdown / condition_ids)已删(前端不展示);
+            # 用事件级聚合验证分组:3 子盘合一,map1 的 1 笔信号汇总到事件级。
+            self.assertEqual(grouped["open_signal_count"], 1)
+            self.assertEqual(grouped["signal_count"], 1)
+            self.assertEqual(grouped["side_counts"], {"0": 1})
 
     def test_dashboard_events_return_counts_not_raw_follow_payloads(self):
         with TemporaryDirectory() as tmp:
