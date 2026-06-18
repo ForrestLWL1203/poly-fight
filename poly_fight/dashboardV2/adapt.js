@@ -53,19 +53,23 @@
     return Math.floor(diff / (86400 * 30)) + "个月前";
   }
 
-  /* parse an ISO/epoch into "MM-DD HH:mm" or "今天/明天 HH:mm" */
+  /* parse an ISO/epoch into "MM-DD HH:mm" or "今天/明天 HH:mm".
+     钉死 UTC+8(北京):赛事时间统一按北京墙钟显示,不随查看设备的时区漂移。
+     做法 = 把绝对时刻 +8h 后用 getUTC* 读取(中国无夏令时,固定偏移即正确)。 */
   function fmtClock(value, nowMs) {
     const d = toDate(value);
     if (!d) return "";
     const pad = (n) => String(n).padStart(2, "0");
-    const hm = pad(d.getHours()) + ":" + pad(d.getMinutes());
-    const now = new Date(nowMs || Date.now());
-    const dayKey = (x) => x.getFullYear() * 372 + x.getMonth() * 31 + x.getDate();
-    const delta = dayKey(d) - dayKey(now);
+    const OFFSET = 8 * 3600 * 1000;             // UTC+8 固定偏移
+    const ds = new Date(d.getTime() + OFFSET);
+    const ns = new Date((nowMs || Date.now()) + OFFSET);
+    const hm = pad(ds.getUTCHours()) + ":" + pad(ds.getUTCMinutes());
+    const dayKey = (x) => x.getUTCFullYear() * 372 + x.getUTCMonth() * 31 + x.getUTCDate();
+    const delta = dayKey(ds) - dayKey(ns);
     if (delta === 0) return "今天 " + hm;
     if (delta === 1) return "明天 " + hm;
     if (delta === 2) return "后天 " + hm;
-    return pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + hm;
+    return pad(ds.getUTCMonth() + 1) + "-" + pad(ds.getUTCDate()) + " " + hm;
   }
 
   function toDate(value) {
