@@ -2098,6 +2098,9 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
         bucket["follow_exit_price"] = (
             round(weighted_exit / exit_stake, 8) if exit_stake > 0 and not mixed_outcomes else None
         )
+        # 提前卖出的镜像平仓金额(各次 partial_exits 的 sold_stake 之和),供前端在钱包头部
+        # 与"提前卖出"标签一起显示(比只显示卖出价更直观)。
+        bucket["follow_exit_stake"] = round(exit_stake, 8) if exit_stake > 0 and not mixed_outcomes else None
         bucket["follow_realized_pnl"] = round(realized_pnl, 8) if realized_count else None
     title = title or str(market.get("title") or "")
     question = question or str(market.get("question") or "")

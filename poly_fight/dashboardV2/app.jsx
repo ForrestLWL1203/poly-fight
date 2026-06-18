@@ -779,11 +779,15 @@ function WalletLegBlock({ w, prices, ev }) {
           {w.leaderboard_rank != null && <RankBadge rank={w.leaderboard_rank} />}
           <WalletAddress address={w.wallet} href={polymarketProfileUrl(w.wallet)} onClick={(e) => e.stopPropagation()} copyable />
           <span className="side-chips">{sides.map((sd) => <SideChip key={sd.index + ":" + sd.outcome} outcome={sd.outcome} index={sd.index} ev={ev} />)}</span>
+          {w.follow_exit_price != null && (
+            <Badge tone="warn" title="目标钱包在结算前清仓(或对账兜底补平),我们已镜像平仓 — 非市场结算">
+              提前卖出{w.follow_exit_stake != null ? ` ${money(w.follow_exit_stake)}` : ""} @ {priceStr(w.follow_exit_price)}
+            </Badge>
+          )}
         </div>
         <div className="wallet-block-meta">
           <span>投入 <b>{money(w.follow_total_stake)}</b></span>
           <span>均价 <b>{priceStr(w.follow_avg_entry_price)}</b></span>
-          {w.follow_exit_price != null && <span title="提前卖出的加权卖出价">卖出价 <b>{priceStr(w.follow_exit_price)}</b></span>}
           <span>盈亏 <b className={pnlClass(pnlValue || 0)}>{pnlValue != null ? signedMoney(pnlValue) : "—"}</b></span>
         </div>
       </div>
