@@ -840,6 +840,13 @@ class FollowStore:
                     "end_ts": "INTEGER",
                 },
             )
+            # M5 自动降级:终态结果是否已被纳入一轮重评(防重启后重复处理)。默认 0=未处理;
+            # 现有历史结果迁移后 = 0,会被下一轮 M5 补处理一次(本就该评而从未评过)。
+            _ensure_columns(
+                conn,
+                "follow_results",
+                {"m5_processed": "INTEGER NOT NULL DEFAULT 0"},
+            )
             conn.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_market_cache_kind ON market_cache(cache_kind);
@@ -1007,6 +1014,34 @@ class FollowStore:
         with self.connect() as conn:
             rows = conn.execute("SELECT raw_json FROM follow_results ORDER BY resolved_at, signal_id").fetchall()
         return [_loads(row["raw_json"], {}) for row in rows]
+
+    def load_unprocessed_m5_results(self) -> list[dict[str, Any]]:
+        """M5 自动降级:尚未纳入重评的终态结果(settled + exited,均有真实盈亏)。
+        计数与批次钱包从此派生 → 持久化、跨重启累加、含提前卖出。返回 [{signal_id,wallet}]。"""
+        self.init_db()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT signal_id, wallet FROM follow_results "
+                "WHERE status IN ('settled', 'exited') AND COALESCE(m5_processed, 0) = 0 "
+                "ORDER BY resolved_at, signal_id"
+            ).fetchall()
+        return [{"signal_id": str(r["signal_id"]), "wallet": str(r["wallet"] or "")} for r in rows]
+
+    def mark_m5_results_processed(self, signal_ids: list[str] | set[str]) -> int:
+        """把这批终态结果标记为已纳入一轮 M5 重评(防下次重启重复计数/处理)。"""
+        ids = [str(s) for s in signal_ids if s]
+        if not ids:
+            return 0
+        self.init_db()
+        with self.connect() as conn:
+            conn.execute("BEGIN")
+            placeholders = ",".join("?" for _ in ids)
+            cur = conn.execute(
+                f"UPDATE follow_results SET m5_processed = 1 WHERE signal_id IN ({placeholders})",
+                ids,
+            )
+            conn.commit()
+        return cur.rowcount
 
     def save_follow_strategy(self, strategy: dict[str, Any], *, ts: int | None = None) -> dict[str, Any]:
         self.init_db()

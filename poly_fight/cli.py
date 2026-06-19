@@ -7341,9 +7341,8 @@ def command_run(args: argparse.Namespace) -> int:
     # M5 动态降级:跨 tick 累计被跟钱包的新结算笔数,满阈值就对那批钱包后台重评/隔离
     # (事件驱动,替代旧的固定 2h observe-v2 降级扫描)。
     rescore_threshold = int(getattr(args, "rescore_settled_threshold", 10) or 0)
-    pending_rescore_wallets: set[str] = set()
-    pending_settled_count = 0
     rescore_thread: threading.Thread | None = None
+    m5_store = FollowStore(follow_dir / "follow.db")   # M5 计数从 DB 派生(持久化、含 exited)
 
     def sleep_or_stop(seconds: int) -> None:
         if not stop_requested["value"] and int(seconds) > 0:
@@ -7444,18 +7443,14 @@ def command_run(args: argparse.Namespace) -> int:
             first_error_at = None
             tick_count += 1
 
-            # Accumulate newly-settled follow trades; at the threshold, re-score that
-            # batch of wallets off-thread (demote below-A ones). Skips while a prior
-            # re-score is still running (its wallets stay pending for the next round).
-            if rescore_threshold > 0:
-                pending_rescore_wallets.update(
-                    normalize_wallet(w) for w in (summary.get("newly_settled_wallets") or []) if normalize_wallet(w)
-                )
-                pending_settled_count += int(summary.get("settled_signal_count") or 0)
-                if pending_settled_count >= rescore_threshold and (rescore_thread is None or not rescore_thread.is_alive()):
-                    batch = set(pending_rescore_wallets)
-                    pending_rescore_wallets = set()
-                    pending_settled_count = 0
+            # M5 计数从 DB 派生:未处理的终态结果(settled + exited,均有真实盈亏)。持久化
+            # 跨重启累加、含提前卖出。达阈值即把这批标记已处理(防重启重复)+ off-thread
+            # 重评其钱包(跌出 grade-A 即隔离)。上一轮重评还在跑则跳过(这批留到下轮)。
+            if rescore_threshold > 0 and (rescore_thread is None or not rescore_thread.is_alive()):
+                pending = m5_store.load_unprocessed_m5_results()
+                if len(pending) >= rescore_threshold:
+                    batch = {normalize_wallet(r["wallet"]) for r in pending if normalize_wallet(r["wallet"])}
+                    m5_store.mark_m5_results_processed([r["signal_id"] for r in pending])
 
                     def _run_rescore(wallets: set[str] = batch) -> None:
                         try:

@@ -2961,6 +2961,27 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(store.load_market_cache(cache_kind="closed", now_ts=200, ttl_seconds=900)[0]["m1"]["condition_id"], "m1")
             self.assertEqual(store.load_market_cache(cache_kind="active", now_ts=200, ttl_seconds=900)[0], {})
 
+    def test_m5_unprocessed_results_persist_and_mark(self):
+        # M5 计数从 DB 派生:settled + exited 都算未处理;标记后不再计;跨"重启"(新 store 实例)持久。
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "follow.db"
+            store = FollowStore(db_path)
+            results = [
+                {"signal_id": "s1", "status": "settled", "wallet": "0xA", "condition_id": "c1", "settled_at": 100, "legs": []},
+                {"signal_id": "s2", "status": "exited", "wallet": "0xB", "condition_id": "c2", "exit_at": 101, "legs": []},
+                {"signal_id": "s3", "status": "settled", "wallet": "0xA", "condition_id": "c3", "settled_at": 102, "legs": []},
+            ]
+            store.save_follow_snapshot(wallet_trade_state={}, open_signals=[], result_events=results, performance={})
+            # settled + exited 都算未处理(共 3),钱包去重 {0xA,0xB}
+            pend = store.load_unprocessed_m5_results()
+            self.assertEqual(len(pend), 3)
+            self.assertEqual({p["wallet"] for p in pend}, {"0xA", "0xB"})
+            # 标记 s1/s2 已处理 → 只剩 s3
+            self.assertEqual(store.mark_m5_results_processed(["s1", "s2"]), 2)
+            self.assertEqual([p["signal_id"] for p in store.load_unprocessed_m5_results()], ["s3"])
+            # 模拟重启:新 store 实例读同库,已处理仍不计(持久化、不重复处理)
+            self.assertEqual([p["signal_id"] for p in FollowStore(db_path).load_unprocessed_m5_results()], ["s3"])
+
     def test_follow_store_market_cache_migrates_to_cache_kind_primary_key(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "follow.db"
