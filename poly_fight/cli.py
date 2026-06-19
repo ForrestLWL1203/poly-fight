@@ -6091,14 +6091,19 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
         return 0
 
     # 2) 每场双侧持仓者 → 种子(无 winner;当前盈亏只软排序不硬筛)
+    # sort_by 必须用 data-api 合法枚举 TOTAL_PNL(与 collect-v2/observe-v2 一致);旧值 "CASHPNL"
+    # 被 data-api 拒绝 → 每场抛异常被吞 → 0 seeds(observe-live 自上线起一直空转)。collect_live_seed_positions
+    # 反正自己按 seed_cost 重排,API 排序值不影响结果。fetch 失败计数并随 tick 暴露,避免再次静默全失败。
     seed_positions: list[dict[str, Any]] = []
+    position_fetch_error_count = 0
     for market in live_markets:
         condition_id = str(market.get("condition_id") or market.get("conditionId") or "").lower()
         if not condition_id:
             continue
         try:
-            response = client.market_positions(condition_id, limit=positions_per_market, sort_by="CASHPNL", sort_direction="DESC")
+            response = client.market_positions(condition_id, limit=positions_per_market, sort_by="TOTAL_PNL", sort_direction="DESC")
         except Exception:
+            position_fetch_error_count += 1
             continue
         seed_positions.extend(collect_live_seed_positions(market, response, positions_per_market=positions_per_market))
     seed_wallets = aggregate_seed_wallets(seed_positions)
@@ -6115,7 +6120,8 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
     )
     if not new_seed_wallets:
         print(json.dumps({"event": "observe_live_tick", "live_markets": len(live_markets),
-                          "seed_wallets": len(seed_wallets), "new_candidates": 0}))
+                          "seed_wallets": len(seed_wallets), "new_candidates": 0,
+                          "position_fetch_errors": position_fetch_error_count}))
         return 0
 
     # 4) 评分(与 observe-v2 同口径 scope/profile —— 复用同样的模块级函数,保证 grade 一致)
@@ -6213,6 +6219,7 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
         "event": "observe_live_tick", "live_markets": len(live_markets),
         "seed_wallets": len(seed_wallets), "new_candidates": len(new_seed_wallets),
         "profiled": len(new_profiles), "leaderboard": len(leaderboard), "new_live_on_board": new_on_board,
+        "position_fetch_errors": position_fetch_error_count,
     }))
     return 0
 

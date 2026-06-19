@@ -28,8 +28,9 @@ class _FakeClient:
         self.market_positions_calls = []
         self.list_events_calls = 0
 
-    def market_positions(self, condition_id, *, limit=20, sort_by="CASHPNL", sort_direction="DESC"):
+    def market_positions(self, condition_id, *, limit=20, sort_by="TOTAL_PNL", sort_direction="DESC"):
         self.market_positions_calls.append(condition_id)
+        self.last_sort_by = sort_by
         return self._mp.get(condition_id, [])
 
     def list_events_paginated(self, **_kwargs):
@@ -93,6 +94,8 @@ class TestObserveLiveGates(unittest.TestCase):
             event = self._run(data_dir, markets, client)
             self.assertEqual(event["live_markets"], 1)
             self.assertEqual(client.market_positions_calls, ["m_live"])  # 发现层跑了
+            # 防回归:必须用 data-api 合法枚举 TOTAL_PNL;旧值 "CASHPNL" 被拒 → 每场抛异常被吞 → 0 seeds。
+            self.assertEqual(client.last_sort_by, "TOTAL_PNL")
             self.assertEqual(event["new_candidates"], 0)                  # 去重后无新候选
             self.assertEqual(client.list_events_calls, 0)                 # early-exit:没进评分(无分类集拉取)
 
