@@ -126,16 +126,16 @@ function FollowStatusBadge({ f }) {
   if (f.settlementType === "manual_exit")
     return <Badge tone="warn" title="目标钱包在比赛结算前清仓(或对账兜底补平),我们已镜像平仓 — 非市场结算">提前卖出</Badge>;
   if (f.settlementType === "auto_and_manual")
-    return <Badge tone="warn" title="多个信号:部分提前镜像平仓、部分等到市场结算">部分提前卖出</Badge>;
-  return <Badge tone="neutral">已结算</Badge>;
+    return <Badge tone="warn" title="多个信号:部分镜像平仓、部分等到市场结算">部分卖出</Badge>;
+  return <Badge tone="accent" dot title="持有到市场结算(自然结算)">自动结算</Badge>;
 }
 function MatchCell({ ev, tag, held }) {
   const dual = held && held.length >= 2;
   return (
     <div className="match-cell">
-      <div className="match-game">{ev.game ? <GameIcon game={ev.game} base={ASSET_BASE} chip /> : null}<span className="match-meta">{ev.meta}</span>{tag ? <span className="mkt-tag">{tag}</span> : null}{dual ? <span className="dual-tag">双边</span> : null}</div>
+      <div className="match-game">{ev.game ? <GameIcon game={ev.game} base={ASSET_BASE} chip /> : null}<span className="match-meta">{ev.meta}</span></div>
       <TeamLine ev={ev} held={held} />
-      {(ev.start || ev.end) && <div className="match-times"><span>开始 {ev.start || "—"}</span><span className="dot-sep">·</span><span>{ev.delayed ? "原定截止 " : "截止 "}{ev.end || "—"}</span></div>}
+      {(ev.start || ev.end || tag || dual) && <div className="match-times">{(ev.start || ev.end) && <React.Fragment><span>开始 {ev.start || "—"}</span><span className="dot-sep">·</span><span>{ev.delayed ? "原定截止 " : "截止 "}{ev.end || "—"}</span></React.Fragment>}{tag ? <span className="mkt-tag">{tag}</span> : null}{dual ? <span className="dual-tag">双边</span> : null}</div>}
     </div>
   );
 }
