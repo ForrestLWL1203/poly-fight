@@ -5611,6 +5611,34 @@ class CoreTest(unittest.TestCase):
         # 单场已满 → match_cap_reached
         self.assertEqual(ev(0.78, 0.55, cond=200)["block_reason"], "match_cap_reached")
 
+    def test_kelly_conviction_ramp_and_dynamic_bankroll(self):
+        # 信念 N-ramp + 动态 bankroll(见 review/follow-sizing-conviction-and-dynamic-bankroll.md)。
+        s = default_follow_strategy(balance_usdc=5000)
+        s["stake_sizing"]["per_signal_cap_percent"] = 1.0   # 单笔 1% → base $50@5000
+        s["stake_sizing"]["per_match_cap_percent"] = 10.0   # 单场 10% → C $500@5000;ramp 默认 5/10
+
+        def ev(order_cash, bankroll, theta=0.66, p=0.59, cond=0.0):
+            return evaluate_follow_candidate(
+                strategy=s, target_wallet_order_cash_usdc=order_cash, available_balance_usdc=bankroll,
+                condition_funded_stake_usdc=cond, condition_funded_order_count=0,
+                wallet_condition_funded_order_count=0,
+                bucket_win_rate=theta, entry_price=p, bankroll_usdc=bankroll,
+            )
+
+        # 动态 bankroll:单笔cap 随传入权益走(不再钉在静态 usable_balance=5000)。小单 N<5:
+        self.assertEqual(ev(100, 5000)["funded_stake"], 50)    # 1% × 5000
+        self.assertEqual(ev(100, 6000)["funded_stake"], 60)    # 权益涨 → 1% × 6000
+        self.assertEqual(ev(100, 4000)["funded_stake"], 40)    # 权益跌 → 1% × 4000
+
+        # N-ramp(bankroll 5000 → C=$500, base=$50, N_start5/N_full10):
+        self.assertEqual(ev(1000, 5000)["funded_stake"], 50)   # N=2 不触发
+        self.assertEqual(ev(2500, 5000)["funded_stake"], 50)   # N=5 起点 frac0 → base
+        self.assertEqual(ev(3000, 5000)["funded_stake"], 140)  # N=6 → 50+(500-50)×1/5
+        self.assertEqual(ev(3000, 5000)["stake_mode"], "kelly_conviction")
+        self.assertEqual(ev(5000, 5000)["funded_stake"], 500)  # N=10 封顶单场cap
+        self.assertEqual(ev(9508, 5000)["funded_stake"], 500)  # N=19 仍封顶 C(Aurora:原 $50)
+        self.assertEqual(ev(9508, 5000, cond=400)["funded_stake"], 100)  # 单场已投 $400 → 只补剩余
+
     def test_follow_strategy_max_entry_price_default_and_clamp(self):
         # 默认 = 全系统唯一分水岭 0.85;缺字段补默认;clamp 到 [0,1];0 = 不限(均 normalize 处理)。
         self.assertEqual(default_follow_strategy()["prefilters"]["max_follow_entry_price"], 0.85)
