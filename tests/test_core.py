@@ -14817,7 +14817,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(effective_bankroll_usdc(args.bankroll_usdc), float("inf"))
         self.assertTrue(args.skip_initial_build)
         self.assertEqual(args.max_run_ticks, 1)
-        self.assertEqual(args.pool_refresh_hours, 24)
+        self.assertEqual(args.pool_refresh_hours, 12)
         self.assertEqual(args.observe_window_hours, 24)
         self.assertEqual(args.user_trades_limit, 50)
         self.assertEqual(args.user_trades_max_pages, 1)

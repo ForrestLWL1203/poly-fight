@@ -7844,11 +7844,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--ws-drain-seconds", type=int, default=5)
     # M5 动态降级:每累计这么多笔新结算跟单,就对那批被跟钱包重评一次,跌出 A 榜即隔离
     # (事件驱动,替代旧的固定 2h observe-v2 降级扫描)。<=0 关闭 runner 侧降级。
-    run.add_argument("--rescore-settled-threshold", type=int, default=10)
+    run.add_argument("--rescore-settled-threshold", type=int, default=5)
     run.add_argument("--quarantine-sell-frac", type=float, default=0.2)
     run.add_argument("--error-retry-seconds", type=int, default=180)
     run.add_argument("--max-consecutive-error-seconds", type=int, default=600)
-    run.add_argument("--pool-refresh-hours", type=float, default=24)
+    run.add_argument("--pool-refresh-hours", type=float, default=12)
     run.add_argument("--skip-initial-build", action="store_true")
     run.add_argument("--max-run-ticks", type=int, default=0)
     run.set_defaults(func=command_run)
