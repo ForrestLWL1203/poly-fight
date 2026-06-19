@@ -20,10 +20,10 @@ DEFAULT_MIN_STAKE_USDC = 1.0            # Polymarket CLOB 最小单(INVALID_ORDE
 # 跟单现价门:有效胜率 = θ̂(近期加权点估) × 此折扣,现价需 < 该值才跟(留 5% 相对安全边际)。
 # 比纯 wilson_lb 宽(与入榜的 θ̂ 轴一致),又不至于按头版胜率满价追。
 THETA_FOLLOW_DISCOUNT = 0.95
-# 信念 N-ramp:目标钱包单笔下单额 / 单场cap = N。N 越大(钱包越重注=信念越高),
-# 我们的单笔越往单场cap 线性放大。N<start 维持现行 Kelly;N≥full 跟满单场cap。
-DEFAULT_CONVICTION_RAMP_START_N = 5.0
-DEFAULT_CONVICTION_RAMP_FULL_N = 10.0
+# 跟单额 = 镜像比例 × 目标钱包这笔买入额(随下注大小线性、无断崖),夹在
+# [min_stake 下限, 单场剩余额度]。多笔按比例累加、总额受单场cap 收口。
+# 10% ↔ "钱包下 10×单场cap 时正好打满 cap"(N_full=10)。Kelly edge 仅当门(θ̂×0.95>现价)。
+DEFAULT_FOLLOW_MIRROR_PERCENT = 10.0
 
 
 def _finite_positive(value: Any) -> bool:
@@ -55,8 +55,7 @@ def default_follow_strategy(*, balance_usdc: float | None = None) -> dict[str, A
             "per_signal_cap_percent": DEFAULT_PER_SIGNAL_CAP_PERCENT,
             "per_match_cap_percent": DEFAULT_PER_MATCH_CAP_PERCENT,
             "min_stake_usdc": DEFAULT_MIN_STAKE_USDC,
-            "conviction_ramp_start_n": DEFAULT_CONVICTION_RAMP_START_N,
-            "conviction_ramp_full_n": DEFAULT_CONVICTION_RAMP_FULL_N,
+            "follow_mirror_percent": DEFAULT_FOLLOW_MIRROR_PERCENT,
             # legacy(兼容保留):
             "ratio_percent": 10.0,
             "per_order_cap_enabled": False,
@@ -109,8 +108,7 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
     sizing["per_signal_cap_percent"] = round(to_float(sizing.get("per_signal_cap_percent") if sizing.get("per_signal_cap_percent") is not None else DEFAULT_PER_SIGNAL_CAP_PERCENT), 8)
     sizing["per_match_cap_percent"] = round(to_float(sizing.get("per_match_cap_percent") if sizing.get("per_match_cap_percent") is not None else DEFAULT_PER_MATCH_CAP_PERCENT), 8)
     sizing["min_stake_usdc"] = round(to_float(sizing.get("min_stake_usdc") if sizing.get("min_stake_usdc") is not None else DEFAULT_MIN_STAKE_USDC), 8)
-    sizing["conviction_ramp_start_n"] = round(to_float(sizing.get("conviction_ramp_start_n") if sizing.get("conviction_ramp_start_n") is not None else DEFAULT_CONVICTION_RAMP_START_N), 8)
-    sizing["conviction_ramp_full_n"] = round(to_float(sizing.get("conviction_ramp_full_n") if sizing.get("conviction_ramp_full_n") is not None else DEFAULT_CONVICTION_RAMP_FULL_N), 8)
+    sizing["follow_mirror_percent"] = round(to_float(sizing.get("follow_mirror_percent") if sizing.get("follow_mirror_percent") is not None else DEFAULT_FOLLOW_MIRROR_PERCENT), 8)
     # legacy
     sizing["ratio_percent"] = round(to_float(sizing.get("ratio_percent")), 8)
     sizing["per_order_cap_enabled"] = bool(sizing.get("per_order_cap_enabled"))
@@ -274,51 +272,34 @@ def evaluate_follow_candidate(
     raw_stake = 0.0
     stake_mode = mode
     if mode == "kelly":
-        # 跟多少 = ¼Kelly × edge_lb/(1−p) × 本金,落到 单笔%/单场%/最小$ 边界内。
-        # bankroll 优先用调用方传入的**动态权益**(初始本金 + 已实现盈亏,随盈亏浮动;
-        # cli 侧 = account_balance + funded_open_exposure),缺时回退策略里的静态
-        # usable_balance(初始种子),再回退当前可用。这样单场/单笔cap、Kelly 缩放都随盈亏动态。
+        # 跟单额 = 镜像比例 × 目标钱包这笔买入额(随下注大小线性、无断崖),夹在
+        # [min_stake 下限, 单场剩余额度]。多笔按比例累加、总额受单场cap 收口。
+        # Kelly edge 仅当门:有效胜率 θ̂×0.95 ≤ 现价则不跟(价已涨过把握)。
+        # bankroll 优先用调用方传入的**动态权益**(初始本金 + 已实现盈亏;cli 侧 =
+        # account_balance + funded_open_exposure),缺时回退静态 usable_balance,再回退可用。
+        # 单场cap = bankroll × per_match_cap_percent,随盈亏动态。
         bankroll = to_float(bankroll_usdc)
         if bankroll <= 0:
             bankroll = to_float(normalized["balance"].get("usable_balance_usdc"))
         if bankroll <= 0:
             bankroll = to_float(available_balance_usdc)
-        win_rate = to_float(bucket_win_rate) * THETA_FOLLOW_DISCOUNT   # θ̂ 点估 × 0.95(留 5% 边际)
-        p = to_float(entry_price)
         if bankroll <= 0:
             return _block("no_bankroll", strategy=normalized)
+        p = to_float(entry_price)
         if not (0.0 < p < 1.0):
             return _block("no_live_price", strategy=normalized)
-        edge_lb = win_rate - p
-        if edge_lb <= 0:
-            return _block("no_live_edge", strategy=normalized)   # 现价 ≥ θ̂×0.95 → 不跟(价已涨过把握)
-        raw_stake = to_float(sizing.get("kelly_fraction")) * (edge_lb / (1.0 - p)) * bankroll
-        per_signal_cap = bankroll * to_float(sizing.get("per_signal_cap_percent")) / 100.0
-        if per_signal_cap > 0:
-            raw_stake = min(raw_stake, per_signal_cap)
+        if to_float(bucket_win_rate) * THETA_FOLLOW_DISCOUNT - p <= 0:
+            return _block("no_live_edge", strategy=normalized)   # 现价 ≥ θ̂×0.95 → 不跟
         min_stake = to_float(sizing.get("min_stake_usdc"))
         per_match_cap = bankroll * to_float(sizing.get("per_match_cap_percent")) / 100.0
-        # 信念 N-ramp:N = 目标钱包单笔下单额 / 单场cap。N 越大(钱包越重注=信念越高),
-        # 单笔从 per_signal_cap 线性抬到单场cap;N<start 不动(维持 Kelly),N≥full 跟满单场cap。
-        # 覆盖被 per_signal_cap 压平的"巨额欠跟",只升不降。
-        if per_match_cap > 0 and order_cash > 0:
-            ramp_start = to_float(sizing.get("conviction_ramp_start_n"))
-            ramp_full = to_float(sizing.get("conviction_ramp_full_n"))
-            n = order_cash / per_match_cap
-            if ramp_full > ramp_start and n >= ramp_start:
-                frac = min(1.0, (n - ramp_start) / (ramp_full - ramp_start))
-                base = per_signal_cap if per_signal_cap > 0 else min_stake
-                conviction_stake = base + (per_match_cap - base) * frac
-                if conviction_stake > raw_stake:
-                    raw_stake = conviction_stake
-                    stake_mode = "kelly_conviction"
+        raw_stake = order_cash * to_float(sizing.get("follow_mirror_percent")) / 100.0
         if per_match_cap > 0:
             match_remaining = per_match_cap - to_float(condition_funded_stake_usdc)
             if match_remaining < min_stake:
                 return _block("match_cap_reached", strategy=normalized)   # 本场已到上限
             raw_stake = min(raw_stake, match_remaining)
-        if 0 < raw_stake < min_stake:   # Kelly 算出 < 最小单 → 补足(edge 正且额度够)
-            raw_stake = min_stake
+        raw_stake = max(raw_stake, min_stake)   # 不低于动态下限(算出更小也提到下限)
+        stake_mode = "kelly_mirror"
     elif mode == "fixed":
         raw_stake = to_float(sizing.get("fixed_usdc"))
     elif mode == "balance_percent":
