@@ -698,15 +698,14 @@ function FollowsPage({ data, goStrategy, onOpenFollow }) {
         </div>
         <div className="tbl-wrap">
           <table className="ps-table">
-            <thead><tr><th>赛事</th><th>状态</th><th>结算</th><th>钱包数</th><th>单数</th><th>投入</th><th>盈亏</th><th>质量</th></tr></thead>
+            <thead><tr><th>赛事</th><th>状态</th><th>钱包数</th><th>单数</th><th>投入</th><th>盈亏</th><th>质量</th></tr></thead>
             <tbody key={status + cur} className="tbl-fade">
               {pageRows.map((f) => (
                 <tr key={f.cid} className="clickable" onClick={() => onOpenFollow(f.cid)}>
                   <td><MatchCell ev={f} tag={f.marketType} held={(f.sides || []).map((s) => s.outcome)} /></td>
-                  <td><div className="evt-status"><FollowStatusBadge f={f} />{f.sourceOffLeaderboard && <Badge tone="warn" title="源钱包已不在最新榜单 — 此跟单继续跟至结算，但不再新开仓">源已脱榜</Badge>}</div></td>
                   <td><div className="cell-stack">
-                    {f.settlement === "盈利" ? <span className="pnl-up strong">盈利</span> : f.settlement === "亏损" ? <span className="pnl-down strong">亏损</span> : <span className="muted">未结算</span>}
-                    {f.exitPrice != null && <span className="muted" title="提前卖出的加权卖出价">卖出 {priceStr(f.exitPrice)}</span>}
+                    <div className="evt-status"><FollowStatusBadge f={f} />{f.sourceOffLeaderboard && <Badge tone="warn" title="源钱包已不在最新榜单 — 此跟单继续跟至结算，但不再新开仓">源已脱榜</Badge>}</div>
+                    {f.exitPrice != null && <span className="muted" title="提前卖出/部分卖出的加权卖出价">卖出价：{priceStr(f.exitPrice)}</span>}
                   </div></td>
                   <td className="strong">{f.wallets}</td>
                   <td className="num">{f.legs}</td>
@@ -715,7 +714,7 @@ function FollowsPage({ data, goStrategy, onOpenFollow }) {
                   <td>{qualityBadge(f.quality)}</td>
                 </tr>
               ))}
-              {!rows.length && <tr><td colSpan="8" className="empty-cell">暂无跟单记录</td></tr>}
+              {!rows.length && <tr><td colSpan="7" className="empty-cell">暂无跟单记录</td></tr>}
             </tbody>
           </table>
         </div>
