@@ -138,18 +138,16 @@ DEFAULT_REFRESH_CACHE_RETENTION_DAYS = {
     "raw_user_trades": 1,
     "clob_market_metadata": 30,
 }
-LEGACY_TRADE_QUARANTINE_REASONS = {"material_sell", "two_sided_switch"}
-# M5 动态淘汰:observe-v2 重评在榜钱包近期交易,跌出 grade-A 即隔离。
+# M5 动态淘汰旧实现:跌出 grade-A 曾隔离进 quarantine(reason=rescore_below_grade_a)。现已改为
+# 直接删除淘汰(见 rescore_demote_wallets),不再写该 reason;常量保留仅用于清除历史遗留隔离行。
 RESCORE_QUARANTINE_REASON = "rescore_below_grade_a"
-RESCORE_COOLDOWN_DAYS = 7
-# 隔离入口收束为两个:人工按钮 + M5 重评。两者都不被历史复审自动清除。
+# 历史复审/启动时清除的非手动隔离 reason(含已废弃的 trade 隔离 + 自动降级隔离)。
+LEGACY_TRADE_QUARANTINE_REASONS = {"material_sell", "two_sided_switch", RESCORE_QUARANTINE_REASON}
+# 隔离入口收束为人工按钮一种(不被历史复审自动清除)。自动淘汰已改直接删除,无 quarantine 中间态。
 STICKY_QUARANTINE_REASONS = {
     "manual_dashboard_quarantine",
     "manual_quarantine",
-    RESCORE_QUARANTINE_REASON,
 }
-# 自动隔离(非手动):满冷却后由重评决定恢复/留隔离。当前仅 M5 重评一种。
-AUTO_RECOVERABLE_QUARANTINE_REASONS = {RESCORE_QUARANTINE_REASON}
 
 @contextmanager
 def acquire_build_lock(data_dir: Path, *, blocking: bool = True):
@@ -5721,10 +5719,11 @@ def rescore_demote_wallets(
 ) -> dict[str, Any]:
     """M5 降级重评(独立于 observe-v2 周期发现,由 follow runner 按结算笔数事件触发)。
 
-    对给定 batch 钱包用当前 scope 重 profile,跌出 grade-A 榜的 → 隔离进 follow.db
-    (reason=rescore_below_grade_a,7 天冷却由 observe-v2 恢复)。只读榜 + 只写 follow.db
-    quarantine:**不**写 leaderboard_v2.db、**不**写共享交易缓存(use_cache=False)、**不**发布,
-    因此与周期 observe-v2 进程无写争用。榜面显示由下次发现 tick 调和;隔离即时停止跟单。
+    对给定 batch 钱包用当前 scope 重 profile,跌出 grade-A 榜的 → **直接删除淘汰**(无 quarantine
+    中间态):从打分池 profiles 剔除 + 删该钱包原始交易缓存 + 重建并发布 A 榜 → 即时下榜停跟。
+    保留 follow.db 的跟单研究记录(信号/腿/结算/CLV),未结算仓位继续结算到底。日后若重新达标,
+    observer 周期发现会把它作为新候选自然加回 A 榜。favorite(人工置顶、越过 grade-A 强制跟单)
+    不被自动淘汰。删除走 build lock 与 observe 进程串行化;发布窗口暂停开新信号避免读到半写榜。
     """
     now_dt = datetime.now(timezone.utc) if now_ts is None else datetime.fromtimestamp(now_ts, tz=timezone.utc)
     now_ts = int(now_dt.timestamp())
@@ -5811,47 +5810,65 @@ def rescore_demote_wallets(
         if wallet:
             reprofiled[wallet] = result
 
-    # 内存重建榜(现有 profiles 叠加重评结果)判断 batch 是否仍在 A 榜;不持久化、不发布。
+    def _rebuild_board(profiles: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        return build_collector_leaderboard_v2(
+            profiles, now_ts=now_ts,
+            per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
+            max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
+            include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
+            gate_kwargs=_v2_gate_kwargs_from_args(args),
+        )["leaderboard"]
+
+    # 内存重建榜(现有 profiles 叠加重评结果)判断 batch 是否仍在 A 榜。favorite 是人工置顶、
+    # 越过 grade-A 强制跟单的覆盖项 → 不自动淘汰。
     existing = load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2")
-    profiles_by_wallet = dict(existing)
-    profiles_by_wallet.update(reprofiled)
-    collector_result = build_collector_leaderboard_v2(
-        profiles_by_wallet, now_ts=now_ts,
-        per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
-        max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
-        include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
-        gate_kwargs=_v2_gate_kwargs_from_args(args),
+    new_board = {
+        normalize_wallet(r.get("wallet"))
+        for r in _rebuild_board({**existing, **reprofiled})
+        if normalize_wallet(r.get("wallet"))
+    }
+    favorites = {
+        normalize_wallet((info or {}).get("wallet") or key)
+        for key, info in follow_store.load_wallet_favorites(category="esports").items()
+    }
+    demoted = sorted(
+        wallet for wallet in targets
+        if wallet in reprofiled and wallet not in new_board and wallet not in favorites
     )
-    new_board = {normalize_wallet(r.get("wallet")) for r in collector_result["leaderboard"] if normalize_wallet(r.get("wallet"))}
-    demoted: list[str] = []
-    for wallet in sorted(targets):
-        if wallet in reprofiled and wallet not in new_board:
-            follow_store.upsert_wallet_quarantine(wallet, reason=RESCORE_QUARANTINE_REASON, ts=now_ts, category="esports")
-            demoted.append(wallet)
+    if not demoted:
+        return {"rescored": len(reprofiled), "demoted": 0, "demoted_wallets": []}
+
+    # 淘汰=直接删除:从打分池剔除 + 删原始交易缓存 + 重建发布榜(即时下榜停跟)。build lock 与
+    # observe 进程串行化;发布窗口暂停开新信号,避免 runner 主循环读到半写榜。
+    with acquire_build_lock(data_dir, blocking=True):
+        profiles_by_wallet = dict(load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2"))
+        for wallet in demoted:
+            profiles_by_wallet.pop(wallet, None)
+            try:
+                user_trades_cache_path(output_dir, wallet).unlink()
+            except FileNotFoundError:
+                pass
+        write_json(
+            output_dir / "collector_v2_wallet_profiles.json",
+            [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
+        )
+        write_json(
+            output_dir / "collector_v2_leaderboard.json",
+            [slim_profile_for_storage(row) for row in _rebuild_board(profiles_by_wallet)],
+        )
+        for category in FOLLOW_SIGNAL_CATEGORIES:
+            set_pause_new_signals(follow_dir, category, {"status": "paused", "reason": "rescore_demote", "started_at": now_ts})
+        try:
+            publish_collector_dashboard_outputs(
+                output_dir, data_dir,
+                summary={"collector": V2_COLLECTOR_NAME, "category": "esports", "source": "rescore_demote"},
+                now_ts=now_ts, prefix="collector_v2", db_filename="leaderboard_v2.db",
+                profiles_publish_name="wallet_profiles_v2.json", collector_name=V2_COLLECTOR_NAME,
+            )
+        finally:
+            for category in FOLLOW_SIGNAL_CATEGORIES:
+                set_pause_new_signals(follow_dir, category, None)
     return {"rescored": len(reprofiled), "demoted": len(demoted), "demoted_wallets": demoted}
-
-
-def _observe_v2_recovery_targets(
-    follow_store: "FollowStore",
-    *,
-    now_ts: int,
-    cooldown_days: int,
-) -> set[str]:
-    """M5 恢复候选 = 自动原因隔离且满冷却的钱包(observe-v2 重评回到 A 即解隔离)。
-
-    降级已拆到 follow runner(rescore_demote_wallets,按结算笔数事件触发),不在此计算。"""
-    cooldown_cut = now_ts - max(1, int(cooldown_days)) * SECONDS_PER_DAY
-    recovery: set[str] = set()
-    for key, info in follow_store.load_wallet_quarantine(category="esports").items():
-        info = info or {}
-        wallet = normalize_wallet(info.get("wallet") or key)
-        if (
-            wallet
-            and str(info.get("reason") or "") in AUTO_RECOVERABLE_QUARANTINE_REASONS
-            and to_int(info.get("quarantined_at")) < cooldown_cut
-        ):
-            recovery.add(wallet)
-    return recovery
 
 
 def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
@@ -5873,17 +5890,14 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
         lookback_hours=float(getattr(args, "observe_lookback_hours", 4.0)),
         gamma_pages=int(getattr(args, "observe_gamma_pages", 2)),
     )
-    # M5 降级已拆出到 follow runner(按结算笔数事件触发 rescore_demote_wallets)。observe-v2
-    # 只保留:M4 发现 + 满冷却的恢复(本地 SQLite,廉价:重评隔离钱包,回到 A 榜则解隔离)。
+    # M5 降级已拆出到 follow runner(按结算笔数事件触发 rescore_demote_wallets,直接删除淘汰
+    # 钱包,无 quarantine 中间态、无恢复重评)。observe-v2 只负责 M4 发现:跌出的钱包若日后重新
+    # 达标,会作为新候选被周期发现自然加回 A 榜。
     follow_store = FollowStore(follow_dir / "follow.db")
     profile_lookback_days = int(getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS) or V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
-    recovery_targets = _observe_v2_recovery_targets(
-        follow_store, now_ts=now_ts, cooldown_days=RESCORE_COOLDOWN_DAYS,
-    )
-    rescore_wallets = set(recovery_targets)
 
-    # 无新结算盘且无恢复目标 → 真没事做(省一次分类集 Gamma 调用)
-    if not new_markets and not rescore_wallets:
+    # 无新结算盘 → 真没事做(省一次分类集 Gamma 调用)
+    if not new_markets:
         print(json.dumps({"event": "observe_v2_tick", "new_settled_markets": 0, "rescored": 0}))
         return 0
 
@@ -5957,23 +5971,13 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
         return {**profile, "profile_lookback_days": profile_lookback_days, "seed": collector_seed_payload(seed_wallet), "observed_at": now_ts}
 
     new_profiles = [r for r in run_ordered_io_tasks(new_seed_wallets, profile_one, max_workers=getattr(args, "max_workers", 8)) if not isinstance(r, Exception)]
-    # M5 重评:对降级/恢复目标重 profile(cache_ttl=0 → 每 tick 增量拉最新交易,廉价)
-    rescore_profiles = [
-        r for r in run_ordered_io_tasks(
-            [{"wallet": w} for w in sorted(rescore_wallets)],
-            lambda sw: profile_one(sw, cache_ttl_days=0),
-            max_workers=getattr(args, "max_workers", 8),
-        ) if not isinstance(r, Exception)
-    ]
 
     # 4) 整体重建 + 发布。临界区(merge→写 profiles→build→publish)加 build lock 与
     #    collect-v2 / observe-live 串行化,避免并发 publish 的 lost-update。publish 函数本身
     #    不再取锁(避免同进程二次 flock 自死锁)。
-    demoted: list[str] = []
-    recovered: list[str] = []
     with acquire_build_lock(resolve_data_dir(args), blocking=True):
         profiles_by_wallet = dict(existing)
-        for profile in [*new_profiles, *rescore_profiles]:   # 重评 profile 覆盖旧的
+        for profile in new_profiles:   # 新候选 profile 覆盖旧的
             wallet = normalize_wallet(profile.get("wallet"))
             if wallet:
                 profiles_by_wallet[wallet] = profile
@@ -5993,13 +5997,6 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
             output_dir / "collector_v2_leaderboard.json",
             [slim_profile_for_storage(row) for row in leaderboard],
         )
-
-        # M5 恢复:满冷却的隔离钱包重评回到 A 榜 → 解隔离。(降级已拆到 follow runner。)
-        new_board_wallets = {normalize_wallet(r.get("wallet")) for r in leaderboard if normalize_wallet(r.get("wallet"))}
-        for wallet in sorted(recovery_targets):
-            if wallet in new_board_wallets:
-                follow_store.clear_wallet_quarantine_wallets({wallet})
-                recovered.append(wallet)
 
         for category in FOLLOW_SIGNAL_CATEGORIES:
             set_pause_new_signals(follow_dir, category, {"status": "paused", "reason": "observe_v2", "started_at": now_ts})
@@ -6024,7 +6021,7 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
         "event": "observe_v2_tick", "new_settled_markets": len(new_markets),
         "new_candidates": len(new_seed_wallets), "profiled": len(new_profiles),
         "leaderboard": len(leaderboard), "new_on_board_2h": new_on_board,
-        "rescored": len(rescore_profiles), "demoted": len(demoted), "recovered": len(recovered),
+        "rescored": 0, "demoted": 0, "recovered": 0,
     }))
     return 0
 

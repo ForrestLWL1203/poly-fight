@@ -13995,31 +13995,35 @@ class CoreTest(unittest.TestCase):
             # 不存在的 db → 空(不抛)
             self.assertEqual(storage_module.LeaderboardStore(Path(d) / "nope.db").load_observe_analyzed(now_ts=now), {})
 
-    def test_observe_v2_recovery_targets_cooldown_and_reason(self):
-        # 降级已拆到 follow runner;observe-v2 只算恢复:auto 原因隔离且满冷却。
-        from poly_fight.cli import _observe_v2_recovery_targets, RESCORE_QUARANTINE_REASON
-        with TemporaryDirectory() as tmp:
-            store = FollowStore(Path(tmp) / "follow.db")
-            now = 1_700_000_000
-            store.upsert_wallet_quarantine("0xWD", reason=RESCORE_QUARANTINE_REASON, ts=now - 10 * 86400, category="esports")
-            store.upsert_wallet_quarantine("0xWE", reason="manual_dashboard_quarantine", ts=now - 10 * 86400, category="esports")
-            store.upsert_wallet_quarantine("0xWF", reason=RESCORE_QUARANTINE_REASON, ts=now - 1 * 86400, category="esports")
-            recovery = _observe_v2_recovery_targets(store, now_ts=now, cooldown_days=7)
-            self.assertEqual(recovery, {"0xwd"})  # auto 满冷却;manual 排除、冷却内(wf)排除
+    def _setup_rescore_demote_case(self, root, *, now, favorite=None):
+        """Seed leaderboard_v2.db + 打分池 profiles + 0xdrop 原始交易缓存,返回常用路径。"""
+        import poly_fight.storage as storage_module
+        esports_dir = root / "esports"
+        follow_dir = root / "follow"
+        collector_dir = esports_dir / "collector_v2"
+        collector_dir.mkdir(parents=True, exist_ok=True)
+        storage_module.LeaderboardStore(esports_dir / "leaderboard_v2.db").replace_leaderboard(
+            [{"wallet": "0xdrop", "grade": "A"}, {"wallet": "0xkeep", "grade": "A"}],
+            category="esports", updated_at=now,
+        )
+        (collector_dir / "collector_v2_wallet_profiles.json").write_text(
+            json.dumps([{"wallet": "0xdrop", "grade": "A"}, {"wallet": "0xkeep", "grade": "A"}]))
+        from poly_fight.cli import user_trades_cache_path
+        drop_cache = user_trades_cache_path(collector_dir, "0xdrop")
+        drop_cache.parent.mkdir(parents=True, exist_ok=True)
+        drop_cache.write_text("[]")
+        if favorite:
+            FollowStore(follow_dir / "follow.db").upsert_wallet_favorite(favorite, category="esports", ts=now)
+        return esports_dir, follow_dir, collector_dir, drop_cache
 
-    def test_rescore_demote_wallets_quarantines_off_board_only(self):
+    def test_rescore_demote_wallets_deletes_off_board_only(self):
         from unittest.mock import patch
-        from poly_fight.cli import rescore_demote_wallets, RESCORE_QUARANTINE_REASON, normalize_wallet
+        from poly_fight.cli import rescore_demote_wallets, normalize_wallet
         import poly_fight.storage as storage_module
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            esports_dir = root / "esports"
-            follow_dir = root / "follow"
             now = 1_700_000_000
-            storage_module.LeaderboardStore(esports_dir / "leaderboard_v2.db").replace_leaderboard(
-                [{"wallet": "0xdrop", "grade": "A"}, {"wallet": "0xkeep", "grade": "A"}],
-                category="esports", updated_at=now,
-            )
+            esports_dir, follow_dir, collector_dir, drop_cache = self._setup_rescore_demote_case(root, now=now)
 
             class FakeClient:
                 def list_events_paginated(self, **_kwargs):
@@ -14028,9 +14032,9 @@ class CoreTest(unittest.TestCase):
             parser = build_parser()
             args = parser.parse_args(["--data-dir", str(esports_dir), "run", "--stake-usdc", "1"])
 
-            # After re-profile, 0xdrop fell off the A-board, 0xkeep stayed.
+            # 重评后 0xdrop 跌出 A 榜,0xkeep 留榜(决策与持久化两次 build 都走这个 fake)。
             def fake_build(profiles, **_kwargs):
-                return {"leaderboard": [{"wallet": "0xkeep"}]}
+                return {"leaderboard": [{"wallet": w, "grade": "A"} for w in profiles if w != "0xdrop"]}
 
             with patch("poly_fight.cli.build_collector_leaderboard_v2", side_effect=fake_build):
                 result = rescore_demote_wallets(
@@ -14039,12 +14043,48 @@ class CoreTest(unittest.TestCase):
                 )
 
             self.assertEqual(set(result["demoted_wallets"]), {"0xdrop"})
-            q = FollowStore(follow_dir / "follow.db").load_wallet_quarantine(category="esports")
-            quarantined = {normalize_wallet((info or {}).get("wallet") or k): (info or {}) for k, info in q.items()}
-            self.assertIn("0xdrop", quarantined)          # fell off board -> quarantined
-            self.assertNotIn("0xkeep", quarantined)        # stayed on board -> spared
-            self.assertNotIn("0xnotonboard", quarantined)  # not on board -> not a target
-            self.assertEqual(quarantined["0xdrop"].get("reason"), RESCORE_QUARANTINE_REASON)
+            # 不再写 quarantine 中间态
+            self.assertEqual(FollowStore(follow_dir / "follow.db").load_wallet_quarantine(category="esports"), {})
+            # 直接下榜(从 leaderboard_v2.db 删除)
+            board_rows, _meta = storage_module.LeaderboardStore(esports_dir / "leaderboard_v2.db").load_leaderboard(category="esports")
+            board = {normalize_wallet(r.get("wallet")) for r in board_rows}
+            self.assertNotIn("0xdrop", board)
+            self.assertIn("0xkeep", board)
+            # 打分 profile + 原始交易缓存被删
+            profiles = json.loads((collector_dir / "collector_v2_wallet_profiles.json").read_text())
+            self.assertEqual({normalize_wallet(p.get("wallet")) for p in profiles}, {"0xkeep"})
+            self.assertFalse(drop_cache.exists())
+
+    def test_rescore_demote_wallets_spares_favorite(self):
+        from unittest.mock import patch
+        from poly_fight.cli import rescore_demote_wallets, normalize_wallet
+        import poly_fight.storage as storage_module
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = 1_700_000_000
+            # 0xdrop 被人工置顶 → 即便跌出 A 榜也不自动删除。
+            esports_dir, follow_dir, collector_dir, drop_cache = self._setup_rescore_demote_case(root, now=now, favorite="0xdrop")
+
+            class FakeClient:
+                def list_events_paginated(self, **_kwargs):
+                    return []
+
+            parser = build_parser()
+            args = parser.parse_args(["--data-dir", str(esports_dir), "run", "--stake-usdc", "1"])
+
+            def fake_build(profiles, **_kwargs):
+                return {"leaderboard": [{"wallet": w, "grade": "A"} for w in profiles if w != "0xdrop"]}
+
+            with patch("poly_fight.cli.build_collector_leaderboard_v2", side_effect=fake_build):
+                result = rescore_demote_wallets(
+                    FakeClient(), args, wallets={"0xdrop", "0xkeep"},
+                    follow_dir=follow_dir, now_ts=now,
+                )
+
+            self.assertEqual(result["demoted_wallets"], [])      # favorite 不被淘汰
+            self.assertTrue(drop_cache.exists())                 # 缓存保留
+            profiles = json.loads((collector_dir / "collector_v2_wallet_profiles.json").read_text())
+            self.assertEqual({normalize_wallet(p.get("wallet")) for p in profiles}, {"0xdrop", "0xkeep"})
 
     def test_clear_revalidated_quarantine_protects_sticky_reasons(self):
         with TemporaryDirectory() as tmp:

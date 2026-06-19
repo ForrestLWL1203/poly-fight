@@ -47,8 +47,9 @@ collect-v2 / build-leaderboard (periodic full rebuild):
   -> scoped wallet history -> score -> A-only leaderboard.db (per category)
 
 observe-v2 (sidecar, ~2h): newly-SETTLED markets -> top-PnL dual-side holders
-  -> score on history -> merge into leaderboard; also M5 quarantine recovery +
-  resolution/score freshness refresh. Covers matches not seen live.
+  -> score on history -> merge into leaderboard; also resolution/score freshness
+  refresh. Covers matches not seen live. (No demotion/recovery here — demoted
+  wallets are deleted by the follow runner; re-discovery is the only way back.)
 
 observe-live (sidecar, ~10min): ACTIVE (unsettled) watched markets over a volume
   gate -> dual-side current holders -> score on history -> grade-A promoted into
@@ -222,7 +223,7 @@ SELL mirrors exit proportionally (cumulative wallet_sold_frac; >= $1 min, hold/a
 material SELL or opposite-side BUY writes wallet_quarantine
 post-start snapshot records CLV once
 same conditionId with both outcomes open marks contested
-settled markets move open signals to results; M5 demotion re-scores followed wallets every 10 settle events
+settled markets move open signals to results; M5 demotion re-scores followed wallets every N settle events (--rescore-settled-threshold, default 5) and DELETES any that fall out of grade-A: leaderboard row + scoring profile + raw trade cache dropped (no quarantine middle state). Favorites are spared; follow.db research records are kept and open positions settle out. Re-discovery by the observer is the only way back onto the board.
 ```
 
 Do not rely on `/trades` time-range params. Use local cursor `{timestamp, id}`
