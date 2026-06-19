@@ -10476,6 +10476,26 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(list(follow_dir.iterdir()), [])
             self.assertEqual(list((log_dir / "follow").iterdir()), [])
 
+    def test_prune_old_logs_deletes_only_aged_spawn_logs(self):
+        with TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            old_run = log_dir / "dashboard-runner-1000.out"
+            old_observe = log_dir / "dashboard-observe-1000.out"
+            fresh = log_dir / "dashboard-runner-2000.out"
+            other = log_dir / "keep-me.txt"  # 非 dashboard-*.out,不该被动
+            for p in (old_run, old_observe, fresh, other):
+                p.write_text("x", encoding="utf-8")
+            stale = time.time() - 8 * 86400  # 8 天前 > 7 天阈值
+            os.utime(old_run, (stale, stale))
+            os.utime(old_observe, (stale, stale))
+
+            dashboard_module._prune_old_logs(log_dir, max_age_days=7)
+
+            self.assertFalse(old_run.exists())
+            self.assertFalse(old_observe.exists())
+            self.assertTrue(fresh.exists())  # 新文件保留
+            self.assertTrue(other.exists())  # 非匹配 glob 保留
+
     def test_wipe_collector_data_clears_category_keeps_sibling_follow(self):
         # 完整重采:清空类目采集目录(profiles/db/交易缓存),但 follow.db(独立 follow 目录)保留。
         with TemporaryDirectory() as tmp:
@@ -14085,6 +14105,42 @@ class CoreTest(unittest.TestCase):
             self.assertTrue(drop_cache.exists())                 # 缓存保留
             profiles = json.loads((collector_dir / "collector_v2_wallet_profiles.json").read_text())
             self.assertEqual({normalize_wallet(p.get("wallet")) for p in profiles}, {"0xdrop", "0xkeep"})
+
+    def test_purge_legacy_demote_quarantine_deletes_not_releases(self):
+        from unittest.mock import patch
+        from poly_fight.cli import purge_legacy_demote_quarantine, normalize_wallet, RESCORE_QUARANTINE_REASON
+        import poly_fight.storage as storage_module
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = 1_700_000_000
+            # 0xbad = 历史自动降级隔离;0xmanual = 人工隔离(必须保留);0xkeep = 正常在榜。
+            esports_dir, follow_dir, collector_dir, bad_cache = self._setup_rescore_demote_case(root, now=now)
+            # 复用 helper 的 0xdrop/0xkeep seed,把 0xdrop 当成 0xbad 处理。
+            store = FollowStore(follow_dir / "follow.db")
+            store.upsert_wallet_quarantine("0xdrop", reason=RESCORE_QUARANTINE_REASON, ts=now - 100, category="esports")
+            store.upsert_wallet_quarantine("0xmanual", reason="manual_dashboard_quarantine", ts=now - 100, category="esports")
+
+            parser = build_parser()
+            args = parser.parse_args(["--data-dir", str(esports_dir), "run", "--stake-usdc", "1"])
+
+            def fake_build(profiles, **_kwargs):
+                return {"leaderboard": [{"wallet": w, "grade": "A"} for w in profiles]}
+
+            with patch("poly_fight.cli.build_collector_leaderboard_v2", side_effect=fake_build):
+                result = purge_legacy_demote_quarantine(args, follow_dir=follow_dir, now_ts=now)
+
+            self.assertEqual(result["deleted"], 1)
+            self.assertEqual(result["wallets"], ["0xdrop"])
+            # 历史降级钱包:下榜 + profile/缓存删 + 隔离行清掉(不放回跟单集)
+            board_rows, _meta = storage_module.LeaderboardStore(esports_dir / "leaderboard_v2.db").load_leaderboard(category="esports")
+            self.assertNotIn("0xdrop", {normalize_wallet(r.get("wallet")) for r in board_rows})
+            self.assertFalse(bad_cache.exists())
+            profiles = json.loads((collector_dir / "collector_v2_wallet_profiles.json").read_text())
+            self.assertEqual({normalize_wallet(p.get("wallet")) for p in profiles}, {"0xkeep"})
+            q = store.load_wallet_quarantine(category="esports")
+            qkeys = {normalize_wallet((info or {}).get("wallet") or k) for k, info in q.items()}
+            self.assertNotIn("0xdrop", qkeys)        # 降级隔离行被清
+            self.assertIn("0xmanual", qkeys)         # 人工隔离保留
 
     def test_clear_revalidated_quarantine_protects_sticky_reasons(self):
         with TemporaryDirectory() as tmp:

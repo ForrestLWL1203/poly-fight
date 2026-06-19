@@ -139,10 +139,12 @@ DEFAULT_REFRESH_CACHE_RETENTION_DAYS = {
     "clob_market_metadata": 30,
 }
 # M5 动态淘汰旧实现:跌出 grade-A 曾隔离进 quarantine(reason=rescore_below_grade_a)。现已改为
-# 直接删除淘汰(见 rescore_demote_wallets),不再写该 reason;常量保留仅用于清除历史遗留隔离行。
+# 直接删除淘汰(见 rescore_demote_wallets),不再写该 reason。历史遗留的该类隔离行 = 当初表现差被
+# 淘汰的钱包,启动时按新策略**直接删除**(下榜+删profile+删缓存),**绝不解禁放回跟单集**——见
+# purge_legacy_demote_quarantine。常量保留供该迁移识别这批行。
 RESCORE_QUARANTINE_REASON = "rescore_below_grade_a"
-# 历史复审/启动时清除的非手动隔离 reason(含已废弃的 trade 隔离 + 自动降级隔离)。
-LEGACY_TRADE_QUARANTINE_REASONS = {"material_sell", "two_sided_switch", RESCORE_QUARANTINE_REASON}
+# 历史复审清除的已废弃 trade 隔离 reason(恒 None 的死逻辑残留;非淘汰语义,清掉无妨)。
+LEGACY_TRADE_QUARANTINE_REASONS = {"material_sell", "two_sided_switch"}
 # 隔离入口收束为人工按钮一种(不被历史复审自动清除)。自动淘汰已改直接删除,无 quarantine 中间态。
 STICKY_QUARANTINE_REASONS = {
     "manual_dashboard_quarantine",
@@ -5709,6 +5711,85 @@ def detect_newly_settled_markets(
     return new_markets
 
 
+def _delete_wallets_from_leaderboard(
+    args: argparse.Namespace,
+    *,
+    wallets: set[str],
+    follow_dir: Path,
+    now_ts: int,
+    source: str,
+) -> list[str]:
+    """淘汰的统一执行路径:从 A 榜**直接删除**给定钱包 —— 从打分池 profiles 剔除 + 删该钱包
+    原始交易缓存 + 重建并发布榜(即时下榜停跟)。build lock 与 observe 进程串行化;发布窗口
+    暂停开新信号,避免 runner 主循环读到半写榜。**不**碰 follow.db 跟单研究记录。返回实删钱包。"""
+    targets = sorted({normalize_wallet(w) for w in wallets if normalize_wallet(w)})
+    if not targets:
+        return []
+    data_dir = resolve_data_dir(args)
+    output_dir = resolve_collector_output_dir(args) / "collector_v2"
+    with acquire_build_lock(data_dir, blocking=True):
+        profiles_by_wallet = dict(load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2"))
+        for wallet in targets:
+            profiles_by_wallet.pop(wallet, None)
+            try:
+                user_trades_cache_path(output_dir, wallet).unlink()
+            except FileNotFoundError:
+                pass
+        write_json(
+            output_dir / "collector_v2_wallet_profiles.json",
+            [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
+        )
+        leaderboard = build_collector_leaderboard_v2(
+            profiles_by_wallet, now_ts=now_ts,
+            per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
+            max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
+            include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
+            gate_kwargs=_v2_gate_kwargs_from_args(args),
+        )["leaderboard"]
+        write_json(
+            output_dir / "collector_v2_leaderboard.json",
+            [slim_profile_for_storage(row) for row in leaderboard],
+        )
+        for category in FOLLOW_SIGNAL_CATEGORIES:
+            set_pause_new_signals(follow_dir, category, {"status": "paused", "reason": source, "started_at": now_ts})
+        try:
+            publish_collector_dashboard_outputs(
+                output_dir, data_dir,
+                summary={"collector": V2_COLLECTOR_NAME, "category": "esports", "source": source},
+                now_ts=now_ts, prefix="collector_v2", db_filename="leaderboard_v2.db",
+                profiles_publish_name="wallet_profiles_v2.json", collector_name=V2_COLLECTOR_NAME,
+            )
+        finally:
+            for category in FOLLOW_SIGNAL_CATEGORIES:
+                set_pause_new_signals(follow_dir, category, None)
+    return targets
+
+
+def purge_legacy_demote_quarantine(
+    args: argparse.Namespace,
+    *,
+    follow_dir: Path | str,
+    now_ts: int,
+) -> dict[str, Any]:
+    """一次性迁移(runner 启动跑一次):历史自动降级隔离(reason=rescore_below_grade_a)的钱包
+    = 当初表现差被淘汰,按新策略**直接删除**(下榜+删profile+删缓存)+ 清掉其隔离行。
+    **绝不**解禁放回跟单集。人工隔离(manual_*)不动。库里没有这类行时为 no-op。"""
+    follow_dir = Path(follow_dir)
+    store = FollowStore(follow_dir / "follow.db")
+    legacy = {
+        normalize_wallet((info or {}).get("wallet") or key)
+        for key, info in store.load_wallet_quarantine(category="esports").items()
+        if str((info or {}).get("reason") or "") == RESCORE_QUARANTINE_REASON
+    }
+    legacy.discard("")
+    if not legacy:
+        return {"deleted": 0, "wallets": []}
+    removed = _delete_wallets_from_leaderboard(
+        args, wallets=legacy, follow_dir=follow_dir, now_ts=now_ts, source="legacy_demote_purge")
+    store.clear_wallet_quarantine_wallets(set(legacy))
+    return {"deleted": len(removed), "wallets": sorted(legacy)}
+
+
 def rescore_demote_wallets(
     client: PolymarketClient,
     args: argparse.Namespace,
@@ -5838,42 +5919,15 @@ def rescore_demote_wallets(
     if not demoted:
         return {"rescored": len(reprofiled), "demoted": 0, "demoted_wallets": []}
 
-    # 淘汰=直接删除:从打分池剔除 + 删原始交易缓存 + 重建发布榜(即时下榜停跟)。build lock 与
-    # observe 进程串行化;发布窗口暂停开新信号,避免 runner 主循环读到半写榜。
-    with acquire_build_lock(data_dir, blocking=True):
-        profiles_by_wallet = dict(load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2"))
-        for wallet in demoted:
-            profiles_by_wallet.pop(wallet, None)
-            try:
-                user_trades_cache_path(output_dir, wallet).unlink()
-            except FileNotFoundError:
-                pass
-        write_json(
-            output_dir / "collector_v2_wallet_profiles.json",
-            [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
-        )
-        write_json(
-            output_dir / "collector_v2_leaderboard.json",
-            [slim_profile_for_storage(row) for row in _rebuild_board(profiles_by_wallet)],
-        )
-        for category in FOLLOW_SIGNAL_CATEGORIES:
-            set_pause_new_signals(follow_dir, category, {"status": "paused", "reason": "rescore_demote", "started_at": now_ts})
-        try:
-            publish_collector_dashboard_outputs(
-                output_dir, data_dir,
-                summary={"collector": V2_COLLECTOR_NAME, "category": "esports", "source": "rescore_demote"},
-                now_ts=now_ts, prefix="collector_v2", db_filename="leaderboard_v2.db",
-                profiles_publish_name="wallet_profiles_v2.json", collector_name=V2_COLLECTOR_NAME,
-            )
-        finally:
-            for category in FOLLOW_SIGNAL_CATEGORIES:
-                set_pause_new_signals(follow_dir, category, None)
+    # 淘汰=直接删除(统一执行路径,见 _delete_wallets_from_leaderboard)。
+    _delete_wallets_from_leaderboard(
+        args, wallets=set(demoted), follow_dir=Path(follow_dir), now_ts=now_ts, source="rescore_demote")
     return {"rescored": len(reprofiled), "demoted": len(demoted), "demoted_wallets": demoted}
 
 
 def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
-    """M4 发现 + M5 重评一次 tick:新结算盘→新候选 profile;同时重评在榜且最近有跟单的地址,
-    跌出 grade-A 即隔离(满冷却且重评回 A 则恢复);合并重建 A-only 榜 → 发布。"""
+    """M4 发现一次 tick:新结算盘 → top-PnL 双侧持仓者 → 按 scope 打分 → 合并重建 A-only 榜 → 发布。
+    (降级/恢复已全部移出:降级由 follow runner 直接删除淘汰,无 quarantine 中间态、无恢复重评。)"""
     client = client or build_client(args)
     output_dir = resolve_collector_output_dir(args) / "collector_v2"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -7186,8 +7240,8 @@ def command_follow(
     else:
         performance = aggregate_follow_performance(performance, [])
     # follow tick 本身不写隔离。M5 自动降级由 runner 按结算笔数事件触发(command_run →
-    # rescore_demote_wallets,重评被跟钱包跌出 grade-A 即隔离);冷却恢复由 observe-v2 负责。
-    # 隔离入口仍是两个:人工按钮 + M5 重评。
+    # rescore_demote_wallets,重评被跟钱包跌出 grade-A 即【直接删除】淘汰,无 quarantine 中间态)。
+    # quarantine 入口现在只剩**人工按钮**一种。
     stage_seconds["settlement_and_quarantine"] = round(time.monotonic() - settlement_started_mono, 3)
     balance_ledger_result = {"configured": account_balance_configured, "applied_count": 0, "applied_amount_usdc": 0.0}
     if account_balance_configured:
@@ -7302,7 +7356,9 @@ def command_follow(
         "output_dir": str(follow_dir),
     }
     if emit:
-        print(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True))
+        # 单行紧凑 JSON:每拍一行而非 ~92 行 pretty-print,日志增速减半、grep 更快。
+        # 完整结构化记录已经 save_run_tick 入库(follow.db),这里只为可读观测。
+        print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return summary
 
 
@@ -7331,6 +7387,14 @@ def command_run(args: argparse.Namespace) -> int:
                 "data_dir": str(category_data_dirs(collection_root)[category]),
             }
         )
+
+    # 一次性迁移:历史自动降级隔离的钱包(当初表现差被淘汰)按新策略直接删除,**不**解禁放回跟单集。
+    try:
+        purge = purge_legacy_demote_quarantine(category_args("esports"), follow_dir=follow_dir, now_ts=now_init)
+        if purge["deleted"]:
+            print(json.dumps({"status": "legacy_demote_purge", **purge}, ensure_ascii=False))
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"status": "legacy_demote_purge_error", "error": str(exc)}, ensure_ascii=False))
 
     def request_stop(signum, _frame) -> None:
         stop_reason["value"] = f"signal_{signum}"
@@ -7472,7 +7536,7 @@ def command_run(args: argparse.Namespace) -> int:
 
             # M5 计数从 DB 派生:未处理的终态结果(settled + exited,均有真实盈亏)。持久化
             # 跨重启累加、含提前卖出。达阈值即把这批标记已处理(防重启重复)+ off-thread
-            # 重评其钱包(跌出 grade-A 即隔离)。上一轮重评还在跑则跳过(这批留到下轮)。
+            # 重评其钱包(跌出 grade-A 即直接删除淘汰)。上一轮重评还在跑则跳过(这批留到下轮)。
             if rescore_threshold > 0 and (rescore_thread is None or not rescore_thread.is_alive()):
                 pending = m5_store.load_unprocessed_m5_results()
                 if len(pending) >= rescore_threshold:
