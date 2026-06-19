@@ -181,19 +181,32 @@
 }
 /* 钱包采集按钮容器 */
 .sample-trigger { position: relative; display: inline-flex; }
-/* M4 动态观测新入榜钱包:亮闪 NEW 标记(2h 内显示) */
-.wallet-cell { display: inline-flex; align-items: center; gap: 8px; }
+/* observe-v2 / observe-live 动态观测新入榜钱包:地址右上角闪光 NEW 角标(4h 内显示) */
+.wallet-cell { position: relative; display: inline-flex; align-items: center; gap: 8px; }
 .new-badge {
+  position: absolute; top: -9px; right: -7px; z-index: 3;
   display: inline-flex; align-items: center;
-  padding: 1px 7px; border-radius: 999px;
-  font-size: 10px; font-weight: 800; letter-spacing: 0.06em;
-  color: #fff; background: var(--accent); flex: none;
-  animation: new-pulse 1.8s ease-out infinite;
+  padding: 1px 6px; border-radius: 999px;
+  font-size: 9px; line-height: 1.5; font-weight: 800; letter-spacing: 0.05em;
+  color: #fff; flex: none; overflow: hidden;
+  background: linear-gradient(120deg, var(--accent) 0%, #ff9a6a 100%);
+  box-shadow: 0 1px 5px rgba(255, 107, 74, 0.55);
+  animation: new-glow 1.8s ease-in-out infinite;
 }
-@keyframes new-pulse {
-  0%   { box-shadow: 0 0 0 0 var(--accent-ring); }
-  70%  { box-shadow: 0 0 0 6px rgba(255, 107, 74, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(255, 107, 74, 0); }
+/* 扫光高亮:一道斜向白光周期性掠过角标 */
+.new-badge::after {
+  content: ""; position: absolute; inset: 0;
+  background: linear-gradient(120deg, transparent 25%, rgba(255, 255, 255, 0.9) 50%, transparent 75%);
+  transform: translateX(-130%);
+  animation: new-shine 2.4s ease-in-out infinite;
+}
+@keyframes new-shine {
+  0%, 55% { transform: translateX(-130%); }
+  100%    { transform: translateX(130%); }
+}
+@keyframes new-glow {
+  0%, 100% { box-shadow: 0 1px 5px rgba(255, 107, 74, 0.45); }
+  50%      { box-shadow: 0 1px 9px rgba(255, 107, 74, 0.85); }
 }
 
 /* ---- Overview grid ---- */

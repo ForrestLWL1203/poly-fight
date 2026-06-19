@@ -224,6 +224,7 @@
   }
 
   function wallet(row, nowMs) {
+    nowMs = nowMs || Date.now();   // 调用方未传 → 用当前时间(否则 isNew 里 nowMs=undefined→NaN→恒 false)
     const obs = row.observed || {};
     const settled = num(obs.wins) + num(obs.losses);
     return {
