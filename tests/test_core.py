@@ -137,6 +137,7 @@ from poly_fight.core import (
     classify_edge_type,
     classify_market_type,
     classify_wallet,
+    classify_wallet_bucket,
     event_category,
     event_league,
     event_to_market_record,
@@ -3778,6 +3779,37 @@ class CoreTest(unittest.TestCase):
         self.assertNotEqual(thin_sub["grade"], "A")
         self.assertIn("thin_followable_subset", thin_sub["reasons"])
 
+    def test_v21_thin_sample_gate_requires_stronger_signal_below_anchor(self):
+        # v21:桶 full n_eff 落在 [放松地板6, 满严格锚点10) → 须 edge_lb≥0.08 且 θ̂≥0.80 才给 A。
+        now = 100 + 86400
+        base = {
+            "category": "esports", "esports_closed_count": 8,
+            "effective_sample_size": 8, "effective_sample_size_full": 8,  # 8 ∈ [6,10) → 薄
+            "last_esports_trade_at": 100, "bot_like_score": 0,
+        }
+        # 强信号:θ̂=0.90、便宜入场 → edge_lb 大 → 过薄门 → A。
+        strong = classify_wallet_bucket(
+            {**base, "recency_weighted_win_rate": 0.90, "median_entry_price": 0.45},
+            now_ts=now, min_sample=6, n_eff_anchor=10)
+        self.assertEqual(strong["grade"], "A")
+        # 弱胜率:θ̂=0.72(过基础0.68,未过薄门0.80)、edge_lb 仍≥0.08 → 被薄门砍。
+        weak_wr = classify_wallet_bucket(
+            {**base, "recency_weighted_win_rate": 0.72, "median_entry_price": 0.30},
+            now_ts=now, min_sample=6, n_eff_anchor=10)
+        self.assertNotEqual(weak_wr["grade"], "A")
+        self.assertIn("thin_underqualified", weak_wr["reasons"])
+        # 同样弱胜率但不给锚点(旧行为)→ 薄门不启用 → 仍 A(向后兼容)。
+        no_anchor = classify_wallet_bucket(
+            {**base, "recency_weighted_win_rate": 0.72, "median_entry_price": 0.30},
+            now_ts=now, min_sample=6)
+        self.assertEqual(no_anchor["grade"], "A")
+        # full n_eff ≥ 锚点(够厚,非薄样本)→ 不受薄门约束,弱胜率走基础门即可 A。
+        thick = classify_wallet_bucket(
+            {**base, "effective_sample_size_full": 12,
+             "recency_weighted_win_rate": 0.72, "median_entry_price": 0.30},
+            now_ts=now, min_sample=6, n_eff_anchor=10)
+        self.assertEqual(thick["grade"], "A")
+
     def test_grading_eligibility_is_single_source_across_consumers(self):
         # 单一真相源回归护栏:同一份 profile,collector/observe/demote 共用的
         # build_collector_leaderboard_v2,与 follow 的 eligible_follow_wallets / wallet_is_followable,
@@ -3890,22 +3922,27 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(slim[k], trade[k])
 
     def test_derive_scope_params_adapts_to_density(self):
-        # 密集(λ≈16 ≥ T2=14):短 lookback、n_eff dense 档 10。
+        # v21:n_eff_floor = 子集门6 + round((锚点−6)×scale=0.5);锚点(n_eff_floor_full)按 λ 分档不变。
+        # 密集(λ≈16 ≥ T2=14):锚点 dense=10 → 地板 6+round(2)=8。
         dense = derive_scope_params(markets=1440, window_days=90, gaps=[1.0] * 80)
         self.assertEqual(dense["lookback_days"], 14)          # 180/16=11.25 → clamp 到下限 14
-        self.assertEqual(dense["n_eff_floor"], 10)            # λ=16 ≥ T2 → dense=10
+        self.assertEqual(dense["n_eff_floor_full"], 10)       # λ=16 ≥ T2 → 锚点 dense=10
+        self.assertEqual(dense["n_eff_floor"], 8)             # 6+round((10-6)*0.5)=8
         self.assertEqual(dense["idle_ceiling_hours"], 72)     # p90 gap=1 → 2×1×24=48 → clamp 72
-        # 中档(T1=9 ≤ λ≈11.7 < T2=14):n_eff mid 档 8。
+        # 中档(T1=9 ≤ λ≈11.7 < T2=14):锚点 mid=8 → 地板 6+round(1)=7。
         mid = derive_scope_params(markets=1053, window_days=90, gaps=[1.0] * 60)
-        self.assertEqual(mid["n_eff_floor"], 8)               # λ≈11.7 ∈ [9,14) → mid=8
-        # 稀疏(λ≈6 < T1=9):长 lookback、n_eff sparse 档 7。
+        self.assertEqual(mid["n_eff_floor_full"], 8)          # λ≈11.7 ∈ [9,14) → 锚点 mid=8
+        self.assertEqual(mid["n_eff_floor"], 7)               # 6+round((8-6)*0.5)=7
+        # 稀疏(λ≈6 < T1=9):锚点 sparse=7 → 地板 6+round(0.5)=6(并入子集门)。
         sparse = derive_scope_params(markets=540, window_days=90, gaps=[1.0] * 40 + [9.0])
         self.assertEqual(sparse["lookback_days"], 30)         # 180/6=30
-        self.assertEqual(sparse["n_eff_floor"], 7)            # λ=6 < T1 → sparse=7
-        # 极稀疏:lookback 封顶 90,n_eff 仍 sparse 档 7。
+        self.assertEqual(sparse["n_eff_floor_full"], 7)       # λ=6 < T1 → 锚点 sparse=7
+        self.assertEqual(sparse["n_eff_floor"], 6)            # 6+round((7-6)*0.5)=6
+        # 极稀疏:lookback 封顶 90,锚点仍 sparse=7 → 地板 6。
         tiny = derive_scope_params(markets=90, window_days=90, gaps=[7.0, 14.0])
         self.assertEqual(tiny["lookback_days"], 90)           # 180/1=180 → clamp 90
-        self.assertEqual(tiny["n_eff_floor"], 7)
+        self.assertEqual(tiny["n_eff_floor_full"], 7)
+        self.assertEqual(tiny["n_eff_floor"], 6)
         # idle 锚 p90 gap(尾部),clamp 到 [72h, 21d]。
         bursty = derive_scope_params(markets=200, window_days=90, gaps=[1.0, 1.0, 10.0, 10.0])
         self.assertGreater(bursty["idle_ceiling_hours"], 72)  # p90≈10d → 放宽

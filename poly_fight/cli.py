@@ -4650,6 +4650,16 @@ def scope_n_eff_floors(scopes: dict[str, Any]) -> dict[str, int]:
     return {g: int(p["n_eff_floor"]) for g, p in (scopes or {}).items() if isinstance(p, dict) and p.get("n_eff_floor")}
 
 
+def scope_n_eff_anchors(scopes: dict[str, Any]) -> dict[str, int]:
+    """{game_family: n_eff_floor_full} —— 满严格锚点,启用薄样本附加门(v21)。
+    只返回显式带锚点的游戏;旧校准文件无此字段 → 空 map → classify 不加薄门(安全退化)。"""
+    return {
+        g: int(p["n_eff_floor_full"])
+        for g, p in (scopes or {}).items()
+        if isinstance(p, dict) and p.get("n_eff_floor_full")
+    }
+
+
 def scope_lookback_by_game(scopes: dict[str, Any]) -> dict[str, int]:
     """{game_family: lookback_days} —— 用于 per-game 打分窗口截断。"""
     return {g: int(p["lookback_days"]) for g, p in (scopes or {}).items() if isinstance(p, dict) and p.get("lookback_days")}
@@ -5165,6 +5175,7 @@ def _command_collect_wallets(
     # scope 自适应:collect 起步刷新校准(单一真相源),per-game lookback/n_eff 由此派生。
     scope_params = load_scope_params(resolve_data_dir(args), client=client, now=now_dt, refresh=True)
     n_eff_floors = scope_n_eff_floors(scope_params)
+    n_eff_anchors = scope_n_eff_anchors(scope_params)
     lookback_by_game = scope_lookback_by_game(scope_params)
     # discovery 一次按"最长 per-game 窗口"拉取;打分 scope 再按 per-game 窗口收口(见下方 filter)。
     lookback_days = scope_max_lookback_days(scope_params, default_lookback_days)
@@ -5405,6 +5416,7 @@ def _command_collect_wallets(
             now_ts=now_ts,
             scoring_basis=scoring_basis,
             n_eff_floors=n_eff_floors,
+            n_eff_anchors=n_eff_anchors,
         )
         return {
             **profile,
@@ -5740,6 +5752,7 @@ def rescore_demote_wallets(
     default_lookback_days = int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS)
     scope_params = load_scope_params(data_dir, client=None, now=now_dt, refresh=False)
     n_eff_floors = scope_n_eff_floors(scope_params)
+    n_eff_anchors = scope_n_eff_anchors(scope_params)
     lookback_by_game = scope_lookback_by_game(scope_params)
     lookback_days = scope_max_lookback_days(scope_params, default_lookback_days)
     closed_events = client.list_events_paginated(
@@ -5780,7 +5793,7 @@ def rescore_demote_wallets(
             condition_game_family_by_id=condition_game_family_by_id,
             user_trades_loader=lambda _w: trades,
             current_positions_loader=lambda _w: [],
-            now_ts=now_ts, scoring_basis="hold", n_eff_floors=n_eff_floors,
+            now_ts=now_ts, scoring_basis="hold", n_eff_floors=n_eff_floors, n_eff_anchors=n_eff_anchors,
         )
         return {**profile, "profile_lookback_days": default_profile_lookback, "observed_at": now_ts}
 
@@ -5883,6 +5896,7 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
     #    observe 每 tick 读缓存校准;缓存 >24h 过期才用 client 重算(daily 保鲜,不每 tick 重算)。
     scope_params = load_scope_params(resolve_data_dir(args), client=client, now=now_dt, refresh=False)
     n_eff_floors = scope_n_eff_floors(scope_params)
+    n_eff_anchors = scope_n_eff_anchors(scope_params)
     lookback_by_game = scope_lookback_by_game(scope_params)
     lookback_days = scope_max_lookback_days(scope_params, int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS))
     closed_events = client.list_events_paginated(
@@ -5931,7 +5945,7 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
             condition_game_family_by_id=condition_game_family_by_id,
             user_trades_loader=lambda _w: trades,
             current_positions_loader=lambda _w: [],
-            now_ts=now_ts, scoring_basis="hold", n_eff_floors=n_eff_floors,
+            now_ts=now_ts, scoring_basis="hold", n_eff_floors=n_eff_floors, n_eff_anchors=n_eff_anchors,
         )
         # observed_at:M4 发现并打分的时间 → dashboard 据此显示 2h "new" 标记
         return {**profile, "profile_lookback_days": profile_lookback_days, "seed": collector_seed_payload(seed_wallet), "observed_at": now_ts}
@@ -6102,6 +6116,7 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
     profile_lookback_days = int(getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS) or V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
     scope_params = load_scope_params(data_dir, client=client, now=now_dt, refresh=False)
     n_eff_floors = scope_n_eff_floors(scope_params)
+    n_eff_anchors = scope_n_eff_anchors(scope_params)
     lookback_by_game = scope_lookback_by_game(scope_params)
     lookback_days = scope_max_lookback_days(scope_params, int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS))
     closed_events = client.list_events_paginated(
@@ -6137,7 +6152,7 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
             condition_game_family_by_id=condition_game_family_by_id,
             user_trades_loader=lambda _w: trades,
             current_positions_loader=lambda _w: [],
-            now_ts=now_ts, scoring_basis="hold", n_eff_floors=n_eff_floors,
+            now_ts=now_ts, scoring_basis="hold", n_eff_floors=n_eff_floors, n_eff_anchors=n_eff_anchors,
         )
         return {**profile, "profile_lookback_days": profile_lookback_days,
                 "seed": collector_seed_payload(seed_wallet), "observed_at": now_ts, "seed_source": "observe_live"}
