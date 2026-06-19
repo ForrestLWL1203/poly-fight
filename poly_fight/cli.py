@@ -7849,6 +7849,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--error-retry-seconds", type=int, default=180)
     run.add_argument("--max-consecutive-error-seconds", type=int, default=600)
     run.add_argument("--pool-refresh-hours", type=float, default=12)
+    # 与 pool-refresh 对齐:每次 12h 刷新就让全部已有钱包在滚动后的新窗口上重评一遍
+    # (复用增量成交缓存、只重算分,不重下历史)。raw_user_trades 文件 1 天保留 > 12h 重评
+    # 周期 → 增量缓存在两次重评间存活,不会被清后触发整窗重拉。
+    run.add_argument("--collector-profile-cache-ttl-hours", type=float, default=12)
     run.add_argument("--skip-initial-build", action="store_true")
     run.add_argument("--max-run-ticks", type=int, default=0)
     run.set_defaults(func=command_run)
