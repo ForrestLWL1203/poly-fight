@@ -294,7 +294,9 @@ MOMENTUM_MAX_TWO_SIDED_RATE = 0.05
 # 原 v2_bucket_gate 的 Wilson/ROI/PnL/positive_rate/entry 门已随该函数删除)。
 V2_MAX_TWO_SIDED_RATE = 0.20       # material 双边市场率 ≤ 0.20(实证空谷,降噪;edge 无关)
 V2_MAX_BOT_SCORE = 70              # bot 评分硬排除阈
-V2_MAX_TAIL_ENTRY_RATE = 0.25      # 尾盘追高市场占比 ≤ 0.25
+# v21:board 级 tail 门已删(原 V2_MAX_TAIL_ENTRY_RATE=0.25)。其"整盘 avg≥0.75"定义把分批
+# 建仓误判成追高,且与 edge_lb 评级门 + 0.85 跟单执行上限三重冗余。discovery 种子预筛仍有独立
+# 的 tail 软门(默认 0.34,见下方 filter_profile_seed_wallets_*),那是另一层、阈值更松。
 # 钱包级硬门:最后一笔(scoped)交易超过这么多小时 → 直接不入榜(比逐桶 14 天门紧得多)。
 # 跟单要钱包当下活跃;沉寂 >72h 的不再上榜(collector 发现 + observer 重评共用)。
 V2_MAX_LEADERBOARD_IDLE_HOURS = 336  # 14d:打分窗口(14-30d)已管"是否活跃",72h 过紧会误杀低频高手
@@ -4964,7 +4966,6 @@ def build_collector_leaderboard_v2(
     max_two_sided_rate = float(gate_kwargs.get("max_two_sided_rate", V2_MAX_TWO_SIDED_RATE))
     max_bot_score = int(gate_kwargs.get("max_bot_score", V2_MAX_BOT_SCORE))
     max_idle_hours = int(gate_kwargs.get("max_idle_hours", V2_MAX_LEADERBOARD_IDLE_HOURS))
-    max_tail_entry_rate = float(gate_kwargs.get("max_tail_entry_rate", V2_MAX_TAIL_ENTRY_RATE))
     qualified: list[dict[str, Any]] = []
     rejected_counts: dict[str, int] = {}
     for wallet, profile in profiles_by_wallet.items():
@@ -4988,13 +4989,9 @@ def build_collector_leaderboard_v2(
         if _v2_grade_rank(profile.get("grade")) < _v2_grade_rank(min_grade):
             rejected_counts["grade_below_floor"] = rejected_counts.get("grade_below_floor", 0) + 1
             continue
-        participated = to_int(_v2_candidate_metric(profile, "participated_market_count")) or to_int(profile.get("esports_closed_count"))
-        wallet_tail_rate = (
-            to_int(_v2_candidate_metric(profile, "tail_entry_market_count")) / participated if participated > 0 else 0.0
-        )
-        if max_tail_entry_rate > 0 and wallet_tail_rate > max_tail_entry_rate:
-            rejected_counts["tail_entry_over_limit"] = rejected_counts.get("tail_entry_over_limit", 0) + 1
-            continue
+        # v21:board 级 tail 门已删。它用"整盘 avg 买入价 ≥0.75"判定追高,会把分批建仓
+        # (median 入场低、avg 被晚加仓拉高)的高手误判;且与 edge_lb 评级门 + 0.85 跟单执行
+        # 现价上限三重冗余 —— 复制不了的高价买单本就被 edge_lb 刷掉 + 执行层不跟。交给那两道把关。
         # 逐桶 = classify_wallet_bucket 已算好的逐桶 A(θ̂≥0.58 + n_eff≥10 + edge,非 esports/别桶已隔离)。
         per_game_type_grades = profile.get("per_game_type_grades") if isinstance(profile.get("per_game_type_grades"), dict) else {}
         eligible: list[dict[str, Any]] = []
@@ -5121,7 +5118,6 @@ def build_collector_leaderboard_v2(
 def _v2_gate_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
     # 仅钱包级硬排除门(逐桶质量统一走 classify_wallet_bucket)。
     return {
-        "max_tail_entry_rate": float(getattr(args, "v2_max_tail_entry_rate", V2_MAX_TAIL_ENTRY_RATE)),
         "max_two_sided_rate": float(getattr(args, "v2_max_two_sided_rate", V2_MAX_TWO_SIDED_RATE)),
         "max_bot_score": int(getattr(args, "v2_max_bot_score", V2_MAX_BOT_SCORE)),
         "max_idle_hours": int(getattr(args, "max_leaderboard_idle_hours", V2_MAX_LEADERBOARD_IDLE_HOURS)),
@@ -7699,7 +7695,6 @@ def build_parser() -> argparse.ArgumentParser:
         # V2 钱包级硬排除门(逐桶质量统一走 classify_wallet_bucket,不再有逐桶 ROI/Wilson 参数)。
         subparser.add_argument("--v2-max-two-sided-rate", type=float, default=V2_MAX_TWO_SIDED_RATE)
         subparser.add_argument("--v2-max-bot-score", type=int, default=V2_MAX_BOT_SCORE)
-        subparser.add_argument("--v2-max-tail-entry-rate", type=float, default=V2_MAX_TAIL_ENTRY_RATE)
         # 钱包级硬门:最后一笔交易超过这么多小时 → 不入榜(默认 72h;<=0 关闭)。
         subparser.add_argument("--max-leaderboard-idle-hours", type=int, default=V2_MAX_LEADERBOARD_IDLE_HOURS)
         subparser.add_argument("--v2-per-game-quota", type=int, default=V2_PER_GAME_QUOTA)
