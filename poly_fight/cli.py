@@ -7295,7 +7295,8 @@ def command_run(args: argparse.Namespace) -> int:
     # 队标抓取节流:对阵盘多无队标,每 tick 重抓是空转 → 约 30min 才跑一次(WS 健康时 tick ~5s)。
     last_logo_refresh_at = 0.0
     LOGO_REFRESH_INTERVAL_SECONDS = 1800
-    stop_requested = {"value": False, "reason": ""}
+    stop_event = threading.Event()   # 收到停止信号立即唤醒 sleep(避免 PEP 475 睡满长间隔才停)
+    stop_reason = {"value": ""}
     collection_root = resolve_dashboard_root(args)
     follow_dir = resolve_follow_dir(args, collection_root)
 
@@ -7309,8 +7310,8 @@ def command_run(args: argparse.Namespace) -> int:
         )
 
     def request_stop(signum, _frame) -> None:
-        stop_requested["value"] = True
-        stop_requested["reason"] = f"signal_{signum}"
+        stop_reason["value"] = f"signal_{signum}"
+        stop_event.set()
 
     previous_sigterm = None
     try:
@@ -7345,8 +7346,9 @@ def command_run(args: argparse.Namespace) -> int:
     m5_store = FollowStore(follow_dir / "follow.db")   # M5 计数从 DB 派生(持久化、含 exited)
 
     def sleep_or_stop(seconds: int) -> None:
-        if not stop_requested["value"] and int(seconds) > 0:
-            time.sleep(int(seconds))
+        # Event.wait 收到停止信号立即返回(不像 time.sleep 会睡满整段),所以 SIGTERM/停跟单秒停。
+        if int(seconds) > 0:
+            stop_event.wait(int(seconds))
 
     def maybe_build(force: bool = False) -> bool:
         nonlocal last_build_at
@@ -7393,7 +7395,7 @@ def command_run(args: argparse.Namespace) -> int:
                     )
                 )
                 sleep_or_stop(int(args.error_retry_seconds))
-        while not stop_requested["value"]:
+        while not stop_event.is_set():
             iteration_started_mono = time.monotonic()
             try:
                 maybe_build(force=False)
@@ -7483,8 +7485,8 @@ def command_run(args: argparse.Namespace) -> int:
     finally:
         if collector is not None:
             collector.stop()
-        if stop_requested["value"]:
-            print(json.dumps({"status": "stopped", "reason": stop_requested["reason"], "ticks": tick_count}, ensure_ascii=False))
+        if stop_event.is_set():
+            print(json.dumps({"status": "stopped", "reason": stop_reason["value"], "ticks": tick_count}, ensure_ascii=False))
         if previous_sigterm is not None:
             try:
                 signal.signal(signal.SIGTERM, previous_sigterm)
