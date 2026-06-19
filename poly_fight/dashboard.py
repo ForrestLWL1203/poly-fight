@@ -2803,6 +2803,23 @@ def _runner_default_params(config: DashboardConfig) -> dict[str, Any]:
     }
 
 
+def _prune_old_logs(log_dir: Path, *, max_age_days: int = 7, pattern: str = "dashboard-*.out") -> None:
+    """删除 log_dir 下 mtime 超过 max_age_days 的 spawn 日志(best-effort,绝不向 spawn 路径抛错)。
+
+    runner/observe 日志名是 dashboard-<role>-<spawn_ts>.out:每次重启换一个新文件、永不原地轮转,
+    不清理就无界堆积。在每次 runner spawn(新文件唯一出现的时机)调用即可封顶。"""
+    cutoff = time.time() - max_age_days * 86400
+    try:
+        for f in log_dir.glob(pattern):
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def _spawn_detached_process(command: list[str], log_path: Path, starter: Any) -> tuple[int, int]:
     """起一个分离的子进程,返回 (pid, pgid)。starter 给定时走注入(便于测试)。"""
     if starter is not None:
@@ -2848,6 +2865,7 @@ def start_runner(
     realtime_refresh = bool(strategy.get("realtime_refresh"))
     log_dir = _follow_log_dir(config.data_dir, log_dir=config.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
+    _prune_old_logs(log_dir)  # 删 >7 天的旧 spawn 日志(runner/observe),封顶总量
     log_path = log_dir / f"dashboard-runner-{now_ts}.out"
     command = [
         sys.executable,
