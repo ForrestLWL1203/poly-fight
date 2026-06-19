@@ -834,6 +834,15 @@ function FollowDetailModal({ cid, onClose, toast }) {
     finally { setRefreshing(false); }
   };
 
+  /* 详情打开期间每 25s 静默自动刷新实时盘口(手动按钮仍可即时刷 + toast)。 */
+  React.useEffect(() => {
+    let alive = true;
+    const id = setInterval(() => {
+      Api.marketPrices(cid).then((p) => alive && setPrices(p.outcome_prices || null)).catch(() => {});
+    }, 25000);
+    return () => { alive = false; clearInterval(id); };
+  }, [cid]);
+
   const stop = (e) => e.stopPropagation();
   const mp = (detail && detail.match_parts) || {};
   const titleGame = detail ? Adapt.normalizeGame(mp.game) : "";
@@ -1544,6 +1553,18 @@ function Dashboard({ onLogout, toast }) {
     const stream = Api.openStream(onFrame, (status) => { if (status === "error") startPolling(); });
     return () => { alive = false; stream.close(); if (pollTimer) clearInterval(pollTimer); };
   }, [merge]);
+
+  /* 有 open 跟单时,定时重拉 /api/events → 后端实时拉盘口算未结算盈亏(SSE 帧不带 events)。
+     无 open 跟单则不轮询,省 gamma 请求。open_signal_count 由 SSE 每 2s 刷新。 */
+  const hasOpenFollows = !!(data.overview && Adapt.num(data.overview.open_signal_count) > 0);
+  React.useEffect(() => {
+    if (!hasOpenFollows) return;
+    let alive = true;
+    const id = setInterval(() => {
+      Api.events().then((e) => alive && merge({ events: e })).catch(() => {});
+    }, 25000);
+    return () => { alive = false; clearInterval(id); };
+  }, [hasOpenFollows, merge]);
 
   /* theme */
   React.useEffect(() => {
