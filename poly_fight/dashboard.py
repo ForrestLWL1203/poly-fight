@@ -964,7 +964,10 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
     all_signals = [*open_signals, *results]
     settled = [row for row in results if row.get("status") == "settled"]
     exited = [row for row in results if row.get("status") == "exited"]
-    wins = [row for row in settled if _result_win(row)]
+    # 跟单胜负 = 每笔跟单(含提前卖出 exited + 自然结算 settled)整体 PnL 符号:
+    # >0 胜 / <0 负 / =0 中性不计。与市场结算到哪边无关——提前卖出盈利同样算胜。
+    decided = [row for row in (*settled, *exited) if _signal_our_pnl(row) != 0]
+    wins = [row for row in decided if _signal_our_pnl(row) > 0]
     legs = [leg for signal in all_signals for leg in signal.get("legs") or []]
     result_legs = [leg for signal in results for leg in signal.get("legs") or []]
     total_stake = sum(_leg_actual_stake(leg) for leg in legs)
@@ -987,7 +990,7 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
         "result_count": len(results),
         "settled_count": len(settled),
         "exited_count": len(exited),
-        "win_rate": (len(wins) / len(settled)) if settled else None,
+        "win_rate": (len(wins) / len(decided)) if decided else None,
         "our_realized_pnl": our_pnl,
         "hypothetical_pnl": hypothetical_pnl,
         "wallet_basis_realized_pnl": wallet_basis_pnl,
@@ -1052,7 +1055,12 @@ def _overview_equity_points(results: list[dict[str, Any]]) -> list[dict[str, Any
 def _overview_win_rates_by_game(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for signal in results:
-        if str(signal.get("status") or "") != "settled":
+        # 含提前卖出(exited)与自然结算(settled);胜负只看每笔跟单整体 PnL 符号
+        # (>0 胜 / <0 负 / =0 中性不计),与市场结算到哪边无关。
+        if str(signal.get("status") or "") not in ("settled", "exited"):
+            continue
+        pnl = _signal_our_pnl(signal)
+        if pnl == 0:
             continue
         game = _overview_signal_game(signal)
         if not game:
@@ -1064,15 +1072,15 @@ def _overview_win_rates_by_game(results: list[dict[str, Any]]) -> list[dict[str,
                 "game_label": GAME_FAMILY_LABELS.get(game, game.upper()),
                 "wins": 0,
                 "losses": 0,
-                "settled_count": 0,
+                "settled_count": 0,  # = wins+losses(纳入胜负的笔数,含 exited)
                 "win_rate": None,
             },
         )
-        row["settled_count"] += 1
-        if _result_win(signal):
+        if pnl > 0:
             row["wins"] += 1
         else:
             row["losses"] += 1
+        row["settled_count"] = row["wins"] + row["losses"]
     for row in grouped.values():
         total = int(row["settled_count"] or 0)
         row["win_rate"] = (row["wins"] / total) if total else None
@@ -1356,7 +1364,10 @@ def _overview_for_signals(open_signals: list[dict[str, Any]], results: list[dict
     all_signals = [*open_signals, *results]
     settled = [row for row in results if row.get("status") == "settled"]
     exited = [row for row in results if row.get("status") == "exited"]
-    wins = [row for row in settled if _result_win(row)]
+    # 跟单胜负 = 每笔跟单(含提前卖出 exited + 自然结算 settled)整体 PnL 符号:
+    # >0 胜 / <0 负 / =0 中性不计。与市场结算到哪边无关——提前卖出盈利同样算胜。
+    decided = [row for row in (*settled, *exited) if _signal_our_pnl(row) != 0]
+    wins = [row for row in decided if _signal_our_pnl(row) > 0]
     legs = [leg for signal in all_signals for leg in signal.get("legs") or []]
     result_legs = [leg for signal in results for leg in signal.get("legs") or []]
     resolved_stake = sum(_to_float(leg.get("stake")) for leg in result_legs)
@@ -1368,7 +1379,7 @@ def _overview_for_signals(open_signals: list[dict[str, Any]], results: list[dict
         "result_count": len(results),
         "settled_count": len(settled),
         "exited_count": len(exited),
-        "win_rate": (len(wins) / len(settled)) if settled else None,
+        "win_rate": (len(wins) / len(decided)) if decided else None,
         "our_realized_pnl": our_pnl,
         "wallet_basis_realized_pnl": wallet_basis_pnl,
         "total_stake": sum(_to_float(leg.get("stake")) for leg in legs),
