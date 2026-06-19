@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 import threading
 import time
 import urllib.error
@@ -221,7 +222,22 @@ class PolymarketClient:
                 }
                 if max_end_date is not None:
                     event_params["max_end_date"] = max_end_date
-                batch = self.list_events(**event_params)
+                try:
+                    batch = self.list_events(**event_params)
+                except Exception as exc:
+                    # 单页失败(例:Gamma 对超大 offset 返回 422,或瞬时网络错)不致命:
+                    # 当作该 tag 已翻到头,用已累积的事件继续下个 tag,而非炸穿整个采集流程。
+                    # offset 上限是确定性错误、重试无用(get_json 已重试),故此处只能优雅收口。
+                    print(
+                        json.dumps({
+                            "event": "list_events_page_error",
+                            "tag_slug": tag_slug,
+                            "offset": page * limit,
+                            "error": str(exc),
+                        }),
+                        file=sys.stderr,
+                    )
+                    break
                 if not batch:
                     break
                 for event in batch:

@@ -4637,7 +4637,17 @@ def load_scope_params(
     cached = read_json(path, {}) if path.exists() else {}
     fresh = bool(cached.get("scopes")) and (now_ts - int(cached.get("calibrated_at") or 0)) < SCOPE_CALIBRATION_MAX_AGE_SECONDS
     if client is not None and (refresh or not fresh):
-        scopes = compute_scope_calibration(client, window_days=window_days, min_volume=min_volume, now=now)
+        try:
+            scopes = compute_scope_calibration(client, window_days=window_days, min_volume=min_volume, now=now)
+        except Exception as exc:
+            # 校准失败(API 故障 / 分页异常等)不致命:回退到磁盘缓存校准(无则 {} → 全局默认),
+            # 且**不覆盖**磁盘旧校准。否则一次 API 抖动会让整个 collect 崩 —— 尤其 launcher 全量
+            # 采集已先清空 data/,崩在校准 = 库被清空却没重建。宁可用旧/默认参数把 collect 跑完。
+            print(json.dumps({
+                "event": "scope_calibration_failed", "error": str(exc),
+                "fallback": "cached" if cached.get("scopes") else "global_default",
+            }), file=sys.stderr)
+            return cached.get("scopes") or {}
         payload = {"category": category, "calibration_window_days": window_days, "calibrated_at": now_ts, "scopes": scopes}
         Path(data_dir).mkdir(parents=True, exist_ok=True)
         write_json(path, payload)

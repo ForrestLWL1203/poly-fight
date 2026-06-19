@@ -860,6 +860,31 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(calls, [max_end_date])
 
+    def test_event_pagination_survives_page_error_returns_partial(self):
+        # 单页抛错(如 Gamma 对超大 offset 返回 HTTP 422)不致命:该 tag 优雅收口,
+        # 用已累积事件继续下一个 tag,而非炸穿整个采集流程(否则 collect 在校准/发现阶段崩)。
+        calls = []
+
+        class Client(PolymarketClient):
+            def list_events(self, *, closed, active=None, limit=100, offset=0,
+                            order="endDate", tag_slug="esports", max_end_date=None):
+                calls.append((tag_slug, offset))
+                if tag_slug == "cs2" and offset == 0:
+                    return [{"id": f"cs2-{i}", "endDate": "2026-06-01T00:00:00Z"} for i in range(100)]
+                if tag_slug == "cs2" and offset == 100:
+                    raise RuntimeError("GET failed: ...&offset=100: HTTP Error 422: Unprocessable Entity")
+                if tag_slug == "lol" and offset == 0:
+                    return [{"id": "lol-0", "endDate": "2026-06-01T00:00:00Z"}]
+                return []
+
+        rows = Client().list_events_paginated(closed=True, max_pages=10, tag_slugs=("cs2", "lol"))
+        ids = {r["id"] for r in rows}
+        # cs2 第0页 100 条保留,第1页 422 被吞掉(不抛)→ 不影响 lol 继续被采。
+        self.assertEqual(len(rows), 101)
+        self.assertIn("cs2-99", ids)
+        self.assertIn("lol-0", ids)
+        self.assertEqual(calls, [("cs2", 0), ("cs2", 100), ("lol", 0)])
+
     def test_classification_set_keeps_only_settled_historical_main_matches(self):
         def esports_event(condition_id, end_date, title="Dota 2: A vs B", prices='["1","0"]'):
             return {
