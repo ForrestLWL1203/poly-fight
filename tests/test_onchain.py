@@ -29,15 +29,18 @@ WALLET = "0x47138dc1eef25f1ea91f3b2fda0e0f455c634d21"
 OTHER = "0xa42f127d7e8df9f16881ffcc9ed0bc0326875f5a"
 
 
-def make_log(token_id: str, *, frm: str, to: str, value_shares: float,
-             tx: str, block: int = 100, ts: int = 1781455861, log_index: int = 0) -> dict:
-    data = "0x" + format(int(token_id), "064x") + format(int(value_shares * 1e6), "064x")
+def make_order_filled(*, maker, taker=OTHER, maker_asset, taker_asset, maker_amt, taker_amt,
+                      tx, block=100, ts=1781455861, log_index=0, address=None) -> dict:
+    """Build a CTF Exchange OrderFilled log. Amounts are raw 6-decimal ints."""
+    data = "0x" + "".join(format(int(x), "064x")
+                          for x in (maker_asset, taker_asset, maker_amt, taker_amt, 0))
     return {
+        "address": address or oc.EXCHANGE_ADDRESSES[1],
         "topics": [
-            oc.TRANSFER_SINGLE_TOPIC,
-            oc.topic_for_address(OTHER),   # operator
-            oc.topic_for_address(frm),
-            oc.topic_for_address(to),
+            oc.ORDER_FILLED_TOPIC,
+            "0x" + "00" * 32,                 # orderHash (indexed)
+            oc.topic_for_address(maker),
+            oc.topic_for_address(taker),
         ],
         "data": data,
         "transactionHash": tx,
@@ -45,6 +48,20 @@ def make_log(token_id: str, *, frm: str, to: str, value_shares: float,
         "blockNumber": hex(block),
         "blockTimestamp": hex(ts),
     }
+
+
+def buy_log(*, wallet=WALLET, token=TOKEN_YES, price, shares, tx, **kw) -> dict:
+    """wallet buys `shares` of `token` at `price` (maker_asset=USDC=0)."""
+    return make_order_filled(maker=wallet, maker_asset=0, taker_asset=int(token),
+                             maker_amt=round(price * shares * 1e6), taker_amt=round(shares * 1e6),
+                             tx=tx, **kw)
+
+
+def sell_log(*, wallet=WALLET, token=TOKEN_YES, price, shares, tx, **kw) -> dict:
+    """wallet sells `shares` of `token` at `price` (maker_asset=1 marker, USDC in takerAmt)."""
+    return make_order_filled(maker=wallet, maker_asset=1, taker_asset=int(token),
+                             maker_amt=round(shares * 1e6), taker_amt=round(price * shares * 1e6),
+                             tx=tx, **kw)
 
 
 class TestAssetMap(unittest.TestCase):
@@ -69,31 +86,46 @@ class TestDecode(unittest.TestCase):
     def setUp(self):
         self.amap = oc.build_asset_map([{"conditionId": COND, "clobTokenIds": [TOKEN_YES, TOKEN_NO]}])
 
-    def test_buy_to_wallet(self):
-        log = make_log(TOKEN_YES, frm=OTHER, to=WALLET, value_shares=5, tx="0xabc")
-        fill = oc.decode_transfer_single(log, is_sell=False, asset_map=self.amap)
+    def test_buy_decodes_exact_price(self):
+        log = buy_log(price=0.62, shares=5, tx="0xabc")
+        fill = oc.decode_order_filled(log, wallets={WALLET}, asset_map=self.amap)
         self.assertEqual(fill["wallet"], WALLET)
         self.assertEqual(fill["side"], "BUY")
         self.assertEqual(fill["conditionId"], COND)
         self.assertEqual(fill["outcomeIndex"], 0)
         self.assertEqual(fill["size"], 5.0)
+        self.assertEqual(fill["price"], 0.62)
         self.assertEqual(fill["transactionHash"], "0xabc")
 
-    def test_sell_from_wallet(self):
-        log = make_log(TOKEN_NO, frm=WALLET, to=OTHER, value_shares=12.5, tx="0xdef")
-        fill = oc.decode_transfer_single(log, is_sell=True, asset_map=self.amap)
+    def test_sell_decodes_exact_price(self):
+        log = sell_log(token=TOKEN_NO, price=0.8, shares=12.5, tx="0xdef")
+        fill = oc.decode_order_filled(log, wallets={WALLET}, asset_map=self.amap)
         self.assertEqual(fill["wallet"], WALLET)
         self.assertEqual(fill["side"], "SELL")
         self.assertEqual(fill["outcomeIndex"], 1)
         self.assertEqual(fill["size"], 12.5)
+        self.assertEqual(fill["price"], 0.8)
+
+    def test_complementary_taker_leg_ignored(self):
+        # The mint-complement leg has the wallet as TAKER (maker=other) -> ignored,
+        # so the spurious 0.25 NO-leg never becomes a follow.
+        log = make_order_filled(maker=OTHER, taker=WALLET, maker_asset=0, taker_asset=int(TOKEN_NO),
+                                maker_amt=round(0.25 * 5 * 1e6), taker_amt=round(5 * 1e6), tx="0xc")
+        self.assertIsNone(oc.decode_order_filled(log, wallets={WALLET}, asset_map=self.amap))
 
     def test_off_scope_token_returns_none(self):
-        log = make_log("999999", frm=OTHER, to=WALLET, value_shares=1, tx="0x1")
-        self.assertIsNone(oc.decode_transfer_single(log, is_sell=False, asset_map=self.amap))
+        log = buy_log(token="999999", price=0.5, shares=1, tx="0x1")
+        self.assertIsNone(oc.decode_order_filled(log, wallets={WALLET}, asset_map=self.amap))
+
+    def test_insane_price_guarded(self):
+        # price > 1 (unseen encoding) -> rejected, never a corrupt fill.
+        log = make_order_filled(maker=WALLET, maker_asset=0, taker_asset=int(TOKEN_YES),
+                                maker_amt=round(5 * 1e6), taker_amt=round(3 * 1e6), tx="0xbad")
+        self.assertIsNone(oc.decode_order_filled(log, wallets={WALLET}, asset_map=self.amap))
 
     def test_malformed_log_returns_none(self):
-        self.assertIsNone(oc.decode_transfer_single({"topics": [], "data": "0x"},
-                                                    is_sell=False, asset_map=self.amap))
+        self.assertIsNone(oc.decode_order_filled({"topics": [], "data": "0x"},
+                                                 wallets={WALLET}, asset_map=self.amap))
 
 
 class TestTradeCompatibility(unittest.TestCase):
@@ -103,10 +135,10 @@ class TestTradeCompatibility(unittest.TestCase):
         self.amap = oc.build_asset_map([{"conditionId": COND, "clobTokenIds": [TOKEN_YES, TOKEN_NO]}])
 
     def _trade(self, *, tx, ts, side="BUY", token=TOKEN_YES, price=0.62):
-        frm, to = (OTHER, WALLET) if side == "BUY" else (WALLET, OTHER)
-        log = make_log(token, frm=frm, to=to, value_shares=5, tx=tx, ts=ts)
-        fill = oc.decode_transfer_single(log, is_sell=(side == "SELL"), asset_map=self.amap)
-        return oc.fill_to_trade(fill, price=price)
+        builder = buy_log if side == "BUY" else sell_log
+        log = builder(token=token, price=price, shares=5, tx=tx, ts=ts)
+        fill = oc.decode_order_filled(log, wallets={WALLET}, asset_map=self.amap)
+        return oc.fill_to_trade(fill)   # uses the exact on-chain price in the fill
 
     def test_accessors_read_onchain_trade(self):
         t = self._trade(tx="0xaaa", ts=1781455900, side="BUY", price=0.62)
@@ -143,89 +175,67 @@ class TestTradeCompatibility(unittest.TestCase):
         self.assertEqual([trade_id(x) for x in new], ["0xzzz"])
 
 
-class _ScriptedWS:
-    """Fake WSClient: replays a script of payloads / exceptions for recv_message."""
+class TestPolling(unittest.TestCase):
+    """getLogs cursor-polling collector: exact price, self-heal, dedup."""
 
-    def __init__(self, url, script):
-        self.url = url
-        self._script = list(script)
-        self.sent = []
-
-    def connect(self):
-        pass
-
-    def set_timeout(self, _t):
-        pass
-
-    def send_text(self, text):
-        self.sent.append(text)
-
-    def recv_message(self):
-        if not self._script:
-            raise oc.WSError("script exhausted")
-        item = self._script.pop(0)
-        if isinstance(item, BaseException):
-            raise item
-        return (oc.WSClient.OP_TEXT, item)
-
-    def close(self):
-        pass
-
-
-class TestHeartbeat(unittest.TestCase):
-    def _collector(self, script, **kw):
+    def _collector(self, **kw):
         events = []
-        col = oc.WSFollowCollector(
-            wss_url="ws://x", https_url="http://x",
-            wallets={WALLET},
+        col = oc.OnchainFollowCollector(
+            https_url="http://x", wallets={WALLET},
             asset_map=oc.build_asset_map([{"conditionId": COND, "clobTokenIds": [TOKEN_YES, TOKEN_NO]}]),
-            recv_timeout=0.001,
             on_event=lambda k, d: events.append((k, d)),
-            ws_factory=lambda url: _ScriptedWS(url, script),
             **kw,
         )
         return col, events
 
-    def test_silent_stall_flips_unhealthy_and_reconnects(self):
-        # WS never pushes anything (not even newHeads) -> stale detection fires.
-        class _StallWS(_ScriptedWS):
-            def recv_message(self):
-                time.sleep(0.002)  # let wall-clock advance toward stale_timeout
-                raise oc.WSTimeout()
+    def test_poll_buffers_exact_priced_fill(self):
+        col, _ = self._collector()
+        col._cursor = 990
+        log = buy_log(price=0.62, shares=5, tx="0xabc", block=995)
+        with mock.patch.object(oc, "block_number", return_value=1000), \
+             mock.patch.object(oc, "rpc_call", return_value=[log]):
+            col._poll_once()
+        self.assertTrue(col.healthy)
+        drained = col.drain()
+        self.assertIn(WALLET, drained)
+        self.assertEqual(drained[WALLET][0]["price"], 0.62)
+        self.assertEqual(col._cursor, 1000)
 
-        events = []
-        col = oc.WSFollowCollector(
-            wss_url="ws://x", https_url="http://x", wallets={WALLET},
-            recv_timeout=0.001, stale_timeout=0.05,
-            on_event=lambda k, d: events.append((k, d)),
-            ws_factory=lambda url: _StallWS(url, []),
-        )
-        with mock.patch.object(oc, "block_number", return_value=1000):
-            with self.assertRaises(oc.WSError):
-                col._connect_and_listen()
-        self.assertFalse(col._healthy)
-        self.assertTrue(any(k == "ws_stale" for k, _ in events))
+    def test_cursor_self_heals_on_failure(self):
+        col, _ = self._collector(unhealthy_after_failures=2)
+        col._cursor = 990
+        with mock.patch.object(oc, "block_number", return_value=1000), \
+             mock.patch.object(oc, "rpc_call", side_effect=RuntimeError("rpc down")):
+            col._poll_once()
+            col._poll_once()
+        self.assertFalse(col.healthy)
+        self.assertEqual(col._cursor, 990)  # never advanced -> gap re-covered next round
+        # recovery: the fill from the outage window is caught on the next success
+        log = buy_log(price=0.7, shares=3, tx="0xrec", block=996)
+        with mock.patch.object(oc, "block_number", return_value=1001), \
+             mock.patch.object(oc, "rpc_call", return_value=[log]):
+            col._poll_once()
+        self.assertTrue(col.healthy)
+        self.assertIn(WALLET, col.drain())
 
-    def test_heartbeat_keeps_alive_and_buffers_fill(self):
-        buy_log = make_log(TOKEN_YES, frm=OTHER, to=WALLET, value_shares=100, tx="0xtx1", block=1001)
-        script = [
-            json.dumps({"id": 1, "result": "S1"}),
-            json.dumps({"id": 2, "result": "S2"}),
-            json.dumps({"id": 3, "result": "S3"}),
-            json.dumps({"method": "eth_subscription", "params": {"subscription": "S3", "result": {"number": "0x3e8"}}}),
-            json.dumps({"method": "eth_subscription", "params": {"subscription": "S1", "result": buy_log}}),
-            oc.WSError("end"),
-        ]
-        col, events = self._collector(script, stale_timeout=5.0)
-        with mock.patch.object(oc, "block_number", return_value=900):
-            with self.assertRaises(oc.WSError):
-                col._connect_and_listen()
-        buffered = col.drain()
-        self.assertIn(WALLET, buffered)
-        self.assertEqual(col._last_block, 1001)  # max(newHeads 1000, fill 1001)
-        self.assertFalse(any(k == "ws_stale" for k, _ in events))
-        self.assertTrue(any(k == "ws_connected" for k, _ in events))
+    def test_dedup_across_overlap(self):
+        col, _ = self._collector()
+        col._cursor = 990
+        log = buy_log(price=0.5, shares=2, tx="0xa", block=995, log_index=3)
+        with mock.patch.object(oc, "block_number", return_value=1000), \
+             mock.patch.object(oc, "rpc_call", return_value=[log]):
+            col._poll_once()
+        with mock.patch.object(oc, "block_number", return_value=1003), \
+             mock.patch.object(oc, "rpc_call", return_value=[log]):  # overlap re-returns it
+            col._poll_once()
+        self.assertEqual(col.fill_count, 1)
+
+    def test_no_wallets_is_healthy_idle(self):
+        col = oc.OnchainFollowCollector(https_url="http://x", wallets=set())
+        col._poll_once(current_hint=1000)   # no wallets -> healthy-idle, no RPC needed
+        self.assertTrue(col.healthy)
 
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -7921,6 +7921,8 @@ class CoreTest(unittest.TestCase):
                 "tokenId": "tok_yes",
                 "side": "BUY",
                 "size": 50.0,
+                "price": 0.55,        # exact on-chain fill price (USDC/shares)
+                "cash": 27.5,         # 50 * 0.55
                 "transactionHash": "0xfeed",
                 "logIndex": 0,
                 "blockNumber": 100,

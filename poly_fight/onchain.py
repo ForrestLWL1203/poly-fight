@@ -1,20 +1,23 @@
-"""On-chain follow detection: near-real-time CTF TransferSingle stream.
+"""On-chain follow detection: cursor-based eth_getLogs polling of CTF Exchange
+``OrderFilled`` events.
 
-Replaces the data-api per-wallet polling as the follow detector. A
-``WSFollowCollector`` thread holds two ``eth_subscribe`` log filters (buy: the
-target wallet in `to`; sell: in `from`) over the Polygon CTF contract, decodes
-each fill, maps the ERC1155 token id to (conditionId, outcomeIndex) via the
-watched markets' ``clobTokenIds``, and buffers it per wallet. The follow loop
-drains the buffer on a short cadence and feeds the SAME ``process_follow_trades``
-pipeline, so CLV/quarantine/settlement/persistence are untouched.
+Replaces the old WS ``eth_subscribe`` collector (which silently dropped log
+subscriptions while newHeads kept the connection "healthy" → 10h blind windows)
+and the old ``TransferSingle`` decode (which carried shares but NOT price, so the
+follow entry price was a ``clob_price`` proxy — wrong by up to 0.20 vs the real
+fill). A background thread polls ``eth_getLogs`` on a cursor every
+``poll_interval`` seconds, decodes each ``OrderFilled`` where ``maker == watched
+wallet`` (the wallet's own signed order; verified 12/12 fills carry maker=wallet
+regardless of market-taker vs limit-maker), and buffers it per wallet with the
+EXACT fill price (USDC / shares from the event). The follow loop drains the
+buffer and feeds the SAME ``process_follow_trades`` pipeline.
 
-On-chain ``TransferSingle`` carries shares but not the wallet's fill price; the
-follow entry price comes from the live CLOB ask (``clob_price``). Because WS
-detection is near-instant (sub-second after the block), the price hasn't drifted,
-so using the current ask as both our entry and the wallet's reference is sound.
+Reliability: the cursor only advances after a successful poll, so a failed poll
+just re-covers the gap next round — no permanent misses (the WS path's fatal
+flaw). Dedup by (txHash, tokenId, logIndex), bounded by block age.
 
 stdlib only. Read-only (we observe public chain logs; no orders, no keys).
-Measured rationale + latency numbers: review/onchain-probe-findings.md.
+Design: review/onchain-polling-design.md.
 """
 from __future__ import annotations
 
@@ -25,11 +28,18 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from .ws_client import WSClient, WSError, WSTimeout
-
 # Polygon mainnet.
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-TRANSFER_SINGLE_TOPIC = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
+# CTF Exchange contracts that emit OrderFilled (v1 + v2). Lowercase.
+EXCHANGE_ADDRESSES = (
+    "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e",  # v1
+    "0xe111180000d2663c0091e4f400237545b87b996b",  # v2
+)
+# keccak256("OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)")
+# — verified empirically against on-chain receipts (not computed; stdlib has no keccak).
+# topics: [topic0, orderHash, maker(indexed), taker(indexed)]
+# data:   [makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled, fee]
+ORDER_FILLED_TOPIC = "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
 GETLOGS_MAX_SPAN = 10  # Alchemy free tier caps eth_getLogs range at 10 blocks.
 CLOB_BASE = "https://clob.polymarket.com"
 
@@ -88,7 +98,10 @@ def block_number(https_url: str) -> int:
 
 
 def clob_price(token_id: str, side: str = "buy", *, base: str = CLOB_BASE, timeout: float = 8.0) -> float | None:
-    """Live CLOB price for a token id. side=buy -> the ask we'd pay to follow."""
+    """Live CLOB price for a token id. side=buy -> the ask we'd pay to follow.
+
+    Retained as a utility; the follow path no longer uses it for entry price
+    (we read the exact on-chain fill price from OrderFilled instead)."""
     url = f"{base}/price?token_id={token_id}&side={side.lower()}"
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
@@ -129,31 +142,55 @@ def build_asset_map(markets: list[dict] | dict[str, dict]) -> dict[str, dict]:
     return asset_map
 
 
-def decode_transfer_single(log: dict, *, is_sell: bool, asset_map: dict[str, dict]) -> dict | None:
-    """Decode a CTF TransferSingle log into a fill dict, or None if off-scope.
+def decode_order_filled(log: dict, *, wallets: set[str], asset_map: dict[str, dict]) -> dict | None:
+    """Decode a CTF Exchange ``OrderFilled`` log into the watched wallet's own fill.
 
-    is_sell=True -> the watched wallet is `from` (topic2, sold); else `to`
-    (topic3, bought). Returns None when the token id isn't in asset_map.
+    Only the wallet's OWN order leg is decoded (maker == wallet — the order's
+    signer; verified that every fill carries maker=wallet whether the order took
+    or made liquidity). Complementary mint legs (taker == wallet) are ignored.
+
+    Layout (verified on-chain): topics = [topic0, orderHash, maker, taker];
+    data = [makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled, fee].
+    For maker=wallet: token = takerAssetId; makerAssetId==0 (USDC) => BUY
+    (usdc=makerAmt, shares=takerAmt); else => SELL (usdc=takerAmt, shares=makerAmt).
+    Price = usdc/shares (both 6-decimals → raw ratio). Returns None if off-scope
+    or the price is not a sane (0, 1] probability (guard against unseen encodings).
     """
     topics = log.get("topics") or []
     if len(topics) < 4:
         return None
-    data = (log.get("data") or "0x")[2:]
-    if len(data) < 128:
+    maker = addr_from_topic(topics[2])
+    if maker not in wallets:
         return None
-    token_id = str(int(data[0:64], 16))
+    data = (log.get("data") or "0x")[2:]
+    if len(data) < 256:
+        return None
+    maker_asset = int(data[0:64], 16)
+    taker_asset = int(data[64:128], 16)
+    maker_amt = int(data[128:192], 16)
+    taker_amt = int(data[192:256], 16)
+    token_id = str(taker_asset)
     mapped = asset_map.get(token_id)
     if mapped is None:
         return None
-    value = int(data[64:128], 16)
-    wallet = addr_from_topic(topics[2] if is_sell else topics[3])
+    if maker_asset == 0:           # wallet gives USDC -> BUY
+        usdc, shares, side = maker_amt, taker_amt, "BUY"
+    else:                          # wallet gives token -> SELL (receives USDC)
+        usdc, shares, side = taker_amt, maker_amt, "SELL"
+    if shares <= 0 or usdc <= 0:
+        return None
+    price = usdc / shares          # 6-dec / 6-dec cancels -> probability price
+    if not (0.0 < price <= 1.0):   # guard: unseen encoding -> skip, don't corrupt
+        return None
     return {
-        "wallet": wallet,
+        "wallet": maker,
         "conditionId": mapped["conditionId"],
         "outcomeIndex": mapped["outcomeIndex"],
         "tokenId": token_id,
-        "side": "SELL" if is_sell else "BUY",
-        "size": round(value / 1e6, 6),       # ERC1155 shares carry 6 decimals
+        "side": side,
+        "size": round(shares / 1e6, 6),
+        "price": round(price, 6),
+        "cash": round(usdc / 1e6, 6),
         "transactionHash": str(log.get("transactionHash") or "").lower(),
         "logIndex": int(log.get("logIndex"), 16) if log.get("logIndex") else 0,
         "blockNumber": int(log.get("blockNumber"), 16) if log.get("blockNumber") else 0,
@@ -161,15 +198,17 @@ def decode_transfer_single(log: dict, *, is_sell: bool, asset_map: dict[str, dic
     }
 
 
-def fill_to_trade(fill: dict, *, price: float | None, fallback_ts: int | None = None) -> dict:
+def fill_to_trade(fill: dict, *, price: float | None = None, fallback_ts: int | None = None) -> dict:
     """Build a trade dict in the shape process_follow_trades / select_new_trades expect.
 
-    timestamp <- blockTimestamp (the canonical on-chain settlement time);
+    timestamp <- blockTimestamp (canonical on-chain settlement time);
     id/transactionHash <- tx hash (matches the data-api cursor scheme so a
-    WS<->data-api fallback switch keeps cursors comparable);
-    price/curPrice <- live CLOB ask (used for our entry + slippage reference).
+    getLogs<->data-api fallback switch keeps cursors comparable);
+    price/curPrice <- the EXACT on-chain fill price decoded from OrderFilled
+    (``fill["price"]``); the optional ``price`` arg overrides only if given.
     """
     ts = fill.get("blockTs") or fallback_ts or 0
+    fill_price = price if price is not None else fill.get("price")
     trade: dict[str, Any] = {
         "conditionId": fill["conditionId"],
         "outcomeIndex": fill["outcomeIndex"],
@@ -181,60 +220,59 @@ def fill_to_trade(fill: dict, *, price: float | None, fallback_ts: int | None = 
         "id": fill["transactionHash"],
         "source": "onchain",
     }
-    if price is not None:
-        trade["price"] = price
-        trade["curPrice"] = price
+    if fill_price is not None:
+        trade["price"] = fill_price
+        trade["curPrice"] = fill_price
     return trade
 
 
 # --------------------------------------------------------------------------- #
 # collector
 # --------------------------------------------------------------------------- #
-class WSFollowCollector(threading.Thread):
-    """Background thread: subscribe to CTF TransferSingle for a wallet set.
+class OnchainFollowCollector(threading.Thread):
+    """Background thread: poll ``eth_getLogs`` for CTF Exchange ``OrderFilled``
+    where maker is a watched wallet, decode the exact fill, buffer per wallet.
 
-    Buffers decoded fills per wallet (deduped by tx+token). The follow loop calls
-    ``drain()`` each short cycle. ``healthy`` is False whenever the WS is down so
-    the loop can fall back to data-api polling. ``update_wallets`` /
-    ``update_asset_map`` trigger a clean resubscribe.
+    Cursor-based + self-healing: ``_cursor`` only advances on a successful poll,
+    so a failed/timed-out poll re-covers the gap next round (no permanent miss).
+    ``healthy`` is False after consecutive failures so the follow loop can fall
+    back to data-api. ``drain()`` returns buffered fills; ``update_wallets`` /
+    ``update_asset_map`` just swap the snapshot (no resubscribe needed).
     """
 
     def __init__(
         self,
         *,
-        wss_url: str,
         https_url: str,
         wallets: set[str] | None = None,
         asset_map: dict[str, dict] | None = None,
-        recv_timeout: float = 1.0,
-        stale_timeout: float = 90.0,
-        reconnect_min: float = 1.0,
-        reconnect_max: float = 30.0,
+        poll_interval: float = 30.0,
+        poll_overlap_blocks: int = 5,
+        cold_start_lookback_blocks: int = 300,
+        max_catchup_blocks: int = 600,
+        unhealthy_after_failures: int = 2,
+        seen_prune_margin_blocks: int = 40,
         on_event: Callable[[str, dict], None] | None = None,
-        ws_factory: Callable[[str], Any] | None = None,
     ):
-        super().__init__(daemon=True, name="ws-follow-collector")
-        self.wss_url = wss_url
+        super().__init__(daemon=True, name="onchain-follow-collector")
         self.https_url = https_url
-        self.recv_timeout = recv_timeout
-        # 静默停推检测:WS 不断开但停止推送时(healthy 仍 True、却收不到任何成交,
-        # data-api 兜底也不触发)。订阅 newHeads 当独立心跳,超过 stale_timeout 没收到
-        # 任何消息就判定停推 → 翻 unhealthy + 重连(进而触发 data-api 兜底)。
-        self.stale_timeout = stale_timeout
-        self.reconnect_min = reconnect_min
-        self.reconnect_max = reconnect_max
+        self.poll_interval = poll_interval
+        self.poll_overlap_blocks = poll_overlap_blocks
+        self.cold_start_lookback_blocks = cold_start_lookback_blocks
+        self.max_catchup_blocks = max_catchup_blocks
+        self.unhealthy_after_failures = max(1, int(unhealthy_after_failures))
+        self.seen_prune_margin_blocks = seen_prune_margin_blocks
         self.on_event = on_event or (lambda *_: None)
-        self._ws_factory = ws_factory or WSClient
 
         self._lock = threading.Lock()
         self._wallets = {w.lower() for w in (wallets or set())}
         self._asset_map = dict(asset_map or {})
         self._buffer: dict[str, list[dict]] = {}
-        self._seen: set[tuple[str, str]] = set()
-        self._dirty = threading.Event()
+        self._seen: dict[tuple[str, str, int], int] = {}  # (tx, token, logIndex) -> block
         self._stop_evt = threading.Event()
         self._healthy = False
-        self._last_block = 0
+        self._cursor = 0
+        self._consecutive_failures = 0
         self._fill_count = 0
 
     # -- public API ------------------------------------------------------- #
@@ -249,10 +287,7 @@ class WSFollowCollector(threading.Thread):
     def update_wallets(self, wallets: set[str]) -> None:
         new = {w.lower() for w in wallets}
         with self._lock:
-            if new == self._wallets:
-                return
             self._wallets = new
-        self._dirty.set()
 
     def update_asset_map(self, asset_map: dict[str, dict]) -> None:
         with self._lock:
@@ -267,138 +302,101 @@ class WSFollowCollector(threading.Thread):
 
     def stop(self) -> None:
         self._stop_evt.set()
-        self._dirty.set()
 
     # -- thread loop ------------------------------------------------------ #
     def run(self) -> None:
-        backoff = self.reconnect_min
+        # Cold start: seed the cursor a bounded window back and scan once, so a
+        # restart catches trades during downtime for wallets with persisted
+        # cursors (command_follow's per-wallet cold-start handles brand-new ones).
+        try:
+            current = block_number(self.https_url)
+            self._cursor = max(0, current - self.cold_start_lookback_blocks)
+            self._poll_once(current_hint=current, cold_start=True)
+        except Exception as exc:  # noqa: BLE001
+            self._on_failure(exc, phase="cold_start")
         while not self._stop_evt.is_set():
-            try:
-                self._connect_and_listen()
-                backoff = self.reconnect_min
-            except Exception as exc:  # noqa: BLE001
-                self._healthy = False
-                self.on_event("ws_error", {"error": str(exc)[:200]})
-                if self._stop_evt.is_set():
-                    break
-                self._stop_evt.wait(backoff)
-                backoff = min(self.reconnect_max, backoff * 2)
+            if self._stop_evt.wait(self.poll_interval):
+                break
+            self._poll_once()
         self._healthy = False
 
-    def _connect_and_listen(self) -> None:
+    def _poll_once(self, *, current_hint: int | None = None, cold_start: bool = False) -> None:
         with self._lock:
             wallets = set(self._wallets)
-        self._dirty.clear()
-        ws = self._ws_factory(self.wss_url)
-        ws.connect()
-        ws.set_timeout(self.recv_timeout)
-        try:
-            # Backfill any gap since the last disconnect, then track from current.
-            current = block_number(self.https_url)
-            if self._last_block and current > self._last_block:
-                self._backfill(self._last_block + 1, current, wallets)
-            self._last_block = current
-
-            sub_buy = sub_sell = sub_block = None
-            if wallets:
-                topics = [topic_for_address(w) for w in wallets]
-                if len(topics) > 900:
-                    self.on_event("wallet_set_large", {"count": len(topics)})
-                ws.send_text(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe",
-                                         "params": ["logs", {"address": CTF_ADDRESS,
-                                                             "topics": [TRANSFER_SINGLE_TOPIC, None, None, topics]}]}))
-                ws.send_text(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "eth_subscribe",
-                                         "params": ["logs", {"address": CTF_ADDRESS,
-                                                             "topics": [TRANSFER_SINGLE_TOPIC, None, topics, None]}]}))
-            # Heartbeat: newHeads streams a block ~every 2s regardless of trades, so
-            # silence here (unlike on the logs subs) unambiguously means a stall.
-            ws.send_text(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "eth_subscribe",
-                                     "params": ["newHeads"]}))
-            self._healthy = True
-            self.on_event("ws_connected", {"wallets": len(wallets)})
-
-            last_msg_mono = time.monotonic()
-            while not self._stop_evt.is_set() and not self._dirty.is_set():
-                try:
-                    opcode, payload = ws.recv_message()
-                except WSTimeout:
-                    if time.monotonic() - last_msg_mono > self.stale_timeout:
-                        self._healthy = False  # flip first so command_follow falls back now
-                        idle = round(time.monotonic() - last_msg_mono, 1)
-                        self.on_event("ws_stale", {"idle_seconds": idle})
-                        raise WSError(f"stale: no ws message for {idle}s")
-                    continue
-                last_msg_mono = time.monotonic()  # any frame (incl. newHeads) is a heartbeat
-                if opcode == WSClient.OP_CLOSE:
-                    raise WSError("server closed")
-                try:
-                    msg = json.loads(payload)
-                except ValueError:
-                    continue
-                if "id" in msg and "result" in msg:
-                    if msg["id"] == 1:
-                        sub_buy = msg["result"]
-                    elif msg["id"] == 2:
-                        sub_sell = msg["result"]
-                    elif msg["id"] == 3:
-                        sub_block = msg["result"]
-                    continue
-                if msg.get("method") != "eth_subscription":
-                    continue
-                params = msg.get("params", {})
-                sub = params.get("subscription")
-                log = params.get("result", {})
-                if sub == sub_buy:
-                    self._handle_log(log, is_sell=False)
-                elif sub == sub_sell:
-                    self._handle_log(log, is_sell=True)
-                elif sub == sub_block:
-                    # heartbeat only; advance the block cursor so a reconnect backfills
-                    # exactly the gap.
-                    try:
-                        num = int(str(log.get("number")), 16)
-                    except (TypeError, ValueError):
-                        num = 0
-                    if num > self._last_block:
-                        self._last_block = num
-        finally:
-            self._healthy = False
-            ws.close()
-
-    def _handle_log(self, log: dict, *, is_sell: bool) -> None:
-        with self._lock:
-            asset_map = self._asset_map
-            wallets = self._wallets
-        fill = decode_transfer_single(log, is_sell=is_sell, asset_map=asset_map)
-        if fill is None or fill["wallet"] not in wallets:
-            return
-        key = (fill["transactionHash"], fill["tokenId"])
-        with self._lock:
-            if key in self._seen:
-                return
-            self._seen.add(key)
-            self._buffer.setdefault(fill["wallet"], []).append(fill)
-            self._fill_count += 1
-            if fill["blockNumber"] > self._last_block:
-                self._last_block = fill["blockNumber"]
-        self.on_event("fill", fill)
-
-    def _backfill(self, from_block: int, to_block: int, wallets: set[str]) -> None:
         if not wallets:
+            self._healthy = True  # nothing to watch; healthy-idle, don't flap to data-api
+            self._consecutive_failures = 0
             return
-        topics = [topic_for_address(w) for w in wallets]
+        try:
+            current = current_hint if current_hint is not None else block_number(self.https_url)
+        except Exception as exc:  # noqa: BLE001
+            self._on_failure(exc, phase="block_number")
+            return
+        from_block = max(0, self._cursor + 1 - self.poll_overlap_blocks)
+        if current - from_block > self.max_catchup_blocks:
+            skipped = from_block
+            from_block = current - self.max_catchup_blocks
+            self.on_event("poll_gap_skipped", {"from": skipped, "to": from_block})
+        before = self._fill_count
+        try:
+            self._scan(from_block, current, wallets)
+        except Exception as exc:  # noqa: BLE001
+            self._on_failure(exc, phase="getlogs")
+            return
+        self._cursor = current
+        self._consecutive_failures = 0
+        self._healthy = True
+        self._prune_seen()
+        recovered = self._fill_count - before
+        if recovered or cold_start:
+            self.on_event("poll", {"fills": recovered, "from": from_block, "to": current, "cold_start": cold_start})
+
+    def _on_failure(self, exc: Exception, *, phase: str) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self.unhealthy_after_failures:
+            self._healthy = False
+        self.on_event("poll_error", {"error": str(exc)[:200], "phase": phase, "consecutive": self._consecutive_failures})
+
+    def _scan(self, from_block: int, to_block: int, wallets: set[str]) -> None:
+        """getLogs OrderFilled with maker in `wallets`, chunked by GETLOGS_MAX_SPAN.
+
+        One topic filter (maker = topic index 2) suffices: the wallet's own order
+        always carries maker=wallet, so the complementary taker=wallet legs (which
+        we must NOT count) are naturally excluded."""
+        if from_block > to_block or not wallets:
+            return
+        maker_topics = [topic_for_address(w) for w in wallets]
         block = from_block
         while block <= to_block and not self._stop_evt.is_set():
             end = min(block + GETLOGS_MAX_SPAN - 1, to_block)
-            for is_sell, topic_filter in (
-                (False, [TRANSFER_SINGLE_TOPIC, None, None, topics]),
-                (True, [TRANSFER_SINGLE_TOPIC, None, topics, None]),
-            ):
-                logs = rpc_call(self.https_url, "eth_getLogs", [{
-                    "fromBlock": hex(block), "toBlock": hex(end),
-                    "address": CTF_ADDRESS, "topics": topic_filter,
-                }])
-                for log in logs or []:
-                    self._handle_log(log, is_sell=is_sell)
+            logs = rpc_call(self.https_url, "eth_getLogs", [{
+                "fromBlock": hex(block), "toBlock": hex(end),
+                "address": list(EXCHANGE_ADDRESSES),
+                "topics": [ORDER_FILLED_TOPIC, None, maker_topics, None],
+            }])
+            for log in logs or []:
+                self._handle_log(log)
             block = end + 1
-        self.on_event("backfill", {"from": from_block, "to": to_block})
+
+    def _handle_log(self, log: dict) -> None:
+        with self._lock:
+            asset_map = self._asset_map
+            wallets = self._wallets
+        fill = decode_order_filled(log, wallets=wallets, asset_map=asset_map)
+        if fill is None:
+            return
+        key = (fill["transactionHash"], fill["tokenId"], fill["logIndex"])
+        with self._lock:
+            if key in self._seen:
+                return
+            self._seen[key] = fill["blockNumber"]
+            self._buffer.setdefault(fill["wallet"], []).append(fill)
+            self._fill_count += 1
+        self.on_event("fill", fill)
+
+    def _prune_seen(self) -> None:
+        cutoff = self._cursor - self.poll_overlap_blocks - self.seen_prune_margin_blocks
+        if cutoff <= 0:
+            return
+        with self._lock:
+            self._seen = {k: b for k, b in self._seen.items() if b >= cutoff}
