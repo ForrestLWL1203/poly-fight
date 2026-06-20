@@ -1105,7 +1105,7 @@ function StrategyEditor({ s, up, wallet, locked }) {
           </div>
         </div>
         <div className="cfg-head"><h3>单笔跟单金额</h3><Badge tone="up" outline>必填</Badge></div>
-        <p className="cfg-sub">每个有效信号买入多少 · 推荐 Kelly 智能（按 edge 自动定额）· 金额向下取整规避下单异常</p>
+        <p className="cfg-sub">每个有效信号买入多少 · 推荐智能定额（按 信念²×实力 自动定额）· 金额向下取整规避下单异常</p>
         <div className="opt-list">
           <SizingOption id="kelly" active={s.sizing === "kelly"} onSelect={up("sizing")} title="Kelly 智能（推荐）" desc="按 信念²（钱包押注÷单场额度）× 实力（edge_lb，含样本折扣）自动定额：又强又重注才下大 · 单场上限 + 最小单兜底 · 与评分轴同口径">
             <div className="ctrl-row">

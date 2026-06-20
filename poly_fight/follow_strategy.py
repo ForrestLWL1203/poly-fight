@@ -12,8 +12,10 @@ ACTIVE_FOLLOW_STRATEGY_ID = "active"
 # 现价上限默认(0 = 不限)= 全系统唯一分水岭 FOLLOWABLE_PRICE_CEILING(评分/跟单/seed 同源)。
 DEFAULT_MAX_FOLLOW_ENTRY_PRICE = FOLLOWABLE_PRICE_CEILING
 DEFAULT_FIXED_STAKE_USDC = 1.0          # 固定注默认每信号金额(legacy)
-# v18 Kelly 智能引擎默认值:跟多少 = ¼Kelly(edge_lb/(1−p))×本金,落到 单笔%/单场%/最小$ 边界内。
-DEFAULT_KELLY_FRACTION = 0.25           # ¼ Kelly(UI:保守0.125/标准0.25/激进0.5)
+# 【已休眠】曾用 ¼Kelly×edge/(1−p)×本金 给注码;现注码 = 单场cap×信念²×实力(见 DEFAULT_EDGE_REF
+# / DEFAULT_FILL_LINE_X_CAP 与 evaluate_follow_candidate),edge 仅当准入门。kelly_fraction 字段
+# 仅供旧 db 反序列化,不参与算注。
+DEFAULT_KELLY_FRACTION = 0.25
 DEFAULT_PER_SIGNAL_CAP_PERCENT = 5.0    # 单笔上限 = 本金 5%
 DEFAULT_PER_MATCH_CAP_PERCENT = 10.0    # 单场(condition)上限 = 本金 10%,防一场亏光
 DEFAULT_MIN_STAKE_USDC = 1.0            # Polymarket CLOB 最小单(INVALID_ORDER_MIN_SIZE)
@@ -52,8 +54,8 @@ def default_follow_strategy(*, balance_usdc: float | None = None) -> dict[str, A
         # (每 2h 发现新钱包 + 放回冷却到期的隔离钱包 + 增量更新榜单)。
         # 作为策略字段持久化,运行中不可改。
         "realtime_refresh": False,
-        # v18 默认 = Kelly 智能引擎:按 edge 自己定额(edge_lb=wilson_lb−现价,f*=edge/(1−p),¼Kelly),
-        # 落到 单笔%/单场%/最小$ 三道边界内。legacy fixed/proportional/balance_percent 仍可选(验证 kelly 后再废弃)。
+        # 默认 mode="kelly":注码 = 单场cap × 信念²(押注/打满线) × 实力(edge_lb/edge_ref),
+        # edge 仅当准入门(θ̂×0.95>现价)。legacy fixed/proportional/balance_percent 仍可选但已少用。
         "stake_sizing": {
             "mode": "kelly",
             "kelly_fraction": DEFAULT_KELLY_FRACTION,

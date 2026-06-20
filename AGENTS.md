@@ -58,8 +58,9 @@ observe-live (sidecar, ~10min): ACTIVE (unsettled) watched markets over a volume
   serialize via acquire_build_lock.)
 
 follow / run:
-  leaderboard wallets -> upcoming/in-progress watched markets -> on-chain WS fill
-  detection (data-api fallback) -> paper legs -> CLV / settlement / performance.
+  leaderboard wallets -> upcoming/in-progress watched markets -> on-chain
+  eth_getLogs cursor-polling fill detection (data-api fallback) -> paper legs
+  -> CLV / settlement / performance.
   Incremental backfill synthesizes each newly-eligible wallet's pre-existing
   positions into legs (startup + mid-run live-seed promotions).
 
@@ -215,12 +216,11 @@ Per tick:
 read category leaderboards (reloaded every tick; live-seed promotions picked up next tick)
 filter by follow recency and wallet_quarantine
 build watched markets: upcoming within observe window OR started-but-unresolved
-detect fills via on-chain WS (drain ~5s when healthy); data-api polling fallback
+detect fills via on-chain eth_getLogs cursor polling (~15-30s/round, drain when healthy); data-api polling fallback
 incremental backfill: each NEWLY-eligible wallet's pre-existing positions -> legs once
 new BUY trades create paper legs (open or add)
 sub-min BUY fills accumulate per (wallet,cond,outcome) until >= min order, then follow (small-buy accumulator)
 SELL mirrors exit proportionally (cumulative wallet_sold_frac; >= $1 min, hold/accumulate else, dust full-clear)
-material SELL or opposite-side BUY writes wallet_quarantine
 post-start snapshot records CLV once
 same conditionId with both outcomes open marks contested
 settled markets move open signals to results; M5 demotion re-scores followed wallets every N settle events (--rescore-settled-threshold, default 5) and DELETES any that fall out of grade-A: leaderboard row + scoring profile + raw trade cache dropped (no quarantine middle state). Favorites are spared; follow.db research records are kept and open positions settle out. Re-discovery by the observer is the only way back onto the board.
@@ -233,10 +233,21 @@ and recent pages (`--user-trades-limit` default 100,
 Stake sizing:
 
 The active runner sizes by a configurable follow strategy persisted in
-`follow.db` (Kelly-on-edge): `edge = θ̂×0.95 − price`; stake ≈ ¼-Kelly ×
-edge/(1−price) × bankroll, bounded by per-signal cap (5%), per-match cap (10%),
-and a `min_stake` floor. `θ̂` is the followed bucket's recency-weighted point
-win-rate. Each BUY leg (incl. adds) is sized independently.
+`follow.db` (mode `kelly`): **stake = per-match cap × conviction² × skill**,
+clamped to `[min_stake floor, per-match remaining]`.
+- `conviction = min(1, (wallet_order_cash / fill_line)²)`, fill_line =
+  `fill_line_x_cap`(10) × per-match cap — wallet must bet ~10× our cap to max out.
+- `skill = clamp(0, 1, bucket edge_lb / edge_ref)`, `edge_ref` = 0.20. `edge_lb`
+  is the followed bucket's copy-edge lower bound (sample-shrunk ≈ edge+Wilson).
+  Sizes by per-bet edge strength, NOT leaderboard rank. Missing edge_lb → skill 1.0.
+- edge (`θ̂×0.95 − price`) is only an entry GATE (`no_live_edge` if ≤ 0), it does
+  NOT scale the bet. (`kelly_fraction`/`follow_mirror_percent` are dormant fields.)
+- per-match cap (10% × dynamic bankroll) is the cumulative ceiling; an optional
+  per-signal hard cap (`per_signal_cap_enabled`, default OFF, set via dashboard
+  checkbox) caps a single leg. Each BUY leg is sized independently.
+
+See review/follow-sizing-conviction-and-dynamic-bankroll.md. (This is NOT
+"Kelly-on-edge" — that was an earlier draft; edge now only gates entry.)
 
 ```text
 # legacy / no-strategy fallback only:
@@ -333,14 +344,22 @@ Allowed dashboard mutations only:
 ```text
 POST /api/wallet-refresh
 POST /api/wallet-favorites
+POST /api/wallet-quarantine
 POST /api/account-balance
+POST /api/follow-strategy
+POST /api/follow-strategies      (+ /api/follow-strategies/<id>/{activate,delete})
 POST /api/runner/start
 POST /api/runner/stop
 POST /api/reset-data
 ```
 
 `wallet-refresh` and runner controls write process/control state only, not
-follow signal state. `account-balance` writes the manual paper usable-funds cap
+follow signal state. `wallet-favorites` / `wallet-quarantine` are the **manual**
+pin / quarantine buttons (manual quarantine is the only quarantine entry point —
+there is no automatic quarantine). `follow-strategy` saves the active follow
+strategy and `follow-strategies` manages the saved-strategy library (runner start
+requires a saved strategy); both mutate strategy config in `follow.db`, never
+follow signal/leg state. `account-balance` writes the manual paper usable-funds cap
 in `follow.db`; it must be locked while the runner is running. `reset-data` is an
 explicit personal-use destructive operation for clearing generated
 category/follow/log state; it must stay behind authenticated dashboard access

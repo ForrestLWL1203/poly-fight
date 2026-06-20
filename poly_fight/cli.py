@@ -7736,9 +7736,9 @@ def build_parser() -> argparse.ArgumentParser:
         # Fixed polling cadence (seconds). >0 overrides the adaptive min/max curve so every
         # wallet is checked on one steady interval; 0 restores the start-time-aware backoff.
         subparser.add_argument("--tick-seconds", type=int, default=60)
-        # When the on-chain WS collector is healthy, drain it on this short cadence
-        # instead of the slow data-api tick (the WS already detected fills sub-second;
-        # this bounds how soon we act on them). Ignored when WS is unavailable.
+        # When the on-chain getLogs collector is healthy, drain it on this short cadence
+        # instead of the slow data-api tick (getLogs polls ~15-30s/round; this bounds
+        # how soon we act on buffered fills). Ignored when the collector is unavailable.
         subparser.add_argument("--ws-drain-seconds", type=int, default=5)
         # 独立持仓对账兜底:每 N 秒只核对最久未核对的 M 笔 open 跟单的目标持仓(分批轮转,
         # 不放进每 5s 主循环)。目标已清仓 → 镜像平仓。0 关闭。
