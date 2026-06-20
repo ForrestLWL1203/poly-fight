@@ -14110,6 +14110,37 @@ class CoreTest(unittest.TestCase):
             profiles = json.loads((collector_dir / "collector_v2_wallet_profiles.json").read_text())
             self.assertEqual({normalize_wallet(p.get("wallet")) for p in profiles}, {"0xdrop", "0xkeep"})
 
+    def test_rescore_demote_reprofile_uses_accumulated_cache(self):
+        # 口径对齐:rescore 降级重评必须读累积增量缓存(use_cache=True / force_refresh=False),与
+        # observe/collect 同源。否则截断现拉低估 n_eff → 误删边界钱包 → observe 用全缓存又判 A 加回 → ping-pong。
+        from unittest.mock import patch
+        from poly_fight.cli import rescore_demote_wallets
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp); now = 1_700_000_000
+            esports_dir, follow_dir, collector_dir, _ = self._setup_rescore_demote_case(root, now=now)
+            captured = {}
+
+            def fake_fetch(*_a, **k):
+                captured.update(k)
+                return ([], "cache")
+
+            class FakeClient:
+                def list_events_paginated(self, **_k):
+                    return []
+
+            fake_market = {"condition_id": "0xc1", "market_type": "map_winner", "game_family": "cs2"}
+            parser = build_parser()
+            args = parser.parse_args(["--data-dir", str(esports_dir), "run", "--stake-usdc", "1"])
+            with patch("poly_fight.cli.build_classification_set", return_value=[fake_market]), \
+                 patch("poly_fight.cli.backfill_market_resolutions", return_value={}), \
+                 patch("poly_fight.cli.filter_classification_set_by_game_window", return_value=[fake_market]), \
+                 patch("poly_fight.cli.fetch_recent_esports_user_trades_for_wallet", side_effect=fake_fetch), \
+                 patch("poly_fight.cli.build_collector_leaderboard_v2", side_effect=lambda profiles, **_k: {"leaderboard": [{"wallet": w} for w in profiles]}):
+                rescore_demote_wallets(FakeClient(), args, wallets={"0xdrop"}, follow_dir=follow_dir, now_ts=now)
+            self.assertTrue(captured, "profile_one 应调用 fetch(condition_ids 非空)")
+            self.assertTrue(captured.get("use_cache"), "rescore 必须读累积缓存(与 observe 同口径)")
+            self.assertFalse(captured.get("force_refresh"), "rescore 不应 force_refresh(截断现拉会低估 n_eff)")
+
     def test_purge_legacy_demote_quarantine_deletes_not_releases(self):
         from unittest.mock import patch
         from poly_fight.cli import purge_legacy_demote_quarantine, normalize_wallet, RESCORE_QUARANTINE_REASON

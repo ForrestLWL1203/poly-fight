@@ -5865,7 +5865,11 @@ def rescore_demote_wallets(
                 max_pages=getattr(args, "user_history_trades_max_pages", 3),
                 max_esports_markets=getattr(args, "max_esports_markets_per_wallet", 100),
                 data_dir=output_dir, now_ts=now_ts,
-                cache_ttl_days=0, force_refresh=True, use_cache=False, include_source=True,
+                # **口径对齐**:必须和 observe/collect 同一份取数 —— 读累积增量缓存(use_cache=True,
+                # force_refresh=False),而非现拉截断的 3 页。否则高交易量钱包 n_eff 被低估 → 误判跌出 A
+                # 删除,observe 用全缓存又判 A 加回 → 同一钱包 ping-pong。降级判定必须基于和采集器相同的完整数据。
+                cache_ttl_days=getattr(args, "user_trades_cache_ttl_days", 1),
+                force_refresh=False, use_cache=True, include_source=True,
                 retention_days=lookback_days,
             )
         except Exception:
