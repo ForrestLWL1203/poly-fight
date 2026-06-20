@@ -324,6 +324,9 @@ SEED_MULTI_BUCKET_MIN_WINS = 8
 # 唯一的 seed 现金门:单场均额(seed_cost_total/seed_market_count)≥ 此值才做数。
 # v2 profiling 预筛(filter_profile_seed_wallets_v2)与诊断拒因统计共用此单一来源。
 SEED_MIN_AVG_CASH = 100.0
+# 专精桶场均地板:钱包被跟的合格桶,其桶级 median 押注额须 ≥ 此值,否则该桶不上榜/不跟
+# (防"seed 那批押够了、但专精桶平时都是小注"溜进来)。**与 seed 现金门统一为同一个 100**。
+MIN_BUCKET_MEDIAN_CASH = SEED_MIN_AVG_CASH
 # observe-live:活跃盘种子发现的市场活跃度门(volume 达此值才扫,控成本);读 follow
 # runner 维护的 active 市场缓存,缓存可稍陈(best-effort,只读)。
 LIVE_SEED_MIN_VOLUME = 5000.0
@@ -4966,6 +4969,7 @@ def build_collector_leaderboard_v2(
     max_two_sided_rate = float(gate_kwargs.get("max_two_sided_rate", V2_MAX_TWO_SIDED_RATE))
     max_bot_score = int(gate_kwargs.get("max_bot_score", V2_MAX_BOT_SCORE))
     max_idle_hours = int(gate_kwargs.get("max_idle_hours", V2_MAX_LEADERBOARD_IDLE_HOURS))
+    min_bucket_median_cash = float(gate_kwargs.get("min_bucket_median_cash", MIN_BUCKET_MEDIAN_CASH))
     qualified: list[dict[str, Any]] = []
     rejected_counts: dict[str, int] = {}
     for wallet, profile in profiles_by_wallet.items():
@@ -5004,6 +5008,12 @@ def build_collector_leaderboard_v2(
             if not include_technical and bucket_edge == "technical":
                 rejected_counts["technical_excluded"] = rejected_counts.get("technical_excluded", 0) + 1
                 continue
+            # 专精桶场均地板:桶级 median 押注额 < 门 → 不算合格桶(防小注玩家靠 seed 大单溜进来)。
+            # 字段缺失(None)时不拦(生产 profile 必有此字段;留宽容避免最小合成 profile 误伤)。
+            _bucket_med = metrics.get("median_position_size")
+            if _bucket_med is not None and to_float(_bucket_med) < min_bucket_median_cash:
+                rejected_counts["bucket_cash_below_floor"] = rejected_counts.get("bucket_cash_below_floor", 0) + 1
+                continue
             eligible.append(
                 {
                     "bucket_key": bucket_key,
@@ -5037,6 +5047,10 @@ def build_collector_leaderboard_v2(
                 bucket_edge = classify_edge_type(metrics)
                 if not include_technical and bucket_edge == "technical":
                     rejected_counts["technical_excluded"] = rejected_counts.get("technical_excluded", 0) + 1
+                    continue
+                _bucket_med = metrics.get("median_position_size")
+                if _bucket_med is not None and to_float(_bucket_med) < min_bucket_median_cash:
+                    rejected_counts["bucket_cash_below_floor"] = rejected_counts.get("bucket_cash_below_floor", 0) + 1
                     continue
                 eligible.append(
                     {
@@ -5121,6 +5135,7 @@ def _v2_gate_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "max_two_sided_rate": float(getattr(args, "v2_max_two_sided_rate", V2_MAX_TWO_SIDED_RATE)),
         "max_bot_score": int(getattr(args, "v2_max_bot_score", V2_MAX_BOT_SCORE)),
         "max_idle_hours": int(getattr(args, "max_leaderboard_idle_hours", V2_MAX_LEADERBOARD_IDLE_HOURS)),
+        "min_bucket_median_cash": float(getattr(args, "v2_min_bucket_cash", MIN_BUCKET_MEDIAN_CASH)),
     }
 
 
@@ -7800,6 +7815,8 @@ def build_parser() -> argparse.ArgumentParser:
         # v2 种子预筛(廉价召回;质量在导出门把控)
         subparser.add_argument("--v2-min-seed-markets", type=int, default=1)
         subparser.add_argument("--v2-min-seed-avg-cash", type=float, default=SEED_MIN_AVG_CASH)
+        # 专精桶场均地板:合格桶 median 押注额须 ≥ 此值(默认与 seed 现金门统一为 100)。
+        subparser.add_argument("--v2-min-bucket-cash", type=float, default=MIN_BUCKET_MEDIAN_CASH)
         # M4 observe-v2:结算检测窗口(应 ≥ tick 间隔 + buffer)
         subparser.add_argument("--observe-lookback-hours", type=float, default=4.0)
         subparser.add_argument("--observe-gamma-pages", type=int, default=2)

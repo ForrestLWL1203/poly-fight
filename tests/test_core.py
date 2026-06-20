@@ -13875,7 +13875,8 @@ class CoreTest(unittest.TestCase):
 
     def _v2_profile(self, wallet, game, *, roi=0.25, pnl=2000.0, wilson=0.62,
                     positive=0.78, two_sided=0.02, edge_type="directional",
-                    now=1_700_000_000, market_type="main_match", grade="A"):
+                    now=1_700_000_000, market_type="main_match", grade="A",
+                    median_position_size=1500.0):
         hold = pnl if edge_type != "technical" else -abs(pnl)
         rate = 0.0 if edge_type != "technical" else None
         metrics = {
@@ -13902,6 +13903,7 @@ class CoreTest(unittest.TestCase):
             "bucket_win_rate": wilson,
             "bucket_eff_sample": 12.0,
             "bucket_copy_edge": round(wilson - 0.45, 6),
+            "median_position_size": median_position_size,
         }
         return {
             "wallet": wallet,
@@ -13937,6 +13939,19 @@ class CoreTest(unittest.TestCase):
         # round-robin:cs2 唯一钱包即使 seed_score 全局垫底也拿到 profiling 名额
         # (全局 top-3 会是 3 个 lol、把 cs2 挤掉)。从源头解决偏科。
         self.assertIn("0xcs2a", wallets)
+
+    def test_v2_bucket_median_cash_floor(self):
+        # 专精桶场均地板:合格桶 median 押注额 < 门(默认 100)→ 不上榜;≥ 门 → 上榜。
+        now = 1_700_000_000
+        big = self._v2_profile("0xbig", "cs2", wilson=0.70, now=now, median_position_size=300)
+        small = self._v2_profile("0xsmall", "lol", wilson=0.70, now=now, median_position_size=56)
+        out = build_collector_leaderboard_v2({"0xbig": big, "0xsmall": small}, now_ts=now)
+        kept = {row["wallet"] for row in out["leaderboard"]}
+        self.assertIn("0xbig", kept)        # median 300 ≥ 100 → 上榜
+        self.assertNotIn("0xsmall", kept)   # median 56 < 100 → 专精桶不合格 → 不上榜
+        # 门可调:降到 50 → median 56 也进(证明走的是这道可配置门)
+        loose = build_collector_leaderboard_v2({"0xsmall": small}, now_ts=now, gate_kwargs={"min_bucket_median_cash": 50})
+        self.assertIn("0xsmall", {row["wallet"] for row in loose["leaderboard"]})
 
     def test_v2_leaderboard_per_game_quota_prevents_domination(self):
         now = 1_700_000_000
