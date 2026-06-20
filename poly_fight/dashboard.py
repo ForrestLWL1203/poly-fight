@@ -2849,6 +2849,9 @@ def start_runner(
     current = build_runner_status(config)
     if current.get("status") == "running":
         raise RunnerAlreadyRunning(current)
+    # 起新进程前先扫掉任何残留的 follow 进程(上一轮 run 崩了只剩 observe 孤儿、或控制文件 pid 已失配),
+    # 否则新 runner 会与旧 sidecar 并存 → 重复 observe + 之后无从 stop。status!=running 才走到这,安全。
+    _reap_follow_processes(_find_follow_processes(config))
     min_stake = to_float(config.runner_stake_usdc)
     if not math.isfinite(min_stake) or min_stake <= 0:
         raise ValueError("invalid_stake_usdc")
@@ -2969,21 +2972,26 @@ def start_runner(
 
 def stop_runner(config: DashboardConfig) -> dict[str, Any]:
     current = build_runner_status(config)
+    # 按命令模式扫出所有 follow 进程(run + observe sidecar,含控制文件没记的孤儿)。
+    follow_processes = _find_follow_processes(config)
     pid = int(current.get("pid") or 0)
-    if not pid:
+    if not pid and not follow_processes:
         return {"status": "stopped", "data_dir": str(config.data_dir), "follow_dir": str(_follow_dir(config))}
+    # 给注入的 stopper 也看到扫描结果(便于测试 + 自定义停法覆盖全集)。
+    stop_target = {**current, "follow_processes": follow_processes}
     if config.runner_process_stopper is not None:
-        config.runner_process_stopper(current)
+        config.runner_process_stopper(stop_target)
     else:
         _terminate_runner_process(current)
-        _terminate_observe_process(current)   # 一并停掉实时刷新的 observe-v2 进程
+        _terminate_observe_process(current)   # 控制文件记录的 observe-v2 / observe-live
+        _reap_follow_processes(follow_processes)  # 兜底:杀掉控制文件没记的孤儿(run/observe)
     status = {
         **current,
         "status": "stopping",
         "stop_requested_at": int(time.time()),
     }
     _update_runner_control(_follow_dir(config), status)
-    return status
+    return {**status, "reaped_pids": [int(row.get("pid") or 0) for row in follow_processes]}
 
 
 def reset_dashboard_data(config: DashboardConfig) -> dict[str, Any]:
@@ -3035,6 +3043,64 @@ def _find_runner_processes(config: DashboardConfig) -> list[dict[str, Any]]:
     data_dir = config.data_dir
     candidates = [_normalize_process_row(row) for row in rows]
     return [row for row in candidates if _process_matches_runner(row, data_dir)]
+
+
+def _is_poly_fight_follow_command(tokens: list[str], command: str) -> bool:
+    """匹配 follow 全家:run 主进程 + observe-v2 / observe-live sidecar。"""
+    has_cli = (
+        "poly_fight.cli" in tokens
+        or any(token.endswith("poly_fight/cli.py") or token.endswith("poly_fight\\cli.py") for token in tokens)
+        or "poly_fight.cli" in command
+    )
+    return has_cli and any(sub in tokens for sub in ("run", "observe-v2", "observe-live"))
+
+
+def _follow_data_dir_match_values(data_dir: Path) -> set[str]:
+    """root data_dir + 各 category 子目录(observe 用 <root>/esports 起,run 用 root)。"""
+    values = {str(data_dir), str(data_dir.resolve())}
+    for sub in category_data_dirs(data_dir).values():
+        values.add(str(sub))
+        values.add(str(Path(sub).resolve()))
+    return values
+
+
+def _process_matches_follow(row: dict[str, Any], data_dir: Path) -> bool:
+    command = str(row.get("command") or "")
+    stat = str(row.get("stat") or "").upper()
+    pid = int(row.get("pid") or 0)
+    if stat.startswith("Z") or "<defunct>" in command:
+        return False
+    tokens = _command_tokens(command)
+    if pid <= 0 or not _is_poly_fight_follow_command(tokens, command):
+        return False
+    data_dir_values = _data_dir_values_from_command(tokens)
+    if not data_dir_values:
+        return _runner_default_data_dir_matches(data_dir)
+    expected = _follow_data_dir_match_values(data_dir)
+    return any(value in expected or str(Path(value).resolve()) in expected for value in data_dir_values)
+
+
+def _find_follow_processes(config: DashboardConfig) -> list[dict[str, Any]]:
+    """扫描进程表里**所有** follow 进程(run + observe sidecar),按命令模式匹配,
+    **不依赖控制文件 pid** —— 这样重启覆盖了控制文件、或 run 崩了只剩 observe 孤儿,也能找全。"""
+    if config.runner_process_lister is not None:
+        rows = config.runner_process_lister()
+    else:
+        rows = _system_processes()
+    candidates = [_normalize_process_row(row) for row in rows]
+    return [row for row in candidates if _process_matches_follow(row, config.data_dir)]
+
+
+def _reap_follow_processes(processes: list[dict[str, Any]]) -> list[int]:
+    """杀掉给定 follow 进程(run + observe,含控制文件没记的孤儿)。返回处理的 pid。"""
+    reaped: list[int] = []
+    for row in processes:
+        pid = int(row.get("pid") or 0)
+        if pid <= 0:
+            continue
+        _terminate_pgid_or_pid(int(row.get("pgid") or 0), pid)
+        reaped.append(pid)
+    return reaped
 
 
 def _system_processes() -> list[dict[str, Any]]:

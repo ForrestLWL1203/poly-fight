@@ -9988,6 +9988,44 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(777, status["pid"])
             self.assertEqual(120, status["stop_requested_at"])
 
+    def test_find_follow_processes_matches_run_and_observe(self):
+        # 进程扫描要找全 follow 全家(run + observe-v2 + observe-live),排除 serve/无关/僵尸。
+        from poly_fight.dashboard import _find_follow_processes
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp); eroot = data_dir / "esports"
+            rows = [
+                {"pid": 100, "pgid": 100, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {data_dir} run --follow-dir x"},
+                {"pid": 101, "pgid": 101, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {eroot} observe-v2 --category esports"},
+                {"pid": 102, "pgid": 102, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {eroot} observe-live --category esports"},
+                {"pid": 103, "pgid": 103, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {data_dir} serve --port 8787"},
+                {"pid": 104, "pgid": 104, "stat": "S", "command": "python -m other.thing run"},
+                {"pid": 105, "pgid": 105, "stat": "Z", "command": f"python -m poly_fight.cli --data-dir {eroot} observe-v2 <defunct>"},
+            ]
+            config = DashboardConfig(data_dir=data_dir, username="a", password="p", cookie_secret="s",
+                                     runner_process_lister=lambda: rows)
+            got = {int(r["pid"]) for r in _find_follow_processes(config)}
+            self.assertEqual(got, {100, 101, 102})  # serve/无关/僵尸 排除
+
+    def test_stop_runner_reaps_orphan_observe_by_scan(self):
+        # 关键回归:控制文件没记的 observe 孤儿(重启覆盖 pid 后留下的),stop 也能按扫描杀掉。
+        from poly_fight.dashboard import stop_runner
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp); follow_dir = data_dir / "follow"; eroot = data_dir / "esports"
+            captured = {}
+            rows = [
+                {"pid": 200, "pgid": 200, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {data_dir} run --follow-dir {follow_dir}"},
+                {"pid": 999, "pgid": 999, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {eroot} observe-live --category esports"},
+            ]
+            config = DashboardConfig(data_dir=data_dir, follow_dir=follow_dir, username="a", password="p", cookie_secret="s",
+                                     runner_process_lister=lambda: rows,
+                                     runner_process_stopper=lambda status: captured.update(status))
+            result = stop_runner(config)
+            reaped = set(result.get("reaped_pids") or [])
+            self.assertIn(999, reaped)   # 孤儿 observe 被纳入收割
+            self.assertIn(200, reaped)
+            fp = {int(r["pid"]) for r in (captured.get("follow_processes") or [])}
+            self.assertEqual(fp, {200, 999})  # stopper 看到完整集(含孤儿)
+
     def test_dashboard_runner_stopped_status_includes_default_runner_inputs(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
