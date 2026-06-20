@@ -407,6 +407,7 @@
       sizing: mode,
       // Kelly 智能引擎参数
       kellyFraction: str(num(sizing.kelly_fraction) || 0.25, "0.25"),
+      perSignalCapOn: !!sizing.per_signal_cap_enabled,
       perSignalPct: str(num(sizing.per_signal_cap_percent) || 5, "5"),
       perMatchPct: str(num(sizing.per_match_cap_percent) || 10, "10"),
       minStake: str(num(sizing.min_stake_usdc) || 1, "1"),
@@ -436,6 +437,7 @@
       stake_sizing: {
         mode,
         kelly_fraction: num(k.kellyFraction),
+        per_signal_cap_enabled: k.sizing === "kelly" && !!k.perSignalCapOn,
         per_signal_cap_percent: num(k.perSignalPct),
         per_match_cap_percent: num(k.perMatchPct),
         min_stake_usdc: num(k.minStake),

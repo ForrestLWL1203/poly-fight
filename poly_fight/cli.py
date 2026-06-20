@@ -6670,8 +6670,20 @@ def command_follow(
                 if isinstance(val, dict) and val.get("bucket_win_rate") is not None:
                     out[str(key)] = to_float(val.get("bucket_win_rate"))
         return out
+    # kelly 实力乘数:每钱包 桶→edge_lb(copy-edge 下界,含样本折扣 ≈ edge+wilson)。同 θ̂ 一样的键。
+    def _edge_lb_map(row: dict[str, Any]) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for src in ("per_game_type_grades", "per_type_grades"):
+            for key, val in (row.get(src) or {}).items():
+                if isinstance(val, dict) and val.get("bucket_edge_lb") is not None:
+                    out[str(key)] = to_float(val.get("bucket_edge_lb"))
+        return out
     bucket_theta_by_wallet = {
         f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}": _theta_map(row)
+        for row in eligible_wallet_rows
+    }
+    bucket_edge_lb_by_wallet = {
+        f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}": _edge_lb_map(row)
         for row in eligible_wallet_rows
     }
     eligible_leagues_by_wallet = {
@@ -6916,6 +6928,7 @@ def command_follow(
                     eligible_market_types=eligible_market_types_by_wallet.get(scope_key),
                     eligible_buckets=eligible_buckets_by_wallet.get(scope_key),
                     bucket_theta=bucket_theta_by_wallet.get(scope_key),
+                    bucket_edge_lb=bucket_edge_lb_by_wallet.get(scope_key),
                     eligible_category=category,
                     eligible_leagues=eligible_leagues_by_wallet.get(scope_key),
                     conflict_policy="dual_follow",
@@ -7106,6 +7119,7 @@ def command_follow(
                 eligible_market_types=eligible_market_types_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 eligible_buckets=eligible_buckets_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 bucket_theta=bucket_theta_by_wallet.get(scope_key),
+                bucket_edge_lb=bucket_edge_lb_by_wallet.get(scope_key),
                 eligible_category=category if wallet_can_open_new else None,
                 eligible_leagues=eligible_leagues_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 conflict_policy="dual_follow",

@@ -20,10 +20,15 @@ DEFAULT_MIN_STAKE_USDC = 1.0            # Polymarket CLOB 最小单(INVALID_ORDE
 # 跟单现价门:有效胜率 = θ̂(近期加权点估) × 此折扣,现价需 < 该值才跟(留 5% 相对安全边际)。
 # 比纯 wilson_lb 宽(与入榜的 θ̂ 轴一致),又不至于按头版胜率满价追。
 THETA_FOLLOW_DISCOUNT = 0.95
-# 跟单额 = 镜像比例 × 目标钱包这笔买入额(随下注大小线性、无断崖),夹在
-# [min_stake 下限, 单场剩余额度]。多笔按比例累加、总额受单场cap 收口。
-# 10% ↔ "钱包下 10×单场cap 时正好打满 cap"(N_full=10)。Kelly edge 仅当门(θ̂×0.95>现价)。
-DEFAULT_FOLLOW_MIRROR_PERCENT = 10.0
+# 凸形信念 sizing:跟单 = 单场cap × (钱包这笔买入额 / 打满线)²,夹在 [min_stake, 单场剩余额度]。
+# 打满线 = fill_line_x_cap × 单场cap(钱包押到打满线 → 跟满 cap;中等单按平方衰减,压低中等暴露、
+# 躲"4赢1负亏光")。Kelly edge 仅当门(θ̂×0.95>现价)。follow_mirror_percent 已弃用、字段休眠。
+DEFAULT_FILL_LINE_X_CAP = 10.0          # 钱包押满 10×单场cap → 跟满 cap(信念满)
+# 实力(skill)= 钱包该桶 edge_lb / edge_ref,夹 [0,1]。edge_lb 是 copy-edge 下界(含样本折扣,
+# ≈ edge+wilson),低实力即便高信念也把注码摁住(防"跟着菜鸟重注亏光")。edge_ref = 满实力对应的 edge。
+# 0.20 是刻意保守的高门槛:只有极少数(实测 8/76)又强又重注的才逼近 cap;不追求多数钱包够到 cap。
+DEFAULT_EDGE_REF = 0.20
+DEFAULT_FOLLOW_MIRROR_PERCENT = 10.0    # 弃用(旧线性镜像);保留供旧 db 配置反序列化不报错
 
 
 def _finite_positive(value: Any) -> bool:
@@ -52,10 +57,14 @@ def default_follow_strategy(*, balance_usdc: float | None = None) -> dict[str, A
         "stake_sizing": {
             "mode": "kelly",
             "kelly_fraction": DEFAULT_KELLY_FRACTION,
+            # 单笔硬上限:默认**关**(不勾不生效,纯按公式)。策略编辑页勾选 → 单笔卡死在 % 上限。
+            "per_signal_cap_enabled": False,
             "per_signal_cap_percent": DEFAULT_PER_SIGNAL_CAP_PERCENT,
             "per_match_cap_percent": DEFAULT_PER_MATCH_CAP_PERCENT,
             "min_stake_usdc": DEFAULT_MIN_STAKE_USDC,
-            "follow_mirror_percent": DEFAULT_FOLLOW_MIRROR_PERCENT,
+            "fill_line_x_cap": DEFAULT_FILL_LINE_X_CAP,
+            "edge_ref": DEFAULT_EDGE_REF,
+            "follow_mirror_percent": DEFAULT_FOLLOW_MIRROR_PERCENT,  # 弃用,休眠
             # legacy(兼容保留):
             "ratio_percent": 10.0,
             "per_order_cap_enabled": False,
@@ -108,6 +117,9 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
     sizing["per_signal_cap_percent"] = round(to_float(sizing.get("per_signal_cap_percent") if sizing.get("per_signal_cap_percent") is not None else DEFAULT_PER_SIGNAL_CAP_PERCENT), 8)
     sizing["per_match_cap_percent"] = round(to_float(sizing.get("per_match_cap_percent") if sizing.get("per_match_cap_percent") is not None else DEFAULT_PER_MATCH_CAP_PERCENT), 8)
     sizing["min_stake_usdc"] = round(to_float(sizing.get("min_stake_usdc") if sizing.get("min_stake_usdc") is not None else DEFAULT_MIN_STAKE_USDC), 8)
+    sizing["fill_line_x_cap"] = round(to_float(sizing.get("fill_line_x_cap") if sizing.get("fill_line_x_cap") is not None else DEFAULT_FILL_LINE_X_CAP), 8)
+    sizing["edge_ref"] = round(to_float(sizing.get("edge_ref") if sizing.get("edge_ref") is not None else DEFAULT_EDGE_REF), 8)
+    sizing["per_signal_cap_enabled"] = bool(sizing.get("per_signal_cap_enabled"))
     sizing["follow_mirror_percent"] = round(to_float(sizing.get("follow_mirror_percent") if sizing.get("follow_mirror_percent") is not None else DEFAULT_FOLLOW_MIRROR_PERCENT), 8)
     # legacy
     sizing["ratio_percent"] = round(to_float(sizing.get("ratio_percent")), 8)
@@ -167,6 +179,10 @@ def validate_follow_strategy(strategy: dict[str, Any] | None) -> tuple[bool, lis
             errors.append("stake_sizing.per_match_cap_percent")
         if not _finite_positive(sizing.get("min_stake_usdc")):
             errors.append("stake_sizing.min_stake_usdc")
+        if not _finite_positive(sizing.get("fill_line_x_cap")):
+            errors.append("stake_sizing.fill_line_x_cap")
+        if not _finite_positive(sizing.get("edge_ref")):
+            errors.append("stake_sizing.edge_ref")
     if sizing["mode"] == "proportional" and not _finite_positive(sizing.get("ratio_percent")):
         errors.append("stake_sizing.ratio_percent")
     if sizing.get("per_order_cap_enabled") and not _finite_positive(sizing.get("per_order_cap_usdc")):
@@ -253,6 +269,7 @@ def evaluate_follow_candidate(
     condition_funded_order_count: int,
     wallet_condition_funded_order_count: int,
     bucket_win_rate: float = 0.0,      # kelly:被跟桶 θ̂(近期加权点估胜率);内部再 ×0.95 折扣
+    bucket_edge_lb: float | None = None,  # kelly:被跟桶 edge_lb(copy-edge 下界)→ 实力乘数;None=缺则中性1.0
     entry_price: float = 0.0,          # kelly:跟单时实时价 p
     bankroll_usdc: float = 0.0,        # kelly:本金(Kelly 缩放 + %上限基准);缺则回退 available
 ) -> dict[str, Any]:
@@ -272,8 +289,9 @@ def evaluate_follow_candidate(
     raw_stake = 0.0
     stake_mode = mode
     if mode == "kelly":
-        # 跟单额 = 镜像比例 × 目标钱包这笔买入额(随下注大小线性、无断崖),夹在
-        # [min_stake 下限, 单场剩余额度]。多笔按比例累加、总额受单场cap 收口。
+        # 凸形信念 sizing:跟单 = 单场cap × (钱包这笔买入额 / 打满线)²,夹在 [min_stake, 单场剩余]。
+        #   打满线 = fill_line_x_cap × 单场cap(钱包押到打满线 → 跟满 cap;中等单按平方衰减 → 压低
+        #   中等暴露、躲"4赢1负亏光";只有钱包重注=高信念才接近 cap)。曲线连续单调、无断崖。
         # Kelly edge 仅当门:有效胜率 θ̂×0.95 ≤ 现价则不跟(价已涨过把握)。
         # bankroll 优先用调用方传入的**动态权益**(初始本金 + 已实现盈亏;cli 侧 =
         # account_balance + funded_open_exposure),缺时回退静态 usable_balance,再回退可用。
@@ -292,14 +310,32 @@ def evaluate_follow_candidate(
             return _block("no_live_edge", strategy=normalized)   # 现价 ≥ θ̂×0.95 → 不跟
         min_stake = to_float(sizing.get("min_stake_usdc"))
         per_match_cap = bankroll * to_float(sizing.get("per_match_cap_percent")) / 100.0
-        raw_stake = order_cash * to_float(sizing.get("follow_mirror_percent")) / 100.0
-        if per_match_cap > 0:
-            match_remaining = per_match_cap - to_float(condition_funded_stake_usdc)
-            if match_remaining < min_stake:
-                return _block("match_cap_reached", strategy=normalized)   # 本场已到上限
-            raw_stake = min(raw_stake, match_remaining)
+        if per_match_cap <= 0:
+            return _block("no_bankroll", strategy=normalized)
+        # 信念:钱包押多重(额/打满线)²,夹 [0,1]。打满线 = fill_line_x_cap × 单场cap。
+        fill_line = to_float(sizing.get("fill_line_x_cap")) * per_match_cap
+        conviction = (order_cash / fill_line) if fill_line > 0 else 1.0
+        conviction = min(1.0, conviction * conviction)
+        # 实力:钱包该桶 edge_lb / edge_ref,夹 [0,1]。缺(None)→ 中性 1.0(只靠信念,不静默砍光)。
+        edge_ref = to_float(sizing.get("edge_ref"))
+        if bucket_edge_lb is None or edge_ref <= 0:
+            skill = 1.0
+        else:
+            skill = max(0.0, min(1.0, to_float(bucket_edge_lb) / edge_ref))
+        raw_stake = per_match_cap * conviction * skill   # 单场cap × 信念 × 实力
+        # 单笔硬上限:**可选**(per_signal_cap_enabled 勾选才生效)。不勾 → 纯按公式;勾 → 单笔
+        # 卡死在 per_signal_cap(防一笔吃满整场)。单场cap 仍是多笔累计上限,独立生效。
+        if sizing.get("per_signal_cap_enabled"):
+            per_signal_cap = bankroll * to_float(sizing.get("per_signal_cap_percent")) / 100.0
+            if per_signal_cap > 0:
+                raw_stake = min(raw_stake, per_signal_cap)
+        # 多笔累计:单场剩余额度(condition 已投合计 → per_match_cap 收口)。
+        match_remaining = per_match_cap - to_float(condition_funded_stake_usdc)
+        if match_remaining < min_stake:
+            return _block("match_cap_reached", strategy=normalized)   # 本场已到上限
+        raw_stake = min(raw_stake, match_remaining)
         raw_stake = max(raw_stake, min_stake)   # 不低于动态下限(算出更小也提到下限)
-        stake_mode = "kelly_mirror"
+        stake_mode = "kelly_conviction"
     elif mode == "fixed":
         raw_stake = to_float(sizing.get("fixed_usdc"))
     elif mode == "balance_percent":
@@ -363,11 +399,16 @@ def strategy_summary(strategy: dict[str, Any] | None) -> str:
     sizing = normalized["stake_sizing"]
     mode = sizing["mode"]
     if mode == "kelly":
+        signal_cap_text = (
+            f"单笔≤{to_float(sizing.get('per_signal_cap_percent')):g}%/"
+            if sizing.get("per_signal_cap_enabled") else ""
+        )
         stake_text = (
-            f"Kelly×{to_float(sizing.get('kelly_fraction')):g}"
-            f"(单笔≤{to_float(sizing.get('per_signal_cap_percent')):g}%/"
-            f"单场≤{to_float(sizing.get('per_match_cap_percent')):g}%,"
-            f"最小${to_float(sizing.get('min_stake_usdc')):g})"
+            f"单场cap × 信念² × 实力"
+            f"(打满线 {to_float(sizing.get('fill_line_x_cap')):g}×cap,"
+            f"实力 edge_lb/{to_float(sizing.get('edge_ref')):g},"
+            f"{signal_cap_text}单场≤{to_float(sizing.get('per_match_cap_percent')):g}%,"
+            f"最小${to_float(sizing.get('min_stake_usdc')):g},edge 门 θ̂×0.95)"
         )
     elif mode == "fixed":
         stake_text = f"固定 {to_float(sizing.get('fixed_usdc')):g} USDC"

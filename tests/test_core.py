@@ -5668,62 +5668,66 @@ class CoreTest(unittest.TestCase):
 
             self.assertFalse(store.load_follow_strategy()["configured"])
 
-    def test_kelly_stake_sizing_engine(self):
-        # 跟单额 = 镜像比例 × 钱包买入额,夹 [min_stake, 单场剩余];edge 仅当门(θ̂×0.95>现价)。
-        # 见 review/follow-sizing-conviction-and-dynamic-bankroll.md。
+    def test_kelly_conviction_sizing_engine(self):
+        # 跟单额 = 单场cap × 信念²(钱包额/打满线)× 实力(edge_lb/edge_ref),夹 [min_stake, 单场剩余];
+        # edge 仅当门(θ̂×0.95>现价);单笔硬上限 opt-in。见 review/follow-sizing-...md。
         s = default_follow_strategy(balance_usdc=2000)
-        s["stake_sizing"]["per_match_cap_percent"] = 10.0   # 单场cap = $200@2000
+        s["stake_sizing"]["per_match_cap_percent"] = 10.0   # 单场cap=$200@2000 → 打满线=10×cap=$2000
         s["stake_sizing"]["min_stake_usdc"] = 10.0
-        s["stake_sizing"]["follow_mirror_percent"] = 10.0
+        s["stake_sizing"]["edge_ref"] = 0.20
         self.assertEqual(s["stake_sizing"]["mode"], "kelly")
 
-        def ev(order_cash, theta=0.74, p=0.66, cond=0.0, avail=2000):
+        def ev(order_cash, edge_lb=0.20, theta=0.74, p=0.66, cond=0.0, avail=2000):
             return evaluate_follow_candidate(
                 strategy=s, target_wallet_order_cash_usdc=order_cash, available_balance_usdc=avail,
                 condition_funded_stake_usdc=cond, condition_funded_order_count=0,
                 wallet_condition_funded_order_count=0,
-                bucket_win_rate=theta, entry_price=p, bankroll_usdc=2000,
+                bucket_win_rate=theta, bucket_edge_lb=edge_lb, entry_price=p, bankroll_usdc=2000,
             )
 
-        # 镜像 10%:随钱包买入额线性,小单不再死按 cap
-        self.assertEqual(ev(300)["funded_stake"], 30)        # 10% × 300
-        self.assertEqual(ev(300)["stake_mode"], "kelly_mirror")
-        self.assertEqual(ev(50)["funded_stake"], 10)         # 10%×50=5 → 提到下限 $10
-        self.assertEqual(ev(2000)["funded_stake"], 200)      # 10%×2000 = 单场cap $200
-        self.assertEqual(ev(9508)["funded_stake"], 200)      # 撞单场cap $200
+        # 信念²(skill=1.0 @ edge_lb=edge_ref):押满打满线→cap;中等单平方衰减;小单提下限
+        self.assertEqual(ev(2000)["funded_stake"], 200)      # (2000/2000)²=1 → cap $200
+        self.assertEqual(ev(2000)["stake_mode"], "kelly_conviction")
+        self.assertEqual(ev(1000)["funded_stake"], 50)       # (0.5)²=0.25 → $50
+        self.assertEqual(ev(300)["funded_stake"], 10)        # (0.15)²≈0.022 → $4.5 → 提下限 $10
+        self.assertEqual(ev(9508)["funded_stake"], 200)      # 信念封顶 → cap $200
+        # 实力乘数:edge_lb 越低注码越小(押满信念也被摁住);None=缺则中性 1.0
+        self.assertEqual(ev(2000, edge_lb=0.10)["funded_stake"], 100)   # skill 0.5 → $100
+        self.assertEqual(ev(2000, edge_lb=0.05)["funded_stake"], 50)    # skill 0.25 → $50
+        self.assertEqual(ev(2000, edge_lb=None)["funded_stake"], 200)   # 缺 edge → skill 1.0
         # edge 门:现价 ≥ θ̂×0.95 → 不跟;edge 正常 → 跟
-        self.assertEqual(ev(300, theta=0.80, p=0.77)["block_reason"], "no_live_edge")  # 0.76 ≤ 0.77
-        self.assertTrue(ev(300, theta=0.80, p=0.50)["would_follow"])
-        # 单场:已投$190 → 剩$10=min → 跟$10;已投$195 → 剩$5<min → match_cap_reached
+        self.assertEqual(ev(2000, theta=0.80, p=0.77)["block_reason"], "no_live_edge")  # 0.76 ≤ 0.77
+        self.assertTrue(ev(2000, theta=0.80, p=0.50)["would_follow"])
+        # 单笔硬上限 opt-in:默认关 → 可达 cap;勾上 5%($100)→ 卡死 $100
+        self.assertEqual(ev(2000)["funded_stake"], 200)
+        s["stake_sizing"]["per_signal_cap_enabled"] = True
+        s["stake_sizing"]["per_signal_cap_percent"] = 5.0     # $100@2000
+        self.assertEqual(ev(2000)["funded_stake"], 100)
+        s["stake_sizing"]["per_signal_cap_enabled"] = False
+        # 单场累计:已投$190 → 剩$10=min → $10;已投$195 → 剩$5<min → match_cap_reached
         self.assertEqual(ev(9508, cond=190)["funded_stake"], 10)
         self.assertEqual(ev(9508, cond=195)["block_reason"], "match_cap_reached")
 
-    def test_kelly_mirror_dynamic_bankroll(self):
-        # 镜像 sizing 的动态 bankroll:单场cap 随传入权益走(非静态 usable_balance);
-        # 镜像比例直接乘钱包买入额,不受权益影响(见 review/follow-sizing-...md)。
+    def test_kelly_conviction_dynamic_bankroll(self):
+        # 动态 bankroll:单场cap = 10% × 传入权益(非静态 usable_balance);巨注信念封顶(=1)、
+        # skill=1.0(edge_lb=edge_ref)→ 注码 = cap,随权益浮动。
         s = default_follow_strategy(balance_usdc=5000)   # 静态 usable_balance=5000
         s["stake_sizing"]["per_match_cap_percent"] = 10.0
         s["stake_sizing"]["min_stake_usdc"] = 10.0
-        s["stake_sizing"]["follow_mirror_percent"] = 10.0
+        s["stake_sizing"]["edge_ref"] = 0.20
 
         def ev(order_cash, bankroll, cond=0.0):
             return evaluate_follow_candidate(
                 strategy=s, target_wallet_order_cash_usdc=order_cash, available_balance_usdc=bankroll,
                 condition_funded_stake_usdc=cond, condition_funded_order_count=0,
                 wallet_condition_funded_order_count=0,
-                bucket_win_rate=0.70, entry_price=0.55, bankroll_usdc=bankroll,
+                bucket_win_rate=0.70, bucket_edge_lb=0.20, entry_price=0.55, bankroll_usdc=bankroll,
             )
 
-        # 大单撞 cap:单场cap = 10% × 动态权益(非静态 5000)。$9508 钱包单:
+        # 巨注(≥打满线=bankroll)信念封顶 → 注码 = 单场cap = 10% × 动态权益:
         self.assertEqual(ev(9508, 5000)["funded_stake"], 500)   # cap 10% × 5000
         self.assertEqual(ev(9508, 6000)["funded_stake"], 600)   # 权益涨 → cap 10% × 6000
         self.assertEqual(ev(9508, 4000)["funded_stake"], 400)   # 权益跌 → cap 10% × 4000
-        # 小单按镜像比例,与权益无关:
-        self.assertEqual(ev(200, 5000)["funded_stake"], 20)
-        self.assertEqual(ev(200, 9999)["funded_stake"], 20)
-        # LGD 多笔小额逐笔累加(各按 10%),不再死按 cap:
-        self.assertEqual(ev(199, 5000)["funded_stake"], 19)
-        self.assertEqual(ev(483, 5000, cond=30)["funded_stake"], 48)
 
     def test_follow_strategy_max_entry_price_default_and_clamp(self):
         # 默认 = 全系统唯一分水岭 0.85;缺字段补默认;clamp 到 [0,1];0 = 不限(均 normalize 处理)。

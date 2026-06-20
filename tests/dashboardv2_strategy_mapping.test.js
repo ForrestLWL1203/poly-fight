@@ -48,17 +48,22 @@ function backendErrors(s) {
 }
 
 // 0) kelly(默认引擎)round-trip + backend-valid
-const k0 = { usableMode: "cap", usableCap: "2000", minSignalOn: true, minSignal: "10", sizing: "kelly", kellyFraction: "0.25", perSignalPct: "5", perMatchPct: "10", minStake: "1", ratio: "10", ratioCapOn: false, ratioCap: "100", fixed: "50", balancePct: "1", countOn: false, countMode: "event", count: "10", spendOn: false, spendMode: "fixed", spendFixed: "200", spendPct: "5" };
+const k0 = { usableMode: "cap", usableCap: "2000", minSignalOn: true, minSignal: "10", sizing: "kelly", kellyFraction: "0.25", perSignalCapOn: false, perSignalPct: "5", perMatchPct: "10", minStake: "1", ratio: "10", ratioCapOn: false, ratioCap: "100", fixed: "50", balancePct: "1", countOn: false, countMode: "event", count: "10", spendOn: false, spendMode: "fixed", spendFixed: "200", spendPct: "5" };
 const s0 = A.strategyFromKit(k0, 2000);
 eq("k0.mode", s0.stake_sizing.mode, "kelly");
 eq("k0.kelly_fraction", s0.stake_sizing.kelly_fraction, 0.25);
+eq("k0.signal_cap_off", s0.stake_sizing.per_signal_cap_enabled, false);  // 默认不勾 → 单笔cap 不生效
 eq("k0.per_signal", s0.stake_sizing.per_signal_cap_percent, 5);
 eq("k0.per_match", s0.stake_sizing.per_match_cap_percent, 10);
 eq("k0.min_stake", s0.stake_sizing.min_stake_usdc, 1);
 eq("k0.balance_required", s0.balance.required, true);
 eq("k0.backend_valid", backendErrors(s0), []);
 const rtk0 = A.strategyToKit(s0, 2000);
-["sizing", "kellyFraction", "perSignalPct", "perMatchPct", "minStake"].forEach((f) => eq("k0.rt." + f, rtk0[f], k0[f]));
+["sizing", "kellyFraction", "perSignalCapOn", "perSignalPct", "perMatchPct", "minStake"].forEach((f) => eq("k0.rt." + f, rtk0[f], k0[f]));
+// 0b) kelly + 勾选单笔硬上限 → per_signal_cap_enabled true,往返保持
+const s0b = A.strategyFromKit({ ...k0, perSignalCapOn: true }, 2000);
+eq("k0b.signal_cap_on", s0b.stake_sizing.per_signal_cap_enabled, true);
+eq("k0b.rt.on", A.strategyToKit(s0b, 2000).perSignalCapOn, true);
 
 // 1) proportional + per-order cap + condition count cap + fixed spend cap
 const k1 = { usableMode: "cap", usableCap: "5000", minSignalOn: true, minSignal: "10", sizing: "ratio", ratio: "10", ratioCapOn: true, ratioCap: "100", fixed: "50", balancePct: "1", countOn: true, countMode: "event", count: "10", spendOn: true, spendMode: "fixed", spendFixed: "200", spendPct: "5" };
