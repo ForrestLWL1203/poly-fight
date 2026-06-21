@@ -2916,8 +2916,10 @@ def start_runner(
             )
         pid = int(process.pid)
         pgid = _process_group_id(pid) or pid
-    # 实时刷新:勾选则随 runner 起一个独立的 observe-v2 --loop-hours 2 进程(2h 一轮、
-    # 回看 4h 去重维护 delta),发布到 dashboard 读的同一个 esports/leaderboard_v2.db。
+    # 实时刷新:勾选则随 runner 起 observe-live 快循环(从活跃/未结算 watchlist 盘提前发现优质
+    # 钱包并晋升,发布到 dashboard 读的同一个 esports/leaderboard_v2.db)。
+    # observe-v2(M4 从已结算赛事增量发现)已停用(2026-06-21):与 observe-live 功能重叠,
+    # 结算侧发现交由周期 collect-v2 覆盖,不再起这个 sidecar。
     observe_pid = 0
     observe_pgid = 0
     observe_log_path = ""
@@ -2926,28 +2928,11 @@ def start_runner(
     observe_live_log_path = ""
     if realtime_refresh:
         observe_data_dir = category_data_dirs(config.data_dir)["esports"]
-        observe_command = [
-            sys.executable, "-u", "-m", "poly_fight.cli",
-            "--data-dir", str(observe_data_dir),
-            "observe-v2", "--category", "esports",
-            "--loop-hours", "2", "--observe-lookback-hours", "4",
-            "--defer-first-tick",  # 榜单刚被手动采集刷新过,先睡满一轮再维护
-            "--follow-dir", str(follow_dir),
-        ]
-        # 门槛全在 core.py 评分常量里:collect-v2 与 observe-v2 天然一致,无需再从上次
-        # 采集命令继承阈值 flag(那些 --v2-* 参数已从 CLI 删除)。
-        observe_log = log_dir / f"dashboard-observe-{now_ts}.out"
-        observe_pid, observe_pgid = _spawn_detached_process(
-            observe_command, observe_log, config.runner_process_starter
-        )
-        observe_log_path = str(observe_log)
-        # observe-live(3.1):分钟级快循环,从活跃(未结算)watchlist 盘提前发现优质钱包
-        # 并晋升,发布到同一 leaderboard_v2.db(与 observe-v2 用 build lock 串行化防竞争)。
         observe_live_command = [
             sys.executable, "-u", "-m", "poly_fight.cli",
             "--data-dir", str(observe_data_dir),
             "observe-live", "--category", "esports",
-            "--loop-minutes", "10",
+            "--loop-minutes", "60",
             "--defer-first-tick",
             "--follow-dir", str(follow_dir),
         ]

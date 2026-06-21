@@ -10094,28 +10094,20 @@ class CoreTest(unittest.TestCase):
                 "--v2-min-positive-rate", "0.7500", "--v2-max-median-entry", "0.7500",
             ]}}})
 
-            # 策略勾上实时刷新 → runner + observe-v2 + observe-live 三个进程
+            # 策略勾上实时刷新 → runner + observe-live 两个进程(observe-v2 已停用)
             strat_on = default_follow_strategy(balance_usdc=100)
             strat_on["realtime_refresh"] = True
             store.save_follow_strategy(strat_on, ts=200)
             on = start_runner(config)
-            self.assertEqual(len(calls), 3)
-            observe_cmd = calls[1]
-            self.assertIn("observe-v2", observe_cmd)
-            self.assertEqual(observe_cmd[observe_cmd.index("--loop-hours") + 1], "2")
-            self.assertEqual(observe_cmd[observe_cmd.index("--observe-lookback-hours") + 1], "4")
-            self.assertIn(str(data_dir / "esports"), observe_cmd)   # 与 collect-v2 同一 data 目录
-            # 刚采集完先睡满一轮再跑
-            self.assertIn("--defer-first-tick", observe_cmd)
-            # 不再继承已删除的阈值 flag(传入会让 observe-v2 报 unrecognized arguments)
-            self.assertNotIn("--v2-min-positive-rate", observe_cmd)
-            self.assertNotIn("--v2-max-median-entry", observe_cmd)
+            self.assertEqual(len(calls), 2)
             self.assertTrue(on["realtime_refresh"])
-            self.assertEqual(on["observe_pid"], 4321)
-            # observe-live(3.1):分钟级快循环,同一 esports data 目录,发布同一 leaderboard_v2.db
-            observe_live_cmd = calls[2]
+            # observe-v2 不再 spawn
+            self.assertIsNone(on["observe_pid"])
+            self.assertFalse(any("observe-v2" in c for c in calls))
+            # observe-live:快循环(1h),同一 esports data 目录,发布同一 leaderboard_v2.db
+            observe_live_cmd = calls[1]
             self.assertIn("observe-live", observe_live_cmd)
-            self.assertEqual(observe_live_cmd[observe_live_cmd.index("--loop-minutes") + 1], "10")
+            self.assertEqual(observe_live_cmd[observe_live_cmd.index("--loop-minutes") + 1], "60")
             self.assertIn(str(data_dir / "esports"), observe_live_cmd)
             self.assertIn("--defer-first-tick", observe_live_cmd)
             self.assertEqual(on["observe_live_pid"], 4321)
