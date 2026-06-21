@@ -6568,6 +6568,10 @@ def command_follow(
         collector.update_asset_map(onchain_asset_map)
         collector.update_wallets({normalize_wallet(row.get("wallet")) for row in follow_wallets})
     detection_source = "onchain" if (collector is not None and collector.healthy) else "data_api"
+    # 进程冷启动:本 tick 强制走免费 data-api 把停机期漏单补回(各钱包持久化游标),补完交还 WS。
+    # 冷启动不再用 getLogs 全量回补,省 Alchemy 额度(重启频繁时尤甚)。
+    if collector is not None and getattr(collector, "cold_catchup_pending", False):
+        detection_source = "data_api"
     next_interval = desired_tick_interval(
         list(watched.values()),
         open_signals,
@@ -6804,6 +6808,9 @@ def command_follow(
                 max_workers=args.max_workers,
             )
             trade_request_count = len(follow_wallets)
+            # 冷启动 data-api 补单已完成本轮 → 清标志,后续 tick 交还 onchain WS 实时路径。
+            if collector is not None and getattr(collector, "cold_catchup_pending", False):
+                collector.clear_cold_catchup()
         stage_seconds["wallet_trade_fetch"] = round(time.monotonic() - wallet_fetch_started_mono, 3)
         wallet_process_started_mono = time.monotonic()
 

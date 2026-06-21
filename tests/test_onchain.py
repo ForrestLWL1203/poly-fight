@@ -235,6 +235,46 @@ class TestPolling(unittest.TestCase):
         col._poll_once(current_hint=1000)   # no wallets -> healthy-idle, no RPC needed
         self.assertTrue(col.healthy)
 
+    class _FakeWS:
+        # 连上后第一条消息即 OP_CLOSE → _run_ws_session 在连接块(冷启动/回补)跑完后干净退出。
+        OP_TEXT = 0x1
+        OP_CLOSE = 0x8
+        def __init__(self, url): pass
+        def connect(self): pass
+        def send_text(self, s): pass
+        def set_timeout(self, t): pass
+        def recv_message(self): return (0x8, b"")
+        def close(self): pass
+
+    def _run_one_session(self, col):
+        rpc_methods = []
+        with mock.patch.object(oc, "WSClient", self._FakeWS), \
+             mock.patch.object(oc, "block_number", return_value=2000), \
+             mock.patch.object(oc, "rpc_call", side_effect=lambda *a, **k: rpc_methods.append(a[1]) or []):
+            col._run_ws_session({WALLET})
+        return rpc_methods
+
+    def test_cold_start_uses_dataapi_not_getlogs(self):
+        # 进程冷启动(cursor<=0)默认不烧 getLogs 全量回补:只把游标定到当前块头(1 次
+        # eth_blockNumber),置 cold_catchup_pending,交给 runner 走 data-api 补单。
+        col, events = self._collector(wss_url="wss://x", cold_start_via_dataapi=True)
+        col._cursor = 0  # cold
+        rpc_methods = self._run_one_session(col)
+        self.assertTrue(col.cold_catchup_pending)
+        self.assertEqual(col._cursor, 2000)                 # 游标定到块头
+        self.assertNotIn("eth_getLogs", rpc_methods)        # 冷启动不发 getLogs
+        self.assertIn(("cold_start_dataapi", {"cursor": 2000}), events)
+        col.clear_cold_catchup()
+        self.assertFalse(col.cold_catchup_pending)
+
+    def test_cold_start_legacy_getlogs_when_disabled(self):
+        # 关掉新行为(cold_start_via_dataapi=False)→ 回到旧版冷启动 getLogs 全量回补。
+        col, _ = self._collector(wss_url="wss://x", cold_start_via_dataapi=False)
+        col._cursor = 0
+        rpc_methods = self._run_one_session(col)
+        self.assertFalse(col.cold_catchup_pending)
+        self.assertIn("eth_getLogs", rpc_methods)           # 旧行为:冷启动仍 getLogs
+
     def test_backfill_buffers_fill_and_advances_cursor(self):
         col, events = self._collector()
         col._cursor = 990

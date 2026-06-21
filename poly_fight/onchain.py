@@ -266,6 +266,7 @@ class OnchainFollowCollector(threading.Thread):
         reconnect_rewind_blocks: int = 150,    # 每次重连 getLogs 回补时回退的窗口(抓近期静默漏单,~5min)
         reconnect_min: float = 1.0,
         reconnect_max: float = 30.0,
+        cold_start_via_dataapi: bool = True,   # 冷启动(进程首连)不烧 getLogs 全量回补,交给 runner 走免费 data-api 补单
         on_event: Callable[[str, dict], None] | None = None,
     ):
         super().__init__(daemon=True, name="onchain-follow-collector")
@@ -284,6 +285,8 @@ class OnchainFollowCollector(threading.Thread):
         self.reconnect_rewind_blocks = max(0, int(reconnect_rewind_blocks))
         self.reconnect_min = reconnect_min
         self.reconnect_max = reconnect_max
+        self.cold_start_via_dataapi = bool(cold_start_via_dataapi)
+        self._cold_catchup_pending = False
         self.on_event = on_event or (lambda *_: None)
 
         self._lock = threading.Lock()
@@ -306,6 +309,14 @@ class OnchainFollowCollector(threading.Thread):
     @property
     def fill_count(self) -> int:
         return self._fill_count
+
+    @property
+    def cold_catchup_pending(self) -> bool:
+        """进程冷启动后置 True:runner 应本 tick 强制走 data-api 补停机期漏单,补完调 clear。"""
+        return self._cold_catchup_pending
+
+    def clear_cold_catchup(self) -> None:
+        self._cold_catchup_pending = False
 
     def update_wallets(self, wallets: set[str]) -> None:
         new = {w.lower() for w in wallets}
@@ -400,9 +411,17 @@ class OnchainFollowCollector(threading.Thread):
                 "params": ["logs", {"address": list(EXCHANGE_ADDRESSES),
                                     "topics": [ORDER_FILLED_TOPIC, None, maker_topics, None]}],
             }))
-            # 连上即回补:首连用 cold-start 窗口,重连用 rewind 小窗抓近期静默漏单。
+            # 连上即回补。**冷启动(进程首连,cursor<=0)默认不用 getLogs**:补单不要求时效,
+            # 交给 runner 走免费 data-api 兜(置 cold_catchup_pending,只用 1 次 eth_blockNumber 把游标
+            # 定到当前块头)。同进程内的**重连**(cursor>0,健康期 stale/recycle/异常)仍用 rewind 小窗
+            # getLogs 保证 live 续连的时效。这样 getLogs 只在"真有实时缺口"时发,重启不再烧全量回补。
             cold = self._cursor <= 0
-            self._backfill(wallets, rewind=0 if cold else self.reconnect_rewind_blocks, cold_start=cold)
+            if cold and self.cold_start_via_dataapi:
+                self._cursor = block_number(self.https_url)
+                self._cold_catchup_pending = True
+                self.on_event("cold_start_dataapi", {"cursor": self._cursor})
+            else:
+                self._backfill(wallets, rewind=0 if cold else self.reconnect_rewind_blocks, cold_start=cold)
             self._dirty.clear()
             self._healthy = True
             self._consecutive_failures = 0
