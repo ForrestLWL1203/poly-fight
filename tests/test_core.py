@@ -5607,6 +5607,35 @@ class CoreTest(unittest.TestCase):
             store.apply_account_ledger([credit])
             self.assertEqual(store.load_account_balance()["balance_usdc"], 115)
 
+    def test_save_strategy_does_not_repin_running_balance(self):
+        # 回归:保存策略曾把运行现金 re-pin 回静态预设 → 抹掉未结算持仓扣款、现金虚高。
+        # 现在仅首次未配置时 seed;之后保存策略不再覆盖运行余额。
+        from poly_fight.follow_strategy import default_follow_strategy
+
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+
+            # 首次保存(balance=5000)→ seed 一次。
+            store.save_follow_strategy(default_follow_strategy(balance_usdc=5000))
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 5000)
+
+            # 模拟买入扣现金 → 现金降到 3970。
+            store.apply_account_ledger([{
+                "ledger_id": "buy:s:t", "kind": "buy", "amount_usdc": -1030,
+                "created_at": 1, "signal_id": "s", "trade_id": "t",
+            }])
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 3970)
+
+            # 再次保存策略(改了参数,balance 仍写 5000)→ 现金**不得**被重置回 5000。
+            strat = default_follow_strategy(balance_usdc=5000)
+            strat["sizing"]["per_match_percent"] = 2.0  # 改个参数,重新保存
+            store.save_follow_strategy(strat)
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 3970)
+
+            # 显式改余额仍走 set_account_balance。
+            store.set_account_balance(4000, source="manual")
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 4000)
+
     def test_account_result_ledger_credits_each_reentry_episode(self):
         # 回归:信号 exit→再入场→再 exit 复用同一 signal_id。旧 per-signal keying
         # (exit:{signal_id})只能落一条 → 第二段回笼撞主键被吞 → 本金不回笼(CHAOS 丢 $200)。
@@ -5737,7 +5766,9 @@ class CoreTest(unittest.TestCase):
 
             self.assertTrue(saved["configured"])
             self.assertEqual(saved["balance"]["usable_balance_usdc"], 0)
-            self.assertFalse(store.load_account_balance()["configured"])
+            # 余额由 account_balance(已设 100)管理;保存 balance=0 的策略**不得**删除/覆盖它。
+            self.assertTrue(store.load_account_balance()["configured"])
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 100)
 
     def _library_strategy(self, *, ratio=10.0):
         # ratio 仅作区分标记,映射到新模型的 per_signal_percent(per_match 同值过校验)。
@@ -6135,13 +6166,14 @@ class CoreTest(unittest.TestCase):
         self.assertEqual((stake, tier), (50, "capped"))
 
     def test_follow_strategy_evaluator_caps_to_balance_below_target(self):
-        # 单笔 = 余额×per_signal%;available 不足 target 但 ≥$1 → cap 到余额下单。
-        strategy = default_follow_strategy(balance_usdc=5000)
-        strategy["sizing"]["per_signal_percent"] = 1.0   # 单笔 = 50
-        strategy["sizing"]["per_match_percent"] = 5.0
-        # available 30 < target 50,但 ≥ $1 → cap 到余额下单,而不是弃单
+        # 注码按可动用现金(available)算。balance_capped:min_stake 把 target 顶到高于现金,
+        # 现金 ≥$1 → cap 到现金下单(min_stake=50 > 现金 30)。
+        capped_strategy = default_follow_strategy(balance_usdc=5000)
+        capped_strategy["sizing"]["per_signal_percent"] = 1.0
+        capped_strategy["sizing"]["per_match_percent"] = 300.0  # 每场预算够大,不在此门被挡
+        capped_strategy["sizing"]["min_stake_usdc"] = 50        # target 被 min_stake 顶到 50
         capped = evaluate_follow_candidate(
-            strategy=strategy,
+            strategy=capped_strategy,
             target_wallet_order_cash_usdc=200,
             available_balance_usdc=30,
             bucket_win_rate=0.90, entry_price=0.50, bankroll_usdc=5000,
@@ -6149,9 +6181,12 @@ class CoreTest(unittest.TestCase):
         self.assertTrue(capped["would_follow"])
         self.assertEqual(capped["funded_stake"], 30)
         self.assertEqual(capped["stake_mode"], "balance_capped")
-        # available < $1 → 真正 insufficient_balance
+        # insufficient_balance:现金 < $1 → 连一整单都买不起(默认 min_stake=1)。
+        broke_strategy = default_follow_strategy(balance_usdc=5000)
+        broke_strategy["sizing"]["per_signal_percent"] = 1.0
+        broke_strategy["sizing"]["per_match_percent"] = 300.0   # budget 0.5×300%=1.5 ≥ min_stake 1
         broke = evaluate_follow_candidate(
-            strategy=strategy,
+            strategy=broke_strategy,
             target_wallet_order_cash_usdc=200,
             available_balance_usdc=0.5,
             bucket_win_rate=0.90, entry_price=0.50, bankroll_usdc=5000,

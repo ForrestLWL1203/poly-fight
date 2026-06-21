@@ -60,6 +60,31 @@ class TestBudgetSplit(unittest.TestCase):
         self.assertEqual(r["target_stake"], 30)
 
 
+class TestCashBasedSizing(unittest.TestCase):
+    """单笔注码 = per_signal_percent% × 可动用现金(available),不含未结算持仓权益。"""
+
+    def test_sizes_off_available_cash_not_equity(self):
+        # 现金 3794(< 旧 bankroll/权益 6000)→ 1% 按现金算 = $37,不是 $60。
+        s = _strategy(per_signal_percent=1.0, per_match_percent=100.0)
+        r = evaluate_follow_candidate(
+            strategy=s, market_type="main_match",
+            target_wallet_order_cash_usdc=100.0, bucket_win_rate=0.9, entry_price=0.5,
+            available_balance_usdc=3794.0, bankroll_usdc=6000.0,  # 权益更高但应被忽略
+        )
+        self.assertTrue(r["would_follow"])
+        self.assertEqual(r["target_stake"], 37)  # floor(3794 × 1%)
+
+    def test_no_cash_blocks(self):
+        s = _strategy(per_signal_percent=1.0, per_match_percent=100.0)
+        r = evaluate_follow_candidate(
+            strategy=s, market_type="main_match",
+            target_wallet_order_cash_usdc=100.0, bucket_win_rate=0.9, entry_price=0.5,
+            available_balance_usdc=0.0, bankroll_usdc=6000.0,
+        )
+        self.assertFalse(r["would_follow"])
+        self.assertEqual(r["block_reason"], "no_bankroll")
+
+
 class TestPerMatchTotalBudget(unittest.TestCase):
     """每场预算 = 整场所有钱包合计(不是每钱包)。预算 = 余额 × per_match_percent%。"""
 

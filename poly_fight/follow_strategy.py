@@ -214,7 +214,7 @@ def evaluate_follow_candidate(
     bucket_win_rate: float = 0.0,                    # 被跟桶 θ̂(近期加权点估);×THETA_FOLLOW_DISCOUNT 作 edge 门
     bucket_edge_lb: float | None = None,             # 保留入参(已不参与算注),不使用
     entry_price: float = 0.0,                        # 跟单时实时价 p
-    bankroll_usdc: float = 0.0,                      # 余额基准(动态权益);缺则回退 balance/available
+    bankroll_usdc: float = 0.0,                      # 旧入参:回退用;注码实际按 available_balance_usdc(现金)算
     wallet_condition_funded_stake_usdc: float = 0.0, # 保留入参(每钱包每场口径已弃用,改用整场总额),不使用
     market_type: str | None = None,                  # 市场类型;main_match=主盘,其余=子盘 → 选各自预算cap
 ) -> dict[str, Any]:
@@ -246,12 +246,11 @@ def evaluate_follow_candidate(
     if to_float(bucket_win_rate) * THETA_FOLLOW_DISCOUNT - p <= 0:
         return _block("no_live_edge", strategy=normalized)
 
-    # ── 余额基准 ──
-    bankroll = to_float(bankroll_usdc)
-    if bankroll <= 0:
-        bankroll = to_float(normalized["balance"].get("usable_balance_usdc"))
-    if bankroll <= 0:
-        bankroll = to_float(available_balance_usdc)
+    # ── 余额基准 = 可动用现金(买入即扣;单笔注码 + 每场预算都按现金算,不含未结算持仓)。
+    #    available_balance_usdc 已是"扣掉本 tick 已下新单后的现金"(runner 侧算好),故仓位越铺
+    #    开、现金越少、后续单笔自然递减。**现金 ≤ 0 即停手**——绝不回退到 strategy.balance 那个
+    #    静态预设(它不随现金变,回退会在现金耗尽后仍按预设超额下注)。bankroll_usdc 旧入参已弃用。──
+    bankroll = to_float(available_balance_usdc)
     if bankroll <= 0:
         return _block("no_bankroll", strategy=normalized)
 

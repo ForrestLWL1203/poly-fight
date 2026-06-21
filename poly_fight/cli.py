@@ -7437,6 +7437,52 @@ def command_serve(args: argparse.Namespace) -> int:
 
 
 
+def command_reconcile_balance(args: argparse.Namespace) -> dict[str, Any]:
+    """从 signals 真值重算"可动用现金",覆盖被污染的 account_balance。
+
+    现金账本本应 = 初始本金 − Σ买入注资 + Σ结算/卖出回笼。历史上保存策略会把运行余额
+    re-pin 回静态预设、抹掉未结算持仓的扣款,导致现金单向虚高。此命令用与运行时完全相同的
+    逐腿账本构造(account_buy/result_ledger_entries)从头重算并 set_account_balance 覆盖。
+
+    幂等:重复跑结果一致(--initial 不变时)。dry-run 默认只打印,加 --apply 才写库。
+    """
+    data_dir = resolve_dashboard_root(args)
+    follow_dir = resolve_follow_dir(args, data_dir)
+    store = FollowStore(follow_dir / "follow.db")
+    snapshot = store.load_dashboard_snapshot()
+    open_signals = snapshot.get("open_signals") or []
+    results = snapshot.get("results") or []
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    buys = account_buy_ledger_entries([*open_signals, *results], created_at=now_ts)
+    payouts = account_result_ledger_entries(results, created_at=now_ts)
+    buy_total = round(sum(to_float(e["amount_usdc"]) for e in buys), 8)        # 负
+    payout_total = round(sum(to_float(e["amount_usdc"]) for e in payouts), 8)  # 正
+    open_exposure = round(funded_open_exposure(open_signals), 8)
+    initial = to_float(args.initial)
+    cash = round(initial + buy_total + payout_total, 8)
+
+    current = store.load_account_balance()
+    out = {
+        "status": "reconcile_balance",
+        "initial_usdc": round(initial, 2),
+        "funded_total_usdc": round(-buy_total, 2),     # 历史累计注资(正数显示)
+        "payout_total_usdc": round(payout_total, 2),   # 历史累计回笼
+        "open_exposure_usdc": round(open_exposure, 2), # 仍压在未结算持仓的现金
+        "recomputed_cash_usdc": round(cash, 2),
+        "current_balance_usdc": (round(to_float(current.get("balance_usdc")), 2)
+                                 if current.get("configured") else None),
+        "applied": False,
+    }
+    if cash < 0:
+        out["warning"] = "recomputed cash < 0 — 检查 --initial 是否正确"
+    if getattr(args, "apply", False):
+        store.set_account_balance(cash, ts=now_ts, source="reconcile")
+        out["applied"] = True
+    print(json.dumps(out, ensure_ascii=False, indent=2), flush=True)
+    return out
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Polymarket esports smart-wallet analysis")
     parser.add_argument("--data-dir", default=None)
@@ -7654,6 +7700,14 @@ def build_parser() -> argparse.ArgumentParser:
     logos.add_argument("--max-events", type=int, default=0)
     logos.add_argument("--observe-window-hours", type=float, default=24)
     logos.set_defaults(func=command_refresh_team_logos)
+
+    reconcile = subparsers.add_parser(
+        "reconcile-balance",
+        help="recompute usable cash from signals ground truth and overwrite account_balance",
+    )
+    reconcile.add_argument("--initial", type=float, required=True, help="initial paper bankroll (e.g. 5000)")
+    reconcile.add_argument("--apply", action="store_true", help="write the recomputed cash (default: dry-run print only)")
+    reconcile.set_defaults(func=command_reconcile_balance)
 
     follow = subparsers.add_parser("follow", help="run one paper follow tick")
     add_follow_arguments(follow)

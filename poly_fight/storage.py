@@ -1090,7 +1090,13 @@ class FollowStore:
                     _dumps(normalized),
                 ),
             )
-            if balance > 0:
+            # 运行余额是"买入即扣"的现金账本(account_balance_ledger 驱动),保存策略**不能**
+            # re-pin 它:否则改任何参数都会把现金重置回静态预设、抹掉当时未结算持仓的扣款,
+            # 之后这些持仓结算又贷记回来 → 现金单向虚高、注码被吹大(实测 5000 起跑变 6000 权益)。
+            # 仅在**首次尚未配置**时,用策略里的 balance 作为初始本金 seed 一次;之后改余额走
+            # 专门入口 set_account_balance(source=manual)。balance<=0 不再删除已有余额。
+            existing = self.load_account_balance(conn)
+            if balance > 0 and not existing.get("configured"):
                 balance_row = {
                     "configured": True,
                     "balance_usdc": balance,
@@ -1104,8 +1110,6 @@ class FollowStore:
                     """,
                     (balance, "strategy", updated_at, _dumps(balance_row)),
                 )
-            else:
-                conn.execute("DELETE FROM account_balance WHERE id = 1")
         return normalized
 
     def load_follow_strategy(self, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
