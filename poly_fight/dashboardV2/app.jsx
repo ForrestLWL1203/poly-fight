@@ -1022,7 +1022,10 @@ const clampNum = (v) => String(v).replace(/[^\d.]/g, "");
 
 function strategyDigest(s) {
   const n = (v) => Number(v) || 0;
-  const sizing = `单笔 余额${s.perSignalPct || 0}%（每钱包每场≤余额${s.perMatchPct || 0}%）`;
+  const subTxt = (Number(s.perMatchSubPct) || 0) !== (Number(s.perMatchPct) || 0)
+    ? `主盘${s.perMatchPct || 0}%/子盘${s.perMatchSubPct || 0}%` : `${s.perMatchPct || 0}%`;
+  const capTxt = (Number(s.maxOrdersPerMatch) || 0) > 0 ? `，每场≤${s.maxOrdersPerMatch}笔` : "";
+  const sizing = `单笔 余额${s.perSignalPct || 0}%（每钱包每场≤余额${subTxt}${capTxt}）`;
   const filter = `门槛 ${usdInt(n(s.minSignal))}`;
   const maxEntry = s.maxEntryOn ? `现价 ≤ ${s.maxEntry}` : null;
   return { sizing, chips: [filter, maxEntry].filter(Boolean) };
@@ -1103,7 +1106,8 @@ function strategyNodes(s) {
     { k: "信号门槛", v: s.minSignalOn ? `忽略 < ${usdInt(n(s.minSignal))}` : "不限" },
     { k: "现价上限", v: s.maxEntryOn ? `现价 ≤ ${s.maxEntry}` : "不限" },
     { k: "单笔金额", v: dg.sizing, key: true },
-    { k: "单场预算", v: `每钱包每场 ≤ 余额 ${s.perMatchPct || 0}%` },
+    { k: "单场预算", v: `主盘 ≤ 余额 ${s.perMatchPct || 0}% · 子盘 ≤ ${s.perMatchSubPct || 0}%` },
+    { k: "每场笔数", v: (Number(s.maxOrdersPerMatch) || 0) > 0 ? `≤ ${s.maxOrdersPerMatch} 笔` : "不限" },
     { k: "动态刷新", v: s.realtimeRefresh ? "开启" : "关闭" },
   ];
 }
@@ -1132,15 +1136,19 @@ function StrategyEditor({ s, up, wallet, locked }) {
           </div>
         </div>
         <div className="cfg-head"><h3>单笔跟单金额</h3><Badge tone="up" outline>必填</Badge></div>
-        <p className="cfg-sub">注码 = 余额 × 单笔基数%（动态随余额，不抄目标仓位大小）· 每钱包每场累计 ≤ 单场预算（加仓只填到预算，不叠加）· 金额向下取整规避下单异常</p>
+        <p className="cfg-sub">注码 = 余额 × 单笔基数%（动态随余额，不抄目标仓位大小）· 每钱包每场累计 ≤ 单场预算（加仓只填到预算，不叠加）· 主盘/子盘预算解耦 · 金额向下取整规避下单异常</p>
         <div className="opt-card is-active">
           <div className="opt-body" onClick={(e) => e.stopPropagation()}>
             <div className="ctrl-row">
               <NumField value={s.perSignalPct} onChange={up("perSignalPct")} unit="%" lead="单笔基数（余额）" width={60} />
-              <NumField value={s.perMatchPct} onChange={up("perMatchPct")} unit="%" lead="单场预算（余额）" width={60} />
+              <NumField value={s.perMatchPct} onChange={up("perMatchPct")} unit="%" lead="主盘单场预算（余额）" width={60} />
+              <NumField value={s.perMatchSubPct} onChange={up("perMatchSubPct")} unit="%" lead="子盘单场预算（余额）" width={60} />
+            </div>
+            <div className="ctrl-row">
+              <NumField value={s.maxOrdersPerMatch} onChange={up("maxOrdersPerMatch")} unit="笔" lead="每场最大笔数（0=无限）" width={60} />
               <NumField value={s.minStake} onChange={up("minStake")} unit="USDC" lead="单笔下限" width={72} />
             </div>
-            <p className="cfg-sub">单笔基数 = 每笔下注占余额%；单场预算 = 每钱包每场累计上限占余额%（≥ 单笔基数）；单笔下限 = dust 地板，仅防 &lt;$1 废单。</p>
+            <p className="cfg-sub">单笔基数 = 每笔下注占余额%；主盘单场预算 = 主盘（系列胜者）每钱包每场累计上限%；子盘单场预算 = map/game winner 每个单局独立上限%（可调低压制连押系列堆叠，不汇总）；每场最大笔数 = 单钱包同一市场最多跟几笔（主子同限，0=无限）；单笔下限 = dust 地板，仅防 &lt;$1 废单。</p>
           </div>
         </div>
       </div>

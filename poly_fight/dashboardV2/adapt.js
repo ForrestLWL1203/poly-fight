@@ -395,6 +395,8 @@
     const str = (v, d) => (v === 0 || v ? String(v) : d);
     const perSignal = sizing.per_signal_percent != null ? sizing.per_signal_percent : sizing.per_signal_cap_percent;
     const perMatch = sizing.per_match_percent != null ? sizing.per_match_percent : sizing.per_match_cap_percent;
+    // 子盘(map/game winner)每场预算:缺失 → 回退主盘值(行为不变)。
+    const perMatchSub = sizing.per_match_percent_sub != null ? sizing.per_match_percent_sub : perMatch;
     // 现价上限:字段缺失(老策略)→ 默认开 0.68(评分价区);显式 0 → 关。
     const maxEntryRaw = pre.max_follow_entry_price;
     const maxEntryVal = num(maxEntryRaw);
@@ -407,6 +409,8 @@
       maxEntry: str(maxEntryVal > 0 ? maxEntryVal : 0.68, "0.68"),
       perSignalPct: str(num(perSignal) || 1, "1"),
       perMatchPct: str(num(perMatch) || 1, "1"),
+      perMatchSubPct: str(num(perMatchSub) || num(perMatch) || 1, "1"),
+      maxOrdersPerMatch: str(num(sizing.max_follow_orders_per_match) || 0, "0"),
       minStake: str(num(sizing.min_stake_usdc) || 1, "1"),
       realtimeRefresh: !!s.realtime_refresh,
     };
@@ -420,6 +424,8 @@
       sizing: {
         per_signal_percent: num(k.perSignalPct),
         per_match_percent: num(k.perMatchPct),
+        per_match_percent_sub: num(k.perMatchSubPct) || num(k.perMatchPct),  // 空 → 回退主盘(防存成0=非法)
+        max_follow_orders_per_match: num(k.maxOrdersPerMatch) || 0,
         min_stake_usdc: num(k.minStake),
       },
       prefilters: {

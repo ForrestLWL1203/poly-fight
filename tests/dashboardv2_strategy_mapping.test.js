@@ -48,6 +48,17 @@ eq("s0.backend_valid", backendErrors(s0), []);
 const rt0 = A.strategyToKit(s0, 2000);
 ["usableMode", "minSignalOn", "minSignal", "maxEntryOn", "maxEntry", "perSignalPct", "perMatchPct", "minStake"].forEach((f) => eq("s0.rt." + f, rt0[f], k0[f]));
 
+// 主盘/子盘预算解耦 + 每场最大笔数(2026-06-21)
+eq("s0.sub_falls_back_to_main", s0.sizing.per_match_percent_sub, 2); // kit 无子盘字段 → 回退主盘(非 0)
+eq("s0.max_orders_default", s0.sizing.max_follow_orders_per_match, 0);
+const kSub = { usableMode: "cap", usableCap: "2000", minSignalOn: false, minSignal: "10", maxEntryOn: false, maxEntry: "0.68", perSignalPct: "1", perMatchPct: "2", perMatchSubPct: "0.5", maxOrdersPerMatch: "3", minStake: "1" };
+const sSub = A.strategyFromKit(kSub, 2000);
+eq("sub.per_match_sub", sSub.sizing.per_match_percent_sub, 0.5);
+eq("sub.max_orders", sSub.sizing.max_follow_orders_per_match, 3);
+const rtSub = A.strategyToKit(sSub, 2000);
+eq("sub.rt.perMatchSubPct", rtSub.perMatchSubPct, "0.5");
+eq("sub.rt.maxOrdersPerMatch", rtSub.maxOrdersPerMatch, "3");
+
 // 1) "all balance" + signal threshold off + entry ceiling off
 const k1 = { usableMode: "all", usableCap: "", minSignalOn: false, minSignal: "10", maxEntryOn: false, maxEntry: "0.68", perSignalPct: "1", perMatchPct: "1", minStake: "1", realtimeRefresh: true };
 const s1 = A.strategyFromKit(k1, 1200);

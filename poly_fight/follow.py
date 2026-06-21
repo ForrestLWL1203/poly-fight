@@ -780,6 +780,7 @@ def process_follow_trades(
                 ),
                 entry_price=to_float(current_price),
                 bankroll_usdc=to_float(bankroll_usdc) if bankroll_usdc != float("inf") else 0.0,
+                market_type=market_type,  # 主盘/子盘 → 选各自的每场预算 cap
             )
             if strategy_decision.get("block_reason") == "small_target_wallet_order":
                 stats["small_wallet_trade_blocked_count"] += 1
