@@ -3833,21 +3833,21 @@ class CoreTest(unittest.TestCase):
             {**base, "recency_weighted_win_rate": 0.90, "median_entry_price": 0.45},
             now_ts=now, min_sample=6, n_eff_anchor=10)
         self.assertEqual(strong["grade"], "A")
-        # 弱胜率:θ̂=0.72(过基础0.68,未过薄门0.80)、edge_lb 仍≥0.08 → 被薄门砍。
+        # 弱胜率:θ̂=0.78(过基础0.75,未过薄门0.80)、edge_lb 仍≥0.08 → 被薄门砍。
         weak_wr = classify_wallet_bucket(
-            {**base, "recency_weighted_win_rate": 0.72, "median_entry_price": 0.30},
+            {**base, "recency_weighted_win_rate": 0.78, "median_entry_price": 0.30},
             now_ts=now, min_sample=6, n_eff_anchor=10)
         self.assertNotEqual(weak_wr["grade"], "A")
         self.assertIn("thin_underqualified", weak_wr["reasons"])
         # 同样弱胜率但不给锚点(旧行为)→ 薄门不启用 → 仍 A(向后兼容)。
         no_anchor = classify_wallet_bucket(
-            {**base, "recency_weighted_win_rate": 0.72, "median_entry_price": 0.30},
+            {**base, "recency_weighted_win_rate": 0.78, "median_entry_price": 0.30},
             now_ts=now, min_sample=6)
         self.assertEqual(no_anchor["grade"], "A")
         # full n_eff ≥ 锚点(够厚,非薄样本)→ 不受薄门约束,弱胜率走基础门即可 A。
         thick = classify_wallet_bucket(
             {**base, "effective_sample_size_full": 12,
-             "recency_weighted_win_rate": 0.72, "median_entry_price": 0.30},
+             "recency_weighted_win_rate": 0.78, "median_entry_price": 0.30},
             now_ts=now, min_sample=6, n_eff_anchor=10)
         self.assertEqual(thick["grade"], "A")
 
@@ -4039,7 +4039,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual({r["condition_id"] for r in kept}, {"v-fresh", "c-fresh"})
 
     def test_win_rate_floor_excludes_low_winrate_high_edge_bucket(self):
-        # v20:桶内 θ̂ < 0.68 即使买得便宜、edge 充足,也判 C —— 不进榜、不跟单。
+        # v23:桶内 θ̂ < 0.75 即使买得便宜、edge 充足,也判 C —— 不进榜、不跟单。
         now = 1_000_000
 
         def summary(n, win_rate, avg_price):
@@ -4067,8 +4067,8 @@ class CoreTest(unittest.TestCase):
             "win_rate_below_floor",
             (low.get("per_game_type_grades") or {}).get("cs2:main_match", {}).get("reasons") or [],
         )
-        # θ̂≈0.75 同样买便宜 → 过胜率门 → 合格
-        high = classify_wallet(summary(20, 0.75, 0.25), now_ts=now)
+        # θ̂≈0.85 同样买便宜 → 过胜率门(0.75) → 合格
+        high = classify_wallet(summary(20, 0.85, 0.25), now_ts=now)
         self.assertIn("cs2:main_match", high.get("eligible_buckets") or [])
 
     def test_valorant_thin_bucket_eligible_under_adaptive_neff(self):
@@ -5652,21 +5652,18 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = FollowStore(Path(tmp) / "follow.db")
             strategy = default_follow_strategy(balance_usdc=250)
-            strategy["stake_sizing"]["mode"] = "fixed"
-            strategy["stake_sizing"]["fixed_usdc"] = 50
+            strategy["sizing"]["per_signal_percent"] = 1.0
+            strategy["sizing"]["per_match_percent"] = 2.0
             strategy["prefilters"]["min_target_wallet_order_cash_usdc"] = 12
-            strategy["condition_limits"]["order_count_mode"] = "condition"
-            strategy["condition_limits"]["max_orders"] = 3
 
             saved = store.save_follow_strategy(strategy, ts=1234)
             loaded = store.load_follow_strategy()
 
             self.assertTrue(saved["configured"])
             self.assertEqual(saved["updated_at"], 1234)
-            self.assertEqual(loaded["stake_sizing"]["mode"], "fixed")
-            self.assertEqual(loaded["stake_sizing"]["fixed_usdc"], 50)
+            self.assertEqual(loaded["sizing"]["per_signal_percent"], 1.0)
+            self.assertEqual(loaded["sizing"]["per_match_percent"], 2.0)
             self.assertEqual(loaded["prefilters"]["min_target_wallet_order_cash_usdc"], 12)
-            self.assertEqual(loaded["condition_limits"]["max_orders"], 3)
             self.assertEqual(store.load_account_balance()["balance_usdc"], 250)
 
             readonly = store.load_follow_strategy_readonly()
@@ -5676,73 +5673,49 @@ class CoreTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = FollowStore(Path(tmp) / "follow.db")
             strategy = default_follow_strategy(balance_usdc=100)
-            strategy["stake_sizing"]["mode"] = "fixed"
-            strategy["stake_sizing"]["fixed_usdc"] = 0
+            strategy["sizing"]["per_signal_percent"] = 0   # 非法:单笔% 必须 > 0
 
-            with self.assertRaisesRegex(ValueError, "fixed_usdc"):
+            with self.assertRaisesRegex(ValueError, "per_signal_percent"):
                 store.save_follow_strategy(strategy, ts=1234)
 
             self.assertFalse(store.load_follow_strategy()["configured"])
 
-    def test_kelly_tiered_unit_sizing_engine(self):
-        # 分段线性单位制:单位 = round(余额 × 单笔上限%);N = 目标下单额/单位。
-        # N≤50 → 1 单位;N>50 → (1+(N-50)/10)×单位。每钱包每场 ≤ 50%×单场cap。edge 仅当门。
-        s = default_follow_strategy(balance_usdc=3500)
-        s["stake_sizing"]["per_signal_cap_percent"] = 1.0   # 单位 = round(3500×1%) = 35
-        s["stake_sizing"]["per_match_cap_percent"] = 10.0   # 单场cap=$350 → 每钱包每场 ≤ $175
-        s["stake_sizing"]["min_stake_usdc"] = 10.0
-        self.assertEqual(s["stake_sizing"]["mode"], "kelly")
+    def test_sizing_flat_per_signal_with_match_budget(self):
+        # 单一模型:单笔 = 余额×per_signal%;每钱包每场预算 = 余额×per_match%(加仓只填到预算,不叠加)。
+        s = default_follow_strategy(balance_usdc=5000)
+        s["sizing"]["per_signal_percent"] = 1.0   # 单笔 = 5000×1% = 50
+        s["sizing"]["per_match_percent"] = 2.0    # 每钱包每场预算 = 5000×2% = 100
+        s["sizing"]["min_stake_usdc"] = 1.0
 
-        def ev(order_cash, theta=0.74, p=0.66, wallet_funded=0.0, bankroll=3500):
+        def ev(order_cash=200, theta=0.74, p=0.60, wallet_funded=0.0, bankroll=5000):
             return evaluate_follow_candidate(
                 strategy=s, target_wallet_order_cash_usdc=order_cash, available_balance_usdc=bankroll,
-                condition_funded_stake_usdc=0.0, condition_funded_order_count=0,
-                wallet_condition_funded_order_count=0, wallet_condition_funded_stake_usdc=wallet_funded,
+                wallet_condition_funded_stake_usdc=wallet_funded,
                 bucket_win_rate=theta, entry_price=p, bankroll_usdc=bankroll,
             )
 
-        # ≤50 倍单位 → 下 1 单位($35);包括小单(过 prefilter 即 ≥1 单位)
-        self.assertEqual(ev(100)["funded_stake"], 35)         # N=2.9 → 35
-        self.assertEqual(ev(100)["stake_mode"], "tiered_unit")
-        self.assertEqual(ev(1750)["funded_stake"], 35)        # N=50 → 35(连续点)
-        # >50 倍 → 每超 10 倍加 1 单位:70 倍 → (1+(70-50)/10)×35 = 3×35 = 105
-        self.assertEqual(ev(2450)["funded_stake"], 105)       # N=70 → 105
-        self.assertEqual(ev(2100)["funded_stake"], 70)        # N=60 → (1+1)×35 = 70
-        # 每钱包每场封顶 = 50% × 单场cap(350)= 175:巨注被夹到 175
-        self.assertEqual(ev(7000)["funded_stake"], 175)       # N=200 → (1+15)×35=560 → cap 175
-        # 该钱包本场已投 $170 → 剩 5 < min → match_cap_reached
-        self.assertEqual(ev(2450, wallet_funded=170)["block_reason"], "match_cap_reached")
-        # edge 门:现价 ≥ θ̂×0.95 → 不跟
-        self.assertEqual(ev(2450, theta=0.80, p=0.77)["block_reason"], "no_live_edge")
-        self.assertTrue(ev(2450, theta=0.80, p=0.50)["would_follow"])
-
-    def test_kelly_tiered_unit_dynamic_bankroll(self):
-        # 单位 + 每钱包每场cap 都随动态权益走(非静态 usable_balance)。
-        s = default_follow_strategy(balance_usdc=5000)
-        s["stake_sizing"]["per_signal_cap_percent"] = 1.0
-        s["stake_sizing"]["per_match_cap_percent"] = 10.0
-        s["stake_sizing"]["min_stake_usdc"] = 10.0
-
-        def ev(order_cash, bankroll):
-            return evaluate_follow_candidate(
-                strategy=s, target_wallet_order_cash_usdc=order_cash, available_balance_usdc=bankroll,
-                condition_funded_stake_usdc=0.0, condition_funded_order_count=0,
-                wallet_condition_funded_order_count=0, wallet_condition_funded_stake_usdc=0.0,
-                bucket_win_rate=0.70, entry_price=0.55, bankroll_usdc=bankroll,
-            )
-
-        # 巨注撞每钱包每场cap = 50% × (权益×10%),随权益浮动:
-        self.assertEqual(ev(99999, 5000)["funded_stake"], 250)   # 50% × 500
-        self.assertEqual(ev(99999, 6000)["funded_stake"], 300)   # 50% × 600
-        self.assertEqual(ev(99999, 4000)["funded_stake"], 200)   # 50% × 400
-        # 单位随权益:余额 4000 → 单位 round(4000×1%)=40;N=2.5 → 1 单位 40
-        self.assertEqual(ev(100, 4000)["funded_stake"], 40)
+        # flat:不论目标下多大,单笔都是 50(无 ramp、不抄大小)
+        self.assertEqual(ev(200)["funded_stake"], 50)
+        self.assertEqual(ev(99999)["funded_stake"], 50)
+        self.assertEqual(ev(200)["stake_mode"], "unit_pct")
+        # 加仓只填到预算 100:已投 60 → 剩 40 → 这笔 40(填满不叠加)
+        self.assertEqual(ev(200, wallet_funded=60)["funded_stake"], 40)
+        # 已投到顶(100) → 预算用完 → match_budget_reached
+        self.assertEqual(ev(200, wallet_funded=100)["block_reason"], "match_budget_reached")
+        # 单笔/预算都随动态权益:bankroll 4000 → 单笔 40
+        self.assertEqual(ev(200, bankroll=4000)["funded_stake"], 40)
+        # 门:目标单太小 / 入场价超上限(默认 0.68) / edge 不足
+        self.assertEqual(ev(5)["block_reason"], "small_target_wallet_order")
+        self.assertEqual(ev(200, p=0.80)["block_reason"], "entry_above_ceiling")
+        # p≤0.68 过 ceiling,但 θ̂×0.95 ≤ p → edge 门拦
+        self.assertEqual(ev(200, theta=0.65, p=0.64)["block_reason"], "no_live_edge")
+        self.assertTrue(ev(200, theta=0.90, p=0.50)["would_follow"])
 
     def test_follow_strategy_max_entry_price_default_and_clamp(self):
-        # 默认 = 全系统唯一分水岭 0.85;缺字段补默认;clamp 到 [0,1];0 = 不限(均 normalize 处理)。
-        self.assertEqual(default_follow_strategy()["prefilters"]["max_follow_entry_price"], 0.85)
+        # 默认 0.68(评分价区);缺字段补默认;clamp 到 [0,1];0 = 不限(均 normalize 处理)。
+        self.assertEqual(default_follow_strategy()["prefilters"]["max_follow_entry_price"], 0.68)
         miss = normalize_follow_strategy({"prefilters": {"min_target_wallet_order_cash_usdc": 10}})
-        self.assertEqual(miss["prefilters"]["max_follow_entry_price"], 0.85)
+        self.assertEqual(miss["prefilters"]["max_follow_entry_price"], 0.68)
         self.assertEqual(
             normalize_follow_strategy({"prefilters": {"max_follow_entry_price": 1.5}})["prefilters"]["max_follow_entry_price"],
             1.0,
@@ -5760,9 +5733,9 @@ class CoreTest(unittest.TestCase):
             store = FollowStore(Path(tmp) / "follow.db")
             store.set_account_balance(100, ts=100, source="manual")
             strategy = default_follow_strategy()
-            strategy["stake_sizing"]["mode"] = "fixed"
-            strategy["stake_sizing"]["fixed_usdc"] = 10
-            strategy["balance"]["usable_balance_usdc"] = 0
+            strategy["configured"] = True
+            strategy["sizing"]["per_signal_percent"] = 1.0
+            strategy["balance"]["usable_balance_usdc"] = 0  # 余额来自 account_balance,strategy 字段可 0
 
             saved = store.save_follow_strategy(strategy, ts=200)
 
@@ -5771,10 +5744,12 @@ class CoreTest(unittest.TestCase):
             self.assertFalse(store.load_account_balance()["configured"])
 
     def _library_strategy(self, *, ratio=10.0):
+        # ratio 仅作区分标记,映射到新模型的 per_signal_percent(per_match 同值过校验)。
         strategy = default_follow_strategy()
         strategy["configured"] = True
-        strategy["stake_sizing"]["mode"] = "proportional"
-        strategy["stake_sizing"]["ratio_percent"] = ratio
+        strategy["balance"]["usable_balance_usdc"] = 5000
+        strategy["sizing"]["per_signal_percent"] = ratio
+        strategy["sizing"]["per_match_percent"] = ratio
         strategy["prefilters"]["min_target_wallet_order_cash_usdc"] = 10
         return strategy
 
@@ -5791,7 +5766,7 @@ class CoreTest(unittest.TestCase):
             # the runner-facing active row mirrors the first (auto-active) strategy
             active = store.load_follow_strategy()
             self.assertTrue(active["configured"])
-            self.assertEqual(active["stake_sizing"]["ratio_percent"], 12)
+            self.assertEqual(active["sizing"]["per_signal_percent"], 12)
 
     def test_follow_strategy_library_second_create_inactive(self):
         with TemporaryDirectory() as tmp:
@@ -5800,7 +5775,7 @@ class CoreTest(unittest.TestCase):
             b = store.create_follow_strategy("B", self._library_strategy(ratio=20), ts=200)
             self.assertFalse(b["active"])
             # active row still the first one
-            self.assertEqual(store.load_follow_strategy()["stake_sizing"]["ratio_percent"], 10)
+            self.assertEqual(store.load_follow_strategy()["sizing"]["per_signal_percent"], 10)
 
     def test_follow_strategy_library_rejects_duplicate_name(self):
         with TemporaryDirectory() as tmp:
@@ -5825,12 +5800,12 @@ class CoreTest(unittest.TestCase):
 
             listing = store.activate_follow_strategy(b["slug"], ts=300)
             self.assertEqual(listing["active_slug"], b["slug"])
-            self.assertEqual(store.load_follow_strategy()["stake_sizing"]["ratio_percent"], 25)
+            self.assertEqual(store.load_follow_strategy()["sizing"]["per_signal_percent"], 25)
             actives = [e["active"] for e in listing["strategies"]]
             self.assertEqual(actives.count(True), 1)
 
             store.activate_follow_strategy(a["slug"], ts=400)
-            self.assertEqual(store.load_follow_strategy()["stake_sizing"]["ratio_percent"], 10)
+            self.assertEqual(store.load_follow_strategy()["sizing"]["per_signal_percent"], 10)
 
     def test_follow_strategy_library_update_active_mirrors_runner_row(self):
         with TemporaryDirectory() as tmp:
@@ -5840,11 +5815,11 @@ class CoreTest(unittest.TestCase):
 
             # updating the non-active strategy must not touch the runner row
             store.update_follow_strategy_entry(b["slug"], "B2", self._library_strategy(ratio=33), ts=300)
-            self.assertEqual(store.load_follow_strategy()["stake_sizing"]["ratio_percent"], 10)
+            self.assertEqual(store.load_follow_strategy()["sizing"]["per_signal_percent"], 10)
 
             # updating the active strategy mirrors into the runner row
             store.update_follow_strategy_entry(a["slug"], "A2", self._library_strategy(ratio=44), ts=400)
-            self.assertEqual(store.load_follow_strategy()["stake_sizing"]["ratio_percent"], 44)
+            self.assertEqual(store.load_follow_strategy()["sizing"]["per_signal_percent"], 44)
             names = sorted(e["name"] for e in store.list_follow_strategies()["strategies"])
             self.assertEqual(names, ["A2", "B2"])
 
@@ -5867,7 +5842,7 @@ class CoreTest(unittest.TestCase):
             listing = store.delete_follow_strategy_entry(a["slug"], ts=300)
             # exactly one remains → it is auto-promoted to active and mirrored
             self.assertEqual(listing["active_slug"], b["slug"])
-            self.assertEqual(store.load_follow_strategy()["stake_sizing"]["ratio_percent"], 20)
+            self.assertEqual(store.load_follow_strategy()["sizing"]["per_signal_percent"], 20)
 
     def test_follow_strategy_library_delete_active_leaves_none_when_many(self):
         with TemporaryDirectory() as tmp:
@@ -5890,7 +5865,7 @@ class CoreTest(unittest.TestCase):
 
             listing = store.delete_follow_strategy_entry(b["slug"], ts=300)
             self.assertEqual(listing["active_slug"], a["slug"])
-            self.assertEqual(store.load_follow_strategy()["stake_sizing"]["ratio_percent"], 10)
+            self.assertEqual(store.load_follow_strategy()["sizing"]["per_signal_percent"], 10)
 
     def test_follow_store_clears_legacy_quarantine_reasons(self):
         with TemporaryDirectory() as tmp:
@@ -6163,170 +6138,33 @@ class CoreTest(unittest.TestCase):
         )
         self.assertEqual((stake, tier), (50, "capped"))
 
-    def test_follow_strategy_evaluator_sizes_and_floors_stakes(self):
-        proportional = default_follow_strategy(balance_usdc=2000)
-        proportional["stake_sizing"]["mode"] = "proportional"
-        proportional["stake_sizing"]["ratio_percent"] = 10
-        decision = evaluate_follow_candidate(
-            strategy=proportional,
-            target_wallet_order_cash_usdc=100,
-            available_balance_usdc=2000,
-            condition_funded_stake_usdc=0,
-            condition_funded_order_count=0,
-            wallet_condition_funded_order_count=0,
-        )
-        self.assertTrue(decision["would_follow"])
-        self.assertEqual(decision["funded_stake"], 10)
-        self.assertEqual(decision["stake_mode"], "proportional")
-
-        capped = default_follow_strategy(balance_usdc=2000)
-        capped["stake_sizing"]["mode"] = "proportional"
-        capped["stake_sizing"]["ratio_percent"] = 10
-        capped["stake_sizing"]["per_order_cap_enabled"] = True
-        capped["stake_sizing"]["per_order_cap_usdc"] = 100
-        decision = evaluate_follow_candidate(
-            strategy=capped,
-            target_wallet_order_cash_usdc=10000,
-            available_balance_usdc=2000,
-            condition_funded_stake_usdc=0,
-            condition_funded_order_count=0,
-            wallet_condition_funded_order_count=0,
-        )
-        self.assertEqual(decision["funded_stake"], 100)
-        self.assertEqual(decision["stake_mode"], "proportional_cap")
-
-        fixed = default_follow_strategy(balance_usdc=2000)
-        fixed["stake_sizing"]["mode"] = "fixed"
-        fixed["stake_sizing"]["fixed_usdc"] = 50
-        decision = evaluate_follow_candidate(
-            strategy=fixed,
-            target_wallet_order_cash_usdc=100,
-            available_balance_usdc=2000,
-            condition_funded_stake_usdc=0,
-            condition_funded_order_count=0,
-            wallet_condition_funded_order_count=0,
-        )
-        self.assertEqual(decision["funded_stake"], 50)
-        self.assertEqual(decision["stake_mode"], "fixed")
-
-        balance_percent = default_follow_strategy(balance_usdc=1890)
-        balance_percent["stake_sizing"]["mode"] = "balance_percent"
-        balance_percent["stake_sizing"]["balance_percent"] = 1
-        decision = evaluate_follow_candidate(
-            strategy=balance_percent,
-            target_wallet_order_cash_usdc=100,
-            available_balance_usdc=1890,
-            condition_funded_stake_usdc=0,
-            condition_funded_order_count=0,
-            wallet_condition_funded_order_count=0,
-        )
-        self.assertEqual(decision["funded_stake"], 18)
-        self.assertEqual(decision["stake_mode"], "balance_percent")
-
-    def test_follow_strategy_evaluator_blocks_without_clipping(self):
-        strategy = default_follow_strategy(balance_usdc=100)
-        strategy["stake_sizing"]["mode"] = "fixed"
-        strategy["stake_sizing"]["fixed_usdc"] = 25
-        strategy["prefilters"]["min_target_wallet_order_cash_usdc"] = 10
-        strategy["condition_limits"]["order_count_mode"] = "condition"
-        strategy["condition_limits"]["max_orders"] = 2
-        strategy["condition_limits"]["stake_cap_mode"] = "fixed"
-        strategy["condition_limits"]["stake_cap_usdc"] = 60
-
-        decision = evaluate_follow_candidate(
-            strategy=strategy,
-            target_wallet_order_cash_usdc=9,
-            available_balance_usdc=100,
-            condition_funded_stake_usdc=0,
-            condition_funded_order_count=0,
-            wallet_condition_funded_order_count=0,
-        )
-        self.assertFalse(decision["would_follow"])
-        self.assertEqual(decision["block_reason"], "small_target_wallet_order")
-
-        decision = evaluate_follow_candidate(
-            strategy=strategy,
-            target_wallet_order_cash_usdc=50,
-            available_balance_usdc=100,
-            condition_funded_stake_usdc=25,
-            condition_funded_order_count=2,
-            wallet_condition_funded_order_count=1,
-        )
-        self.assertFalse(decision["would_follow"])
-        self.assertEqual(decision["block_reason"], "condition_order_cap_reached")
-
-        strategy["condition_limits"]["order_count_mode"] = "none"
-        decision = evaluate_follow_candidate(
-            strategy=strategy,
-            target_wallet_order_cash_usdc=50,
-            available_balance_usdc=100,
-            condition_funded_stake_usdc=50,
-            condition_funded_order_count=1,
-            wallet_condition_funded_order_count=1,
-        )
-        self.assertFalse(decision["would_follow"])
-        self.assertEqual(decision["funded_stake"], 0)
-        self.assertEqual(decision["target_stake"], 25)
-        self.assertEqual(decision["block_reason"], "condition_stake_cap_reached")
-
-    def test_follow_strategy_evaluator_blocks_wallet_condition_order_cap(self):
-        strategy = default_follow_strategy(balance_usdc=100)
-        strategy["stake_sizing"]["mode"] = "fixed"
-        strategy["stake_sizing"]["fixed_usdc"] = 10
-        strategy["condition_limits"]["order_count_mode"] = "wallet"
-        strategy["condition_limits"]["max_orders"] = 2
-
-        blocked = evaluate_follow_candidate(
-            strategy=strategy,
-            target_wallet_order_cash_usdc=50,
-            available_balance_usdc=100,
-            condition_funded_stake_usdc=20,
-            condition_funded_order_count=8,
-            wallet_condition_funded_order_count=2,
-        )
-        self.assertFalse(blocked["would_follow"])
-        self.assertEqual(blocked["block_reason"], "wallet_condition_order_cap_reached")
-
-        accepted = evaluate_follow_candidate(
-            strategy=strategy,
-            target_wallet_order_cash_usdc=50,
-            available_balance_usdc=100,
-            condition_funded_stake_usdc=20,
-            condition_funded_order_count=8,
-            wallet_condition_funded_order_count=1,
-        )
-        self.assertTrue(accepted["would_follow"])
-        self.assertEqual(accepted["funded_stake"], 10)
-
     def test_follow_strategy_evaluator_caps_to_balance_below_target(self):
-        strategy = default_follow_strategy(balance_usdc=100)
-        strategy["stake_sizing"]["mode"] = "fixed"
-        strategy["stake_sizing"]["fixed_usdc"] = 50
-        # 余额 30 < target 50,但 ≥ $1 → cap 到余额下单,而不是弃单
+        # 单笔 = 余额×per_signal%;available 不足 target 但 ≥$1 → cap 到余额下单。
+        strategy = default_follow_strategy(balance_usdc=5000)
+        strategy["sizing"]["per_signal_percent"] = 1.0   # 单笔 = 50
+        strategy["sizing"]["per_match_percent"] = 5.0
+        # available 30 < target 50,但 ≥ $1 → cap 到余额下单,而不是弃单
         capped = evaluate_follow_candidate(
             strategy=strategy,
-            target_wallet_order_cash_usdc=50,
+            target_wallet_order_cash_usdc=200,
             available_balance_usdc=30,
-            condition_funded_stake_usdc=0,
-            condition_funded_order_count=0,
-            wallet_condition_funded_order_count=0,
+            bucket_win_rate=0.90, entry_price=0.50, bankroll_usdc=5000,
         )
         self.assertTrue(capped["would_follow"])
         self.assertEqual(capped["funded_stake"], 30)
         self.assertEqual(capped["stake_mode"], "balance_capped")
-        # 余额 < $1 → 真正 insufficient_balance
+        # available < $1 → 真正 insufficient_balance
         broke = evaluate_follow_candidate(
             strategy=strategy,
-            target_wallet_order_cash_usdc=50,
+            target_wallet_order_cash_usdc=200,
             available_balance_usdc=0.5,
-            condition_funded_stake_usdc=0,
-            condition_funded_order_count=0,
-            wallet_condition_funded_order_count=0,
+            bucket_win_rate=0.90, entry_price=0.50, bankroll_usdc=5000,
         )
         self.assertFalse(broke["would_follow"])
         self.assertEqual(broke["block_reason"], "insufficient_balance")
 
-    def test_follow_strategy_from_legacy_args_preserves_old_ratio_shape(self):
+    def test_follow_strategy_from_legacy_args_maps_to_single_model(self):
+        # 旧 ratio/固定额语义已删:legacy 入参只保留 min_target 门 + 余额,sizing 回落 v2 默认。
         strategy = strategy_from_legacy_args(
             stake_usdc=1,
             stake_ratio_percent=10,
@@ -6337,13 +6175,11 @@ class CoreTest(unittest.TestCase):
         )
         valid, errors = validate_follow_strategy(strategy)
         self.assertTrue(valid, errors)
-        self.assertEqual(strategy["stake_sizing"]["mode"], "proportional")
-        self.assertEqual(strategy["stake_sizing"]["ratio_percent"], 10)
-        self.assertTrue(strategy["stake_sizing"]["per_order_cap_enabled"])
-        self.assertEqual(strategy["stake_sizing"]["per_order_cap_usdc"], 100)
+        self.assertEqual(strategy["schema_version"], 2)
+        self.assertEqual(strategy["sizing"]["per_signal_percent"], 1.0)
         self.assertEqual(strategy["prefilters"]["min_target_wallet_order_cash_usdc"], 10)
-        self.assertEqual(strategy["condition_limits"]["stake_cap_mode"], "fixed")
-        self.assertEqual(strategy["condition_limits"]["stake_cap_usdc"], 75)
+        self.assertNotIn("stake_sizing", strategy)
+        self.assertNotIn("condition_limits", strategy)
 
     def test_process_follow_trades_skips_unfunded_buy_when_balance_is_too_low(self):
         now = 1000
@@ -6681,98 +6517,11 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(stats["small_add_blocked_count"], 0)
         self.assertEqual(stats["new_leg_count"], 2)
 
-    def test_process_follow_trades_strategy_condition_cap_uses_condition_id(self):
-        now = 1000
-        strategy = default_follow_strategy(balance_usdc=1000)
-        strategy["stake_sizing"]["mode"] = "fixed"
-        strategy["stake_sizing"]["fixed_usdc"] = 10
-        strategy["prefilters"]["min_target_wallet_order_cash_usdc"] = 0
-        strategy["condition_limits"]["order_count_mode"] = "condition"
-        strategy["condition_limits"]["max_orders"] = 1
-        existing = [
-            {
-                "signal_id": follow_signal_id("0xB", "m1", 0),
-                "wallet": "0xb",
-                "condition_id": "m1",
-                "outcome_index": 0,
-                "status": "open",
-                "legs": [{"funded_stake": 10, "would_follow": True}],
-            }
-        ]
-        market = {
-            "condition_id": "m1", "event_slug": "same-event", "outcomes": ["A", "B"], "outcome_prices": [0.5, 0.5],
-            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
-            "title": "Match", "market_type": "main_match",
-        }
-        trades = [{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 1, "side": "BUY", "price": 0.5, "size": 100, "timestamp": now}]
-
-        signals, stats = process_follow_trades(
-            existing,
-            wallet="0xA",
-            trades=trades,
-            markets_by_condition={"m1": market},
-            now_ts=now,
-            stake_usdc=1,
-            stake_ratio_percent=10,
-            max_follow_legs=10,
-            max_slippage=0.05,
-            bankroll_usdc=1000,
-            follow_strategy=strategy,
-        )
-
-        self.assertEqual(signals, existing)
-        self.assertEqual(stats["condition_order_cap_blocked_count"], 1)
-        self.assertEqual(stats["new_leg_count"], 0)
-
-    def test_process_follow_trades_strategy_condition_cap_does_not_share_event_slug(self):
-        now = 1000
-        strategy = default_follow_strategy(balance_usdc=1000)
-        strategy["stake_sizing"]["mode"] = "fixed"
-        strategy["stake_sizing"]["fixed_usdc"] = 10
-        strategy["prefilters"]["min_target_wallet_order_cash_usdc"] = 0
-        strategy["condition_limits"]["order_count_mode"] = "condition"
-        strategy["condition_limits"]["max_orders"] = 1
-        existing = [
-            {
-                "signal_id": follow_signal_id("0xB", "m1", 0),
-                "wallet": "0xb",
-                "condition_id": "m1",
-                "outcome_index": 0,
-                "status": "open",
-                "legs": [{"funded_stake": 10, "would_follow": True}],
-            }
-        ]
-        market_m2 = {
-            "condition_id": "m2", "event_slug": "same-event", "outcomes": ["A", "B"], "outcome_prices": [0.5, 0.5],
-            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
-            "title": "Match", "market_type": "main_match",
-        }
-        trades = [{"id": "b1", "proxyWallet": "0xA", "market": "m2", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 100, "timestamp": now}]
-
-        signals, stats = process_follow_trades(
-            existing,
-            wallet="0xA",
-            trades=trades,
-            markets_by_condition={"m2": market_m2},
-            now_ts=now,
-            stake_usdc=1,
-            stake_ratio_percent=10,
-            max_follow_legs=10,
-            max_slippage=0.05,
-            bankroll_usdc=1000,
-            follow_strategy=strategy,
-        )
-
-        self.assertEqual(stats["condition_order_cap_blocked_count"], 0)
-        self.assertEqual(stats["new_leg_count"], 1)
-        self.assertEqual(signals[-1]["condition_id"], "m2")
-        self.assertEqual(signals[-1]["legs"][0]["condition_funded_order_count_before"], 0)
-
     def test_process_follow_trades_strategy_floors_stake_to_integer(self):
         now = 1000
-        strategy = default_follow_strategy(balance_usdc=1000)
-        strategy["stake_sizing"]["mode"] = "proportional"
-        strategy["stake_sizing"]["ratio_percent"] = 10
+        strategy = default_follow_strategy(balance_usdc=990)
+        strategy["sizing"]["per_signal_percent"] = 1.0    # 990×1% = 9.9 → floor 9
+        strategy["sizing"]["per_match_percent"] = 5.0
         strategy["prefilters"]["min_target_wallet_order_cash_usdc"] = 0
         market = {
             "condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [0.5, 0.5],
@@ -6788,19 +6537,18 @@ class CoreTest(unittest.TestCase):
             markets_by_condition={"m1": market},
             now_ts=now,
             stake_usdc=1,
-            stake_ratio_percent=10,
             max_follow_legs=10,
             max_slippage=0.05,
-            bankroll_usdc=1000,
+            bankroll_usdc=990,
             follow_strategy=strategy,
+            bucket_theta={"main_match": 0.90},   # θ̂×0.95=0.855 > 现价 0.5 → 过 edge 门
         )
 
         leg = signals[0]["legs"][0]
         self.assertEqual(stats["new_leg_count"], 1)
-        self.assertEqual(leg["stake"], 4)
-        self.assertEqual(leg["funded_stake"], 4)
-        self.assertEqual(leg["target_wallet_order_cash_usdc"], 45)
-        self.assertEqual(leg["strategy_mode"], "proportional")
+        self.assertEqual(leg["stake"], 9)
+        self.assertEqual(leg["funded_stake"], 9)
+        self.assertEqual(leg["stake_mode"], "unit_pct")
 
     def test_process_follow_trades_caps_total_stake_per_signal(self):
         now = 1000
@@ -9262,12 +9010,9 @@ class CoreTest(unittest.TestCase):
 
                 valid = {
                     "configured": True,
-                    "stake_sizing": {"mode": "proportional", "ratio_percent": 12, "per_order_cap_enabled": False,
-                                     "per_order_cap_usdc": 0, "fixed_usdc": 0, "balance_percent": 0},
-                    "prefilters": {"min_target_wallet_order_cash_usdc": 10},
-                    "condition_limits": {"order_count_mode": "none", "max_orders": 0, "stake_cap_mode": "none",
-                                          "stake_cap_usdc": 0, "stake_cap_balance_percent": 0},
-                    "balance": {"required": False, "usable_balance_usdc": 0},
+                    "sizing": {"per_signal_percent": 12, "per_match_percent": 12, "min_stake_usdc": 1},
+                    "prefilters": {"min_target_wallet_order_cash_usdc": 10, "max_follow_entry_price": 0.68},
+                    "balance": {"required": False, "usable_balance_usdc": 5000},
                 }
 
                 status, payload, _ = call("GET", "/api/follow-strategies", cookie=cookie)
@@ -9282,7 +9027,7 @@ class CoreTest(unittest.TestCase):
                 # the runner-facing strategy endpoint reflects the active strategy
                 status, payload, _ = call("GET", "/api/follow-strategy", cookie=cookie)
                 self.assertTrue(payload["data"]["configured"])
-                self.assertEqual(payload["data"]["stake_sizing"]["ratio_percent"], 12)
+                self.assertEqual(payload["data"]["sizing"]["per_signal_percent"], 12)
 
                 # duplicate name → 409
                 status, payload, _ = call("POST", "/api/follow-strategies", {"name": "稳健", "strategy": valid}, cookie=cookie)
@@ -10390,8 +10135,7 @@ class CoreTest(unittest.TestCase):
                 return FakeProcess()
 
             strategy = default_follow_strategy(balance_usdc=250)
-            strategy["stake_sizing"]["mode"] = "fixed"
-            strategy["stake_sizing"]["fixed_usdc"] = 25
+            strategy["sizing"]["per_signal_percent"] = 1.0
             FollowStore(follow_dir / "follow.db").save_follow_strategy(strategy, ts=100)
 
             status = start_runner(
@@ -10407,8 +10151,10 @@ class CoreTest(unittest.TestCase):
             )
 
             self.assertIn("--strategy-source", calls[0][0])
-            self.assertEqual(status["strategy_summary"], "固定 25 USDC，现价上限 0.85，可用余额 250")
-            self.assertEqual(read_follow_control(follow_dir)["runner"]["strategy_summary"], "固定 25 USDC，现价上限 0.85，可用余额 250")
+            self.assertIn("单笔 余额1%", status["strategy_summary"])
+            self.assertIn("现价上限 0.68", status["strategy_summary"])
+            self.assertIn("可用余额 250", status["strategy_summary"])
+            self.assertIn("单笔 余额1%", read_follow_control(follow_dir)["runner"]["strategy_summary"])
 
     def test_dashboard_runner_start_allows_strategy_without_balance_limit(self):
         with TemporaryDirectory() as tmp:
@@ -10425,8 +10171,8 @@ class CoreTest(unittest.TestCase):
                 return FakeProcess()
 
             strategy = default_follow_strategy()
-            strategy["stake_sizing"]["mode"] = "fixed"
-            strategy["stake_sizing"]["fixed_usdc"] = 25
+            strategy["configured"] = True
+            strategy["sizing"]["per_signal_percent"] = 1.0
             FollowStore(follow_dir / "follow.db").save_follow_strategy(strategy, ts=100)
 
             status = start_runner(
@@ -10723,8 +10469,7 @@ class CoreTest(unittest.TestCase):
                 self.assertEqual(calls, [])
 
                 strategy = default_follow_strategy(balance_usdc=100)
-                strategy["stake_sizing"]["mode"] = "fixed"
-                strategy["stake_sizing"]["fixed_usdc"] = 10
+                strategy["sizing"]["per_signal_percent"] = 1.0
                 conn = http.client.HTTPConnection(host, port, timeout=5)
                 conn.request(
                     "POST",
@@ -10849,8 +10594,8 @@ class CoreTest(unittest.TestCase):
                 self.assertFalse(payload["data"]["configured"])
 
                 strategy = default_follow_strategy(balance_usdc=321)
-                strategy["stake_sizing"]["mode"] = "fixed"
-                strategy["stake_sizing"]["fixed_usdc"] = 12
+                strategy["sizing"]["per_signal_percent"] = 2.0
+                strategy["sizing"]["per_match_percent"] = 2.0
                 strategy["prefilters"]["min_target_wallet_order_cash_usdc"] = 8
                 conn = http.client.HTTPConnection(host, port, timeout=5)
                 conn.request(
@@ -10864,7 +10609,7 @@ class CoreTest(unittest.TestCase):
                 conn.close()
                 self.assertEqual(response.status, 200)
                 self.assertTrue(payload["data"]["configured"])
-                self.assertEqual(payload["data"]["stake_sizing"]["fixed_usdc"], 12)
+                self.assertEqual(payload["data"]["sizing"]["per_signal_percent"], 2.0)
 
                 conn = http.client.HTTPConnection(host, port, timeout=5)
                 conn.request("GET", "/api/overview", headers={"Cookie": cookie})

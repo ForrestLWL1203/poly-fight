@@ -35,9 +35,10 @@ SPORTS_MIN_ROI = 0.15
 ESPORTS_WILSON_LB_MIN = 0.65
 ESPORTS_EDGE_LB_MIN = 0.05
 ESPORTS_N_EFF_FLOOR = 12
-# 桶内胜率硬门(v20):进榜/跟单的专精桶,近期加权胜率 θ̂ 必须 ≥ 此值,否则判 C —— 不进榜、不跟单。
-# 推翻 v17"只看 edge"的取舍:极低胜率靠单场低价冷门拉 edge 的钱包,等比跟单大概率亏、方差过大,排除。
-ESPORTS_MIN_BUCKET_WIN_RATE = 0.68
+# 桶内胜率硬门(v20;v23 2026-06-21 用户要求 0.68→0.75):进榜/跟单的专精桶,近期加权胜率 θ̂ 必须 ≥ 此值,
+# 否则判 C —— 不进榜、不跟单。用户取向:只跟历史胜率更高的钱包,edge 次要(高胜率优先于高 edge)。
+# 实测:0.75 把当前 83 个 A 收敛到 ~56 个(砍约 1/3,lol 收得最多)。
+ESPORTS_MIN_BUCKET_WIN_RATE = 0.75
 SPORTS_WILSON_LB_MIN = 0.55
 SPORTS_EDGE_LB_MIN = 0.03
 SPORTS_N_EFF_FLOOR = 12

@@ -976,28 +976,18 @@ function WalletFollowsModal({ wallet, onClose }) {
 const STRATEGY_DEFAULTS = {
   usableMode: "all", usableCap: "5000",
   minSignalOn: true, minSignal: "10",
-  maxEntryOn: true, maxEntry: "0.85",
-  sizing: "kelly", kellyFraction: "0.25", perSignalPct: "1", perMatchPct: "10", minStake: "1",
-  ratio: "10", ratioCapOn: false, ratioCap: "100",
-  fixed: "50", balancePct: "1",
-  countOn: false, countMode: "event", count: "10",
-  spendOn: false, spendMode: "fixed", spendFixed: "200", spendPct: "5",
+  maxEntryOn: true, maxEntry: "0.68",
+  perSignalPct: "1", perMatchPct: "1", minStake: "1",
   realtimeRefresh: false,
 };
 const clampNum = (v) => String(v).replace(/[^\d.]/g, "");
 
 function strategyDigest(s) {
   const n = (v) => Number(v) || 0;
-  const sizing = s.sizing === "kelly"
-    ? `单位制（单位=余额${s.perSignalPct || 0}% · 每钱包每场≤单场${s.perMatchPct || 0}%的半）`
-    : s.sizing === "ratio"
-    ? `比例 ${s.ratio || 0}%${s.ratioCapOn ? `（封顶 ${usdInt(n(s.ratioCap))}）` : ""}`
-    : s.sizing === "fixed" ? `固定 ${usdInt(n(s.fixed))}` : `余额 ${s.balancePct || 0}%`;
+  const sizing = `单笔 余额${s.perSignalPct || 0}%（每钱包每场≤余额${s.perMatchPct || 0}%）`;
   const filter = `门槛 ${usdInt(n(s.minSignal))}`;
   const maxEntry = s.maxEntryOn ? `现价 ≤ ${s.maxEntry}` : null;
-  const count = s.countOn ? (s.countMode === "event" ? `单场 ${s.count} 笔` : `每钱包 ${s.count} 笔`) : null;
-  const spend = s.spendOn ? (s.spendMode === "fixed" ? `单场 ≤ ${usdInt(n(s.spendFixed))}` : `单场 ≤ 余额 ${s.spendPct}%`) : null;
-  return { sizing, chips: [filter, maxEntry, count, spend].filter(Boolean) };
+  return { sizing, chips: [filter, maxEntry].filter(Boolean) };
 }
 
 function NumField({ value, onChange, unit, width = 76, lead, disabled }) {
@@ -1075,8 +1065,7 @@ function strategyNodes(s) {
     { k: "信号门槛", v: s.minSignalOn ? `忽略 < ${usdInt(n(s.minSignal))}` : "不限" },
     { k: "现价上限", v: s.maxEntryOn ? `现价 ≤ ${s.maxEntry}` : "不限" },
     { k: "单笔金额", v: dg.sizing, key: true },
-    { k: "单场笔数", v: s.countOn ? (s.countMode === "event" ? `整场 ${s.count} 笔` : `每钱包 ${s.count} 笔`) : "不限" },
-    { k: "单场投入", v: s.spendOn ? (s.spendMode === "fixed" ? `≤ ${usdInt(n(s.spendFixed))}` : `≤ 余额 ${s.spendPct}%`) : "不限" },
+    { k: "单场预算", v: `每钱包每场 ≤ 余额 ${s.perMatchPct || 0}%` },
     { k: "动态刷新", v: s.realtimeRefresh ? "开启" : "关闭" },
   ];
 }
@@ -1105,31 +1094,16 @@ function StrategyEditor({ s, up, wallet, locked }) {
           </div>
         </div>
         <div className="cfg-head"><h3>单笔跟单金额</h3><Badge tone="up" outline>必填</Badge></div>
-        <p className="cfg-sub">每个有效信号买入多少 · 推荐智能定额（单位制:基数随余额、大单分段加码）· 金额向下取整规避下单异常</p>
-        <div className="opt-list">
-          <SizingOption id="kelly" active={s.sizing === "kelly"} onSelect={up("sizing")} title="智能定额（推荐）" desc="单位制:单位=余额×单笔基数% · 目标下单≤50×单位→下1单位,>50×每多10倍加1单位 · 每钱包每场≤单场上限的50% · edge(θ̂×0.95>现价)只当准入门">
+        <p className="cfg-sub">注码 = 余额 × 单笔基数%（动态随余额，不抄目标仓位大小）· 每钱包每场累计 ≤ 单场预算（加仓只填到预算，不叠加）· 金额向下取整规避下单异常</p>
+        <div className="opt-card is-active">
+          <div className="opt-body" onClick={(e) => e.stopPropagation()}>
             <div className="ctrl-row">
               <NumField value={s.perSignalPct} onChange={up("perSignalPct")} unit="%" lead="单笔基数（余额）" width={60} />
-              <NumField value={s.perMatchPct} onChange={up("perMatchPct")} unit="%" lead="单场上限（本金）" width={60} />
+              <NumField value={s.perMatchPct} onChange={up("perMatchPct")} unit="%" lead="单场预算（余额）" width={60} />
               <NumField value={s.minStake} onChange={up("minStake")} unit="USDC" lead="单笔下限" width={72} />
             </div>
-          </SizingOption>
-          <SizingOption id="fixed" active={s.sizing === "fixed"} onSelect={up("sizing")} title="固定金额（legacy）" desc="每笔买入固定金额，与 edge 无关 · 简单但不区分机会优劣">
-            <div className="ctrl-row"><NumField value={s.fixed} onChange={up("fixed")} unit="USDC" lead="每笔买入" /></div>
-          </SizingOption>
-          <SizingOption id="balancePct" active={s.sizing === "balancePct"} onSelect={up("sizing")} title="按本金百分比" desc="按当前可动用余额的百分比动态买入">
-            <div className="ctrl-row"><NumField value={s.balancePct} onChange={up("balancePct")} unit="%" lead="每笔占用" /></div>
-          </SizingOption>
-          <SizingOption id="ratio" active={s.sizing === "ratio"} onSelect={up("sizing")} title="按目标比例" desc="跟随目标钱包买入额的固定比例 · 会放大其大注，等同跟着赌，谨慎">
-            <div className="ratio-rows">
-              <span className="rr-lead"><span className="rr-check-slot"></span>跟单比例</span>
-              <NumField value={s.ratio} onChange={up("ratio")} unit="%" width={56} />
-              <label className="rr-lead is-check" onClick={(e) => e.stopPropagation()}>
-                <input type="checkbox" checked={s.ratioCapOn} onChange={(e) => up("ratioCapOn")(e.target.checked)} />单笔封顶
-              </label>
-              <NumField value={s.ratioCap} onChange={up("ratioCap")} unit="USDC" width={56} disabled={!s.ratioCapOn} />
-            </div>
-          </SizingOption>
+            <p className="cfg-sub">单笔基数 = 每笔下注占余额%；单场预算 = 每钱包每场累计上限占余额%（≥ 单笔基数）；单笔下限 = dust 地板，仅防 &lt;$1 废单。</p>
+          </div>
         </div>
       </div>
 
@@ -1143,43 +1117,22 @@ function StrategyEditor({ s, up, wallet, locked }) {
             <NumField value={s.minSignal} onChange={up("minSignal")} unit="USDC" lead="忽略目标买入 <" width={64} disabled={!s.minSignalOn} />
           </div>
         </div>
-        {s.sizing === "kelly" ? <div className="cfg-mini">
-          <div className="cm-head"><Ico n="filter" /><span>风控(Kelly 内置)</span></div>
-          <div className="cm-body">
-            <p className="cfg-sub">单笔基数 / 单场上限 / 单笔下限 已在左侧设置内;注码 = 单位制(基数=余额×单笔基数%,大单分段加码,每钱包每场≤单场上限的50%);现价上限固定 0.85(= 评分价区,系统统一),无需重复配置。</p>
-          </div>
-        </div> : <React.Fragment>
         <div className="cfg-mini">
-          <div className="cm-head"><Ico n="filter" /><span>现价上限</span></div>
+          <div className="cm-head"><Ico n="crosshair" /><span>现价上限</span></div>
           <div className="cm-body">
             <label className="check-row" onClick={(e) => e.stopPropagation()}>
               <input type="checkbox" checked={s.maxEntryOn} onChange={(e) => up("maxEntryOn")(e.target.checked)} /><span className="cr-label">启用</span>
             </label>
             <NumField value={s.maxEntry} onChange={up("maxEntry")} lead="现价 >" unit="不跟" width={56} disabled={!s.maxEntryOn} />
-            <p className="cfg-sub">跟单有延迟:发现时现价已高于此值则不跟,避免追高(0–1)</p>
+            <p className="cfg-sub">跟单有延迟:发现时现价已高于此值则不跟,避免追高(0–1)。默认 0.68（评分价区）。</p>
           </div>
         </div>
-        <div className="cfg-head"><h3>单场风控上限</h3></div>
-        <p className="cfg-sub">对单场赛事的累计跟单设防 · 两项可独立开启</p>
-        <div className="sub-block">
-          <div className="switch-row">
-            <div className="sr-text"><span className="sr-title">单场笔数上限</span><span className="sr-desc">限制一场赛事累计可跟的笔数</span></div>
-            <Switch checked={s.countOn} onChange={(v) => up("countOn")(v)} accent />
+        <div className="cfg-mini">
+          <div className="cm-head"><Ico n="sparkles" /><span>edge 准入门（内置）</span></div>
+          <div className="cm-body">
+            <p className="cfg-sub">仅当 钱包该桶胜率 θ̂ × 0.95 &gt; 现价 才跟（系统统一，无需配置）。卖出侧:目标卖价 ≥ 0.90 才镜像跟卖,否则持有到结算。</p>
           </div>
-          {s.countOn ? <div className="sub-controls">
-            <div className="ctrl-row"><SegmentedControl value={s.countMode} onChange={up("countMode")} options={[{ value: "event", label: "按赛事合计" }, { value: "wallet", label: "按每个钱包" }]} /><NumField value={s.count} onChange={up("count")} unit="笔" width={58} /></div>
-          </div> : null}
         </div>
-        <div className="sub-block">
-          <div className="switch-row">
-            <div className="sr-text"><span className="sr-title">单场投入上限</span><span className="sr-desc">限制一场赛事的累计买入金额</span></div>
-            <Switch checked={s.spendOn} onChange={(v) => up("spendOn")(v)} accent />
-          </div>
-          {s.spendOn ? <div className="sub-controls">
-            <div className="ctrl-row"><SegmentedControl value={s.spendMode} onChange={up("spendMode")} options={[{ value: "fixed", label: "固定金额" }, { value: "balancePct", label: "余额百分比" }]} />{s.spendMode === "fixed" ? <NumField value={s.spendFixed} onChange={up("spendFixed")} unit="USDC" width={88} /> : <NumField value={s.spendPct} onChange={up("spendPct")} unit="%" width={58} />}</div>
-          </div> : null}
-        </div>
-        </React.Fragment>}
       </div>
     </div>
   );

@@ -208,18 +208,16 @@
 
   /* ---- strategy / runner / health ---- */
   let strategy = {
-    configured: true, schema_version: 1, updated_at: ago(600),
-    stake_sizing: { mode: "fixed", ratio_percent: 10, per_order_cap_enabled: false, per_order_cap_usdc: 0, fixed_usdc: 1, balance_percent: 1 },
+    configured: true, schema_version: 2, updated_at: ago(600),
+    sizing: { per_signal_percent: 1, per_match_percent: 1, min_stake_usdc: 1 },
     prefilters: { min_target_wallet_order_cash_usdc: 10, max_follow_entry_price: 0.68 },
-    condition_limits: { order_count_mode: "condition", max_orders: 10, stake_cap_mode: "fixed", stake_cap_usdc: 200, stake_cap_balance_percent: 5 },
     balance: { required: true, usable_balance_usdc: 5000 },
   };
   /* ---- named strategy library (stateful: create/update/activate/delete) ---- */
   const mkStrat = (over) => Object.assign({
-    configured: true, schema_version: 1, updated_at: ago(600),
-    stake_sizing: { mode: "fixed", ratio_percent: 10, per_order_cap_enabled: false, per_order_cap_usdc: 0, fixed_usdc: 1, balance_percent: 1 },
+    configured: true, schema_version: 2, updated_at: ago(600),
+    sizing: { per_signal_percent: 1, per_match_percent: 1, min_stake_usdc: 1 },
     prefilters: { min_target_wallet_order_cash_usdc: 10, max_follow_entry_price: 0.68 },
-    condition_limits: { order_count_mode: "condition", max_orders: 10, stake_cap_mode: "fixed", stake_cap_usdc: 200, stake_cap_balance_percent: 5 },
     balance: { required: true, usable_balance_usdc: 5000 },
   }, over || {});
   let _slugSeq = 1;
@@ -227,8 +225,7 @@
   let library = [
     { slug: "s_mock_steady", name: "稳健跟单", active: true, updated_at: ago(600), strategy: mkStrat({ realtime_refresh: true }) },
     { slug: "s_mock_aggro", name: "激进满仓", active: false, updated_at: ago(3600), strategy: mkStrat({
-      stake_sizing: { mode: "balance_percent", ratio_percent: 10, per_order_cap_enabled: false, per_order_cap_usdc: 0, fixed_usdc: 50, balance_percent: 8 },
-      condition_limits: { order_count_mode: "none", max_orders: 0, stake_cap_mode: "balance_percent", stake_cap_usdc: 0, stake_cap_balance_percent: 20 },
+      sizing: { per_signal_percent: 2, per_match_percent: 4, min_stake_usdc: 1 },
       balance: { required: true, usable_balance_usdc: 5000 },
     }) },
   ];
@@ -274,7 +271,7 @@
     pid: 12345, source: "dashboard", started_at: ago(7445),
     stake_usdc: 1, stake_ratio_percent: 10,
     realtime_refresh: true, observe_running: true, observe_pid: 12346,
-    strategy_configured: true, strategy_updated_at: ago(600), strategy_summary: "比例 10%（封顶 $100）· 门槛 $10",
+    strategy_configured: true, strategy_updated_at: ago(600), strategy_summary: "单笔 余额1%（每钱包每场预算 余额1%）· 现价上限 0.68 · 目标单≥$10",
   };
   // stateful mock so the progress masks (sample / stop) animate end-to-end
   let runnerStatus = "running";

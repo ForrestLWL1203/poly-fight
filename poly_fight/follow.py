@@ -6,9 +6,19 @@ from typing import Any
 
 from .core import SECONDS_PER_DAY, bucket_key, bucket_label, normalize_wallet, parse_dt, to_float, to_int, wallet_is_followable
 from .follow_strategy import evaluate_follow_candidate, normalize_follow_strategy
+from .veto import DECISION_SKIP as VETO_DECISION_SKIP, veto_gate
 
 MIN_ADD_RATIO_TO_FIRST = 0.10
 MIN_WALLET_TRADE_CASH_USDC = 10.0
+
+
+def _cs2_veto_corroboration_enabled(strategy: dict[str, Any] | None) -> bool:
+    """CS2 map-winner 旁路佐证门开关。默认【开】(无策略也生效 → 重启跟单即自动挂上);
+    仅当策略 prefilters.cs2_veto_corroboration 显式置 False 才关。"""
+    if not isinstance(strategy, dict):
+        return True
+    value = (strategy.get("prefilters") or {}).get("cs2_veto_corroboration")
+    return True if value is None else bool(value)
 
 
 def eligible_follow_wallets(
@@ -633,8 +643,11 @@ def process_follow_trades(
         "unfunded_intent_count": 0,
         "small_buy_cached_count": 0,
         "small_buy_triggered_count": 0,
+        "veto_fade_skip_count": 0,
+        "veto_no_data_count": 0,
         "quarantine_events": [],
     }
+    veto_cache: dict[str, Any] = {}  # 本 tick 内按比赛缓存 veto(Map1/2/3 同场复用,不重复打 bo3)
     for trade in sorted(trades, key=lambda row: _trade_tuple(row)):
         condition_id = trade_condition_id(trade)
         outcome_index = trade_outcome_index(trade)
@@ -791,6 +804,28 @@ def process_follow_trades(
             slippage["would_follow"] = False
             follow_block_reasons.append("small_wallet_trade")
             stats["small_wallet_trade_blocked_count"] += 1
+        # CS2 map-winner 旁路佐证门:逆选图方(fade)→ 不跟。veto 不可得/非 fade → 放行(fail-open)。
+        # 钱包基本赛前后 ~±30min 内买 map 份额、veto 此时已可查,故同步判定即可,无需 held 暂存。
+        veto_corroboration = None
+        if (market_type == "map_winner"
+                and str(market.get("game_family") or "").lower() == "cs2"
+                and _cs2_veto_corroboration_enabled(active_strategy)):
+            outcomes_for_veto = market.get("outcomes") or []
+            backed_name = outcomes_for_veto[outcome_index] if 0 <= outcome_index < len(outcomes_for_veto) else None
+            start_iso_for_veto = market.get("match_start_time") or market.get("market_start_time")
+            if backed_name and start_iso_for_veto:
+                veto_corroboration = veto_gate(
+                    market.get("question"), backed_name, start_iso_for_veto,
+                    game_family="cs2", market_type=market_type, cache=veto_cache,
+                )
+                decision = veto_corroboration.get("decision")
+                if decision == VETO_DECISION_SKIP:
+                    slippage["would_follow"] = False
+                    follow_block_reasons.append("veto_fade_skip")
+                    stats["veto_fade_skip_count"] += 1
+                elif decision == "no_veto":
+                    # veto 不可得(api 不通/未发布/没对上)→ 已 fail-open 照常跟,仅计数供观测
+                    stats["veto_no_data_count"] += 1
         stake_mode = None
         stake_ratio = None
         available_balance = bankroll_usdc - _open_signals_exposure(open_signals)
@@ -800,7 +835,7 @@ def process_follow_trades(
             leg_stake = target_stake
             funded_stake = to_float(strategy_decision.get("funded_stake"))
             stake_mode = str(strategy_decision.get("stake_mode") or "strategy")
-            stake_ratio = round(to_float((active_strategy.get("stake_sizing") or {}).get("ratio_percent")) / 100.0, 6)
+            stake_ratio = round(to_float((active_strategy.get("sizing") or {}).get("per_signal_percent")) / 100.0, 6)
             funding_status = "funded" if strategy_decision.get("would_follow") else "blocked"
             would_follow = bool(strategy_decision.get("would_follow")) and bool(slippage["would_follow"])
             if not strategy_decision.get("would_follow"):
@@ -915,7 +950,7 @@ def process_follow_trades(
         }
         if strategy_decision is not None:
             leg["strategy_schema_version"] = to_int(strategy_decision.get("strategy_schema_version"))
-            leg["strategy_mode"] = str((active_strategy.get("stake_sizing") or {}).get("mode") or "")
+            leg["strategy_mode"] = str(strategy_decision.get("stake_mode") or "unit_pct")
             leg["strategy_snapshot"] = strategy_decision.get("strategy_snapshot") or active_strategy
             leg["min_target_wallet_order_cash_usdc"] = round(
                 to_float(((active_strategy.get("prefilters") or {}).get("min_target_wallet_order_cash_usdc"))),
@@ -997,6 +1032,8 @@ def process_follow_trades(
             if strategy_decision is not None:
                 signal["strategy_schema_version"] = leg.get("strategy_schema_version")
                 signal["strategy_mode"] = leg.get("strategy_mode")
+            if veto_corroboration is not None and veto_corroboration.get("applies"):
+                signal["veto_corroboration"] = veto_corroboration  # 审计:选图佐证判定(决胜/顺选图等)
             if detected_after_start:
                 signal["detected_after_start"] = True
             open_signals.append(signal)

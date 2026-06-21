@@ -383,18 +383,19 @@
     };
   }
 
-  /* ---------- Strategy (API <-> kit flat state) ---------- */
+  /* ---------- Strategy (API <-> kit flat state) — 单一模型 v2 ---------- */
   function strategyToKit(api, walletBalance) {
     const s = api || {};
-    const sizing = s.stake_sizing || {};
+    // 兼容:优先读 v2 "sizing",回退旧 "stake_sizing"。
+    const sizing = s.sizing || s.stake_sizing || {};
     const pre = s.prefilters || {};
-    const lim = s.condition_limits || {};
     const bal = s.balance || {};
-    const mode = sizing.mode === "kelly" ? "kelly" : sizing.mode === "fixed" ? "fixed" : sizing.mode === "balance_percent" ? "balancePct" : "ratio";
     const usable = num(bal.usable_balance_usdc);
     const minSignal = num(pre.min_target_wallet_order_cash_usdc);
     const str = (v, d) => (v === 0 || v ? String(v) : d);
-    // 现价上限:字段缺失(老策略)→ 默认开 0.85(全系统唯一分水岭);显式 0 → 关。
+    const perSignal = sizing.per_signal_percent != null ? sizing.per_signal_percent : sizing.per_signal_cap_percent;
+    const perMatch = sizing.per_match_percent != null ? sizing.per_match_percent : sizing.per_match_cap_percent;
+    // 现价上限:字段缺失(老策略)→ 默认开 0.68(评分价区);显式 0 → 关。
     const maxEntryRaw = pre.max_follow_entry_price;
     const maxEntryVal = num(maxEntryRaw);
     return {
@@ -403,60 +404,29 @@
       minSignalOn: minSignal > 0,
       minSignal: str(minSignal || 10, "10"),
       maxEntryOn: maxEntryRaw === undefined || maxEntryRaw === null ? true : maxEntryVal > 0 && maxEntryVal < 1,
-      maxEntry: str(maxEntryVal > 0 ? maxEntryVal : 0.85, "0.85"),
-      sizing: mode,
-      // Kelly 智能引擎参数
-      kellyFraction: str(num(sizing.kelly_fraction) || 0.25, "0.25"),
-      perSignalPct: str(num(sizing.per_signal_cap_percent) || 1, "1"),
-      perMatchPct: str(num(sizing.per_match_cap_percent) || 10, "10"),
+      maxEntry: str(maxEntryVal > 0 ? maxEntryVal : 0.68, "0.68"),
+      perSignalPct: str(num(perSignal) || 1, "1"),
+      perMatchPct: str(num(perMatch) || 1, "1"),
       minStake: str(num(sizing.min_stake_usdc) || 1, "1"),
-      ratio: str(num(sizing.ratio_percent) || 10, "10"),
-      ratioCapOn: !!sizing.per_order_cap_enabled,
-      ratioCap: str(num(sizing.per_order_cap_usdc) || 100, "100"),
-      fixed: str(num(sizing.fixed_usdc) || 50, "50"),
-      balancePct: str(num(sizing.balance_percent) || 1, "1"),
-      countOn: (lim.order_count_mode || "none") !== "none",
-      countMode: lim.order_count_mode === "wallet" ? "wallet" : "event",
-      count: str(num(lim.max_orders) || 10, "10"),
-      spendOn: (lim.stake_cap_mode || "none") !== "none",
-      spendMode: lim.stake_cap_mode === "balance_percent" ? "balancePct" : "fixed",
-      spendFixed: str(num(lim.stake_cap_usdc) || 200, "200"),
-      spendPct: str(num(lim.stake_cap_balance_percent) || 5, "5"),
       realtimeRefresh: !!s.realtime_refresh,
     };
   }
 
   function strategyFromKit(k, walletBalance) {
-    const mode = k.sizing === "kelly" ? "kelly" : k.sizing === "fixed" ? "fixed" : k.sizing === "balancePct" ? "balance_percent" : "proportional";
     const usable = k.usableMode === "cap" ? num(k.usableCap) : num(walletBalance);
-    const balanceRequired = k.sizing === "kelly" || k.sizing === "balancePct" || (k.spendOn && k.spendMode === "balancePct") || k.usableMode === "cap";
     return {
       configured: true,
-      schema_version: 1,
-      stake_sizing: {
-        mode,
-        kelly_fraction: num(k.kellyFraction),
-        per_signal_cap_percent: num(k.perSignalPct),
-        per_match_cap_percent: num(k.perMatchPct),
+      schema_version: 2,
+      sizing: {
+        per_signal_percent: num(k.perSignalPct),
+        per_match_percent: num(k.perMatchPct),
         min_stake_usdc: num(k.minStake),
-        ratio_percent: num(k.ratio),
-        per_order_cap_enabled: k.sizing === "ratio" && !!k.ratioCapOn,
-        per_order_cap_usdc: num(k.ratioCap),
-        fixed_usdc: num(k.fixed),
-        balance_percent: num(k.balancePct),
       },
       prefilters: {
         min_target_wallet_order_cash_usdc: k.minSignalOn ? num(k.minSignal) : 0,
         max_follow_entry_price: k.maxEntryOn ? num(k.maxEntry) : 0,
       },
-      condition_limits: {
-        order_count_mode: k.countOn ? (k.countMode === "wallet" ? "wallet" : "condition") : "none",
-        max_orders: num(k.count),
-        stake_cap_mode: k.spendOn ? (k.spendMode === "balancePct" ? "balance_percent" : "fixed") : "none",
-        stake_cap_usdc: num(k.spendFixed),
-        stake_cap_balance_percent: num(k.spendPct),
-      },
-      balance: { required: balanceRequired, usable_balance_usdc: usable },
+      balance: { required: true, usable_balance_usdc: usable },
       realtime_refresh: !!k.realtimeRefresh,
     };
   }
@@ -495,46 +465,28 @@
     const t = num(sample);
     const threshold = s.minSignalOn ? num(s.minSignal) : 0;
     if (threshold > 0 && t < threshold) return { ignored: true };
+    // 单一模型:单笔 = 可用余额 × per_signal%(flat,与目标下单额无关),夹到 [min_stake, 每场预算]。
     const avail = strategyAvail(s, walletBalance);
-    let raw, basis;
-    if (s.sizing === "kelly") {
-      // Kelly 按实时 edge 定额,与目标下单额无关 → 用代表性场景演示:胜率72% @ 现价62¢(edge 10¢)。
-      const wlb = 0.72, p = 0.62, kf = num(s.kellyFraction) || 0.25;
-      raw = kf * ((wlb - p) / (1 - p)) * avail;
-      const signalCap = avail * num(s.perSignalPct) / 100;
-      if (signalCap > 0) raw = Math.min(raw, signalCap);
-      const minStake = num(s.minStake) || 1;
-      if (raw > 0 && raw < minStake) raw = minStake;
-      basis = `Kelly×${kf}:示例 胜率72%@现价0.62(edge 10¢),单笔≤${s.perSignalPct || 0}%`;
-    } else if (s.sizing === "ratio") {
-      raw = t * num(s.ratio) / 100; basis = `${s.ratio || 0}% × ${_usdInt(t)}`;
-      if (s.ratioCapOn && raw > num(s.ratioCap)) { raw = num(s.ratioCap); basis = `命中封顶 ${_usdInt(num(s.ratioCap))}`; }
-    } else if (s.sizing === "fixed") { raw = num(s.fixed); basis = "固定金额"; }
-    else { raw = avail * num(s.balancePct) / 100; basis = `${s.balancePct || 0}% × 可用 ${_usdInt(avail)}`; }
+    const budget = avail * num(s.perMatchPct) / 100;
+    let raw = avail * num(s.perSignalPct) / 100;
+    if (budget > 0) raw = Math.min(raw, budget);
+    const minStake = num(s.minStake) || 1;
+    if (raw > 0 && raw < minStake) raw = minStake;
+    const basis = `余额${s.perSignalPct || 0}% × 可用 ${_usdInt(avail)}(每钱包每场≤余额${s.perMatchPct || 0}%）`;
     return { amount: Math.floor(Math.max(0, raw)), basis };
   }
 
   /* required-field gaps that must be cleared before the runner may start.
      Empty array => ready. Order/labels match the StrategyPage 待完善 list. */
   function strategyIssues(s, walletBalance) {
-    const avail = strategyAvail(s, walletBalance);
     const issues = [];
-    if (s.sizing === "kelly") {
-      if (!(num(s.kellyFraction) > 0)) issues.push("Kelly 激进度");
-      if (!(num(s.perSignalPct) > 0)) issues.push("单笔上限%");
-      if (!(num(s.perMatchPct) > 0)) issues.push("单场上限%");
-      if (!(num(s.minStake) > 0)) issues.push("单笔下限");
-      if (!(avail > 0)) issues.push("可用余额");
-    } else {
-      const sizingPrimary = s.sizing === "ratio" ? s.ratio : s.sizing === "fixed" ? s.fixed : s.balancePct;
-      if (!(num(sizingPrimary) > 0)) issues.push("单笔金额");
-      if (s.sizing === "ratio" && s.ratioCapOn && !(num(s.ratioCap) > 0)) issues.push("单笔封顶金额");
-      if (s.sizing === "balancePct" && !(avail > 0)) issues.push("可用余额");
-    }
+    if (!(num(s.perSignalPct) > 0)) issues.push("单笔基数%");
+    if (!(num(s.perMatchPct) > 0)) issues.push("单场预算%");
+    else if (num(s.perMatchPct) + 1e-9 < num(s.perSignalPct)) issues.push("单场预算不能小于单笔基数");
+    if (!(num(s.minStake) > 0)) issues.push("单笔下限");
     if (s.usableMode === "cap" && !(num(s.usableCap) > 0)) issues.push("可动用上限");
+    else if (!(strategyAvail(s, walletBalance) > 0)) issues.push("可用余额");
     if (s.minSignalOn && !(num(s.minSignal) > 0)) issues.push("最小信号金额");
-    if (s.countOn && !(num(s.count) > 0)) issues.push("单场笔数");
-    if (s.spendOn && !(num(s.spendMode === "fixed" ? s.spendFixed : s.spendPct) > 0)) issues.push("单场投入上限");
     return issues;
   }
 
