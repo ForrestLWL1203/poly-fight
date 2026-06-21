@@ -15142,11 +15142,12 @@ class CoreTest(unittest.TestCase):
                 raise result
             return result
 
+        # sleep_or_stop 用 stop_event.wait(非 time.sleep);load_rpc_endpoints 置空避免起真 onchain 线程(慢)。
         with patch("poly_fight.cli.build_client", return_value=object()), patch(
             "poly_fight.cli._command_collect_wallets"
         ) as build, patch("poly_fight.cli.command_follow", side_effect=flaky_follow) as follow, patch(
-            "poly_fight.cli.time.sleep"
-        ) as sleep:
+            "poly_fight.cli.load_rpc_endpoints", return_value=(None, None)
+        ), patch("threading.Event.wait") as wait_mock:
             from poly_fight.cli import command_run
 
             with redirect_stdout(StringIO()):
@@ -15154,7 +15155,7 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(build.call_count, 0)
         self.assertEqual(follow.call_count, 2)
-        self.assertEqual(sleep.call_args_list[0].args[0], 180)
+        self.assertEqual(wait_mock.call_args_list[0].args[0], 180)   # 错误重试 sleep
 
     def test_run_loop_subtracts_iteration_runtime_from_sleep(self):
         parser = build_parser()
@@ -15166,7 +15167,9 @@ class CoreTest(unittest.TestCase):
             "poly_fight.cli._command_collect_wallets"
         ), patch(
             "poly_fight.cli.command_follow", return_value={"desired_next_interval_seconds": 120}
-        ) as follow, patch("poly_fight.cli.time.sleep") as sleep, patch(
+        ) as follow, patch("poly_fight.cli.load_rpc_endpoints", return_value=(None, None)), patch(
+            "threading.Event.wait"
+        ) as wait_mock, patch(
             "poly_fight.cli.time.monotonic", side_effect=[0.0, 35.0, 120.0]
         ):
             from poly_fight.cli import command_run
@@ -15175,8 +15178,8 @@ class CoreTest(unittest.TestCase):
                 self.assertEqual(command_run(args), 0)
 
         self.assertEqual(follow.call_count, 2)
-        self.assertEqual(sleep.call_count, 1)
-        self.assertEqual(sleep.call_args.args[0], 85)
+        self.assertEqual(wait_mock.call_count, 1)
+        self.assertEqual(wait_mock.call_args.args[0], 85)   # tick 120 − 运行耗时 35
 
     def test_run_full_refresh_pauses_new_signals(self):
         with TemporaryDirectory() as tmp:
@@ -15250,15 +15253,15 @@ class CoreTest(unittest.TestCase):
         with patch("poly_fight.cli.build_client", return_value=object()), patch(
             "poly_fight.cli._command_collect_wallets"
         ), patch("poly_fight.cli.command_follow", side_effect=RuntimeError("poly down")) as follow, patch(
-            "poly_fight.cli.time.sleep"
-        ) as sleep, patch("poly_fight.cli.time.time", side_effect=lambda: times.pop(0)):
+            "poly_fight.cli.load_rpc_endpoints", return_value=(None, None)
+        ), patch("threading.Event.wait") as wait_mock, patch("poly_fight.cli.time.time", side_effect=lambda: times.pop(0)):
             from poly_fight.cli import command_run
 
             with redirect_stdout(StringIO()):
                 self.assertEqual(command_run(args), 2)
 
         self.assertEqual(follow.call_count, 3)
-        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(wait_mock.call_count, 2)   # 两次错误重试 sleep,第三次错误触发停机
 
 
 if __name__ == "__main__":
