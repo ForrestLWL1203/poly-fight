@@ -295,6 +295,9 @@ V2_MAX_BOT_SCORE = 70              # bot 评分硬排除阈
 V2_MAX_LEADERBOARD_IDLE_HOURS = 336  # 14d:打分窗口(14-30d)已管"是否活跃",72h 过紧会误杀低频高手
 V2_PER_GAME_QUOTA = 0              # 0 = 不设每游戏上限(榜单=全部够格);>0 时才强制每游戏封顶
 V2_MAX_LEADERBOARD_WALLETS = 200   # 仅作安全上限(质量门已把关,大小不重要)
+# M5 自动降级删除后的冷却期:此窗口内 observer(observe-live / observe-v2)不重新发现加回被降级的
+# 钱包,堵「贴门钱包 2 输降级 → 下次赢 observer 立刻拉回」的 demote↔readd 抖动(2026-06-21 用户要求)。
+M5_DEMOTE_COOLDOWN_SECONDS = 24 * 3600
 # 技术型(低买高卖/靠出场)默认不纳入:占比极低 + 我们 follow 延迟高跟不准卖点,风险大。
 # 路径保留(--v2-include-technical 可一键开回)。scoring_basis 用 hold(方向正确性):
 # 技术型方向常错 → hold 口径下算亏损,自然出局,与"复制方向"一致。
@@ -5880,6 +5883,9 @@ def rescore_demote_wallets(
     # 淘汰=直接删除(统一执行路径,见 _delete_wallets_from_leaderboard)。
     _delete_wallets_from_leaderboard(
         args, wallets=set(demoted), follow_dir=Path(follow_dir), now_ts=now_ts, source="rescore_demote")
+    # 冷却:记降级时间戳。M5_DEMOTE_COOLDOWN_SECONDS 内 observer(observe-live / observe-v2)不把它当
+    # 新候选重新发现加回 —— 防边界钱包(贴着 θ̂ 门)2 输降级、下次赢又被 observer 立刻拉回的 ping-pong。
+    follow_store.record_m5_demote_cooldown(demoted, ts=now_ts)
     return {"rescored": len(reprofiled), "demoted": len(demoted), "demoted_wallets": demoted}
 
 
@@ -5948,7 +5954,9 @@ def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | Non
     existing = load_collector_existing_profiles(output_dir, resolve_data_dir(args), prefix="collector_v2")
     # 与 collect-v2 同口径:新种子先过 dust 现金门(min_avg_seed_cash,默认 100),否则小额交易者
     # 会从 observer 溜进榜(collect 有这道门、observer 没有 → 口径不一致)。
-    new_seed_pool = {wallet: sw for wallet, sw in seed_wallets.items() if wallet not in existing}
+    # M5 降级冷却:窗口内不重新发现刚被降级删除的钱包(防 demote↔readd ping-pong)。
+    cooled = follow_store.load_m5_demote_cooldown_wallets(now_ts=now_ts, cooldown_seconds=M5_DEMOTE_COOLDOWN_SECONDS)
+    new_seed_pool = {wallet: sw for wallet, sw in seed_wallets.items() if wallet not in existing and wallet not in cooled}
     new_seed_wallets = filter_profile_seed_wallets_v2(
         new_seed_pool,
         max_wallets=resolve_collector_profile_wallet_limit(args),
@@ -6120,7 +6128,9 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
     # 3) 钱包级去重:只 profile 既有 collector_v2 profiles 没有的新钱包(已打过分的进 profiles
     #    持久化 → 天然负缓存,后续轮次只是集合查找)。无新候选 → early-exit(常态,廉价)。
     existing = load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2")
-    new_seed_pool = {wallet: sw for wallet, sw in seed_wallets.items() if wallet not in existing}
+    # M5 降级冷却:窗口内不重新发现刚被降级删除的钱包(防 demote↔readd ping-pong)。
+    cooled = store.load_m5_demote_cooldown_wallets(now_ts=now_ts, cooldown_seconds=M5_DEMOTE_COOLDOWN_SECONDS)
+    new_seed_pool = {wallet: sw for wallet, sw in seed_wallets.items() if wallet not in existing and wallet not in cooled}
     new_seed_wallets = filter_profile_seed_wallets_v2(
         new_seed_pool,
         max_wallets=resolve_collector_profile_wallet_limit(args),

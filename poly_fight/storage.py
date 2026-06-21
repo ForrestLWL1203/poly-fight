@@ -773,6 +773,11 @@ class FollowStore:
                     quarantined_at INTEGER NOT NULL,
                     raw_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS m5_demote_cooldown (
+                    wallet TEXT PRIMARY KEY,
+                    demoted_at INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS wallet_favorites (
                     wallet_key TEXT PRIMARY KEY,
                     wallet TEXT NOT NULL,
@@ -1449,6 +1454,31 @@ class FollowStore:
             result_key = str(value.get("wallet") or key).lower() if category else key
             result[result_key] = value
         return result
+
+    def record_m5_demote_cooldown(self, wallets: Any, *, ts: int) -> None:
+        """M5 自动降级删除的钱包记一个冷却时间戳;冷却窗口内 observer(observe-live / observe-v2)
+        不把它当新候选重新发现加回(防边界钱包 demote↔readd ping-pong)。"""
+        self.init_db()
+        clean = sorted({str(w or "").lower() for w in (wallets or []) if str(w or "").strip()})
+        if not clean:
+            return
+        with self.connect() as conn:
+            for wallet in clean:
+                conn.execute(
+                    "INSERT OR REPLACE INTO m5_demote_cooldown(wallet, demoted_at, raw_json) VALUES (?, ?, ?)",
+                    (wallet, int(ts), _dumps({"wallet": wallet, "demoted_at": int(ts)})),
+                )
+
+    def load_m5_demote_cooldown_wallets(self, *, now_ts: int, cooldown_seconds: int) -> set[str]:
+        """仍在冷却窗口(now − demoted_at < cooldown_seconds)内的钱包集合。过期行留库不影响判断
+        (按时间窗过滤),下次同一钱包再降级时 INSERT OR REPLACE 覆盖时间戳。"""
+        self.init_db()
+        cutoff = int(now_ts) - max(0, int(cooldown_seconds))
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT wallet FROM m5_demote_cooldown WHERE demoted_at >= ?", (cutoff,)
+            ).fetchall()
+        return {str(row["wallet"]).lower() for row in rows if row["wallet"]}
 
     def clear_wallet_quarantine_reasons(self, reasons: set[str]) -> None:
         self.init_db()

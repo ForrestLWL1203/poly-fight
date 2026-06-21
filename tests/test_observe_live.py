@@ -72,6 +72,48 @@ class TestObserveLiveGates(unittest.TestCase):
             self.assertEqual(event["live_markets"], 0)
             self.assertEqual(client.market_positions_calls, [])  # 没有可扫的盘 → 不发 market_positions
 
+    def _seed_market_and_profiles(self, data_dir: Path):
+        """1 个达门活跃盘 + 空 collector profiles(钱包是全新候选,不会被去重)。"""
+        start = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+        markets = {
+            "m_live": {
+                "condition_id": "m_live", "outcome_prices": [0.5, 0.5], "volume": 100000,
+                "game_family": "lol", "market_type": "main_match", "match_start_time": start,
+            },
+        }
+        (data_dir / "collector_v2").mkdir(parents=True, exist_ok=True)
+        write_json(data_dir / "collector_v2" / "collector_v2_wallet_profiles.json", [])
+        client = _FakeClient({"m_live": [
+            {"positions": [{"proxyWallet": "0xCOOL", "outcomeIndex": 0,
+                            "avgPrice": 0.5, "totalBought": 1000, "totalPnl": 100}]},
+            {"positions": []},
+        ]})
+        return markets, client
+
+    def test_skips_m5_demote_cooldown_wallet(self):
+        # 刚被 M5 降级删除的钱包(冷却窗口内)即使在活跃盘里被发现,也不当新候选 → early-exit。
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            markets, client = self._seed_market_and_profiles(data_dir)
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            FollowStore((data_dir / "follow") / "follow.db").record_m5_demote_cooldown(["0xcool"], ts=now_ts)
+            event = self._run(data_dir, markets, client)
+            self.assertEqual(event["live_markets"], 1)
+            self.assertEqual(client.market_positions_calls, ["m_live"])  # 发现层照跑
+            self.assertEqual(event["new_candidates"], 0)                 # 冷却中 → 被排除
+            self.assertEqual(client.list_events_calls, 0)                # early-exit:没进评分
+
+    def test_m5_cooldown_expired_wallet_rediscovered(self):
+        # 同一钱包,冷却时间戳已过 24h → 不再排除,正常成为新候选(进入评分)。
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            markets, client = self._seed_market_and_profiles(data_dir)
+            stale_ts = int(datetime.now(timezone.utc).timestamp()) - 25 * 3600
+            FollowStore((data_dir / "follow") / "follow.db").record_m5_demote_cooldown(["0xcool"], ts=stale_ts)
+            event = self._run(data_dir, markets, client)
+            self.assertEqual(event["new_candidates"], 1)                 # 冷却已过 → 放行
+            self.assertGreater(client.list_events_calls, 0)              # 进了评分(拉分类集)
+
     def test_discovers_then_dedups_seen_wallet_early_exit(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
