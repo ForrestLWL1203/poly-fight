@@ -1540,15 +1540,17 @@ function Dashboard({ onLogout, toast }) {
     return () => { alive = false; stream.close(); if (pollTimer) clearInterval(pollTimer); };
   }, [merge]);
 
-  /* 有 open 跟单时,定时重拉 /api/events → 后端实时拉盘口算未结算盈亏(SSE 帧不带 events)。
-     无 open 跟单则不轮询,省 gamma 请求。open_signal_count 由 SSE 每 2s 刷新。 */
+  /* 有 open 跟单时,定时重拉 /api/events(详情实时盘口)+ /api/follows(列表未实现盈亏)。
+     两者都按实时价算未实现盈亏,必须同节奏刷新——否则列表(只在 follows_dirty=follow.db 变更时刷)
+     会冻在旧价、与详情(每 60s 刷价)对不上。无 open 跟单则不轮询,省 gamma 请求。 */
   const hasOpenFollows = !!(data.overview && Adapt.num(data.overview.open_signal_count) > 0);
   React.useEffect(() => {
     if (!hasOpenFollows) return;
     let alive = true;
     const id = setInterval(() => {
       Api.events().then((e) => alive && merge({ events: e })).catch(() => {});
-    }, 25000);
+      Api.follows({ page: 1, size: 25 }).then((f) => alive && merge({ follows: f })).catch(() => {});
+    }, 60000);
     return () => { alive = false; clearInterval(id); };
   }, [hasOpenFollows, merge]);
 
