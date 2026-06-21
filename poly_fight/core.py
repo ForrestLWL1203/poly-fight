@@ -46,7 +46,7 @@ SPORTS_MIN_BUCKET_WIN_RATE = 0.60
 # v22(病B,2026-06-21):6→8。scope 自适应把稀疏游戏(dota2/cs2/valorant)地板放宽到~7,导致
 # 半个榜单(41/81)靠 7–11 场可跟切片上榜,8 个是 7 场 100% 全胜——纯小样本运气,Wilson 在 n=7
 # 时(7/7→下界~0.65)惩罚不够。8 作硬地板覆盖自适应向下放宽,砍掉最薄的 ~19% 切片(实战 1/16
-# 的连胜运气钱包)。此门在 classify_wallet_bucket 内从常量取,三入口(collect/observe-v2/降级)共用。
+# 的连胜运气钱包)。此门在 classify_wallet_bucket 内从常量取,三入口(collect/observe-live/降级)共用。
 # 注:此值【已与】scope 自适应全样本地板的基数解耦(后者用 SCOPE_NEFF_FLOOR_BASE=6),只管 min_sub
 # 子集门。因 subset n_eff ≤ full n_eff 恒成立,subset≥8 的幸存者 full 必≥8,自适应地板(≤8)不会
 # 额外多砍 → 精确等于"砍掉 subset<8 的 ~19%",不波及更厚的钱包。

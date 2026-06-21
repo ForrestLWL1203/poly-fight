@@ -274,7 +274,7 @@
   const runnerBase = {
     pid: 12345, source: "dashboard", started_at: ago(7445),
     stake_usdc: 1, stake_ratio_percent: 10,
-    realtime_refresh: true, observe_running: true, observe_pid: 12346,
+    realtime_refresh: true, observe_live_running: true, observe_live_pid: 12346,
     strategy_configured: true, strategy_updated_at: ago(600), strategy_summary: "单笔 余额1%（每钱包每场预算 余额1%）· 现价上限 0.68 · 目标单≥$10",
   };
   // stateful mock so the progress masks (sample / stop) animate end-to-end

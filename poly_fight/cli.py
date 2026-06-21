@@ -295,7 +295,7 @@ V2_MAX_BOT_SCORE = 70              # bot 评分硬排除阈
 V2_MAX_LEADERBOARD_IDLE_HOURS = 336  # 14d:打分窗口(14-30d)已管"是否活跃",72h 过紧会误杀低频高手
 V2_PER_GAME_QUOTA = 0              # 0 = 不设每游戏上限(榜单=全部够格);>0 时才强制每游戏封顶
 V2_MAX_LEADERBOARD_WALLETS = 200   # 仅作安全上限(质量门已把关,大小不重要)
-# M5 自动降级删除后的冷却期:此窗口内 observer(observe-live / observe-v2)不重新发现加回被降级的
+# M5 自动降级删除后的冷却期:此窗口内 observer(observe-live)不重新发现加回被降级的
 # 钱包,堵「贴门钱包 2 输降级 → 下次赢 observer 立刻拉回」的 demote↔readd 抖动(2026-06-21 用户要求)。
 M5_DEMOTE_COOLDOWN_SECONDS = 24 * 3600
 # 技术型(低买高卖/靠出场)默认不纳入:占比极低 + 我们 follow 延迟高跟不准卖点,风险大。
@@ -303,7 +303,7 @@ M5_DEMOTE_COOLDOWN_SECONDS = 24 * 3600
 # 技术型方向常错 → hold 口径下算亏损,自然出局,与"复制方向"一致。
 V2_INCLUDE_TECHNICAL = False
 # 榜单只发 grade-A(= 有 ≥1 个 A 级桶 = follow 实际跟单的集合)。B 档不跟单 → 不上榜、不展示,
-# 但仍保留在内部 profiles 池里(observe-v2 去重必需 + 保留 B→A 晋升路径)。
+# 但仍保留在内部 profiles 池里(observer 去重必需 + 保留 B→A 晋升路径)。
 V2_LEADERBOARD_MIN_GRADE = "A"
 # 统一单一 15 天窗口:发现=打分=近期,全部用最近 15 天。esports 比赛密集,实测 15 天
 # 即可把 6 个桶全部装满 100 场(瓶颈是 bucket_market_limit,不是窗口),故发现层无损;
@@ -5395,7 +5395,7 @@ def _command_collect_wallets(
         for row in [*reused_profiles_by_wallet.values(), *refreshed_profiles]
         if normalize_wallet(row.get("wallet"))
     }
-    # 协调:保留 observe-v2(M4)累积发现的钱包,避免被全量重建丢掉;按打分窗口剪枝防膨胀。
+    # 协调:保留 observer 累积发现的钱包,避免被全量重建丢掉;按打分窗口剪枝防膨胀。
     prune_cutoff = now_ts - max(1, profile_lookback_days) * 86400
     for wallet_key, cached in existing_profiles.items():
         wallet_key = normalize_wallet(wallet_key or cached.get("wallet"))
@@ -5491,7 +5491,7 @@ def _command_collect_wallets(
         }
     )
     # 注:collect-v2 跑在 run-loop maybe_build 里(已 pause follow)、频率以小时计,且每次是
-    #     从共享 profiles 全量重建 → 与 sidecar(observe-v2/observe-live)的 publish 竞争窗口极小
+    #     从共享 profiles 全量重建 → 与 sidecar(observe-live)的 publish 竞争窗口极小
     #     且自愈;故此处暂未包 build lock(两个 sidecar 已互相串行化)。TODO 若未来观测到丢更新再补。
     dashboard_publish = publish_collector_dashboard_outputs(
         output_dir,
@@ -5620,49 +5620,8 @@ def command_collect_v2(args: argparse.Namespace, client: PolymarketClient | None
 
 
 # ============================================================
-# M4 observe-v2 —— 事件驱动增量发现(从新结算赛事;见 review/m4-observe-design.md)
+# M5 降级重评 —— 由 follow runner 按结算笔数事件触发(直接删除淘汰,无 quarantine 中间态)
 # ============================================================
-def detect_newly_settled_markets(
-    client: PolymarketClient,
-    *,
-    analyzed_ids: set[str],
-    now: datetime | None = None,
-    lookback_hours: float = 4.0,
-    gamma_pages: int = 2,
-) -> list[dict[str, Any]]:
-    """检测最近结算的 in-scope esports 盘口(已分析的除外)。
-
-    窗口 lookback_hours = tick 间隔 + buffer(默认 4h 配 2h tick = 2 倍覆盖,靠去重维护 delta;
-    buffer 兼顾 closed→UMA 解析延迟与 tick 抖动)。只返回已结算
-    (winning_outcome 非空)、end_date 在窗口内、且未分析过的盘口。
-    """
-    now = now or datetime.now(timezone.utc)
-    min_end = now - timedelta(hours=max(1.0, float(lookback_hours)))
-    events = client.list_events_paginated(
-        closed=True,
-        active=None,
-        max_pages=gamma_pages,
-        min_end_date=min_end,
-        max_end_date=now,
-        tag_slugs=CATEGORY_TAG_SLUGS["esports"],
-    )
-    classification = build_classification_set(events, now=now, lookback_days=1)
-    new_markets: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for market in classification:
-        cid = str(market.get("condition_id") or "").lower()
-        if not cid or cid in analyzed_ids or cid in seen:
-            continue
-        if winning_outcome_index(market) is None:  # 未结算
-            continue
-        end_dt = parse_dt(market.get("end_date"))
-        if not end_dt or end_dt < min_end or end_dt > now:
-            continue
-        seen.add(cid)
-        new_markets.append(market)
-    return new_markets
-
-
 def _delete_wallets_from_leaderboard(
     args: argparse.Namespace,
     *,
@@ -5750,7 +5709,7 @@ def rescore_demote_wallets(
     follow_dir: Path | str | None = None,
     now_ts: int | None = None,
 ) -> dict[str, Any]:
-    """M5 降级重评(独立于 observe-v2 周期发现,由 follow runner 按结算笔数事件触发)。
+    """M5 降级重评(由 follow runner 按结算笔数事件触发)。
 
     对给定 batch 钱包用当前 scope 重 profile,跌出 grade-A 榜的 → **直接删除淘汰**(无 quarantine
     中间态):从打分池 profiles 剔除 + 删该钱包原始交易缓存 + 重建并发布 A 榜 → 即时下榜停跟。
@@ -5878,203 +5837,18 @@ def rescore_demote_wallets(
     # 淘汰=直接删除(统一执行路径,见 _delete_wallets_from_leaderboard)。
     _delete_wallets_from_leaderboard(
         args, wallets=set(demoted), follow_dir=Path(follow_dir), now_ts=now_ts, source="rescore_demote")
-    # 冷却:记降级时间戳。M5_DEMOTE_COOLDOWN_SECONDS 内 observer(observe-live / observe-v2)不把它当
+    # 冷却:记降级时间戳。M5_DEMOTE_COOLDOWN_SECONDS 内 observer(observe-live)不把它当
     # 新候选重新发现加回 —— 防边界钱包(贴着 θ̂ 门)2 输降级、下次赢又被 observer 立刻拉回的 ping-pong。
     follow_store.record_m5_demote_cooldown(demoted, ts=now_ts)
     return {"rescored": len(reprofiled), "demoted": len(demoted), "demoted_wallets": demoted}
 
 
-def _command_observe_v2(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
-    """M4 发现一次 tick:新结算盘 → top-PnL 双侧持仓者 → 按 scope 打分 → 合并重建 A-only 榜 → 发布。
-    (降级/恢复已全部移出:降级由 follow runner 直接删除淘汰,无 quarantine 中间态、无恢复重评。)"""
-    client = client or build_client(args)
-    output_dir = resolve_collector_output_dir(args) / "collector_v2"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    now_dt = datetime.now(timezone.utc)
-    now_ts = int(now_dt.timestamp())
-    follow_dir = resolve_follow_dir(args, resolve_data_dir(args))
-    positions_per_market = getattr(args, "positions_per_market", 20)
-    observe_store = LeaderboardStore(resolve_data_dir(args) / "leaderboard_v2.db")
-
-    new_markets = detect_newly_settled_markets(
-        client,
-        analyzed_ids=set(observe_store.load_observe_analyzed(now_ts=now_ts)),
-        now=now_dt,
-        lookback_hours=float(getattr(args, "observe_lookback_hours", 4.0)),
-        gamma_pages=int(getattr(args, "observe_gamma_pages", 2)),
-    )
-    # M5 降级已拆出到 follow runner(按结算笔数事件触发 rescore_demote_wallets,直接删除淘汰
-    # 钱包,无 quarantine 中间态、无恢复重评)。observe-v2 只负责 M4 发现:跌出的钱包若日后重新
-    # 达标,会作为新候选被周期发现自然加回 A 榜。
-    follow_store = FollowStore(follow_dir / "follow.db")
-    profile_lookback_days = int(getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS) or V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
-
-    # 无新结算盘 → 真没事做(省一次分类集 Gamma 调用)
-    if not new_markets:
-        print(json.dumps({"event": "observe_v2_tick", "new_settled_markets": 0, "rescored": 0}))
-        return 0
-
-    # 1) 发现:新结算盘 top-20 双侧持仓者(只盈利);无新盘则跳过发现层。
-    seed_positions: list[dict[str, Any]] = []
-    for market in new_markets:
-        condition_id = str(market.get("condition_id") or "").lower()
-        try:
-            response = client.market_positions(condition_id, limit=positions_per_market, sort_by="TOTAL_PNL", sort_direction="DESC")
-        except Exception:
-            continue
-        seed_positions.extend(collect_seed_positions(market, response, positions_per_market=positions_per_market, include_losing_side=True))
-    seed_wallets = aggregate_seed_wallets(seed_positions)
-
-    # 2) 分类集给 profiling 提供 scope(与 collect/rescore 共用同一 scope 校准 → per-game 一致)。
-    #    observe 每 tick 读缓存校准;缓存 >24h 过期才用 client 重算(daily 保鲜,不每 tick 重算)。
-    scope_params = load_scope_params(resolve_data_dir(args), client=client, now=now_dt, refresh=False)
-    n_eff_floors = scope_n_eff_floors(scope_params)
-    n_eff_anchors = scope_n_eff_anchors(scope_params)
-    lookback_by_game = scope_lookback_by_game(scope_params)
-    lookback_days = scope_max_lookback_days(scope_params, int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS))
-    closed_events = client.list_events_paginated(
-        closed=True, active=None, max_pages=getattr(args, "gamma_pages", 10),
-        min_end_date=now_dt - timedelta(days=lookback_days), max_end_date=now_dt,
-        tag_slugs=CATEGORY_TAG_SLUGS["esports"],
-    )
-    classification_set = build_classification_set(closed_events, now=now_dt, lookback_days=lookback_days)
-    profile_classification_set = filter_classification_set_by_game_window(
-        classification_set, now=now_dt, lookback_by_game=lookback_by_game, default_days=profile_lookback_days)
-    condition_ids = {str(row.get("condition_id") or "").lower() for row in profile_classification_set if row.get("condition_id")}
-    market_records_by_id = {str(row.get("condition_id") or "").lower(): row for row in profile_classification_set if row.get("condition_id")}
-    condition_type_by_id = {cid: str(row.get("market_type") or MAIN_MATCH) for cid, row in market_records_by_id.items()}
-    condition_game_family_by_id = {cid: str(row.get("game_family") or "unknown") for cid, row in market_records_by_id.items()}
-
-    # 3) 合并累积 profiles;只 profile "新" 候选(已有的保留,含其 observed_at)
-    existing = load_collector_existing_profiles(output_dir, resolve_data_dir(args), prefix="collector_v2")
-    # 与 collect-v2 同口径:新种子先过 dust 现金门(min_avg_seed_cash,默认 100),否则小额交易者
-    # 会从 observer 溜进榜(collect 有这道门、observer 没有 → 口径不一致)。
-    # M5 降级冷却:窗口内不重新发现刚被降级删除的钱包(防 demote↔readd ping-pong)。
-    cooled = follow_store.load_m5_demote_cooldown_wallets(now_ts=now_ts, cooldown_seconds=M5_DEMOTE_COOLDOWN_SECONDS)
-    new_seed_pool = {wallet: sw for wallet, sw in seed_wallets.items() if wallet not in existing and wallet not in cooled}
-    new_seed_wallets = filter_profile_seed_wallets_v2(
-        new_seed_pool,
-        max_wallets=resolve_collector_profile_wallet_limit(args),
-        min_seed_markets=getattr(args, "v2_min_seed_markets", 1),
-        min_avg_seed_cash=getattr(args, "v2_min_seed_avg_cash", SEED_MIN_AVG_CASH),
-    )
-
-    def profile_one(seed_wallet: dict[str, Any], *, cache_ttl_days: int | None = None) -> dict[str, Any]:
-        wallet = normalize_wallet(seed_wallet.get("wallet"))
-        ttl = getattr(args, "user_trades_cache_ttl_days", 1) if cache_ttl_days is None else cache_ttl_days
-        trades, _source = fetch_recent_esports_user_trades_for_wallet(
-            client, wallet, condition_ids,
-            page_limit=getattr(args, "user_history_trades_limit", 500),
-            max_pages=getattr(args, "user_history_trades_max_pages", 3),
-            max_esports_markets=getattr(args, "max_esports_markets_per_wallet", 100),
-            data_dir=output_dir, now_ts=now_ts,
-            cache_ttl_days=ttl,
-            force_refresh=False, use_cache=True, include_source=True,
-            retention_days=lookback_days,
-        )
-        seed_candidate = build_profile_candidate_from_trades(collector_seed_candidate(seed_wallet), trades, market_records_by_id)
-        profile = profile_candidate_wallet(
-            seed_candidate, condition_ids,
-            market_records_by_id=market_records_by_id,
-            condition_type_by_id=condition_type_by_id,
-            condition_game_family_by_id=condition_game_family_by_id,
-            user_trades_loader=lambda _w: trades,
-            current_positions_loader=lambda _w: [],
-            now_ts=now_ts, scoring_basis="hold", n_eff_floors=n_eff_floors, n_eff_anchors=n_eff_anchors,
-        )
-        # observed_at:M4 发现并打分的时间 → dashboard 据此显示 2h "new" 标记
-        return {**profile, "profile_lookback_days": profile_lookback_days, "seed": collector_seed_payload(seed_wallet), "observed_at": now_ts}
-
-    new_profiles = [r for r in run_ordered_io_tasks(new_seed_wallets, profile_one, max_workers=getattr(args, "max_workers", 8)) if not isinstance(r, Exception)]
-
-    # 4) 整体重建 + 发布。临界区(merge→写 profiles→build→publish)加 build lock 与
-    #    collect-v2 / observe-live 串行化,避免并发 publish 的 lost-update。publish 函数本身
-    #    不再取锁(避免同进程二次 flock 自死锁)。
-    with acquire_build_lock(resolve_data_dir(args), blocking=True):
-        profiles_by_wallet = dict(existing)
-        for profile in new_profiles:   # 新候选 profile 覆盖旧的
-            wallet = normalize_wallet(profile.get("wallet"))
-            if wallet:
-                profiles_by_wallet[wallet] = profile
-        write_json(
-            output_dir / "collector_v2_wallet_profiles.json",
-            [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
-        )
-        collector_result = build_collector_leaderboard_v2(
-            profiles_by_wallet, now_ts=now_ts,
-            per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
-            max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
-            include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
-            gate_kwargs=_v2_gate_kwargs_from_args(args),
-        )
-        leaderboard = collector_result["leaderboard"]
-        write_json(
-            output_dir / "collector_v2_leaderboard.json",
-            [slim_profile_for_storage(row) for row in leaderboard],
-        )
-
-        for category in FOLLOW_SIGNAL_CATEGORIES:
-            set_pause_new_signals(follow_dir, category, {"status": "paused", "reason": "observe_v2", "started_at": now_ts})
-        try:
-            publish_collector_dashboard_outputs(
-                output_dir, resolve_data_dir(args),
-                summary={"collector": V2_COLLECTOR_NAME, "category": "esports", "source": "observe_v2"},
-                now_ts=now_ts, prefix="collector_v2", db_filename="leaderboard_v2.db",
-                profiles_publish_name="wallet_profiles_v2.json", collector_name=V2_COLLECTOR_NAME,
-            )
-        finally:
-            for category in FOLLOW_SIGNAL_CATEGORIES:
-                set_pause_new_signals(follow_dir, category, None)
-
-    observe_store.record_observe_analyzed(
-        [str(market.get("condition_id") or "").lower() for market in new_markets],
-        now_ts=now_ts,
-    )
-
-    new_on_board = sum(1 for row in leaderboard if to_int(row.get("observed_at")) and now_ts - to_int(row.get("observed_at")) < 7200)
-    print(json.dumps({
-        "event": "observe_v2_tick", "new_settled_markets": len(new_markets),
-        "new_candidates": len(new_seed_wallets), "profiled": len(new_profiles),
-        "leaderboard": len(leaderboard), "new_on_board_2h": new_on_board,
-        "rescored": 0, "demoted": 0, "recovered": 0,
-    }))
-    return 0
-
-
-def command_observe_v2(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
-    if float(getattr(args, "loop_hours", 0) or 0) <= 0:
-        return _command_observe_v2(args, client=client)
-    cli_client = client or build_client(args)
-    interval = max(60, int(float(getattr(args, "loop_hours", 0) or 0) * 3600))
-    retry = max(30, int(getattr(args, "loop_error_retry_seconds", 300) or 300))
-    max_iter = int(getattr(args, "loop_max_iterations", 0) or 0)
-    iterations = 0
-    # 作为 follow sidecar 启动时,榜单刚被手动采集刷新过,第一轮先睡满 interval 再跑,
-    # 避免"刚采完就立即用另一套默认阈值重算覆盖"。
-    if getattr(args, "defer_first_tick", False):
-        print(json.dumps({"event": "observe_v2_deferred", "first_tick_in_seconds": interval}))
-        time.sleep(interval)
-    while True:
-        try:
-            _command_observe_v2(args, client=cli_client)
-            wait = interval
-        except KeyboardInterrupt:
-            return 0
-        except Exception as exc:
-            print(json.dumps({"event": "observe_v2_loop_error", "error": str(exc)}))
-            wait = min(interval, retry)
-        iterations += 1
-        if max_iter and iterations >= max_iter:
-            return 0
-        time.sleep(wait)
-
-
 def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
     """observe-live 一次 tick:**活跃(未结算)** watchlist 盘 → 双侧持仓者 → 用其历史
     交易评分 → grade-A **提前**写进 leaderboard(source=observe_live),让跟单侧增量补单
-    看到其 live 持仓即补跟,不等结算。与 observe-v2 共用评分管线 + 同一 leaderboard.db;
+    看到其 live 持仓即补跟,不等结算。与 collect-v2 共用评分管线 + 同一 leaderboard.db;
     差异只在种子来源(live 盘,无 winner)。控量四道:volume 门 + top-K + 钱包级去重
-    early-exit + profiles 持久化天然负缓存。发布临界区与 observe-v2/collect 用 build lock
+    early-exit + profiles 持久化天然负缓存。发布临界区与 collect-v2 用 build lock
     串行化(非阻塞,占用即跳过本轮,分钟级下轮再来)。"""
     client = client or build_client(args)
     output_dir = resolve_collector_output_dir(args) / "collector_v2"
@@ -6103,7 +5877,7 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
         return 0
 
     # 2) 每场双侧持仓者 → 种子(无 winner;当前盈亏只软排序不硬筛)
-    # sort_by 必须用 data-api 合法枚举 TOTAL_PNL(与 collect-v2/observe-v2 一致);旧值 "CASHPNL"
+    # sort_by 必须用 data-api 合法枚举 TOTAL_PNL(与 collect-v2 一致);旧值 "CASHPNL"
     # 被 data-api 拒绝 → 每场抛异常被吞 → 0 seeds(observe-live 自上线起一直空转)。collect_live_seed_positions
     # 反正自己按 seed_cost 重排,API 排序值不影响结果。fetch 失败计数并随 tick 暴露,避免再次静默全失败。
     seed_positions: list[dict[str, Any]] = []
@@ -6138,7 +5912,7 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
                           "position_fetch_errors": position_fetch_error_count}))
         return 0
 
-    # 4) 评分(与 observe-v2 同口径 scope/profile —— 复用同样的模块级函数,保证 grade 一致)
+    # 4) 评分(与 collect-v2 同口径 scope/profile —— 复用同样的模块级函数,保证 grade 一致)
     profile_lookback_days = int(getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS) or V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
     scope_params = load_scope_params(data_dir, client=client, now=now_dt, refresh=False)
     n_eff_floors = scope_n_eff_floors(scope_params)
@@ -6185,7 +5959,7 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
 
     new_profiles = [r for r in run_ordered_io_tasks(new_seed_wallets, profile_one, max_workers=getattr(args, "max_workers", 8)) if not isinstance(r, Exception)]
 
-    # 5) 合并 + 重建 A-only 榜 + 发布;临界区加 build lock(非阻塞)与 observe-v2/collect 串行化。
+    # 5) 合并 + 重建 A-only 榜 + 发布;临界区加 build lock(非阻塞)与 collect-v2 串行化。
     #    锁内重读 existing → 不丢其它 writer 期间新增的 profile(防 lost-update)。
     try:
         with acquire_build_lock(data_dir, blocking=False):
@@ -6625,7 +6399,7 @@ def command_follow(
         if normalize_wallet(row.get("wallet"))
     }
     leaderboard_validated_at = max(leaderboard_mtimes.values() or [0])
-    # M5:实跟/重评/手动类隔离不被历史复审清除(恢复走 observe-v2 重评满冷却,或人工)。
+    # M5:实跟/重评/手动类隔离不被历史复审清除(恢复走 observer 重新发现,或人工)。
     store.clear_revalidated_quarantine(
         leaderboard_wallets,
         validated_at=leaderboard_validated_at,
@@ -7458,7 +7232,7 @@ def command_run(args: argparse.Namespace) -> int:
         print(json.dumps({"status": "onchain_disabled", "reason": "no secret/rpc; using data-api polling"}, ensure_ascii=False), flush=True)
 
     # M5 动态降级:跨 tick 累计被跟钱包的新结算笔数,满阈值就对那批钱包后台重评/隔离
-    # (事件驱动,替代旧的固定 2h observe-v2 降级扫描)。
+    # (事件驱动,替代旧的固定 2h 定时降级扫描)。
     rescore_threshold = int(getattr(args, "rescore_settled_threshold", 10) or 0)
     rescore_thread: threading.Thread | None = None
     m5_store = FollowStore(follow_dir / "follow.db")   # M5 计数从 DB 派生(持久化、含 exited)
@@ -7816,9 +7590,6 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--v2-min-seed-avg-cash", type=float, default=SEED_MIN_AVG_CASH)
         # 专精桶场均地板:合格桶 median 押注额须 ≥ 此值(默认与 seed 现金门统一为 100)。
         subparser.add_argument("--v2-min-bucket-cash", type=float, default=MIN_BUCKET_MEDIAN_CASH)
-        # M4 observe-v2:结算检测窗口(应 ≥ tick 间隔 + buffer)
-        subparser.add_argument("--observe-lookback-hours", type=float, default=4.0)
-        subparser.add_argument("--observe-gamma-pages", type=int, default=2)
 
     collect_v2 = subparsers.add_parser(
         "collect-v2",
@@ -7835,22 +7606,6 @@ def build_parser() -> argparse.ArgumentParser:
         profile_lookback_days=V2_DEFAULT_PROFILE_LOOKBACK_DAYS,
     )
 
-    observe_v2 = subparsers.add_parser(
-        "observe-v2",
-        help="M4: event-driven incremental discovery from newly-settled matches (loop: --loop-hours 2)",
-    )
-    add_build_arguments(observe_v2, include_category=True)
-    add_collector_arguments(observe_v2)
-    add_collector_v2_arguments(observe_v2)
-    observe_v2.add_argument("--defer-first-tick", action="store_true",
-                            help="作为 follow sidecar 时先睡满一轮再跑(避免刚采集完立即重算覆盖)")
-    observe_v2.set_defaults(
-        func=command_observe_v2,
-        max_leaderboard_wallets=V2_MAX_LEADERBOARD_WALLETS,
-        lookback_days=V2_DEFAULT_LOOKBACK_DAYS,
-        profile_lookback_days=V2_DEFAULT_PROFILE_LOOKBACK_DAYS,
-    )
-
     observe_live = subparsers.add_parser(
         "observe-live",
         help="3.1: 活跃(未结算)watchlist 盘提前发现优质钱包并晋升(loop: --loop-minutes 10)",
@@ -7858,7 +7613,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_build_arguments(observe_live, include_category=True)
     add_collector_arguments(observe_live)
     add_collector_v2_arguments(observe_live)
-    # 分钟级快循环(与 observe-v2 的 2h 闭市深采解耦;0=一次性)。market_positions 持仓时效
+    # 分钟级快循环(分钟级快循环;0=一次性)。market_positions 持仓时效
     # 要新,故按分钟跑。--follow-dir 指向 follow 循环的同一 follow 目录(读其 active 市场缓存)。
     observe_live.add_argument("--loop-minutes", type=float, default=0)
     observe_live.add_argument("--defer-first-tick", action="store_true",
@@ -7938,7 +7693,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--tick-seconds", type=int, default=60)
     run.add_argument("--ws-drain-seconds", type=int, default=5)
     # M5 动态降级:每累计这么多笔新结算跟单,就对那批被跟钱包重评一次,跌出 A 榜即隔离
-    # (事件驱动,替代旧的固定 2h observe-v2 降级扫描)。<=0 关闭 runner 侧降级。
+    # (事件驱动,替代旧的固定 2h 定时降级扫描)。<=0 关闭 runner 侧降级。
     run.add_argument("--rescore-settled-threshold", type=int, default=5)
     run.add_argument("--error-retry-seconds", type=int, default=180)
     run.add_argument("--max-consecutive-error-seconds", type=int, default=600)

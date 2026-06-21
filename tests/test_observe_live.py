@@ -1,5 +1,5 @@
 """observe-live(3.1)发现端的关键接缝:只读 follow active 缓存 + 活跃度门 + 未结算过滤
-+ 钱包级去重 early-exit。评分/发布复用 observe-v2 已在产线验证的模块级函数,不在此重测。"""
++ 钱包级去重 early-exit。评分/发布复用 collect-v2 已在产线验证的模块级函数,不在此重测。"""
 import json
 import unittest
 from datetime import datetime, timedelta, timezone

@@ -1475,7 +1475,7 @@ class FollowStore:
         return result
 
     def record_m5_demote_cooldown(self, wallets: Any, *, ts: int) -> None:
-        """M5 自动降级删除的钱包记一个冷却时间戳;冷却窗口内 observer(observe-live / observe-v2)
+        """M5 自动降级删除的钱包记一个冷却时间戳;冷却窗口内 observer(observe-live)
         不把它当新候选重新发现加回(防边界钱包 demote↔readd ping-pong)。"""
         self.init_db()
         clean = sorted({str(w or "").lower() for w in (wallets or []) if str(w or "").strip()})

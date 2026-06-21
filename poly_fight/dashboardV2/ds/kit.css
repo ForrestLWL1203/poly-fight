@@ -181,7 +181,7 @@
 }
 /* 钱包采集按钮容器 */
 .sample-trigger { position: relative; display: inline-flex; }
-/* observe-v2 / observe-live 动态观测新入榜钱包:地址右上角闪光 NEW 角标(4h 内显示) */
+/* observe-live 动态观测新入榜钱包:地址右上角闪光 NEW 角标(4h 内显示) */
 .wallet-cell { position: relative; display: inline-flex; align-items: center; gap: 8px; }
 .new-badge {
   position: absolute; top: -9px; right: -7px; z-index: 3;

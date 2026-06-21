@@ -3877,7 +3877,7 @@ class CoreTest(unittest.TestCase):
         weak = classify_wallet(esports_summary("0xweak", 0.50, 16), now_ts=now)
         profiles = {"0xstrong": strong, "0xweak": weak}
 
-        # collector / observe-v2 / rescore-demote 共用入口
+        # collector / rescore-demote 共用入口
         result = build_collector_leaderboard_v2(profiles, now_ts=now)
         board = {normalize_wallet(r.get("wallet")) for r in result["leaderboard"]}
 
@@ -9750,22 +9750,21 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(120, status["stop_requested_at"])
 
     def test_find_follow_processes_matches_run_and_observe(self):
-        # 进程扫描要找全 follow 全家(run + observe-v2 + observe-live),排除 serve/无关/僵尸。
+        # 进程扫描要找全 follow 全家(run + observe-live),排除 serve/无关/僵尸。
         from poly_fight.dashboard import _find_follow_processes
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp); eroot = data_dir / "esports"
             rows = [
                 {"pid": 100, "pgid": 100, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {data_dir} run --follow-dir x"},
-                {"pid": 101, "pgid": 101, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {eroot} observe-v2 --category esports"},
                 {"pid": 102, "pgid": 102, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {eroot} observe-live --category esports"},
                 {"pid": 103, "pgid": 103, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {data_dir} serve --port 8787"},
                 {"pid": 104, "pgid": 104, "stat": "S", "command": "python -m other.thing run"},
-                {"pid": 105, "pgid": 105, "stat": "Z", "command": f"python -m poly_fight.cli --data-dir {eroot} observe-v2 <defunct>"},
+                {"pid": 105, "pgid": 105, "stat": "Z", "command": f"python -m poly_fight.cli --data-dir {eroot} observe-live <defunct>"},
             ]
             config = DashboardConfig(data_dir=data_dir, username="a", password="p", cookie_secret="s",
                                      runner_process_lister=lambda: rows)
             got = {int(r["pid"]) for r in _find_follow_processes(config)}
-            self.assertEqual(got, {100, 101, 102})  # serve/无关/僵尸 排除
+            self.assertEqual(got, {100, 102})  # serve/无关/僵尸 排除
 
     def test_stop_runner_reaps_orphan_observe_by_scan(self):
         # 关键回归:控制文件没记的 observe 孤儿(重启覆盖 pid 后留下的),stop 也能按扫描杀掉。
@@ -9795,14 +9794,13 @@ class CoreTest(unittest.TestCase):
             data_dir = Path(tmp); follow_dir = data_dir / "follow"; eroot = data_dir / "esports"
             rows = [
                 {"pid": 300, "pgid": 300, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {data_dir} run --follow-dir {follow_dir}"},
-                {"pid": 301, "pgid": 301, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {eroot} observe-v2 --category esports"},
                 {"pid": 302, "pgid": 302, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {eroot} observe-live --category esports"},
                 {"pid": 303, "pgid": 303, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {data_dir} serve --port 8787"},
             ]
             config = DashboardConfig(data_dir=data_dir, follow_dir=follow_dir, username="a", password="p", cookie_secret="s",
                                      runner_process_lister=lambda: rows)
             reaped = set(reap_orphan_follow_processes(config))
-            self.assertEqual(reaped, {300, 301, 302})  # run+observe 全收;serve 自己不收
+            self.assertEqual(reaped, {300, 302})  # run+observe-live 全收;serve 自己不收
 
     def test_serve_startup_reap_noop_when_clean(self):
         # 干净起点(无遗留 follow 进程)时,启动收割是 no-op,不误杀。
@@ -10102,27 +10100,26 @@ class CoreTest(unittest.TestCase):
             off = start_runner(config)
             self.assertEqual(len(calls), 1)
             self.assertFalse(off["realtime_refresh"])
-            self.assertIsNone(off["observe_pid"])
+            self.assertIsNone(off["observe_live_pid"])
 
             # lister 返回 [] → 状态判定永远非 running,可直接再次 start(无需真停进程)
             calls.clear()
 
-            # 即使上次采集命令里残留旧阈值 flag,observe-v2 也不再继承它们
+            # 即使上次采集命令里残留旧阈值 flag,observe-live 也不再继承它们
             # (门槛全在 core.py 评分常量,collect/observe 天然一致;--v2-* 已从 CLI 删除)。
             write_follow_control(follow_dir, {"wallet_refresh": {"esports": {"command": [
                 "python", "-m", "poly_fight.cli", "collect-v2",
                 "--v2-min-positive-rate", "0.7500", "--v2-max-median-entry", "0.7500",
             ]}}})
 
-            # 策略勾上实时刷新 → runner + observe-live 两个进程(observe-v2 已停用)
+            # 策略勾上实时刷新 → runner + observe-live 两个进程
             strat_on = default_follow_strategy(balance_usdc=100)
             strat_on["realtime_refresh"] = True
             store.save_follow_strategy(strat_on, ts=200)
             on = start_runner(config)
             self.assertEqual(len(calls), 2)
             self.assertTrue(on["realtime_refresh"])
-            # observe-v2 不再 spawn
-            self.assertIsNone(on["observe_pid"])
+            # observe-v2 已删除,绝不 spawn(回归守卫)
             self.assertFalse(any("observe-v2" in c for c in calls))
             # observe-live:快循环(1h),同一 esports data 目录,发布同一 leaderboard_v2.db
             observe_live_cmd = calls[1]
@@ -14082,23 +14079,6 @@ class CoreTest(unittest.TestCase):
             q = store.load_wallet_quarantine(category="esports")
             self.assertIn("0xa", q)       # sticky 原因保留
             self.assertNotIn("0xb", q)    # 可复审原因被清除
-
-    def test_detect_newly_settled_markets(self):
-        from unittest.mock import patch
-        from poly_fight.cli import detect_newly_settled_markets
-        now = datetime(2026, 6, 14, tzinfo=timezone.utc)
-        recent = (now - timedelta(hours=2)).isoformat()
-        old = (now - timedelta(hours=20)).isoformat()
-        markets = [
-            {"condition_id": "0xNEW", "outcome_prices": [1.0, 0.0], "end_date": recent},        # 新结算 → 取
-            {"condition_id": "0xSEEN", "outcome_prices": [1.0, 0.0], "end_date": recent},       # 已分析 → 跳
-            {"condition_id": "0xUNRESOLVED", "outcome_prices": None, "end_date": recent},       # 未结算 → 跳
-            {"condition_id": "0xOLD", "outcome_prices": [1.0, 0.0], "end_date": old},           # 超窗口 → 跳
-        ]
-        client = type("C", (), {"list_events_paginated": lambda self, **k: []})()
-        with patch("poly_fight.cli.build_classification_set", return_value=markets):
-            out = detect_newly_settled_markets(client, analyzed_ids={"0xseen"}, now=now, lookback_hours=6)
-        self.assertEqual([str(m["condition_id"]).lower() for m in out], ["0xnew"])
 
     def test_collect_v2_loop_iterations_and_backoff(self):
         import argparse

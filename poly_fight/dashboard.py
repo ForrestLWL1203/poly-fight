@@ -2780,10 +2780,6 @@ def build_runner_status(config: DashboardConfig) -> dict[str, Any]:
             "strategy_summary": recorded.get("strategy_summary", defaults.get("strategy_summary")),
             "log_path": recorded.get("log_path") if source == "dashboard" else None,
             "realtime_refresh": bool(recorded.get("realtime_refresh")) if source == "dashboard" else False,
-            "observe_running": bool(source == "dashboard" and _pid_alive(int(recorded.get("observe_pid") or 0))),
-            "observe_pid": recorded.get("observe_pid") if source == "dashboard" else None,
-            "observe_pgid": recorded.get("observe_pgid") if source == "dashboard" else None,
-            "observe_log_path": recorded.get("observe_log_path") if source == "dashboard" else None,
             "observe_live_running": bool(source == "dashboard" and _pid_alive(int(recorded.get("observe_live_pid") or 0))),
             "observe_live_pid": recorded.get("observe_live_pid") if source == "dashboard" else None,
             "observe_live_pgid": recorded.get("observe_live_pgid") if source == "dashboard" else None,
@@ -2920,11 +2916,6 @@ def start_runner(
         pgid = _process_group_id(pid) or pid
     # 实时刷新:勾选则随 runner 起 observe-live 快循环(从活跃/未结算 watchlist 盘提前发现优质
     # 钱包并晋升,发布到 dashboard 读的同一个 esports/leaderboard_v2.db)。
-    # observe-v2(M4 从已结算赛事增量发现)已停用(2026-06-21):与 observe-live 功能重叠,
-    # 结算侧发现交由周期 collect-v2 覆盖,不再起这个 sidecar。
-    observe_pid = 0
-    observe_pgid = 0
-    observe_log_path = ""
     observe_live_pid = 0
     observe_live_pgid = 0
     observe_live_log_path = ""
@@ -2949,9 +2940,6 @@ def start_runner(
         "pid": pid,
         "pgid": pgid,
         "realtime_refresh": bool(realtime_refresh),
-        "observe_pid": observe_pid or None,
-        "observe_pgid": observe_pgid or None,
-        "observe_log_path": observe_log_path or None,
         "observe_live_pid": observe_live_pid or None,
         "observe_live_pgid": observe_live_pgid or None,
         "observe_live_log_path": observe_live_log_path or None,
@@ -2985,7 +2973,7 @@ def stop_runner(config: DashboardConfig) -> dict[str, Any]:
         config.runner_process_stopper(stop_target)
     else:
         _terminate_runner_process(current)
-        _terminate_observe_process(current)   # 控制文件记录的 observe-v2 / observe-live
+        _terminate_observe_process(current)   # 控制文件记录的 observe-live sidecar
         _reap_follow_processes(follow_processes)  # 兜底:杀掉控制文件没记的孤儿(run/observe)
     status = {
         **current,
@@ -3048,13 +3036,13 @@ def _find_runner_processes(config: DashboardConfig) -> list[dict[str, Any]]:
 
 
 def _is_poly_fight_follow_command(tokens: list[str], command: str) -> bool:
-    """匹配 follow 全家:run 主进程 + observe-v2 / observe-live sidecar。"""
+    """匹配 follow 全家:run 主进程 + observe-live sidecar。"""
     has_cli = (
         "poly_fight.cli" in tokens
         or any(token.endswith("poly_fight/cli.py") or token.endswith("poly_fight\\cli.py") for token in tokens)
         or "poly_fight.cli" in command
     )
-    return has_cli and any(sub in tokens for sub in ("run", "observe-v2", "observe-live"))
+    return has_cli and any(sub in tokens for sub in ("run", "observe-live"))
 
 
 def _follow_data_dir_match_values(data_dir: Path) -> set[str]:
@@ -3259,8 +3247,7 @@ def _terminate_pgid_or_pid(pgid: int, pid: int) -> None:
 
 
 def _terminate_observe_process(status: dict[str, Any]) -> None:
-    """停掉实时刷新挂的 sidecar 子进程(observe-v2 + observe-live;best-effort)。"""
-    _terminate_pgid_or_pid(int(status.get("observe_pgid") or 0), int(status.get("observe_pid") or 0))
+    """停掉实时刷新挂的 observe-live sidecar 子进程(best-effort)。"""
     _terminate_pgid_or_pid(int(status.get("observe_live_pgid") or 0), int(status.get("observe_live_pid") or 0))
 
 

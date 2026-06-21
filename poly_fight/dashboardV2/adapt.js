@@ -247,7 +247,7 @@
       category: row.category || "esports",
       game: normalizeGame(row.primary_game || row.best_game_family),
       // M4 动态观测发现并入榜 < 2h → 显示 "NEW";超过 2h 不再显示
-      // observe-v2 是 2h 一轮,用 4h 窗口(覆盖两轮)让"刚入榜"的 NEW 标稳定可见、不会一过 2h 就闪没。
+      // observe-live 约 1h 一轮,用 4h 窗口让"刚入榜"的 NEW 标稳定可见、不会一轮就闪没。
       isNew: row.observed_at ? (nowMs - num(row.observed_at) * 1000 < 4 * 3600 * 1000) : false,
       score: Math.round(num(row.best_bucket_score)),
       roi: Math.round(pct(row.esports_roi) * 10) / 10,

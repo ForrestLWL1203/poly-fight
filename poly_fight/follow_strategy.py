@@ -49,7 +49,7 @@ def default_follow_strategy(*, balance_usdc: float | None = None) -> dict[str, A
         "configured": configured,
         "schema_version": DEFAULT_FOLLOW_STRATEGY_SCHEMA_VERSION,
         "updated_at": 0,
-        # 实时刷新 Leaderboard:启动跟单时随 runner 起 observe-v2 sidecar。运行中不可改。
+        # 实时刷新 Leaderboard:启动跟单时随 runner 起 observe-live sidecar。运行中不可改。
         "realtime_refresh": False,
         "sizing": {
             "per_signal_percent": DEFAULT_PER_SIGNAL_PERCENT,
