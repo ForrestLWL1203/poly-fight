@@ -239,6 +239,13 @@ def paper_exit_pnl(entry_price: float, exit_price: float, stake: float) -> float
 # 若卖完后剩余 < $1(无法再单独成单的 dust)→ 一刀切全平。
 MIN_FOLLOW_SELL_USDC = 1.0
 
+# 病A 修复(2026-06-21):只在目标"高价止盈"(卖价 ≥ HIGH_EXIT_PRICE)时镜像跟卖;
+# 低于此的提前卖 = 没信念的 flat 平 / 盘中乱平,一律不跟、持有到结算。依据:VPS 全量回测
+# 显示被跟钱包普遍"卖赢家、扛输家"(处置效应),全持有到结算净 +132~+245、不放大亏损
+# (输家他们本就不止损,镜不镜像都一样;赢家过早跑,hold 反而多吃)。见
+# review/follow-optimization-plan.md。0.90+ 出口保留资金利用率/锁高价利润。
+HIGH_EXIT_PRICE = 0.90
+
 
 def _signal_total_stake(signal: dict[str, Any]) -> float:
     return sum(leg_actual_stake(leg) for leg in signal.get("legs") or [])
@@ -253,15 +260,24 @@ def _signal_full_exit_pnl(signal: dict[str, Any], exit_price: float, *, hypothet
 
 
 def apply_follow_sell(signal: dict[str, Any], trade: dict[str, Any], exit_price: float, now_ts: int) -> str:
-    """目标卖出 → 我们按"占总仓比例"同步平仓,返回 "exited" / "partial" / "hold"。
+    """目标卖出 → 我们同步平仓,返回 "exited" / "partial" / "hold"。
 
-    等比例:目标累计卖出占仓 wf → 我们目标也卖到 wf。受 $1 最小下单约束,
+    病A 价格门:仅当目标卖价 ≥ HIGH_EXIT_PRICE(0.90,高价止盈)才镜像;<0.90 的提前卖
+    一律不跟、持有到结算(仅记 wallet_sell_size + 行为)。
+
+    高价止盈分支等比例:目标累计卖出占仓 wf → 我们目标也卖到 wf。受 $1 最小下单约束,
     比例还没攒够 $1 就等("hold");卖了之后剩余会成 dust(<$1)就一刀切全平。
     记 our_sold_fraction、our_partial_exit_pnl(各次按盘口现价实现);余量留到结算。
     """
     sold_before = to_float(signal.get("wallet_sell_size"))
     signal["wallet_sell_size"] = round(sold_before + trade_size(trade), 8)
     signal.setdefault("behavior_events", []).append(_behavior_event("sell", trade))
+
+    # 病A 价格门:目标在 <0.90 提前平仓 → 不镜像,持有到结算(仅记 wallet_sell_size + 行为供审计)。
+    # 我方仓位完全不变(our_sold_fraction / our_partial_exit_pnl 不动)。只有 ≥0.90 高价止盈才往下走镜像。
+    if to_float(exit_price) < HIGH_EXIT_PRICE:
+        signal["wallet_behavior"] = wallet_behavior_summary(signal)
+        return "exited" if to_float(signal.get("our_sold_fraction")) >= 1.0 - 1e-9 else "hold"
 
     bought = sum(to_float(leg.get("wallet_trade_size")) for leg in signal.get("legs") or [])
     wallet_sold_frac = min(1.0, to_float(signal.get("wallet_sell_size")) / bought) if bought > 0 else 1.0

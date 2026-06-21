@@ -44,7 +44,14 @@ SPORTS_N_EFF_FLOOR = 12
 SPORTS_MIN_BUCKET_WIN_RATE = 0.60
 # v19:可跟价区(≤ceiling)子集最小厚度。全样本地板(12)管"真活跃",此项管"别拿太薄的可跟切片下判断"
 # (防 3–5 场侥幸过 edge_lb)。edge_lb 的 Wilson 仍在子集上算。
-ESPORTS_SUBSET_MIN_SAMPLE = 6
+# v22(病B,2026-06-21):6→8。scope 自适应把稀疏游戏(dota2/cs2/valorant)地板放宽到~7,导致
+# 半个榜单(41/81)靠 7–11 场可跟切片上榜,8 个是 7 场 100% 全胜——纯小样本运气,Wilson 在 n=7
+# 时(7/7→下界~0.65)惩罚不够。8 作硬地板覆盖自适应向下放宽,砍掉最薄的 ~19% 切片(实战 1/16
+# 的连胜运气钱包)。此门在 classify_wallet_bucket 内从常量取,三入口(collect/observe-v2/降级)共用。
+# 注:此值【已与】scope 自适应全样本地板的基数解耦(后者用 SCOPE_NEFF_FLOOR_BASE=6),只管 min_sub
+# 子集门。因 subset n_eff ≤ full n_eff 恒成立,subset≥8 的幸存者 full 必≥8,自适应地板(≤8)不会
+# 额外多砍 → 精确等于"砍掉 subset<8 的 ~19%",不波及更厚的钱包。
+ESPORTS_SUBSET_MIN_SAMPLE = 8
 SPORTS_SUBSET_MIN_SAMPLE = 6
 # ── Scope-adaptive calibration（按 game_family 实测赛事密度自适应 lookback / n_eff / idle）──
 # 见 review/scope-adaptive-calibration.md。供给侧信号(Gamma 已结算主盘,profiling 前即可算)→
@@ -61,10 +68,13 @@ SCOPE_NEFF_MID = 8                    # λ_T1 ≤ λ < λ_T2(中,如 lol)—— 
 SCOPE_NEFF_SPARSE = 7                 # λ < λ_T1(稀疏,如 dota2 / valorant)—— 满严格锚点
 SCOPE_NEFF_LAMBDA_T1 = 9.0
 SCOPE_NEFF_LAMBDA_T2 = 14.0
-# v21 缓冲缩放:实际 n_eff 地板 = 子集门 + round((锚点 − 子集门) × scale)。
-#   scale=1.0 → 复现满严格 10/8/7;scale=0.5 → 8/7/6(密集留缓冲、稀疏并入子集门)。
+# v21 缓冲缩放:实际 n_eff 地板 = 基数 + round((锚点 − 基数) × scale)。
+#   scale=1.0 → 复现满严格 10/8/7;scale=0.5 → 8/7/6(密集留缓冲、稀疏并入基数)。
 #   仍按 λ 自适应分档(锚点随密度走),只是整体缓冲按比例缩——单旋钮、非硬编码。
 SCOPE_NEFF_CUSHION_SCALE = 0.5
+# v22:自适应全样本地板的基数。曾 = ESPORTS_SUBSET_MIN_SAMPLE,病B 把子集门抬到 8 后【解耦】,
+#   基数仍保持 6,避免把密集游戏全样本地板连带抬到 9 而超出"只砍最薄 subset<8"的保守范围。
+SCOPE_NEFF_FLOOR_BASE = 6
 # 薄样本附加门:桶 full n_eff 落在 [放松地板, 满严格锚点) 区间(即只因缩放才够样本)→
 #   要求更强信号(edge_lb ≥ THIN_EDGE 且 θ̂ ≥ THIN_WR)才给 A/B,挡贴门弱信号、放行真专精。
 SCOPE_NEFF_THIN_EDGE_MIN = 0.08
@@ -106,7 +116,7 @@ def derive_scope_params(
     window_days: int,
     gaps: list[float] | None = None,
     market_target: int = SCOPE_MARKET_TARGET,
-    subset_floor: int = ESPORTS_SUBSET_MIN_SAMPLE,
+    subset_floor: int = SCOPE_NEFF_FLOOR_BASE,
 ) -> dict[str, Any]:
     """从一个 scope 的密度信号推 {lookback / n_eff / idle}。纯函数、无 IO。
     见 review/scope-adaptive-calibration.md。"""

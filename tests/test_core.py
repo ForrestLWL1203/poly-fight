@@ -3804,6 +3804,22 @@ class CoreTest(unittest.TestCase):
         self.assertNotEqual(thin_sub["grade"], "A")
         self.assertIn("thin_followable_subset", thin_sub["reasons"])
 
+    def test_v22_subset_floor_8_cuts_thin_lucky_slices(self):
+        # 病B(2026-06-21):可跟价区子集 n_eff < 8 → 不据此判桶(挡 7 场连胜运气切片);≥8 才可上 A。
+        now = 100 + 86400
+        base = {
+            "esports_closed_count": 30, "recency_weighted_win_rate": 0.95,
+            "median_entry_price": 0.50, "esports_realized_pnl": 5000,
+            "esports_total_bought": 50000, "last_esports_trade_at": 100, "bot_like_score": 0,
+            "effective_sample_size_full": 30,
+        }
+        thin7 = classify_wallet({**base, "effective_sample_size": 7}, now_ts=now)
+        self.assertNotEqual(thin7["grade"], "A")
+        self.assertIn("thin_followable_subset", thin7["reasons"])
+        ok8 = classify_wallet({**base, "effective_sample_size": 8}, now_ts=now)
+        self.assertEqual(ok8["grade"], "A")
+        self.assertNotIn("thin_followable_subset", ok8["reasons"])
+
     def test_v21_thin_sample_gate_requires_stronger_signal_below_anchor(self):
         # v21:桶 full n_eff 落在 [放松地板6, 满严格锚点10) → 须 edge_lb≥0.08 且 θ̂≥0.80 才给 A。
         now = 100 + 86400
@@ -6814,7 +6830,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(stats["funded_stake_usdc"], 75)
         self.assertEqual(stats["new_leg_count"], 2)
 
-    def test_follow_v2_buy_legs_sell_mirror_exits_by_default(self):
+    def test_follow_v2_low_price_sell_holds_high_price_mirrors(self):
         now = 1000
         market = {
             "condition_id": "m1",
@@ -6846,6 +6862,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(signals[0]["legs"][0]["wallet_fill_price"], 0.45)
         self.assertEqual(signals[0]["behavior_events"][0]["kind"], "add")
 
+        # 病A:目标在 0.6(<0.90)清仓 → 我们不镜像,持有到结算(默认)。仅记 wallet_sell_size+行为。
         sell_market = {**market, "outcome_prices": [0.6, 0.4]}
         signals, stats = process_follow_trades(
             signals,
@@ -6858,11 +6875,28 @@ class CoreTest(unittest.TestCase):
             max_slippage=0.05,
         )
 
+        self.assertEqual(stats["exited_signal_count"], 0)
+        self.assertNotEqual(signals[0]["status"], "exited")
+        self.assertEqual(signals[0]["wallet_sell_size"], 55)
+        self.assertFalse(signals[0].get("our_sold_fraction"))  # 未镜像 → 未设/0
+        self.assertTrue(wallet_behavior_summary(signals[0])["wallet_sold_before_resolution"])
+
+        # 目标在 0.95(≥0.90)高价止盈 → 我们镜像跟卖(全平)。
+        high_market = {**market, "outcome_prices": [0.95, 0.05]}
+        signals, stats = process_follow_trades(
+            signals,
+            wallet="0xA",
+            trades=[{"id": "s2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.95, "size": 55, "timestamp": now + 3}],
+            markets_by_condition={"m1": high_market},
+            now_ts=now + 3,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.05,
+        )
+
         self.assertEqual(stats["exited_signal_count"], 1)
         self.assertEqual(signals[0]["status"], "exited")
-        self.assertEqual(signals[0]["wallet_sell_size"], 55)
-        self.assertTrue(wallet_behavior_summary(signals[0])["sold_before_resolution"])
-        self.assertEqual(signals[0]["exit_price"], 0.6)
+        self.assertEqual(signals[0]["exit_price"], 0.95)
         self.assertGreater(signals[0]["our_realized_pnl"], 0)
 
     def test_follow_records_pre_start_trade_detected_after_start_within_grace(self):
@@ -7128,9 +7162,9 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(signals[0]["league"], "nba")
 
     def test_follow_v4_proportional_sell_then_settle_pnl(self):
-        # 目标买 100@0.40,我们跟 10% = $4 仓(10股@0.40)。目标卖一半(50股)@0.60 →
-        # 我们等比例卖一半(5股):落袋 5×(0.60−0.40)= $1。余下 5股 持有到结算,A 赢(付1.0):
-        # 5×(1.0−0.40)= $3。合计 our_paper_pnl = $4。
+        # 病A 价格门:只在 ≥0.90 高价止盈才镜像比例卖。目标买 100@0.40,我们跟 10% = $4 仓(10股@0.40)。
+        # 目标卖一半(50股)@0.95 → 我们等比例卖一半:落袋 0.5×[4×(0.95−0.40)/0.40] = $2.75。余下半仓持有
+        # 到结算,A 赢(付1.0):0.5×[4×(1.0−0.40)/0.40] = $3。合计 our_paper_pnl = $5.75。
         now = 1000
         market = {
             "condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [0.40, 0.60],
@@ -7142,18 +7176,18 @@ class CoreTest(unittest.TestCase):
             markets_by_condition={"m1": market}, now_ts=now, stake_usdc=1, max_follow_legs=10, max_slippage=0.05,
         )
         self.assertEqual(signals[0]["legs"][0]["funded_stake"], 4.0)
-        market["outcome_prices"] = [0.60, 0.40]  # A 涨到 0.60
+        market["outcome_prices"] = [0.95, 0.05]  # A 涨到 0.95(高价止盈)
         signals, stats = process_follow_trades(
             signals, wallet="0xA",
-            trades=[{"id": "s1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.60, "size": 50, "timestamp": now + 1}],
+            trades=[{"id": "s1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.95, "size": 50, "timestamp": now + 1}],
             markets_by_condition={"m1": market}, now_ts=now + 1, stake_usdc=1, max_follow_legs=10, max_slippage=0.05,
         )
         self.assertEqual(stats["partial_exit_count"], 1)
         self.assertAlmostEqual(signals[0]["our_sold_fraction"], 0.50, places=4)
-        self.assertAlmostEqual(signals[0]["our_partial_exit_pnl"], 1.0, places=4)
+        self.assertAlmostEqual(signals[0]["our_partial_exit_pnl"], 2.75, places=4)
         remaining, settled = settle_open_signals(signals, {"m1": 0}, now_ts=now + 100)
         self.assertEqual(len(settled), 1)
-        self.assertAlmostEqual(settled[0]["our_paper_pnl"], 4.0, places=4)
+        self.assertAlmostEqual(settled[0]["our_paper_pnl"], 5.75, places=4)
 
     def test_follow_v4_small_sell_holds_below_min_order_without_quarantine(self):
         now = 1000
@@ -7213,12 +7247,13 @@ class CoreTest(unittest.TestCase):
             max_slippage=0.05,
         )
 
+        market["outcome_prices"] = [0.95, 0.05]  # 病A:≥0.90 高价止盈才镜像比例卖
         signals, stats = process_follow_trades(
             signals,
             wallet="0xA",
             trades=[
-                {"id": "s1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.5, "size": 10, "timestamp": now + 1},
-                {"id": "s2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.5, "size": 15, "timestamp": now + 2},
+                {"id": "s1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.95, "size": 10, "timestamp": now + 1},
+                {"id": "s2", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.95, "size": 15, "timestamp": now + 2},
             ],
             markets_by_condition={"m1": market},
             now_ts=now + 2,
@@ -8205,7 +8240,7 @@ class CoreTest(unittest.TestCase):
                                     "conditionId": "m1",
                                     "question": "Dota 2: A vs B (BO3)",
                                     "outcomes": ["A", "B"],
-                                    "outcomePrices": ["0.60", "0.40"],
+                                    "outcomePrices": ["0.95", "0.05"],
                                     "active": True,
                                     "closed": False,
                                     "volume": 100000,
@@ -8229,7 +8264,7 @@ class CoreTest(unittest.TestCase):
                     self.wallets.append(wallet)
                     return [
                         {"id": "new-buy", "timestamp": 20, "market": "m2", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 100},
-                        {"id": "new-sell", "timestamp": 30, "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.6, "size": 100},
+                        {"id": "new-sell", "timestamp": 30, "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.95, "size": 100},
                     ]
 
             parser = build_parser()
@@ -8247,8 +8282,8 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(len(snapshot["results"]), 1)
             self.assertEqual(snapshot["results"][0]["condition_id"], "m1")
             self.assertEqual(snapshot["results"][0]["status"], "exited")
-            self.assertEqual(snapshot["results"][0]["exit_price"], 0.6)
-            self.assertEqual(snapshot["results"][0]["our_realized_pnl"], 0.2)
+            self.assertEqual(snapshot["results"][0]["exit_price"], 0.95)
+            self.assertEqual(snapshot["results"][0]["our_realized_pnl"], 0.9)
             self.assertTrue(snapshot["results"][0]["wallet_behavior"]["wallet_sold_before_resolution"])
             self.assertNotIn("m2", {row.get("condition_id") for row in snapshot["open_signals"]})
 
@@ -8316,7 +8351,7 @@ class CoreTest(unittest.TestCase):
                                     "conditionId": "m1",
                                     "question": "Dota 2: A vs B (BO3)",
                                     "outcomes": ["A", "B"],
-                                    "outcomePrices": ["0.60", "0.40"],
+                                    "outcomePrices": ["0.95", "0.05"],
                                     "active": True,
                                     "closed": False,
                                     "volume": 100000,
@@ -8340,7 +8375,7 @@ class CoreTest(unittest.TestCase):
                     self.wallets.append(wallet)
                     return [
                         {"id": "new-buy", "timestamp": 20, "market": "m2", "outcomeIndex": 0, "side": "BUY", "price": 0.5, "size": 100},
-                        {"id": "new-sell", "timestamp": 30, "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.6, "size": 100},
+                        {"id": "new-sell", "timestamp": 30, "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.95, "size": 100},
                     ]
 
             parser = build_parser()
@@ -8354,8 +8389,8 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(len(snapshot["results"]), 1)
             self.assertEqual(snapshot["results"][0]["condition_id"], "m1")
             self.assertEqual(snapshot["results"][0]["status"], "exited")
-            self.assertEqual(snapshot["results"][0]["exit_price"], 0.6)
-            self.assertEqual(snapshot["results"][0]["our_realized_pnl"], 0.2)
+            self.assertEqual(snapshot["results"][0]["exit_price"], 0.95)
+            self.assertEqual(snapshot["results"][0]["our_realized_pnl"], 0.9)
             self.assertTrue(snapshot["results"][0]["wallet_behavior"]["wallet_sold_before_resolution"])
             self.assertNotIn("m2", {row.get("condition_id") for row in snapshot["open_signals"]})
 
@@ -9092,7 +9127,7 @@ class CoreTest(unittest.TestCase):
                                     "conditionId": "m1",
                                     "question": "Dota 2: Team A vs Team B (BO3)",
                                     "outcomes": ["Team A", "Team B"],
-                                    "outcomePrices": ["0.75", "0.25"],
+                                    "outcomePrices": ["0.95", "0.05"],
                                     "active": True,
                                     "closed": False,
                                     "volume": 100000,
@@ -9103,7 +9138,7 @@ class CoreTest(unittest.TestCase):
                     ]
 
                 def trades_for_user(self, _wallet, **_kwargs):
-                    return [{"id": "sell1", "timestamp": 30, "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.75, "size": 10}]
+                    return [{"id": "sell1", "timestamp": 30, "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.95, "size": 10}]
 
             parser = build_parser()
             args = parser.parse_args(
@@ -9126,12 +9161,12 @@ class CoreTest(unittest.TestCase):
 
             summary = command_follow(args, client=FakeClient(), emit=False)
             self.assertEqual(summary["exited_signal_count"], 1)
-            self.assertEqual(summary["balance_ledger_applied_amount_usdc"], 1.5)
-            self.assertEqual(store.load_account_balance()["balance_usdc"], 2.0)
+            self.assertEqual(summary["balance_ledger_applied_amount_usdc"], 1.9)
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 2.4)
 
             summary_again = command_follow(args, client=FakeClient(), emit=False)
             self.assertEqual(summary_again["balance_ledger_applied_count"], 0)
-            self.assertEqual(store.load_account_balance()["balance_usdc"], 2.0)
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 2.4)
 
     def test_dashboard_short_addr_and_session_token(self):
         self.assertEqual(short_addr("0x1234567890abcdef1234567890abcdef12345678"), "0x123...678")
