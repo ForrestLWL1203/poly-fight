@@ -28,6 +28,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+from .ws_client import WSClient, WSError, WSTimeout
+
 # Polygon mainnet.
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 # CTF Exchange contracts that emit OrderFilled (v1 + v2). Lowercase.
@@ -230,20 +232,24 @@ def fill_to_trade(fill: dict, *, price: float | None = None, fallback_ts: int | 
 # collector
 # --------------------------------------------------------------------------- #
 class OnchainFollowCollector(threading.Thread):
-    """Background thread: poll ``eth_getLogs`` for CTF Exchange ``OrderFilled``
+    """Background thread: WS ``eth_subscribe`` logs for CTF Exchange ``OrderFilled``
     where maker is a watched wallet, decode the exact fill, buffer per wallet.
 
-    Cursor-based + self-healing: ``_cursor`` only advances on a successful poll,
-    so a failed/timed-out poll re-covers the gap next round (no permanent miss).
-    ``healthy`` is False after consecutive failures so the follow loop can fall
-    back to data-api. ``drain()`` returns buffered fills; ``update_wallets`` /
-    ``update_asset_map`` just swap the snapshot (no resubscribe needed).
+    主路 = WS 推送(空闲零 CU)。三层保活:① 主动 ``eth_blockNumber`` 心跳(``heartbeat_interval``,
+    防空闲被踢 + 推进游标)② 无帧静默超 ``stale_timeout`` → 重连 ③ 满 ``ws_session_seconds`` → 主动
+    整体重连(连接卫生)。**每次(重)连用 ``eth_getLogs`` 回补 [cursor−rewind → 当前块] 的缺口**
+    (``_backfill``)——这补上了旧 WS 缺的一环:断线/卡顿丢的成交重连后补回,不再"踢掉就永久停"。
+    WS 健康期间不发 getLogs。无 ``wss_url`` → 退回纯 getLogs 轮询(``_run_getlogs_poll``)。
+
+    ``healthy`` 失败后置 False,follow 循环可回退 data-api。``drain()`` 取缓冲;``update_wallets``
+    变更钱包集时置 ``_dirty`` 触发重订阅;``update_asset_map`` 仅换快照。
     """
 
     def __init__(
         self,
         *,
         https_url: str,
+        wss_url: str | None = None,
         wallets: set[str] | None = None,
         asset_map: dict[str, dict] | None = None,
         poll_interval: float = 30.0,
@@ -252,16 +258,32 @@ class OnchainFollowCollector(threading.Thread):
         max_catchup_blocks: int = 600,
         unhealthy_after_failures: int = 2,
         seen_prune_margin_blocks: int = 40,
+        # ── WS 三层保活 ──
+        heartbeat_interval: float = 30.0,      # 主动发 eth_blockNumber:保活 + 推进游标
+        heartbeat_lag_blocks: int = 5,         # 心跳块头减此余量作游标(末几块可能仍在途)
+        stale_timeout: float = 90.0,           # 任何帧静默超此 → 判卡顿、重连
+        ws_session_seconds: float = 3600.0,    # 每满此时长主动整体重连一次(连接卫生)
+        reconnect_rewind_blocks: int = 150,    # 每次重连 getLogs 回补时回退的窗口(抓近期静默漏单,~5min)
+        reconnect_min: float = 1.0,
+        reconnect_max: float = 30.0,
         on_event: Callable[[str, dict], None] | None = None,
     ):
         super().__init__(daemon=True, name="onchain-follow-collector")
         self.https_url = https_url
+        self.wss_url = wss_url
         self.poll_interval = poll_interval
         self.poll_overlap_blocks = poll_overlap_blocks
         self.cold_start_lookback_blocks = cold_start_lookback_blocks
         self.max_catchup_blocks = max_catchup_blocks
         self.unhealthy_after_failures = max(1, int(unhealthy_after_failures))
         self.seen_prune_margin_blocks = seen_prune_margin_blocks
+        self.heartbeat_interval = heartbeat_interval
+        self.heartbeat_lag_blocks = max(0, int(heartbeat_lag_blocks))
+        self.stale_timeout = stale_timeout
+        self.ws_session_seconds = ws_session_seconds
+        self.reconnect_rewind_blocks = max(0, int(reconnect_rewind_blocks))
+        self.reconnect_min = reconnect_min
+        self.reconnect_max = reconnect_max
         self.on_event = on_event or (lambda *_: None)
 
         self._lock = threading.Lock()
@@ -270,6 +292,7 @@ class OnchainFollowCollector(threading.Thread):
         self._buffer: dict[str, list[dict]] = {}
         self._seen: dict[tuple[str, str, int], int] = {}  # (tx, token, logIndex) -> block
         self._stop_evt = threading.Event()
+        self._dirty = threading.Event()  # wallet set changed → 重订阅
         self._healthy = False
         self._cursor = 0
         self._consecutive_failures = 0
@@ -287,7 +310,10 @@ class OnchainFollowCollector(threading.Thread):
     def update_wallets(self, wallets: set[str]) -> None:
         new = {w.lower() for w in wallets}
         with self._lock:
+            changed = new != self._wallets
             self._wallets = new
+        if changed:
+            self._dirty.set()  # 触发重订阅(只在集合真变时,避免每 tick 重连)
 
     def update_asset_map(self, asset_map: dict[str, dict]) -> None:
         with self._lock:
@@ -305,9 +331,34 @@ class OnchainFollowCollector(threading.Thread):
 
     # -- thread loop ------------------------------------------------------ #
     def run(self) -> None:
-        # Cold start: seed the cursor a bounded window back and scan once, so a
-        # restart catches trades during downtime for wallets with persisted
-        # cursors (command_follow's per-wallet cold-start handles brand-new ones).
+        # WS 主路(eth_subscribe logs);无 wss 配置 → 退回 getLogs 轮询。
+        if not self.wss_url:
+            self._run_getlogs_poll()
+            return
+        backoff = self.reconnect_min
+        while not self._stop_evt.is_set():
+            with self._lock:
+                wallets = set(self._wallets)
+            if not wallets:
+                # 无钱包可跟 → 不连 WS,idle(零 CU);视为健康。
+                self._healthy = True
+                self._consecutive_failures = 0
+                self._dirty.clear()
+                if self._stop_evt.wait(min(self.poll_interval, 5.0)):
+                    break
+                continue
+            try:
+                self._run_ws_session(wallets)
+                backoff = self.reconnect_min
+            except Exception as exc:  # noqa: BLE001
+                self._on_failure(exc, phase="ws")
+                if self._stop_evt.wait(backoff):
+                    break
+                backoff = min(self.reconnect_max, backoff * 2)
+        self._healthy = False
+
+    def _run_getlogs_poll(self) -> None:
+        """Fallback(无 wss):cursor getLogs 轮询(WS 之前的行为)。"""
         try:
             current = block_number(self.https_url)
             self._cursor = max(0, current - self.cold_start_lookback_blocks)
@@ -319,6 +370,95 @@ class OnchainFollowCollector(threading.Thread):
                 break
             self._poll_once()
         self._healthy = False
+
+    def _backfill(self, wallets: set[str], *, rewind: int = 0, cold_start: bool = False) -> None:
+        """每次(重)连用 getLogs 补 [cursor-rewind → 当前块] 的缺口。WS 健康期间不调用。"""
+        current = block_number(self.https_url)
+        if self._cursor <= 0:
+            self._cursor = max(0, current - self.cold_start_lookback_blocks)
+        from_block = max(0, self._cursor + 1 - self.poll_overlap_blocks - max(0, rewind))
+        if current - from_block > self.max_catchup_blocks:
+            skipped = from_block
+            from_block = current - self.max_catchup_blocks
+            self.on_event("backfill_gap_skipped", {"from": skipped, "to": from_block})
+        before = self._fill_count
+        self._scan(from_block, current, wallets)
+        self._cursor = max(self._cursor, current)
+        self._prune_seen()
+        self.on_event("backfill", {"fills": self._fill_count - before, "from": from_block, "to": current, "cold_start": cold_start})
+
+    def _run_ws_session(self, wallets: set[str]) -> None:
+        """一次 WS 会话:订阅 OrderFilled logs → 连上即 getLogs 回补缺口 → 收推送 +
+        三层保活(主动 eth_blockNumber 心跳 / 无帧卡顿重连 / 满 session 时长主动重连)。
+        退出本函数 = 需要重连(钱包变更 / 卡顿 / 定期 / 异常),由 run() 重连并再次回补。"""
+        ws = WSClient(self.wss_url)
+        ws.connect()
+        try:
+            maker_topics = [topic_for_address(w) for w in wallets]
+            ws.send_text(json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe",
+                "params": ["logs", {"address": list(EXCHANGE_ADDRESSES),
+                                    "topics": [ORDER_FILLED_TOPIC, None, maker_topics, None]}],
+            }))
+            # 连上即回补:首连用 cold-start 窗口,重连用 rewind 小窗抓近期静默漏单。
+            cold = self._cursor <= 0
+            self._backfill(wallets, rewind=0 if cold else self.reconnect_rewind_blocks, cold_start=cold)
+            self._dirty.clear()
+            self._healthy = True
+            self._consecutive_failures = 0
+            ws.set_timeout(1.0)
+            hb_id = 1000
+            now = time.monotonic()
+            session_start = now
+            last_hb = now
+            last_alive = now
+            while not self._stop_evt.is_set() and not self._dirty.is_set():
+                now = time.monotonic()
+                if now - session_start >= self.ws_session_seconds:
+                    self.on_event("ws_session_recycle", {"elapsed_s": round(now - session_start)})
+                    return  # 定期整体重连(连接卫生)→ run() 重连 + 回补
+                if now - last_hb >= self.heartbeat_interval:
+                    hb_id += 1
+                    ws.send_text(json.dumps({"jsonrpc": "2.0", "id": hb_id, "method": "eth_blockNumber", "params": []}))
+                    last_hb = now
+                try:
+                    opcode, payload = ws.recv_message()
+                except WSTimeout:
+                    if time.monotonic() - last_alive > self.stale_timeout:
+                        self.on_event("ws_stale", {"silent_s": round(time.monotonic() - last_alive, 1)})
+                        return  # 卡顿 → 重连 + 回补
+                    continue
+                if opcode == WSClient.OP_CLOSE:
+                    self.on_event("ws_closed", {})
+                    return
+                if opcode != WSClient.OP_TEXT:
+                    continue
+                last_alive = time.monotonic()
+                try:
+                    msg = json.loads(payload)
+                except Exception:  # noqa: BLE001
+                    continue
+                if msg.get("method") == "eth_subscription":
+                    log = (msg.get("params") or {}).get("result") or {}
+                    self._handle_log(log)
+                    bn = log.get("blockNumber")
+                    if bn:
+                        try:
+                            self._cursor = max(self._cursor, int(bn, 16))
+                        except Exception:  # noqa: BLE001
+                            pass
+                elif "result" in msg and isinstance(msg.get("id"), int) and msg["id"] >= 1000:
+                    # 心跳 eth_blockNumber 响应:活着 + 推进游标到块头(减余量)。
+                    try:
+                        head = int(msg["result"], 16)
+                    except Exception:  # noqa: BLE001
+                        head = 0
+                    if head:
+                        self._cursor = max(self._cursor, head - self.heartbeat_lag_blocks)
+                    self._healthy = True
+                    self._consecutive_failures = 0
+        finally:
+            ws.close()
 
     def _poll_once(self, *, current_hint: int | None = None, cold_start: bool = False) -> None:
         with self._lock:

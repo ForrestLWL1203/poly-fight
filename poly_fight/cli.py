@@ -7445,19 +7445,21 @@ def command_run(args: argparse.Namespace) -> int:
     # data-api; if getLogs polling fails repeatedly it falls back to data-api.
     # No RPC -> data-api. Only https_url is needed (WS is gone).
     collector: OnchainFollowCollector | None = None
-    https_url, _wss_url = load_rpc_endpoints()
+    https_url, wss_url = load_rpc_endpoints()
     onchain_poll_interval = float(getattr(args, "onchain_poll_interval", 30.0) or 30.0)
     if https_url:
         collector = OnchainFollowCollector(
             https_url=https_url,
+            wss_url=wss_url,
             poll_interval=onchain_poll_interval,
             on_event=lambda kind, data: print(
-                json.dumps({"status": "onchain", "event": kind, **{k: v for k, v in data.items() if k in ("error", "phase", "fills", "from", "to", "cold_start", "consecutive")}}, ensure_ascii=False),
+                json.dumps({"status": "onchain", "event": kind, **{k: v for k, v in data.items() if k in ("error", "phase", "fills", "from", "to", "cold_start", "consecutive", "silent_s", "elapsed_s")}}, ensure_ascii=False),
                 flush=True,
             ),
         )
         collector.start()
-        print(json.dumps({"status": "onchain_collector_started", "mode": "getlogs_poll", "poll_interval": onchain_poll_interval, "rpc": https_url.split("/v2/")[0] + "/v2/***"}, ensure_ascii=False), flush=True)
+        mode = "ws_subscribe+getlogs_backfill" if wss_url else "getlogs_poll"
+        print(json.dumps({"status": "onchain_collector_started", "mode": mode, "rpc": https_url.split("/v2/")[0] + "/v2/***"}, ensure_ascii=False), flush=True)
     else:
         print(json.dumps({"status": "onchain_disabled", "reason": "no secret/rpc; using data-api polling"}, ensure_ascii=False), flush=True)
 

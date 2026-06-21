@@ -235,6 +235,35 @@ class TestPolling(unittest.TestCase):
         col._poll_once(current_hint=1000)   # no wallets -> healthy-idle, no RPC needed
         self.assertTrue(col.healthy)
 
+    def test_backfill_buffers_fill_and_advances_cursor(self):
+        col, events = self._collector()
+        col._cursor = 990
+        log = buy_log(price=0.62, shares=5, tx="0xbf", block=995)
+        with mock.patch.object(oc, "block_number", return_value=1000), \
+             mock.patch.object(oc, "rpc_call", return_value=[log]):
+            col._backfill({WALLET})
+        self.assertIn(WALLET, col.drain())
+        self.assertEqual(col._cursor, 1000)
+        self.assertTrue(any(k == "backfill" for k, _ in events))
+
+    def test_backfill_rewind_scans_further_back(self):
+        col, _ = self._collector(reconnect_rewind_blocks=150, poll_overlap_blocks=5)
+        col._cursor = 1000
+        seen = {}
+        with mock.patch.object(oc, "block_number", return_value=1010), \
+             mock.patch.object(col, "_scan", side_effect=lambda fb, tb, w: seen.update(fb=fb, tb=tb)):
+            col._backfill({WALLET}, rewind=150)
+        self.assertEqual(seen["fb"], 1000 + 1 - 5 - 150)  # cursor+1-overlap-rewind = 846
+        self.assertEqual(seen["tb"], 1010)
+
+    def test_update_wallets_sets_dirty_only_on_change(self):
+        col, _ = self._collector()
+        col._dirty.clear()
+        col.update_wallets(set(col._wallets))           # unchanged -> not dirty
+        self.assertFalse(col._dirty.is_set())
+        col.update_wallets(set(col._wallets) | {"0xother"})  # changed -> dirty (resubscribe)
+        self.assertTrue(col._dirty.is_set())
+
 
 if __name__ == "__main__":
     unittest.main()
