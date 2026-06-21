@@ -977,7 +977,7 @@ const STRATEGY_DEFAULTS = {
   usableMode: "all", usableCap: "5000",
   minSignalOn: true, minSignal: "10",
   maxEntryOn: true, maxEntry: "0.85",
-  sizing: "kelly", kellyFraction: "0.25", perSignalCapOn: false, perSignalPct: "5", perMatchPct: "10", minStake: "1",
+  sizing: "kelly", kellyFraction: "0.25", perSignalPct: "1", perMatchPct: "10", minStake: "1",
   ratio: "10", ratioCapOn: false, ratioCap: "100",
   fixed: "50", balancePct: "1",
   countOn: false, countMode: "event", count: "10",
@@ -989,7 +989,7 @@ const clampNum = (v) => String(v).replace(/[^\d.]/g, "");
 function strategyDigest(s) {
   const n = (v) => Number(v) || 0;
   const sizing = s.sizing === "kelly"
-    ? `Kelly 信念²×实力（${s.perSignalCapOn ? `单笔≤${s.perSignalPct || 0}% · ` : ""}单场≤${s.perMatchPct || 0}%）`
+    ? `单位制（单位=余额${s.perSignalPct || 0}% · 每钱包每场≤单场${s.perMatchPct || 0}%的半）`
     : s.sizing === "ratio"
     ? `比例 ${s.ratio || 0}%${s.ratioCapOn ? `（封顶 ${usdInt(n(s.ratioCap))}）` : ""}`
     : s.sizing === "fixed" ? `固定 ${usdInt(n(s.fixed))}` : `余额 ${s.balancePct || 0}%`;
@@ -1105,18 +1105,13 @@ function StrategyEditor({ s, up, wallet, locked }) {
           </div>
         </div>
         <div className="cfg-head"><h3>单笔跟单金额</h3><Badge tone="up" outline>必填</Badge></div>
-        <p className="cfg-sub">每个有效信号买入多少 · 推荐智能定额（按 信念²×实力 自动定额）· 金额向下取整规避下单异常</p>
+        <p className="cfg-sub">每个有效信号买入多少 · 推荐智能定额（单位制:基数随余额、大单分段加码）· 金额向下取整规避下单异常</p>
         <div className="opt-list">
-          <SizingOption id="kelly" active={s.sizing === "kelly"} onSelect={up("sizing")} title="Kelly 智能（推荐）" desc="按 信念²（钱包押注÷单场额度）× 实力（edge_lb，含样本折扣）自动定额：又强又重注才下大 · 单场上限 + 最小单兜底 · 与评分轴同口径">
+          <SizingOption id="kelly" active={s.sizing === "kelly"} onSelect={up("sizing")} title="智能定额（推荐）" desc="单位制:单位=余额×单笔基数% · 目标下单≤50×单位→下1单位,>50×每多10倍加1单位 · 每钱包每场≤单场上限的50% · edge(θ̂×0.95>现价)只当准入门">
             <div className="ctrl-row">
+              <NumField value={s.perSignalPct} onChange={up("perSignalPct")} unit="%" lead="单笔基数（余额）" width={60} />
               <NumField value={s.perMatchPct} onChange={up("perMatchPct")} unit="%" lead="单场上限（本金）" width={60} />
               <NumField value={s.minStake} onChange={up("minStake")} unit="USDC" lead="单笔下限" width={72} />
-            </div>
-            <div className="ratio-rows">
-              <label className="rr-lead is-check" onClick={(e) => e.stopPropagation()}>
-                <input type="checkbox" checked={s.perSignalCapOn} onChange={(e) => up("perSignalCapOn")(e.target.checked)} />单笔硬上限
-              </label>
-              <NumField value={s.perSignalPct} onChange={up("perSignalPct")} unit="%（本金）" width={60} disabled={!s.perSignalCapOn} />
             </div>
           </SizingOption>
           <SizingOption id="fixed" active={s.sizing === "fixed"} onSelect={up("sizing")} title="固定金额（legacy）" desc="每笔买入固定金额，与 edge 无关 · 简单但不区分机会优劣">
@@ -1151,7 +1146,7 @@ function StrategyEditor({ s, up, wallet, locked }) {
         {s.sizing === "kelly" ? <div className="cfg-mini">
           <div className="cm-head"><Ico n="filter" /><span>风控(Kelly 内置)</span></div>
           <div className="cm-body">
-            <p className="cfg-sub">单场上限 / 单笔下限 / 单笔硬上限(可选)已在左侧 Kelly 设置内;注码 = 单场cap × 信念² × 实力(edge_lb);现价上限固定 0.85(= 评分价区,系统统一),无需重复配置。</p>
+            <p className="cfg-sub">单笔基数 / 单场上限 / 单笔下限 已在左侧设置内;注码 = 单位制(基数=余额×单笔基数%,大单分段加码,每钱包每场≤单场上限的50%);现价上限固定 0.85(= 评分价区,系统统一),无需重复配置。</p>
           </div>
         </div> : <React.Fragment>
         <div className="cfg-mini">

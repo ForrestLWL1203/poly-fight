@@ -515,6 +515,7 @@ def _condition_strategy_counts(
     funded_stake = 0.0
     funded_order_count = 0
     wallet_funded_order_count = 0
+    wallet_funded_stake = 0.0
     for signal in open_signals:
         if (signal.get("status") or "open") != "open":
             continue
@@ -529,10 +530,12 @@ def _condition_strategy_counts(
             funded_order_count += 1
             if signal_wallet == normalized_wallet:
                 wallet_funded_order_count += 1
+                wallet_funded_stake = round(wallet_funded_stake + stake, 8)
     return {
         "condition_funded_stake_usdc": funded_stake,
         "condition_funded_order_count": funded_order_count,
         "wallet_condition_funded_order_count": wallet_funded_order_count,
+        "wallet_condition_funded_stake_usdc": wallet_funded_stake,
     }
 
 
@@ -738,6 +741,7 @@ def process_follow_trades(
                 condition_funded_stake_usdc=to_float(condition_counts["condition_funded_stake_usdc"]),
                 condition_funded_order_count=to_int(condition_counts["condition_funded_order_count"]),
                 wallet_condition_funded_order_count=to_int(condition_counts["wallet_condition_funded_order_count"]),
+                wallet_condition_funded_stake_usdc=to_float(condition_counts.get("wallet_condition_funded_stake_usdc")),
                 # kelly:被跟桶 θ̂(现价门)+ edge_lb(实力乘数)+ 实时价 → 信念×实力定额(其它 mode 忽略)
                 bucket_win_rate=to_float((bucket_theta or {}).get(market_bucket) or (bucket_theta or {}).get(market_type) or 0.0),
                 bucket_edge_lb=(

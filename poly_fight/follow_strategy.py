@@ -31,6 +31,13 @@ DEFAULT_FILL_LINE_X_CAP = 10.0          # 钱包押满 10×单场cap → 跟满 
 # 0.20 是刻意保守的高门槛:只有极少数(实测 8/76)又强又重注的才逼近 cap;不追求多数钱包够到 cap。
 DEFAULT_EDGE_REF = 0.20
 DEFAULT_FOLLOW_MIRROR_PERCENT = 10.0    # 弃用(旧线性镜像);保留供旧 db 配置反序列化不报错
+# 分段线性单位制 sizing(2026-06-21 用户简化版,取代信念²×实力):
+#   单位 unit = round(余额 × per_signal_cap_percent%)(动态、取整);N = 目标下单额 / unit。
+#   N ≤ START → 下注 = 1 unit;N > START → (1 + (N−START)/SLOPE) × unit(连续无断崖)。
+#   每钱包每场封顶 = WALLET_MATCH_CAP_FRAC × 单场cap(单场cap = 余额 × per_match_cap_percent%)。
+UNIT_RAMP_START_N = 50.0
+UNIT_RAMP_SLOPE_N = 10.0
+WALLET_MATCH_CAP_FRAC = 0.5
 
 
 def _finite_positive(value: Any) -> bool:
@@ -271,9 +278,10 @@ def evaluate_follow_candidate(
     condition_funded_order_count: int,
     wallet_condition_funded_order_count: int,
     bucket_win_rate: float = 0.0,      # kelly:被跟桶 θ̂(近期加权点估胜率);内部再 ×0.95 折扣
-    bucket_edge_lb: float | None = None,  # kelly:被跟桶 edge_lb(copy-edge 下界)→ 实力乘数;None=缺则中性1.0
+    bucket_edge_lb: float | None = None,  # 【已弃用,sizing 不再用】保留参数避免调用方报错
     entry_price: float = 0.0,          # kelly:跟单时实时价 p
-    bankroll_usdc: float = 0.0,        # kelly:本金(Kelly 缩放 + %上限基准);缺则回退 available
+    bankroll_usdc: float = 0.0,        # kelly:本金(单位/单场cap 基准);缺则回退 available
+    wallet_condition_funded_stake_usdc: float = 0.0,  # 该钱包在该场已投合计 → 每钱包每场封顶用
 ) -> dict[str, Any]:
     normalized = normalize_follow_strategy(strategy)
     valid, errors = validate_follow_strategy(normalized)
@@ -291,13 +299,10 @@ def evaluate_follow_candidate(
     raw_stake = 0.0
     stake_mode = mode
     if mode == "kelly":
-        # 凸形信念 sizing:跟单 = 单场cap × (钱包这笔买入额 / 打满线)²,夹在 [min_stake, 单场剩余]。
-        #   打满线 = fill_line_x_cap × 单场cap(钱包押到打满线 → 跟满 cap;中等单按平方衰减 → 压低
-        #   中等暴露、躲"4赢1负亏光";只有钱包重注=高信念才接近 cap)。曲线连续单调、无断崖。
-        # Kelly edge 仅当门:有效胜率 θ̂×0.95 ≤ 现价则不跟(价已涨过把握)。
-        # bankroll 优先用调用方传入的**动态权益**(初始本金 + 已实现盈亏;cli 侧 =
-        # account_balance + funded_open_exposure),缺时回退静态 usable_balance,再回退可用。
-        # 单场cap = bankroll × per_match_cap_percent,随盈亏动态。
+        # 分段线性单位制(用户简化版):单位 unit = round(余额 × 单笔上限%);N = 目标下单额 / unit。
+        #   N ≤ 50 → 下注 = 1 个单位;N > 50 → 每超 10 倍加 1 个单位:(1+(N-50)/10)×unit(连续无断崖)。
+        #   每钱包每场封顶 = 50% × 单场cap(= 余额 × 单场上限%)。edge 仅当准入门(θ̂×0.95>现价)。
+        # bankroll 用动态权益(account_balance + funded_open_exposure),缺则回退静态/可用。
         bankroll = to_float(bankroll_usdc)
         if bankroll <= 0:
             bankroll = to_float(normalized["balance"].get("usable_balance_usdc"))
@@ -311,33 +316,24 @@ def evaluate_follow_candidate(
         if to_float(bucket_win_rate) * THETA_FOLLOW_DISCOUNT - p <= 0:
             return _block("no_live_edge", strategy=normalized)   # 现价 ≥ θ̂×0.95 → 不跟
         min_stake = to_float(sizing.get("min_stake_usdc"))
-        per_match_cap = bankroll * to_float(sizing.get("per_match_cap_percent")) / 100.0
-        if per_match_cap <= 0:
-            return _block("no_bankroll", strategy=normalized)
-        # 信念:钱包押多重(额/打满线)²,夹 [0,1]。打满线 = fill_line_x_cap × 单场cap。
-        fill_line = to_float(sizing.get("fill_line_x_cap")) * per_match_cap
-        conviction = (order_cash / fill_line) if fill_line > 0 else 1.0
-        conviction = min(1.0, conviction * conviction)
-        # 实力:钱包该桶 edge_lb / edge_ref,夹 [0,1]。缺(None)→ 中性 1.0(只靠信念,不静默砍光)。
-        edge_ref = to_float(sizing.get("edge_ref"))
-        if bucket_edge_lb is None or edge_ref <= 0:
-            skill = 1.0
+        # 单位 = round(余额 × 单笔上限%);动态取整。余额极小致 unit<min_stake 时提到 min_stake。
+        unit = float(round(bankroll * to_float(sizing.get("per_signal_cap_percent")) / 100.0))
+        if unit < min_stake:
+            unit = min_stake
+        n_units = (order_cash / unit) if unit > 0 else 0.0
+        if n_units <= UNIT_RAMP_START_N:
+            raw_stake = unit
         else:
-            skill = max(0.0, min(1.0, to_float(bucket_edge_lb) / edge_ref))
-        raw_stake = per_match_cap * conviction * skill   # 单场cap × 信念 × 实力
-        # 单笔硬上限:**可选**(per_signal_cap_enabled 勾选才生效)。不勾 → 纯按公式;勾 → 单笔
-        # 卡死在 per_signal_cap(防一笔吃满整场)。单场cap 仍是多笔累计上限,独立生效。
-        if sizing.get("per_signal_cap_enabled"):
-            per_signal_cap = bankroll * to_float(sizing.get("per_signal_cap_percent")) / 100.0
-            if per_signal_cap > 0:
-                raw_stake = min(raw_stake, per_signal_cap)
-        # 多笔累计:单场剩余额度(condition 已投合计 → per_match_cap 收口)。
-        match_remaining = per_match_cap - to_float(condition_funded_stake_usdc)
-        if match_remaining < min_stake:
-            return _block("match_cap_reached", strategy=normalized)   # 本场已到上限
-        raw_stake = min(raw_stake, match_remaining)
-        raw_stake = max(raw_stake, min_stake)   # 不低于动态下限(算出更小也提到下限)
-        stake_mode = "kelly_conviction"
+            raw_stake = (1.0 + (n_units - UNIT_RAMP_START_N) / UNIT_RAMP_SLOPE_N) * unit
+        # 每钱包每场封顶 = 50% × 单场cap;按该钱包该场已投收口。
+        per_match_cap = bankroll * to_float(sizing.get("per_match_cap_percent")) / 100.0
+        wallet_match_cap = WALLET_MATCH_CAP_FRAC * per_match_cap
+        remaining = wallet_match_cap - to_float(wallet_condition_funded_stake_usdc)
+        if remaining < min_stake:
+            return _block("match_cap_reached", strategy=normalized)   # 该钱包本场已到上限
+        raw_stake = min(raw_stake, remaining)
+        raw_stake = max(raw_stake, min_stake)
+        stake_mode = "tiered_unit"
     elif mode == "fixed":
         raw_stake = to_float(sizing.get("fixed_usdc"))
     elif mode == "balance_percent":
@@ -401,15 +397,10 @@ def strategy_summary(strategy: dict[str, Any] | None) -> str:
     sizing = normalized["stake_sizing"]
     mode = sizing["mode"]
     if mode == "kelly":
-        signal_cap_text = (
-            f"单笔≤{to_float(sizing.get('per_signal_cap_percent')):g}%/"
-            if sizing.get("per_signal_cap_enabled") else ""
-        )
         stake_text = (
-            f"单场cap × 信念² × 实力"
-            f"(打满线 {to_float(sizing.get('fill_line_x_cap')):g}×cap,"
-            f"实力 edge_lb/{to_float(sizing.get('edge_ref')):g},"
-            f"{signal_cap_text}单场≤{to_float(sizing.get('per_match_cap_percent')):g}%,"
+            f"单位制(单位=余额{to_float(sizing.get('per_signal_cap_percent')):g}%;"
+            f"≤50× 下 1 单位,>50× 每 10× 加 1 单位;"
+            f"每钱包每场≤单场{to_float(sizing.get('per_match_cap_percent')):g}%的50%,"
             f"最小${to_float(sizing.get('min_stake_usdc')):g},edge 门 θ̂×0.95)"
         )
     elif mode == "fixed":
