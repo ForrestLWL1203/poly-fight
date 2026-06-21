@@ -6873,6 +6873,8 @@ def command_follow(
     low_entry_price_blocked_count = 0
     high_entry_price_blocked_count = 0
     small_wallet_trade_blocked_count = 0
+    veto_fade_skip_count = 0
+    veto_no_data_count = 0
     small_add_blocked_count = 0
     signal_cap_limited_count = 0
     signal_cap_blocked_count = 0
@@ -7183,6 +7185,8 @@ def command_follow(
             low_entry_price_blocked_count += stats.get("low_entry_price_blocked_count", 0)
             high_entry_price_blocked_count += stats.get("high_entry_price_blocked_count", 0)
             small_wallet_trade_blocked_count += stats.get("small_wallet_trade_blocked_count", 0)
+            veto_fade_skip_count += stats.get("veto_fade_skip_count", 0)
+            veto_no_data_count += stats.get("veto_no_data_count", 0)
             small_add_blocked_count += stats.get("small_add_blocked_count", 0)
             signal_cap_limited_count += stats.get("signal_cap_limited_count", 0)
             signal_cap_blocked_count += stats.get("signal_cap_blocked_count", 0)
@@ -7351,6 +7355,8 @@ def command_follow(
         "low_entry_price_blocked_count": low_entry_price_blocked_count,
         "high_entry_price_blocked_count": high_entry_price_blocked_count,
         "small_wallet_trade_blocked_count": small_wallet_trade_blocked_count,
+        "veto_fade_skip_count": veto_fade_skip_count,
+        "veto_no_data_count": veto_no_data_count,
         "small_add_blocked_count": small_add_blocked_count,
         "signal_cap_limited_count": signal_cap_limited_count,
         "signal_cap_blocked_count": signal_cap_blocked_count,
