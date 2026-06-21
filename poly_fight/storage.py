@@ -1014,6 +1014,25 @@ class FollowStore:
                 (_dumps(pending or {}),),
             )
 
+    def load_held_pending_veto(self) -> dict[str, dict[str, Any]]:
+        """CS2 map-winner 盘前暂存器:键 "wallet|condition_id|outcome_index" -> {trade,...}。
+        目标钱包在开赛【前】买 map-winner 份额时,先把整笔买单 held 暂存、不开仓;每 tick
+        重新注入重判,直到开赛(now>=start)才用 bo3 veto 判 fade/跟(仍无 veto 则按原逻辑跟)。
+        存 meta JSON blob(仅 runner 读写,跨 tick 持久;每 tick load→更新→save)。见 veto.py。"""
+        self.init_db()
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = 'held_pending_veto'").fetchone()
+        out = _loads(row["value"], {}) if row else {}
+        return out if isinstance(out, dict) else {}
+
+    def save_held_pending_veto(self, pending: dict[str, Any]) -> None:
+        self.init_db()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('held_pending_veto', ?)",
+                (_dumps(pending or {}),),
+            )
+
     def load_results(self) -> list[dict[str, Any]]:
         self.init_db()
         with self.connect() as conn:
