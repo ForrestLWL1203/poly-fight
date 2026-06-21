@@ -9928,6 +9928,37 @@ class CoreTest(unittest.TestCase):
         self.assertNotIn("cost_gate_blocked", stats)           # 闸已删
         self.assertEqual(stats["price_ceiling_blocked"], 1)
 
+    def test_position_backfill_drawdown_guard_and_real_ts(self):
+        # 点1/3:现价较钱包成本跌 ≥40% → 不补(胜负将定);跌 <40%(暂时回调回 scope)→ 补。
+        # 点2:用钱包真实建仓时间(trades),非处理时间。
+        from poly_fight import cli as cli_mod
+        market = {
+            "condition_id": "0xabc", "conditionId": "0xabc",
+            "outcomes": ["A", "B"], "clobTokenIds": ["111", "222"],
+            "outcome_prices": [0.0, 0.0], "market_type": "main_match", "league": "cs2",
+        }
+        positions = {
+            # 钱包 0.69 买,现价 0.445(跌 35% <40%)→ 补
+            "0xkeep": [{"conditionId": "0xabc", "asset": "111", "outcome": "A", "avgPrice": 0.69, "curPrice": 0.445, "size": 1000}],
+            # 钱包 0.69 买,现价 0.40(跌 42% ≥40%)→ 拦(胜负将定)
+            "0xdrop": [{"conditionId": "0xabc", "asset": "111", "outcome": "A", "avgPrice": 0.69, "curPrice": 0.40, "size": 1000}],
+        }
+
+        class FakeClient:
+            def positions(self, wallet, *, limit=200):
+                return positions[wallet]
+            def trades_for_user(self, wallet, *, limit=200):
+                return [{"asset": "111", "side": "BUY", "timestamp": 777}] if wallet == "0xkeep" else []
+
+        with patch("poly_fight.cli.clob_price", return_value=None):
+            by_wallet, stats = cli_mod.build_position_backfill_trades(
+                FakeClient(), [{"wallet": "0xkeep"}, {"wallet": "0xdrop"}], {"0xabc": market},
+                max_entry_price=0.68, now_ts=1000,
+            )
+        self.assertEqual(set(by_wallet), {"0xkeep"})          # 大跌的被回撤护栏拦掉
+        self.assertEqual(stats["drawdown_blocked"], 1)
+        self.assertEqual(by_wallet["0xkeep"][0]["timestamp"], 777)  # 真实建仓时间,非 now_ts(1000)
+
     def test_build_position_backfill_trades_idempotent(self):
         # 已有该 wallet+condition+outcome 的开放信号 → 不再补腿(防重启重复扣)。
         from poly_fight import cli as cli_mod

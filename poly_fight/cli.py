@@ -6388,6 +6388,12 @@ def command_analyze_event(args: argparse.Namespace) -> int:
     return 0
 
 
+# 持仓补单回撤护栏:现价较钱包**成本均价**跌幅 ≥ 此 → 不补(胜负将定/大幅偏离,非暂时回调)。
+# 例:钱包 0.69 买,现价 0.445(跌 35%)→ 补;现价 0.40(跌 42% ≥40%)→ 不补。
+# 配合现价上限(≤max_entry_price 回 scope)一起:既要"跌回可跟价区",又要"没跌太狠"。
+POSITION_BACKFILL_MAX_DRAWDOWN = 0.40
+
+
 def build_position_backfill_trades(
     client: PolymarketClient,
     follow_wallets: list[dict[str, Any]],
@@ -6413,7 +6419,7 @@ def build_position_backfill_trades(
     by_wallet: dict[str, list[dict[str, Any]]] = {}
     stats: dict[str, int] = {
         "wallets_scanned": 0, "positions_in_scope": 0, "already_followed": 0,
-        "price_ceiling_blocked": 0, "candidates": 0,
+        "price_ceiling_blocked": 0, "drawdown_blocked": 0, "candidates": 0,
     }
     for row in follow_wallets:
         wallet = normalize_wallet(row.get("wallet"))
@@ -6424,6 +6430,7 @@ def build_position_backfill_trades(
         except Exception:
             continue
         stats["wallets_scanned"] += 1
+        buy_ts_by_token: dict[str, int] | None = None  # 懒加载:该钱包最近一次买入时间 by token(点2 真实建仓时间)
         for pos in positions or []:
             cid = str(pos.get("conditionId") or "").lower()
             market = markets_by_condition.get(cid)
@@ -6455,9 +6462,27 @@ def build_position_backfill_trades(
                 entry = to_float(pos.get("curPrice"))
             if entry <= 0:
                 continue
-            if max_entry_price > 0 and entry > max_entry_price:   # 仅留现价上限(与 live 同),其余交策略 edge 闸
+            if max_entry_price > 0 and entry > max_entry_price:   # 现价上限(与 live 同):必须跌回可跟价区
                 stats["price_ceiling_blocked"] += 1
                 continue
+            # 回撤护栏(点1/3):现价较钱包成本均价跌幅 ≥ 阈值 → 不补(胜负将定/大幅偏离,非暂时回调)。
+            if avg > 0 and entry < avg * (1.0 - POSITION_BACKFILL_MAX_DRAWDOWN):
+                stats["drawdown_blocked"] += 1
+                continue
+            # 点2:用钱包真实建仓时间(最近一次该 token 买入),而非处理时间(否则 backfill 盖成重启时刻)。
+            if buy_ts_by_token is None:
+                buy_ts_by_token = {}
+                try:
+                    for t in client.trades_for_user(wallet, limit=positions_limit):
+                        if str(t.get("side") or t.get("type") or "").upper() != "BUY":
+                            continue
+                        tk = str(t.get("asset") or "")
+                        tts = to_int(t.get("timestamp"))
+                        if tk and tts and tts > buy_ts_by_token.get(tk, 0):
+                            buy_ts_by_token[tk] = tts
+                except Exception:
+                    buy_ts_by_token = {}
+            wallet_trade_at = buy_ts_by_token.get(token_id) or int(now_ts)
             prices = list(market.get("outcome_prices") or [])
             while len(prices) <= idx:
                 prices.append(0.0)
@@ -6472,7 +6497,7 @@ def build_position_backfill_trades(
                 "side": "BUY",
                 "size": size,
                 "price": round(avg, 8),
-                "timestamp": int(now_ts),
+                "timestamp": int(wallet_trade_at),
                 "id": tid,
                 "transactionHash": tid,
                 "source": "position_backfill",
