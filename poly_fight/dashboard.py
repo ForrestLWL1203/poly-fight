@@ -43,6 +43,10 @@ ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 FAILED_LOGINS: dict[str, list[float]] = {}
 _TRADES_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _TRADES_CACHE_LOCK = threading.Lock()
+# leaderboard 排名映射缓存:键=各类目 leaderboard.db 的 mtime;榜单未重建则复用,避免每次打开
+# 跟单详情都重新 enrich+排序整张榜(~93 钱包的 bucket 分重算,实测占详情耗时 90%)。
+_RANK_CACHE: dict[str, tuple[tuple[int, ...], dict[str, int]]] = {}
+_RANK_CACHE_LOCK = threading.Lock()
 _MATCH_TITLE_RE = re.compile(r"^([^:]+):\s+(.+?)\s+vs\s+(.+?)(\s+\([^)]+\))?\s+-\s+(.+)$", re.IGNORECASE)
 _SPORTS_TITLE_RE = re.compile(r"^(.+?)\s+vs\.?\s+(.+?)(?:\s+-\s+(.+))?$", re.IGNORECASE)
 _ESPORTS_GAME_ORDER = {"dota2": 0, "cs2": 1, "lol": 2}
@@ -2116,10 +2120,19 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
 
 
 def _leaderboard_rank_by_wallet(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str, int]:
+    cats = _category_leaderboards(data_dir)
+    # 缓存键 = 各类目 leaderboard.db mtime;榜单未重建直接复用(排名只在重建时变;手动隔离的
+    # rank 数字略陈到下次重建为止,仅展示无碍)。
+    mtime_key = tuple(int(mtime) for _cat, _dir, _lb, mtime in cats)
+    cache_key = str(data_dir)
+    with _RANK_CACHE_LOCK:
+        cached = _RANK_CACHE.get(cache_key)
+        if cached is not None and cached[0] == mtime_key:
+            return cached[1]
     rows_by_category: dict[str, list[dict[str, Any]]] = {category: [] for category in CATEGORIES}
     quarantine_snapshot = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).load_dashboard_wallet_quarantine()
     quarantine = quarantine_snapshot.get("wallet_quarantine") or {}
-    for source_category, _dir, leaderboard, _mtime in _category_leaderboards(data_dir):
+    for source_category, _dir, leaderboard, _mtime in cats:
         for row in leaderboard if isinstance(leaderboard, list) else []:
             if not isinstance(row, dict):
                 continue
@@ -2148,6 +2161,8 @@ def _leaderboard_rank_by_wallet(data_dir: Path, *, follow_dir: Path | None = Non
             wallet = str(row.get("wallet") or "").lower()
             ranks[f"{category}:{wallet}"] = index
             ranks.setdefault(wallet, index)
+    with _RANK_CACHE_LOCK:
+        _RANK_CACHE[cache_key] = (mtime_key, ranks)
     return ranks
 
 

@@ -834,12 +834,12 @@ function FollowDetailModal({ cid, onClose, toast }) {
     finally { setRefreshing(false); }
   };
 
-  /* 详情打开期间每 25s 静默自动刷新实时盘口(手动按钮仍可即时刷 + toast)。 */
+  /* 打开即拉一次实时盘口(不再显示旧缓存价/等手动刷),之后每 25s 静默自刷(手动按钮仍可即时刷 + toast)。 */
   React.useEffect(() => {
     let alive = true;
-    const id = setInterval(() => {
-      Api.marketPrices(cid).then((p) => alive && setPrices(p.outcome_prices || null)).catch(() => {});
-    }, 25000);
+    const pull = () => Api.marketPrices(cid).then((p) => alive && setPrices(p.outcome_prices || null)).catch(() => {});
+    pull();
+    const id = setInterval(pull, 25000);
     return () => { alive = false; clearInterval(id); };
   }, [cid]);
 
