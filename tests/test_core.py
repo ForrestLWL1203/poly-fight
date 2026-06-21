@@ -5678,16 +5678,16 @@ class CoreTest(unittest.TestCase):
             self.assertFalse(store.load_follow_strategy()["configured"])
 
     def test_sizing_flat_per_signal_with_match_budget(self):
-        # 单一模型:单笔 = 余额×per_signal%;每钱包每场预算 = 余额×per_match%(加仓只填到预算,不叠加)。
+        # 单一模型:单笔 = 余额×per_signal%;每场总预算 = 余额×per_match%(整场所有钱包合计,只填到预算不叠加)。
         s = default_follow_strategy(balance_usdc=5000)
         s["sizing"]["per_signal_percent"] = 1.0   # 单笔 = 5000×1% = 50
-        s["sizing"]["per_match_percent"] = 2.0    # 每钱包每场预算 = 5000×2% = 100
+        s["sizing"]["per_match_percent"] = 2.0    # 每场总预算 = 5000×2% = 100
         s["sizing"]["min_stake_usdc"] = 1.0
 
-        def ev(order_cash=200, theta=0.74, p=0.60, wallet_funded=0.0, bankroll=5000):
+        def ev(order_cash=200, theta=0.74, p=0.60, condition_funded=0.0, bankroll=5000):
             return evaluate_follow_candidate(
                 strategy=s, target_wallet_order_cash_usdc=order_cash, available_balance_usdc=bankroll,
-                wallet_condition_funded_stake_usdc=wallet_funded,
+                condition_funded_stake_usdc=condition_funded,
                 bucket_win_rate=theta, entry_price=p, bankroll_usdc=bankroll,
             )
 
@@ -5695,10 +5695,10 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(ev(200)["funded_stake"], 50)
         self.assertEqual(ev(99999)["funded_stake"], 50)
         self.assertEqual(ev(200)["stake_mode"], "unit_pct")
-        # 加仓只填到预算 100:已投 60 → 剩 40 → 这笔 40(填满不叠加)
-        self.assertEqual(ev(200, wallet_funded=60)["funded_stake"], 40)
-        # 已投到顶(100) → 预算用完 → match_budget_reached
-        self.assertEqual(ev(200, wallet_funded=100)["block_reason"], "match_budget_reached")
+        # 整场加到预算 100:整场已投 60(任意钱包合计)→ 剩 40 → 这笔 40(填满不叠加)
+        self.assertEqual(ev(200, condition_funded=60)["funded_stake"], 40)
+        # 整场已投到顶(100) → 预算用完 → match_budget_reached
+        self.assertEqual(ev(200, condition_funded=100)["block_reason"], "match_budget_reached")
         # 单笔/预算都随动态权益:bankroll 4000 → 单笔 40
         self.assertEqual(ev(200, bankroll=4000)["funded_stake"], 40)
         # 门:目标单太小 / 入场价超上限(默认 0.68) / edge 不足

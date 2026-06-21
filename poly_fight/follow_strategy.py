@@ -11,15 +11,17 @@ from .core import to_float, to_int
 # 注码只有一条公式:stake = floor(余额 × per_signal_percent%)。无 ramp、无 kelly、无镜像、无按比例。
 # "门(是否跟)"与"注码(下多少)"彻底拆开,所有门一律生效:
 #   1) 入场价上限 max_follow_entry_price   2) 目标单太小 min_target_wallet_order_cash_usdc
-#   3) edge 门 θ̂×THETA_FOLLOW_DISCOUNT > 现价   4) 每钱包每场预算 per_match_percent(加仓只填到此,不叠加)
+#   3) edge 门 θ̂×THETA_FOLLOW_DISCOUNT > 现价   4) 每场总预算(每 conditionId 所有钱包/双边合计 ≤ 主盘 per_match_percent% / 子盘 per_match_percent_sub%)
 # 见 review/follow-sizing-refactor-plan.md / review/follow-optimization-plan.md。
 DEFAULT_FOLLOW_STRATEGY_SCHEMA_VERSION = 2
 ACTIVE_FOLLOW_STRATEGY_ID = "active"
 
 DEFAULT_PER_SIGNAL_PERCENT = 1.0          # 单笔 = 余额 × 1%
-DEFAULT_PER_MATCH_PERCENT = 1.0           # 【主盘】每钱包每场预算 = 余额 × 1%(默认 = 单仓)
-# 【子盘】(map/game winner 等非 main_match)每钱包每场预算,与主盘解耦、单独可调。
-# 默认 = 主盘值(不改现状);调低它可压制"一个队连押整个系列每局"的子盘堆叠(每个单局独立按此封顶,不汇总)。
+# 【主盘】每场总预算 = 余额 × per_match_percent%。限额单位 = 单个 conditionId(一个市场,含双边两个
+# outcome);该 condition 所有钱包、两个方向合计 ≤ 此额(先到先得,只填到此不叠加)。
+DEFAULT_PER_MATCH_PERCENT = 1.0
+# 【子盘】(map/game winner 等非 main_match)每场总预算,与主盘解耦、单独可调;口径同上(每 condition
+# 总额,不汇总到系列)。默认 = 主盘值;调低它压制"一个队连押整个系列每局"的子盘堆叠。
 DEFAULT_PER_MATCH_PERCENT_SUB = 1.0
 # 单钱包每场(单个市场/单局)最大跟单笔数,主/子盘同一上限。0 = 无限制(默认,不改现状)。
 DEFAULT_MAX_FOLLOW_ORDERS_PER_MATCH = 0
@@ -51,8 +53,8 @@ def default_follow_strategy(*, balance_usdc: float | None = None) -> dict[str, A
         "realtime_refresh": False,
         "sizing": {
             "per_signal_percent": DEFAULT_PER_SIGNAL_PERCENT,
-            "per_match_percent": DEFAULT_PER_MATCH_PERCENT,            # 主盘单场预算
-            "per_match_percent_sub": DEFAULT_PER_MATCH_PERCENT_SUB,    # 子盘单场预算(map/game winner)
+            "per_match_percent": DEFAULT_PER_MATCH_PERCENT,            # 主盘每场总预算(每 conditionId 总额)
+            "per_match_percent_sub": DEFAULT_PER_MATCH_PERCENT_SUB,    # 子盘每场总预算(map/game winner)
             "max_follow_orders_per_match": DEFAULT_MAX_FOLLOW_ORDERS_PER_MATCH,  # 每场最大跟单笔数(0=无限)
             "min_stake_usdc": DEFAULT_MIN_STAKE_USDC,
         },
@@ -86,15 +88,16 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
         if pm is None:
             pm = old_sz.get("per_match_percent")
             if pm is None and old_sz.get("per_match_cap_percent") is not None:
-                # 旧 per_match_cap_percent 是"单场cap",每钱包拿 0.5×;新口径直接是每钱包预算。
-                pm = to_float(old_sz.get("per_match_cap_percent")) * 0.5
+                # 旧 per_match_cap_percent 是"整场cap"(所有钱包合计)。新 per_match_percent 也是整场总额
+                # 口径 → 直接平移,不再 ×0.5(0.5 是之前每钱包口径的遗留)。
+                pm = to_float(old_sz.get("per_match_cap_percent"))
         ms = new_sz.get("min_stake_usdc")
         if ms is None:
             ms = old_sz.get("min_stake_usdc")
 
         out["sizing"]["per_signal_percent"] = ps if ps is not None else DEFAULT_PER_SIGNAL_PERCENT
         out["sizing"]["per_match_percent"] = pm if pm is not None else DEFAULT_PER_MATCH_PERCENT
-        # 子盘预算:新字段优先;旧配置无此字段 → 回退主盘值(行为不变)。
+        # 子盘预算:新字段优先;旧配置无此字段 → 回退主盘值。
         psub = new_sz.get("per_match_percent_sub")
         out["sizing"]["per_match_percent_sub"] = psub if psub is not None else out["sizing"]["per_match_percent"]
         mo = new_sz.get("max_follow_orders_per_match")
@@ -116,7 +119,7 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
     sizing["per_signal_percent"] = round(to_float(sizing.get("per_signal_percent")), 8)
     sizing["per_match_percent"] = round(to_float(sizing.get("per_match_percent")), 8)
     if sizing.get("per_match_percent_sub") is None:
-        sizing["per_match_percent_sub"] = sizing["per_match_percent"]  # 默认 = 主盘(行为不变)
+        sizing["per_match_percent_sub"] = sizing["per_match_percent"]  # 默认 = 主盘
     sizing["per_match_percent_sub"] = round(to_float(sizing.get("per_match_percent_sub")), 8)
     sizing["max_follow_orders_per_match"] = max(0, to_int(sizing.get("max_follow_orders_per_match")))
     sizing["min_stake_usdc"] = round(to_float(sizing.get("min_stake_usdc")), 8)
@@ -205,15 +208,15 @@ def evaluate_follow_candidate(
     strategy: dict[str, Any],
     target_wallet_order_cash_usdc: float,
     available_balance_usdc: float,
-    condition_funded_stake_usdc: float = 0.0,        # 保留入参(per-event cap 暂未启用),不使用
+    condition_funded_stake_usdc: float = 0.0,        # 该场(整场所有钱包合计)已投 → 每场总预算门
     condition_funded_order_count: int = 0,           # 保留入参,不使用
     wallet_condition_funded_order_count: int = 0,    # 该钱包该场(单市场)已资助笔数 → 每场最大笔数门
     bucket_win_rate: float = 0.0,                    # 被跟桶 θ̂(近期加权点估);×THETA_FOLLOW_DISCOUNT 作 edge 门
     bucket_edge_lb: float | None = None,             # 保留入参(已不参与算注),不使用
     entry_price: float = 0.0,                        # 跟单时实时价 p
     bankroll_usdc: float = 0.0,                      # 余额基准(动态权益);缺则回退 balance/available
-    wallet_condition_funded_stake_usdc: float = 0.0, # 该钱包该场已投合计 → 每钱包每场预算门
-    market_type: str | None = None,                  # 市场类型;main_match=主盘,其余=子盘 → 选预算cap
+    wallet_condition_funded_stake_usdc: float = 0.0, # 保留入参(每钱包每场口径已弃用,改用整场总额),不使用
+    market_type: str | None = None,                  # 市场类型;main_match=主盘,其余=子盘 → 选各自预算cap
 ) -> dict[str, Any]:
     normalized = normalize_follow_strategy(strategy)
     valid, _errors = validate_follow_strategy(normalized)
@@ -259,11 +262,12 @@ def evaluate_follow_candidate(
     if max_orders > 0 and to_int(wallet_condition_funded_order_count) >= max_orders:
         return _block("wallet_condition_order_cap_reached", strategy=normalized)
 
-    # ── 门 6:每钱包每场预算(加仓只填到此,不叠加)。主盘/子盘各自独立 cap ──
+    # ── 门 6:每场总预算。限额单位 = 单个 conditionId(一个市场,含双边两个 outcome)。该 condition
+    #         所有钱包、两个方向合计 ≤ 余额×cap%(先到先得,只填到此不叠加)。主盘/子盘各自独立 cap。──
     is_submarket = str(market_type or "main_match") != "main_match"
     match_percent = to_float(sizing.get("per_match_percent_sub")) if is_submarket else to_float(sizing.get("per_match_percent"))
     budget = bankroll * match_percent / 100.0
-    remaining = budget - to_float(wallet_condition_funded_stake_usdc)
+    remaining = budget - to_float(condition_funded_stake_usdc)
     if remaining < min_stake:
         return _block("match_budget_reached", strategy=normalized)
 

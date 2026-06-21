@@ -60,6 +60,37 @@ class TestBudgetSplit(unittest.TestCase):
         self.assertEqual(r["target_stake"], 30)
 
 
+class TestPerMatchTotalBudget(unittest.TestCase):
+    """每场预算 = 整场所有钱包合计(不是每钱包)。预算 = 余额 × per_match_percent%。"""
+
+    def test_total_across_wallets_caps_at_budget(self):
+        # 预算 $500(10000×5%);整场已被别的钱包投满 $500 → 即使本钱包该场自己投=0,也被挡。
+        s = _strategy(per_signal_percent=1.0, per_match_percent=5.0, min_stake_usdc=30)
+        r = evaluate_follow_candidate(strategy=s, market_type="main_match",
+                                      condition_funded_stake_usdc=500.0,
+                                      wallet_condition_funded_stake_usdc=0.0, **COMMON)
+        self.assertFalse(r["would_follow"])
+        self.assertEqual(r["block_reason"], "match_budget_reached")
+
+    def test_total_below_budget_caps_stake_to_remaining(self):
+        # 整场已投 $480 / 预算 $500 → 剩 $20,新单被夹到整场剩余 $20(< 单笔 1%=$100)。
+        s = _strategy(per_signal_percent=1.0, per_match_percent=5.0, min_stake_usdc=10)
+        r = evaluate_follow_candidate(strategy=s, market_type="main_match",
+                                      condition_funded_stake_usdc=480.0,
+                                      wallet_condition_funded_stake_usdc=0.0, **COMMON)
+        self.assertTrue(r["would_follow"])
+        self.assertEqual(r["target_stake"], 20)
+
+    def test_per_wallet_funded_no_longer_caps(self):
+        # 回归:每钱包口径已弃用。本钱包该场自己已投很多($480),但整场总额还没满($100/$500)→ 不挡。
+        s = _strategy(per_signal_percent=1.0, per_match_percent=5.0, min_stake_usdc=30)
+        r = evaluate_follow_candidate(strategy=s, market_type="main_match",
+                                      condition_funded_stake_usdc=100.0,
+                                      wallet_condition_funded_stake_usdc=480.0, **COMMON)
+        self.assertTrue(r["would_follow"])  # 整场未满 → 放行(证明不再看每钱包)
+        self.assertEqual(r["target_stake"], 100)
+
+
 class TestMaxOrdersPerMatch(unittest.TestCase):
     def test_blocks_at_cap(self):
         s = _strategy(max_follow_orders_per_match=2)
