@@ -27,19 +27,17 @@ ESPORTS_MIN_ROI = 0.20  # 软信号 low_roi 的提示线，不再硬排除
 SPORTS_MIN_ROI = 0.15
 # ── Copy 评分轴 v16(固定注、持有到结算 copy;目标美元盈亏/仓位与我们无关)──
 # 质量门 = 同一桶同时满足三条下界(点估 → 下界:薄样本自动惩罚,抗 6 桶 look-elsewhere):
-#   1) wilson_lb(θ̂, n_eff) ≥ WILSON_LB_MIN           对胜率有把握
-#   2) edge_lb = wilson_lb − 入场中位价 ≥ EDGE_LB_MIN  对"跟着能赚"有把握
+#   1) edge_lb = wilson_lb(θ̂, n_eff) − 入场中位价 ≥ EDGE_LB_MIN  对"跟着能赚"有把握(wilson 下界内含,薄样本自动惩罚)
+#   2) θ̂ ≥ MIN_BUCKET_WIN_RATE                       桶内近期加权胜率硬门
 #   3) n_eff ≥ N_EFF_FLOOR                            数值兜底 + 抗多重比较
 # θ̂ = recency_weighted_win_rate;n_eff = effective_sample_size。价格不再单设带
 # (入场端靠 seed 0.35–0.75 预筛 + edge_lb 兜大热端);美元/PnL/ROI 仅作软 reason、不判定。
-ESPORTS_WILSON_LB_MIN = 0.65
 ESPORTS_EDGE_LB_MIN = 0.05
 ESPORTS_N_EFF_FLOOR = 12
 # 桶内胜率硬门(v20;v23 2026-06-21 用户要求 0.68→0.75):进榜/跟单的专精桶,近期加权胜率 θ̂ 必须 ≥ 此值,
 # 否则判 C —— 不进榜、不跟单。用户取向:只跟历史胜率更高的钱包,edge 次要(高胜率优先于高 edge)。
 # 实测:0.75 把当前 83 个 A 收敛到 ~56 个(砍约 1/3,lol 收得最多)。
 ESPORTS_MIN_BUCKET_WIN_RATE = 0.75
-SPORTS_WILSON_LB_MIN = 0.55
 SPORTS_EDGE_LB_MIN = 0.03
 SPORTS_N_EFF_FLOOR = 12
 SPORTS_MIN_BUCKET_WIN_RATE = 0.60
@@ -2101,7 +2099,6 @@ def classify_wallet_bucket(
     bucket_wilson_lb = wilson_lower_bound_rate(win_rate, eff_sample)   # 在可跟价区子集上算(薄→宽→自动扣)
     bucket_edge_lb = (bucket_wilson_lb - median_entry) if median_entry > 0 else None  # 悲观胜率下每股 edge
     copy_edge = win_rate - median_entry if median_entry > 0 else None                 # 点估 edge,仅展示
-    min_wilson = SPORTS_WILSON_LB_MIN if is_sports else ESPORTS_WILSON_LB_MIN
     min_edge_lb = SPORTS_EDGE_LB_MIN if is_sports else ESPORTS_EDGE_LB_MIN
     min_win_rate = SPORTS_MIN_BUCKET_WIN_RATE if is_sports else ESPORTS_MIN_BUCKET_WIN_RATE  # v20:桶内胜率硬门
     min_eff = float(min_sample)   # n_eff 数值兜底(esports=12),作用于全样本 eff_sample_full
@@ -2114,12 +2111,9 @@ def classify_wallet_bucket(
     if bucket_edge_lb is None or bucket_edge_lb < min_edge_lb:
         reasons.append("weak_edge_lb")
     if win_rate < min_win_rate:
-        reasons.append("win_rate_below_floor")  # v20:桶内 θ̂ < 门(默认 0.68)→ 硬排除
-    # 以下全是软 reason(仅展示/观测,不参与判定):
-    # v17:胜率门已删。实证 edge 在 0.55–0.85 ≈ +5% 平线,胜率不预测盈利、edge 才预测;
-    # 胜率门只会偏袒大热、误杀中价专家(盈利一样)。wilson_lb 仅留作展示。
-    if bucket_wilson_lb < min_wilson:
-        reasons.append("low_win_rate")
+        reasons.append("win_rate_below_floor")  # v20:桶内 θ̂ < 门(默认 0.75)→ 硬排除
+    # 以下全是软 reason(仅展示/观测,不参与判定)。bucket_wilson_lb 不再单设门 —— 它已隐含在
+    # edge_lb(= wilson_lb − 入场中位价)里,只作为字段留存展示,不重复扣一道独立胜率门。
     if loss_count > 0:
         reasons.append("has_losses")
     if pnl <= 0:
@@ -2149,7 +2143,7 @@ def classify_wallet_bucket(
         eff_sample_full >= min_eff   # v18:地板用全样本(活跃度);edge_lb 已含子集 Wilson 置信
         and eff_sample >= min_sub    # v19:可跟价区子集 ≥6,防太薄切片侥幸
         and edge_ok and bucket_edge_lb >= min_edge_lb
-        and win_rate >= min_win_rate  # v20:桶内胜率硬门(默认 0.68)
+        and win_rate >= min_win_rate  # v20:桶内胜率硬门(默认 0.75)
         and thin_ok                   # v21:薄样本(贴放松地板)须更强信号
         and not stale
     ):
@@ -2173,9 +2167,9 @@ def classify_wallet_bucket(
         "entry_edge": round(entry_edge, 8),
         "bucket_win_rate": round(win_rate, 8),                       # θ̂ 近期加权点估胜率
         "bucket_eff_sample": round(eff_sample, 4),                   # n_eff 有效样本
-        "bucket_wilson_lb": round(bucket_wilson_lb, 8),             # Wilson 下界(质量门 1)
+        "bucket_wilson_lb": round(bucket_wilson_lb, 8),             # Wilson 下界(仅展示;已隐含于 edge_lb)
         "bucket_copy_edge": round(copy_edge, 8) if copy_edge is not None else None,        # 点估 edge(展示)
-        "bucket_edge_lb": round(bucket_edge_lb, 8) if bucket_edge_lb is not None else None,  # edge 下界(质量门 2)
+        "bucket_edge_lb": round(bucket_edge_lb, 8) if bucket_edge_lb is not None else None,  # edge 下界(质量门:edge_lb≥min)
         "grade": grade,
         "profile_state": state,
         "reasons": reasons,

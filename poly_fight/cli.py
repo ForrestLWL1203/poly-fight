@@ -260,13 +260,6 @@ ESPORTS_GAME_TAGS = {
 }
 FOLLOW_SIGNAL_CATEGORIES = ("esports",)
 COLLECTOR_NAME = "wallet_collector"
-STRICT_FINAL_MIN_ROI = 0.05
-STRICT_FINAL_MIN_POSITIVE_MARKET_RATE = 0.55
-STRICT_FINAL_MIN_WILSON = 0.50
-STRICT_FINAL_MIN_CAPITAL_WEIGHTED_EDGE = 0.05
-CORE_MIN_RECENT_14D_MARKETS = 3
-CORE_MIN_RECENT_POSITIVE_RATE = 0.50
-CORE_MIN_RECENT_ROI = 0.0
 COLLECTOR_MAX_INACTIVE_SECONDS = 5 * 24 * 60 * 60
 MIN_COPYABLE_BUCKET_ROI = 0.15
 MAX_COPYABLE_TWO_SIDED_COUNT = 1
@@ -4200,16 +4193,12 @@ def build_collector_diagnostics(
         if normalize_wallet(wallet or profile.get("wallet")) in leaderboard_wallets:
             continue
         reasons = set(_leaderboard_reject_reasons_for_profile(profile, now_ts=now_ts))
-        if not reasons and not strict_final_quality_ok(profile):
-            reasons.add("strict_quality_gate")
         for reason in reasons:
             _increment_count(leaderboard_reject_reasons, reason)
         for bucket in profile.get("eligible_buckets") or []:
             bucket_key_value = str(bucket)
             focused = focus_bucket(profile, bucket_key_value)
             bucket_reasons = set(_leaderboard_reject_reasons_for_profile(focused, now_ts=now_ts))
-            if not bucket_reasons and not strict_final_quality_ok(focused):
-                bucket_reasons.add("strict_quality_gate")
             for reason in bucket_reasons:
                 eligible_bucket_reject_reasons.setdefault(bucket_key_value, {})
                 _increment_count(eligible_bucket_reject_reasons[bucket_key_value], reason)
@@ -4807,56 +4796,6 @@ def build_profile_candidate_from_trades(
     return merged
 
 
-def build_seeded_leaderboard(
-    profiles_by_wallet: dict[str, dict[str, Any]],
-    *,
-    now_ts: int,
-    max_leaderboard_wallets: int = 60,
-    require_strict_quality_gate: bool = True,
-    max_two_sided_market_count: int = 0,
-    max_two_sided_market_rate: float = 0.0,
-) -> list[dict[str, Any]]:
-    leaderboard = build_leaderboard_from_profiles(
-        profiles_by_wallet,
-        now_ts=now_ts,
-        max_inactive_days=30,
-        min_participated_markets=2,
-        min_avg_market_cash=250,
-        require_tail_entry_field=True,
-        require_current_scoring_version=True,
-        max_leaderboard_wallets=0 if require_strict_quality_gate else max_leaderboard_wallets,
-        max_two_sided_market_count=max_two_sided_market_count,
-        max_two_sided_market_rate=max_two_sided_market_rate,
-    )
-    rows = [{**row, "collector": COLLECTOR_NAME} for row in leaderboard]
-    if require_strict_quality_gate:
-        rows = [row for row in rows if strict_final_quality_ok(row)]
-        if max_leaderboard_wallets > 0:
-            rows = rows[:max_leaderboard_wallets]
-    return rows
-
-
-def strict_final_quality_metrics_ok(metrics: dict[str, Any]) -> bool:
-    if to_float(metrics.get("esports_roi")) <= STRICT_FINAL_MIN_ROI:
-        return False
-    if to_float(metrics.get("positive_market_rate")) < STRICT_FINAL_MIN_POSITIVE_MARKET_RATE:
-        return False
-    if to_float(metrics.get("wilson_win_rate_lower_bound")) < STRICT_FINAL_MIN_WILSON:
-        return False
-    if to_float(metrics.get("capital_weighted_edge")) < STRICT_FINAL_MIN_CAPITAL_WEIGHTED_EDGE:
-        return False
-    return True
-
-
-def strict_final_quality_ok(row: dict[str, Any]) -> bool:
-    metrics = (
-        leaderboard_rank_metrics(row)
-        if row.get("best_bucket") or row.get("eligible_buckets") or row.get("eligible_market_types")
-        else row
-    )
-    return strict_final_quality_metrics_ok(metrics)
-
-
 def _copyable_reject_reasons(row: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
     metrics = leaderboard_rank_metrics(row)
@@ -4960,8 +4899,8 @@ def build_collector_leaderboard_v2(
     """V2 导出:逐 game×market_type 桶的专精评估 + edge_type 标签 +(可选)每游戏配额。
 
     钱包在任一盘口桶够格即入榜(eligible_buckets 记录够格的盘口),不被它在别处的平庸表现
-    拖累。bot/系统性双边是钱包级硬排除。不走 V1 的 classify_wallet 等级门 / strict_final /
-    copyable / recent_health。
+    拖累。bot/系统性双边是钱包级硬排除。逐桶质量门统一在 classify_wallet_bucket
+    (edge_lb + θ̂ 胜率门 + n_eff),不再有 V1 的 strict_final / recent_health 等散落门。
     """
     gate_kwargs = gate_kwargs or {}
     # 钱包级硬排除:bot / 系统性 material 双边 / 沉寂超时 / 尾盘进场过多(跟单跟不准)。
