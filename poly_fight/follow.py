@@ -13,12 +13,19 @@ MIN_WALLET_TRADE_CASH_USDC = 10.0
 
 
 def _cs2_veto_corroboration_enabled(strategy: dict[str, Any] | None) -> bool:
-    """CS2 map-winner 旁路佐证门开关。默认【开】(无策略也生效 → 重启跟单即自动挂上);
-    仅当策略 prefilters.cs2_veto_corroboration 显式置 False 才关。"""
+    """CS2 map-winner 旁路佐证门(含 held-pending-veto 暂存)总开关 —— 当前【默认关】。
+
+    2026-06-21:实测三个候选 veto 源全军覆没 —— bo3.gg 的 pick/ban(match_maps)对**进行中/赛前**
+    的比赛是空的(赛后才录入,实时拿不到)、HLTV 数据齐全且及时但被 Cloudflare 封死无法自动化、
+    Pinnacle 等盘口结构上根本没有选图归属。没有可靠且及时的数据源 → 整条 veto 佐证暂时停用,
+    cs2 map_winner 一律照常跟(等价于 veto 上线前的行为)。fetch/parse/corroborate/held 代码全保留,
+    找到新数据源后:把本函数默认翻回 True、或在策略 prefilters.cs2_veto_corroboration 显式置 True 即恢复。
+
+    仅当策略 prefilters.cs2_veto_corroboration 显式置 True 才开。"""
     if not isinstance(strategy, dict):
-        return True
+        return False
     value = (strategy.get("prefilters") or {}).get("cs2_veto_corroboration")
-    return True if value is None else bool(value)
+    return False if value is None else bool(value)
 
 
 def eligible_follow_wallets(

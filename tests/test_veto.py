@@ -287,7 +287,9 @@ class TestVetoFollowIntegration(unittest.TestCase):
         trade = {"conditionId": cid, "outcomeIndex": 0, "side": "BUY",
                  "price": 0.5, "size": 100, "timestamp": now_ts - 60, "id": "t1"}
         fake_gate = lambda *a, **k: {"applies": True, "decision": gate_decision}
-        with mock.patch.object(follow, "veto_gate", fake_gate):
+        # veto 佐证默认已停用(无可靠数据源);这些端到端测试验证的是【启用时】的机制,故显式打开。
+        with mock.patch.object(follow, "veto_gate", fake_gate), \
+                mock.patch.object(follow, "_cs2_veto_corroboration_enabled", lambda s: True):
             signals, stats = follow.process_follow_trades(
                 [], wallet="0xWALLET", trades=[trade],
                 markets_by_condition={cid: market}, now_ts=now_ts,
