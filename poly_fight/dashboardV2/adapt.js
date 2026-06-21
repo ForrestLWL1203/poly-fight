@@ -26,6 +26,19 @@
     multi: ["#6b7280", "#a8b1c0"],
   };
 
+  // 子盘标题里带场次信息(BO 系列单局共用系列标题,地图盘也只有一个"地图"标签),
+  // 靠 question 里的 "Game N" / "Map N" 区分场次,否则同一系列的多场看起来一样。
+  // 统一格式 "标签 · 第N量词":单局 -> "单局 · 第N局";地图 -> "地图 · 第N张"。
+  function marketTypeTag(label, question) {
+    const lbl = String(label || "");
+    const q = String(question || "");
+    const gm = /game\s*(\d+)/i.exec(q);
+    if (gm) return lbl ? `${lbl} · 第${gm[1]}局` : `第${gm[1]}局`;
+    const mp = /map\s*(\d+)/i.exec(q);
+    if (mp) return lbl ? `${lbl} · 第${mp[1]}张` : `地图 · 第${mp[1]}张`;
+    return lbl;
+  }
+
   const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
   const pct = (frac) => Math.round(num(frac) * 1000) / 10; // fraction -> percent, 1dp
   const gameLabel = (g) => GAME_LABELS[g] || (g ? String(g).toUpperCase() : "");
@@ -347,10 +360,8 @@
     const pnl = num(row.display_pnl);
     const open = row.status === "open";
     const settlement = open ? "未结算" : (pnl > 0 ? "盈利" : pnl < 0 ? "亏损" : "未结算");
-    // BO 系列的单局盘共用系列标题,靠 market_question 里的 "Game N" 区分(否则两局看起来一样)。
     const mtLabel = row.market_type_label || row.market_type || "";
-    const gm = /game\s*(\d+)/i.exec(String(row.question || row.market_question || ""));
-    const marketType = gm ? (mtLabel ? `${mtLabel} · 第${gm[1]}局` : `第${gm[1]}局`) : mtLabel;
+    const marketType = marketTypeTag(mtLabel, row.question || row.market_question);
     return {
       cid: row.condition_id,
       game: info.game, teamA: info.teamA, teamB: info.teamB, meta: info.meta,
@@ -498,7 +509,7 @@
 
   window.PSAdapt = {
     GAME_LABELS, GAME_ORDER, GAME_COLORS, MARKET_TYPE_LABELS, QUARANTINE_REASONS,
-    num, pct, gameLabel, normalizeGame, timeAgo, fmtClock, toDate, countdown, matchInfo, scopeList,
+    num, pct, gameLabel, normalizeGame, marketTypeTag, timeAgo, fmtClock, toDate, countdown, matchInfo, scopeList,
     overview, equityPoints, equitySeries, rollingPnl, winRates, followTypes, wallet, wallets, event, archivedEvent, events,
     follow, follows, followQuality, strategyToKit, strategyFromKit, strategyEntry, strategyEntries, strategyAvail, strategyExample, strategyIssues,
   };

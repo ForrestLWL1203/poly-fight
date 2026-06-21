@@ -916,7 +916,7 @@ function FollowDetailModal({ cid, onClose, toast }) {
           <div className="mh-match">
             <div className="mh-teamrow">
               <TeamLine ev={ev} held={heldNames} />
-              {(detail.market_type_label || detail.market_type) && <span className="mkt-tag">{detail.market_type_label || detail.market_type}</span>}
+              {(detail.market_type_label || detail.market_type) && <span className="mkt-tag">{Adapt.marketTypeTag(detail.market_type_label || detail.market_type, detail.question)}</span>}
             </div>
             {(ev.start || ev.end) && <div className="match-times" style={{ marginTop: "6px" }}><span>开始 {ev.start || "—"}</span><span className="dot-sep">·</span><span>截止 {ev.end || "—"}</span></div>}
             {sideSummary.length > 0 && (
