@@ -607,7 +607,6 @@ def process_follow_trades(
     stake_ratio_percent: float = 10.0,
     require_pre_match: bool = True,
     post_start_grace_seconds: int = 0,
-    quarantine_sell_frac: float = 0.2,
     eligible_market_types: set[str] | None = None,
     eligible_buckets: set[str] | None = None,
     bucket_theta: dict[str, float] | None = None,   # kelly:桶 → θ̂(近期加权点估胜率),策略内 ×0.95 作现价门
@@ -654,7 +653,6 @@ def process_follow_trades(
         "veto_fade_skip_count": 0,
         "veto_no_data_count": 0,
         "veto_held_count": 0,
-        "quarantine_events": [],
     }
     veto_cache: dict[str, Any] = {}  # 本 tick 内按比赛缓存 veto(Map1/2/3 同场复用,不重复打 bo3)
     # held-pending-veto 复跟:把本钱包上 tick 因「盘前」暂存的 cs2 map_winner 买单重新注入,

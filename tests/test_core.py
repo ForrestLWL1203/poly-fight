@@ -97,7 +97,6 @@ from poly_fight.cli import (
     fetch_user_trades_until_cursor,
     fetch_market_trades_cached,
     filter_profile_candidates,
-    follow_run_log_path,
     load_active_market_cache,
     merge_cached_profile_with_candidate,
     merge_profiles_with_candidates,
@@ -6962,13 +6961,11 @@ class CoreTest(unittest.TestCase):
             stake_usdc=1,
             max_follow_legs=10,
             max_slippage=0.05,
-            quarantine_sell_frac=0.2,
         )
 
         # 目标只卖了 5%(占我们 $4.5 仓的比例 < $1 最小单)→ 等比例攒不够 $1,先不卖、不退出、不隔离。
         self.assertEqual(stats["exited_signal_count"], 0)
         self.assertEqual(stats["partial_exit_count"], 0)
-        self.assertEqual(stats["quarantine_events"], [])
         self.assertEqual(signals[0]["status"], "open")
         self.assertEqual(signals[0]["wallet_sell_size"], 5)
         self.assertFalse(signals[0].get("our_sold_fraction"))  # 没卖 → 未设/0
@@ -7005,11 +7002,9 @@ class CoreTest(unittest.TestCase):
             stake_usdc=1,
             max_follow_legs=10,
             max_slippage=0.05,
-            quarantine_sell_frac=0.2,
         )
 
         # 目标累计卖 25%(攒过 $1)→ 我们等比例卖 25%,部分平仓(非全平),不隔离。
-        self.assertEqual(stats["quarantine_events"], [])
         self.assertEqual(stats["exited_signal_count"], 0)
         self.assertEqual(stats["partial_exit_count"], 1)
         self.assertEqual(signals[0]["wallet_sell_size"], 25)
@@ -7045,10 +7040,8 @@ class CoreTest(unittest.TestCase):
             stake_usdc=1,
             max_follow_legs=10,
             max_slippage=0.05,
-            quarantine_sell_frac=0.2,
         )
 
-        self.assertEqual(stats["quarantine_events"], [])
         self.assertEqual(stats["exited_signal_count"], 1)
         self.assertEqual(signals[0]["status"], "exited")
         self.assertGreater(signals[0]["our_realized_pnl"], 0)
@@ -7084,7 +7077,6 @@ class CoreTest(unittest.TestCase):
         )
 
         self.assertEqual(stats["opposite_blocked_count"], 1)
-        self.assertEqual(stats["quarantine_events"], [])
         self.assertEqual(stats["exited_signal_count"], 0)
         self.assertEqual(stats["new_leg_count"], 1)
         self.assertEqual(len(signals), 2)
@@ -7131,7 +7123,6 @@ class CoreTest(unittest.TestCase):
             max_entry_price=1.0,
         )
 
-        self.assertEqual(stats["quarantine_events"], [])
         self.assertEqual(stats["hedge_event_count"], 0)
         self.assertEqual(stats["low_entry_price_blocked_count"], 1)
         self.assertEqual(stats["new_leg_count"], 0)
@@ -14552,7 +14543,6 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.max_workers, 8)
         self.assertFalse(hasattr(args, "consensus_block_opposite"))
         self.assertFalse(hasattr(args, "conflict_policy"))
-        self.assertEqual(args.quarantine_sell_frac, 0.2)
 
         pre_match_args = parser.parse_args(["follow", "--stake-usdc", "25", "--require-pre-match"])
         self.assertTrue(pre_match_args.require_pre_match)
@@ -14595,7 +14585,6 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.market_batch_count, 2)
         self.assertFalse(hasattr(args, "consensus_block_opposite"))
         self.assertFalse(hasattr(args, "conflict_policy"))
-        self.assertEqual(args.quarantine_sell_frac, 0.2)
         self.assertFalse(args.require_pre_match)
 
         pre_match_args = parser.parse_args(["run", "--stake-usdc", "1", "--require-pre-match"])

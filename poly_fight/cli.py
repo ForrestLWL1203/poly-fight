@@ -718,11 +718,6 @@ def default_log_dir(data_dir: Path) -> Path:
     return data_dir / "logs"
 
 
-def follow_run_log_path(data_dir: Path, log_dir: str | Path | None = None) -> Path:
-    base = Path(log_dir) if log_dir else default_log_dir(data_dir)
-    return base / "follow" / "follow_run_log.jsonl"
-
-
 def read_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
@@ -6928,7 +6923,6 @@ def command_follow(
                     stake_ratio_percent=args.stake_ratio_percent,
                     require_pre_match=args.require_pre_match,
                     post_start_grace_seconds=args.post_start_trade_grace_seconds,
-                    quarantine_sell_frac=args.quarantine_sell_frac,
                     eligible_market_types=eligible_market_types_by_wallet.get(scope_key),
                     eligible_buckets=eligible_buckets_by_wallet.get(scope_key),
                     bucket_theta=bucket_theta_by_wallet.get(scope_key),
@@ -7119,7 +7113,6 @@ def command_follow(
                 stake_ratio_percent=args.stake_ratio_percent,
                 require_pre_match=args.require_pre_match,
                 post_start_grace_seconds=args.post_start_trade_grace_seconds,
-                quarantine_sell_frac=args.quarantine_sell_frac,
                 eligible_market_types=eligible_market_types_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 eligible_buckets=eligible_buckets_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 bucket_theta=bucket_theta_by_wallet.get(scope_key),
@@ -7206,7 +7199,6 @@ def command_follow(
                 stake_ratio_percent=args.stake_ratio_percent,
                 require_pre_match=args.require_pre_match,
                 post_start_grace_seconds=args.post_start_trade_grace_seconds,
-                quarantine_sell_frac=args.quarantine_sell_frac,
                 conflict_policy="dual_follow",
                 bankroll_usdc=bankroll_usdc,
                 max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
@@ -7682,7 +7674,6 @@ def build_parser() -> argparse.ArgumentParser:
         if include_category:
             subparser.add_argument("--category", choices=["esports"], default="esports")
         subparser.add_argument("--gamma-pages", type=int, default=10)
-        subparser.add_argument("--refresh-classification", action="store_true")
         subparser.add_argument("--classification-cache-ttl-hours", type=int, default=24)
         subparser.add_argument("--classification-lookback-days", type=int, default=None)
         subparser.add_argument("--max-workers", type=int, default=8)
@@ -7708,8 +7699,6 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--trades-page-limit", type=int, default=1000)
         subparser.add_argument("--max-pages-per-market", type=int, default=3)
         subparser.add_argument("--market-trades-cache-ttl-days", type=int, default=7)
-        subparser.add_argument("--refresh-market-trades", action="store_true")
-        subparser.add_argument("--no-market-trades-cache", action="store_true")
         subparser.add_argument("--min-trade-cash", type=float, default=50)
         subparser.add_argument("--participation-threshold", type=int, default=8)
         subparser.add_argument("--top-participation-count", type=int, default=100)
@@ -7774,7 +7763,6 @@ def build_parser() -> argparse.ArgumentParser:
         # 不放进每 5s 主循环)。目标已清仓 → 镜像平仓。0 关闭。
         subparser.add_argument("--reconcile-interval-seconds", type=int, default=60)
         subparser.add_argument("--reconcile-batch-size", type=int, default=20)
-        subparser.add_argument("--quarantine-sell-frac", type=float, default=0.2)
         subparser.add_argument("--max-workers", type=int, default=8)
         subparser.add_argument("--max-requests-per-second", type=float, default=10)
         subparser.add_argument("--request-burst", type=int, default=5)
@@ -7952,7 +7940,6 @@ def build_parser() -> argparse.ArgumentParser:
     # M5 动态降级:每累计这么多笔新结算跟单,就对那批被跟钱包重评一次,跌出 A 榜即隔离
     # (事件驱动,替代旧的固定 2h observe-v2 降级扫描)。<=0 关闭 runner 侧降级。
     run.add_argument("--rescore-settled-threshold", type=int, default=5)
-    run.add_argument("--quarantine-sell-frac", type=float, default=0.2)
     run.add_argument("--error-retry-seconds", type=int, default=180)
     run.add_argument("--max-consecutive-error-seconds", type=int, default=600)
     run.add_argument("--pool-refresh-hours", type=float, default=12)
