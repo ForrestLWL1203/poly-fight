@@ -172,10 +172,14 @@
           leaderboard_rank: 1, leg_count: 7, follow_total_stake: 175, followed_outcome_count: 1,
           follow_avg_entry_price: 0.5565, follow_realized_pnl: 2.75,
           follow_exit_price: 0.56, follow_exit_stake: 90,
-          signals: [{ signal_id: "sig-1", outcome: "PARIVISION", outcome_index: 0, legs: [
-            ...Array.from({ length: 7 }, (_, i) => mkLeg({ wallet_trade_at: ago(6000 - i * 600), wallet_fill_price: 0.55 + (i % 3) * 0.003, wallet_trade_cash: 320 - i * 25, our_entry_price: 0.555 + (i % 3) * 0.002, slippage_over_wallet_entry: i % 2 ? -0.002 : 0.005, observed_delay_seconds: 25 + i * 7 })),
-            mkLeg({ wallet_trade_at: ago(900), wallet_fill_price: 0.552, our_entry_price: 0.557, slippage_over_wallet_entry: 0.005, observed_delay_seconds: 120, would_follow: false, funding_status: "unfunded", funded_stake: 0 }),
-          ] }],
+          signals: [{ signal_id: "sig-1", outcome: "PARIVISION", outcome_index: 0,
+            legs: [
+              ...Array.from({ length: 7 }, (_, i) => mkLeg({ wallet_trade_at: ago(6000 - i * 600), wallet_fill_price: 0.55 + (i % 3) * 0.003, wallet_trade_cash: 320 - i * 25, our_entry_price: 0.555 + (i % 3) * 0.002, slippage_over_wallet_entry: i % 2 ? -0.002 : 0.005, observed_delay_seconds: 25 + i * 7 })),
+              mkLeg({ wallet_trade_at: ago(900), wallet_fill_price: 0.552, our_entry_price: 0.557, slippage_over_wallet_entry: 0.005, observed_delay_seconds: 120, would_follow: false, funding_status: "unfunded", funded_stake: 0 }),
+            ],
+            partial_exits: [{ timestamp: ago(540), price: 0.554, sold_stake: 90, sold_fraction_delta: 0.5, cumulative_sold_fraction: 0.5 }],
+            behavior_events: [{ kind: "exit", price: 0.553, size: 5000, timestamp: ago(600) }],
+          }],
         },
         {
           wallet: "0x2b71e9c4a8d3f50612839a4b5c6d7e8f90126789", short_addr: "0x2b7...789",

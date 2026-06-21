@@ -735,11 +735,48 @@ const stripGamePrefix = (title) => { const t = String(title || ""); const i = t.
 
 const WALLET_LEGS_PER_PAGE = 5;
 const isFundedLeg = (leg) => leg.would_follow !== false && leg.funding_status !== "unfunded";
+// 该 signal 已注资买入腿的加权均价(给提前卖出条目算单笔盈亏用)。
+function signalEntryPrice(s) {
+  let wsum = 0, w = 0;
+  (s.legs || []).filter(isFundedLeg).forEach((leg) => {
+    const e = Number(leg.our_entry_price);
+    const st = Number(leg.funded_stake != null ? leg.funded_stake : leg.stake);
+    if (e > 0 && st > 0) { wsum += e * st; w += st; }
+  });
+  return w > 0 ? wsum / w : 0;
+}
 function WalletLegBlock({ w, prices, ev }) {
+  const [open, setOpen] = React.useState(false);
   const [pg, setPg] = React.useState(1);
-  const legs = (w.signals || []).flatMap((s) => (s.legs || [])
-    .filter(isFundedLeg)
-    .map((leg, i) => ({ leg, key: s.signal_id + ":" + i })));
+
+  // 统一买卖条目:买入来自 legs;卖出来自 partial_exits(钱包侧时间/价/量配 behavior_events 的 exit)。
+  const entries = [];
+  (w.signals || []).forEach((s) => {
+    (s.legs || []).filter(isFundedLeg).forEach((leg, i) => {
+      entries.push({
+        dir: "buy", t: Number(leg.wallet_trade_at) || 0,
+        wp: leg.wallet_fill_price, wc: leg.wallet_trade_cash, delay: leg.observed_delay_seconds,
+        op: leg.our_entry_price, amt: (leg.funded_stake != null ? leg.funded_stake : leg.stake),
+        pnl: null, key: s.signal_id + ":b" + i,
+      });
+    });
+    const entry = signalEntryPrice(s);
+    const exits = (s.behavior_events || []).filter((e) => e.kind === "exit");
+    (s.partial_exits || []).forEach((pe, i) => {
+      const be = exits[i] || {};
+      const op = Number(pe.price), amt = Number(pe.sold_stake);
+      entries.push({
+        dir: "sell", t: be.timestamp != null ? Number(be.timestamp) : (Number(pe.timestamp) || 0),
+        wp: be.price, wc: (be.price != null && be.size != null) ? Number(be.price) * Number(be.size) : null,
+        delay: (be.timestamp != null && pe.timestamp != null) ? (Number(pe.timestamp) - Number(be.timestamp)) : null,
+        op: op, amt: amt, pnl: (entry > 0 && op > 0) ? amt * (op - entry) / entry : null,
+        key: s.signal_id + ":s" + i,
+      });
+    });
+  });
+  entries.sort((a, b) => b.t - a.t);  // 最近的在前:卖出/最新动作首页可见,不被多笔买入挤到后页
+  const buyCount = entries.filter((e) => e.dir === "buy").length;
+  const sellCount = entries.filter((e) => e.dir === "sell").length;
 
   // 该钱包在这场买入的边(去重);自对冲会有两边。
   const sides = (() => {
@@ -754,8 +791,7 @@ function WalletLegBlock({ w, prices, ev }) {
     return out;
   })();
 
-  // P&L: settled → realized; open → unrealized from current orderbook
-  // (Σ funded_stake × (current_price − our_entry_price) / our_entry_price).
+  // P&L: settled → realized; open → unrealized from current orderbook.
   const px = prices || [];
   let unrealized = 0, priced = false;
   (w.signals || []).forEach((s) => {
@@ -769,48 +805,50 @@ function WalletLegBlock({ w, prices, ev }) {
   });
   const realized = w.follow_realized_pnl != null;
   const pnlValue = realized ? Number(w.follow_realized_pnl) : (priced ? unrealized : null);
-  const pages = Math.max(1, Math.ceil(legs.length / WALLET_LEGS_PER_PAGE));
+  const pages = Math.max(1, Math.ceil(entries.length / WALLET_LEGS_PER_PAGE));
   const cur = Math.min(pg, pages);
-  const pageLegs = legs.slice((cur - 1) * WALLET_LEGS_PER_PAGE, cur * WALLET_LEGS_PER_PAGE);
+  const pageEntries = entries.slice((cur - 1) * WALLET_LEGS_PER_PAGE, cur * WALLET_LEGS_PER_PAGE);
+  const toggle = () => setOpen((v) => !v);
   return (
-    <div className="wallet-block">
-      <div className="wallet-block-head">
+    <div className={"wallet-block" + (open ? " is-open" : "")}>
+      <div className="wallet-block-head" role="button" tabIndex={0} aria-expanded={open}
+        onClick={toggle} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } }}>
         <div style={{ display: "flex", alignItems: "center", gap: "var(--sp-3)" }}>
           {w.leaderboard_rank != null && <RankBadge rank={w.leaderboard_rank} />}
           <WalletAddress address={w.wallet} href={polymarketProfileUrl(w.wallet)} onClick={(e) => e.stopPropagation()} copyable />
           <span className="side-chips">{sides.map((sd) => <SideChip key={sd.index + ":" + sd.outcome} outcome={sd.outcome} index={sd.index} ev={ev} />)}</span>
-          {w.follow_exit_price != null && (
-            <Badge tone="warn" title="目标钱包在结算前清仓(或对账兜底补平),我们已镜像平仓 — 非市场结算">
-              提前卖出{w.follow_exit_stake != null ? ` ${money(w.follow_exit_stake)}` : ""} @ {priceStr(w.follow_exit_price)}
-            </Badge>
-          )}
         </div>
         <div className="wallet-block-meta">
           <span>投入 <b>{money(w.follow_total_stake)}</b></span>
           <span>均价 <b>{priceStr(w.follow_avg_entry_price)}</b></span>
           <span>盈亏 <b className={pnlClass(pnlValue || 0)}>{pnlValue != null ? signedMoney(pnlValue) : "—"}</b></span>
+          <span className="wlb-cnt">买{buyCount}{sellCount ? <>·<span className="s">卖{sellCount}</span></> : null}</span>
+          <Ico n="chevron-down" className="wlb-chev" />
         </div>
       </div>
-      <div className="tbl-wrap">
-        <table className="ps-table">
-          <thead><tr><th>钱包时间</th><th>钱包价</th><th>钱包额</th><th>延迟</th><th>投入</th><th>我方价</th><th>滑点</th></tr></thead>
-          <tbody key={cur} className="tbl-fade">
-            {pageLegs.map(({ leg, key }) => (
-              <tr key={key}>
-                <td className="muted">{Adapt.fmtClock(leg.wallet_trade_at)}</td>
-                <td className="num">{priceStr(leg.wallet_fill_price)}</td>
-                <td className="num">{money(leg.wallet_trade_cash)}</td>
-                <td className="muted">{fmtDelay(leg.observed_delay_seconds)}</td>
-                <td className="num strong">{money(leg.funded_stake != null ? leg.funded_stake : leg.stake)}</td>
-                <td className="num">{priceStr(leg.our_entry_price)}</td>
-                <td className={"num " + pnlClass(-(Number(leg.slippage_over_wallet_entry) || 0))}>{leg.slippage_over_wallet_entry != null ? (Number(leg.slippage_over_wallet_entry) > 0 ? "+" : "") + Number(leg.slippage_over_wallet_entry).toFixed(3) : "—"}</td>
-              </tr>
-            ))}
-            {!legs.length && <tr><td colSpan="7" className="empty-cell">暂无已跟记录</td></tr>}
-          </tbody>
-        </table>
+      <div className="wallet-legs">
+        <div className="tbl-wrap">
+          <table className="ps-table">
+            <thead><tr><th>方向</th><th>钱包时间</th><th>钱包价</th><th>钱包额</th><th>延迟</th><th>我方价</th><th>我方额</th><th>盈亏</th></tr></thead>
+            <tbody key={cur} className="tbl-fade">
+              {pageEntries.map((en) => (
+                <tr key={en.key} className={en.dir === "sell" ? "sell-row" : ""}>
+                  <td><span className={"leg-dir " + en.dir}>{en.dir === "sell" ? "卖出" : "买入"}</span></td>
+                  <td className="muted">{Adapt.fmtClock(en.t)}</td>
+                  <td className="num">{en.wp != null ? priceStr(en.wp) : "—"}</td>
+                  <td className="num">{en.wc != null ? money(en.wc) : "—"}</td>
+                  <td className="muted">{en.delay != null ? fmtDelay(en.delay) : "—"}</td>
+                  <td className="num">{priceStr(en.op)}</td>
+                  <td className="num strong">{money(en.amt)}</td>
+                  <td className={"num " + (en.pnl != null ? pnlClass(en.pnl) : "")}>{en.pnl != null ? signedMoney(en.pnl) : "—"}</td>
+                </tr>
+              ))}
+              {!entries.length && <tr><td colSpan="8" className="empty-cell">暂无已跟记录</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        {entries.length > WALLET_LEGS_PER_PAGE && <Pager total={entries.length} pageSize={WALLET_LEGS_PER_PAGE} page={cur} onChange={setPg} unit="笔" />}
       </div>
-      {legs.length > WALLET_LEGS_PER_PAGE && <Pager total={legs.length} pageSize={WALLET_LEGS_PER_PAGE} page={cur} onChange={setPg} unit="笔" />}
     </div>
   );
 }

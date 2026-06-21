@@ -114,6 +114,19 @@
 .wallet-block-meta b.pnl-up { color: var(--pnl-up); }
 .wallet-block-meta b.pnl-down { color: var(--pnl-down); }
 .wallet-block-meta b.pnl-flat { color: var(--text-secondary); }
+/* collapsible wallet detail: 默认折叠,点头部展开;买卖统一条目表 */
+.wallet-block-head { cursor: pointer; user-select: none; margin-bottom: 0; }
+.wallet-block-head:hover { opacity: 0.92; }
+.wlb-cnt { font-size: var(--fs-caption); color: var(--text-tertiary); background: var(--surface-card); border-radius: var(--r-xs); padding: 2px 8px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.wlb-cnt .s { color: var(--status-warn); }
+.wlb-chev { width: 16px; height: 16px; flex: none; color: var(--text-tertiary); transition: transform 0.3s ease; }
+.wallet-block.is-open .wlb-chev { transform: rotate(180deg); }
+.wallet-legs { max-height: 0; opacity: 0; overflow: hidden; transition: max-height 0.35s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.25s ease; }
+.wallet-block.is-open .wallet-legs { max-height: 680px; opacity: 1; margin-top: var(--sp-3); }
+.leg-dir { display: inline-block; font-size: var(--fs-caption); font-weight: var(--fw-semibold); padding: 2px 8px; border-radius: var(--r-xs); }
+.leg-dir.buy { background: var(--surface-card); color: var(--text-secondary); }
+.leg-dir.sell { background: var(--status-warn-soft); color: var(--status-warn); }
+.ps-table tr.sell-row td { background: var(--status-warn-soft); }
 
 /* small inline helper */
 .inline-spin-row { display: inline-flex; align-items: center; gap: var(--sp-2); }
