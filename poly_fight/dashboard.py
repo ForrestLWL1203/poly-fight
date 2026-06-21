@@ -3118,6 +3118,17 @@ def _reap_follow_processes(processes: list[dict[str, Any]]) -> list[int]:
     return reaped
 
 
+def reap_orphan_follow_processes(config: DashboardConfig) -> list[int]:
+    """serve 启动时调用:扫掉上一代 serve 遗留的 runner/observe 孤儿。
+
+    spawn 时用 ``start_new_session=True`` 让子进程脱离 serve 的会话,所以重启 serve
+    (systemd restart / 崩溃拉起)时,上一代的 run/observe 会作为 "left-over" 进程残留,
+    控制文件 pid 也对不上 → 面板"停止跟单"杀不掉、状态错乱。让每个新 serve 一起来就把
+    它们清干净 = 干净起点;代价是重启 serve 会顺带停掉正在跑的 runner(之后由用户重新启动)。
+    返回杀掉的 pid。"""
+    return _reap_follow_processes(_find_follow_processes(config))
+
+
 def _system_processes() -> list[dict[str, Any]]:
     for command in (
         ["ps", "-axo", "pid=,ppid=,pgid=,stat=,command="],

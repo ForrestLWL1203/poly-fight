@@ -10019,6 +10019,32 @@ class CoreTest(unittest.TestCase):
             fp = {int(r["pid"]) for r in (captured.get("follow_processes") or [])}
             self.assertEqual(fp, {200, 999})  # stopper 看到完整集(含孤儿)
 
+    def test_serve_startup_reaps_leftover_follow_processes(self):
+        # serve 启动硬化:扫掉上一代 serve 遗留的 run/observe 孤儿(start_new_session 脱离会话,
+        # 重启 serve 时残留 → 面板停不掉)。新 serve 起来即清,返回杀掉的 pid。
+        from poly_fight.dashboard import reap_orphan_follow_processes
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp); follow_dir = data_dir / "follow"; eroot = data_dir / "esports"
+            rows = [
+                {"pid": 300, "pgid": 300, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {data_dir} run --follow-dir {follow_dir}"},
+                {"pid": 301, "pgid": 301, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {eroot} observe-v2 --category esports"},
+                {"pid": 302, "pgid": 302, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {eroot} observe-live --category esports"},
+                {"pid": 303, "pgid": 303, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {data_dir} serve --port 8787"},
+            ]
+            config = DashboardConfig(data_dir=data_dir, follow_dir=follow_dir, username="a", password="p", cookie_secret="s",
+                                     runner_process_lister=lambda: rows)
+            reaped = set(reap_orphan_follow_processes(config))
+            self.assertEqual(reaped, {300, 301, 302})  # run+observe 全收;serve 自己不收
+
+    def test_serve_startup_reap_noop_when_clean(self):
+        # 干净起点(无遗留 follow 进程)时,启动收割是 no-op,不误杀。
+        from poly_fight.dashboard import reap_orphan_follow_processes
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            config = DashboardConfig(data_dir=data_dir, username="a", password="p", cookie_secret="s",
+                                     runner_process_lister=lambda: [])
+            self.assertEqual(reap_orphan_follow_processes(config), [])
+
     def test_dashboard_runner_stopped_status_includes_default_runner_inputs(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
