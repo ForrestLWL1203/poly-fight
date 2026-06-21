@@ -1830,9 +1830,11 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
     groups = _follow_groups_from_signals(
         [signal for signal in result.get("signals", []) if _signal_has_actual_follow(signal)]
     )
+    # 进行中(未结算)的跟单排最前;组内再按开单时间(最近一次建腿动作)最近的在前。
     rows = sorted(
         groups.values(),
         key=lambda row: (
+            1 if str(row.get("status") or "") in {"open", "insufficient_balance"} else 0,
             int(row.get("last_follow_action_at") or 0),
             int(row.get("last_activity_at") or 0),
             str(row.get("condition_id") or ""),

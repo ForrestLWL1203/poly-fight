@@ -1504,7 +1504,7 @@ function Dashboard({ onLogout, toast }) {
       const safe = (p) => p.catch((e) => { if (e instanceof Api.AuthError) onLogout(); return null; });
       const [overview, health, runner, strategy, strategies, wallets, events, follows, refresh] = await Promise.all([
         safe(Api.overview()), safe(Api.health()), safe(Api.runner()), safe(Api.followStrategy()), safe(Api.strategies()),
-        safe(Api.wallets()), safe(Api.events()), safe(Api.follows({ page: 1, size: 25 })),
+        safe(Api.wallets()), safe(Api.events()), safe(Api.follows({ page: 1, size: 100 })),
         safe(Api.walletRefreshStatus()),
       ]);
       if (alive) merge({ overview, health, runner, strategy, strategies, wallets, events, follows, refresh });
@@ -1518,7 +1518,7 @@ function Dashboard({ onLogout, toast }) {
     const refetch = {
       wallets: () => Api.wallets().then((w) => alive && merge({ wallets: w })).catch(() => {}),
       events: () => Api.events().then((e) => alive && merge({ events: e })).catch(() => {}),
-      follows: () => Api.follows({ page: 1, size: 25 }).then((f) => alive && merge({ follows: f })).catch(() => {}),
+      follows: () => Api.follows({ page: 1, size: 100 }).then((f) => alive && merge({ follows: f })).catch(() => {}),
     };
     const onFrame = (frame) => {
       if (!alive || !frame) return;
@@ -1557,7 +1557,7 @@ function Dashboard({ onLogout, toast }) {
     let alive = true;
     const id = setInterval(() => {
       Api.events().then((e) => alive && merge({ events: e })).catch(() => {});
-      Api.follows({ page: 1, size: 25 }).then((f) => alive && merge({ follows: f })).catch(() => {});
+      Api.follows({ page: 1, size: 100 }).then((f) => alive && merge({ follows: f })).catch(() => {});
     }, 60000);
     return () => { alive = false; clearInterval(id); };
   }, [hasOpenFollows, merge]);
