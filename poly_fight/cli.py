@@ -6331,6 +6331,10 @@ def command_analyze_event(args: argparse.Namespace) -> int:
 # 例:钱包 0.69 买,现价 0.445(跌 35%)→ 补;现价 0.40(跌 42% ≥40%)→ 不补。
 # 配合现价上限(≤max_entry_price 回 scope)一起:既要"跌回可跟价区",又要"没跌太狠"。
 POSITION_BACKFILL_MAX_DRAWDOWN = 0.40
+# 绝对低价地板:现价 < 此 → 不补(已基本判负/无盘口)。回撤护栏按**相对成本**算,当钱包成本本身
+# 也接近 0(avg≈entry)时相对跌幅很小、漏拦;此处用绝对值兜底,杜绝 our_entry≈0 把后续
+# mark-to-market 放大成天文数字(0.0005 入场 → 任意上跳即虚增巨额未实现盈亏)。
+POSITION_BACKFILL_MIN_ENTRY = 0.05
 
 
 def build_position_backfill_trades(
@@ -6358,7 +6362,7 @@ def build_position_backfill_trades(
     by_wallet: dict[str, list[dict[str, Any]]] = {}
     stats: dict[str, int] = {
         "wallets_scanned": 0, "positions_in_scope": 0, "already_followed": 0,
-        "price_ceiling_blocked": 0, "drawdown_blocked": 0, "candidates": 0,
+        "price_ceiling_blocked": 0, "drawdown_blocked": 0, "price_floor_blocked": 0, "candidates": 0,
     }
     for row in follow_wallets:
         wallet = normalize_wallet(row.get("wallet"))
@@ -6400,6 +6404,9 @@ def build_position_backfill_trades(
             if entry <= 0:
                 entry = to_float(pos.get("curPrice"))
             if entry <= 0:
+                continue
+            if entry < POSITION_BACKFILL_MIN_ENTRY:   # 绝对低价地板:已基本判负/无盘口,不补(兜回撤护栏的 avg≈entry 盲区)
+                stats["price_floor_blocked"] += 1
                 continue
             if max_entry_price > 0 and entry > max_entry_price:   # 现价上限(与 live 同):必须跌回可跟价区
                 stats["price_ceiling_blocked"] += 1

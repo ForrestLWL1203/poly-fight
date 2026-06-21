@@ -9956,6 +9956,35 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(stats["drawdown_blocked"], 1)
         self.assertEqual(by_wallet["0xkeep"][0]["timestamp"], 777)  # 真实建仓时间,非 now_ts(1000)
 
+    def test_position_backfill_abs_floor_catches_near_zero_drawdown_blindspot(self):
+        # 绝对低价地板兜回撤护栏的盲区:钱包成本本身也接近 0(avg≈entry,相对跌幅 <40% → 回撤护栏放行),
+        # 但现价已 < 0.05 基本判负 → 被绝对地板拦下,杜绝 our_entry≈0 把后续 mark-to-market 放大成天文数字。
+        from poly_fight import cli as cli_mod
+        market = {
+            "condition_id": "0xabc", "conditionId": "0xabc",
+            "outcomes": ["A", "B"], "clobTokenIds": ["111", "222"],
+            "outcome_prices": [0.0, 0.0], "market_type": "main_match", "league": "cs2",
+        }
+        positions = {
+            # 钱包 0.0008 买,现价 0.0005(相对仅跌 37.5% <40% → 回撤护栏放行),但 <0.05 → 地板拦
+            "0xdust": [{"conditionId": "0xabc", "asset": "111", "outcome": "A", "avgPrice": 0.0008, "curPrice": 0.0005, "size": 1000}],
+        }
+
+        class FakeClient:
+            def positions(self, wallet, *, limit=200):
+                return positions[wallet]
+            def trades_for_user(self, wallet, *, limit=200):
+                return []
+
+        with patch("poly_fight.cli.clob_price", return_value=None):
+            by_wallet, stats = cli_mod.build_position_backfill_trades(
+                FakeClient(), [{"wallet": "0xdust"}], {"0xabc": market},
+                max_entry_price=0.68, now_ts=1000,
+            )
+        self.assertEqual(by_wallet, {})                       # 没补任何腿
+        self.assertEqual(stats["price_floor_blocked"], 1)     # 被绝对地板拦下
+        self.assertEqual(stats["drawdown_blocked"], 0)        # 回撤护栏没拦住(相对跌幅 <40%)
+
     def test_build_position_backfill_trades_idempotent(self):
         # 已有该 wallet+condition+outcome 的开放信号 → 不再补腿(防重启重复扣)。
         from poly_fight import cli as cli_mod
