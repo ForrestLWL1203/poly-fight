@@ -341,7 +341,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/follows/"):
             condition_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1]).lower()
-            self._ok(build_follow_detail(self.dashboard_config.data_dir, condition_id, follow_dir=follow_dir))
+            self._ok(build_follow_detail(self.dashboard_config.data_dir, condition_id, follow_dir=follow_dir, client=self.dashboard_config.client))
             return
         if parsed.path == "/api/events":
             self._ok(
@@ -1912,23 +1912,12 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
     rows = rows[start : start + size]
     # 浮盈现价:活跃缓存最多滞后 event_cache_ttl_minutes(默认60min)。对**进行中(open)**
     # 的跟单,渲染时批量拉一次实时盘口价覆盖缓存价(只读内存覆盖,不写库);失败回退缓存。
-    live_prices_by_cid: dict[str, list[float]] = {}
-    if client is not None:
-        open_cids = list(dict.fromkeys(
-            str(row.get("condition_id") or "").lower()
-            for row in rows
-            if str(row.get("status") or "") in {"open", "insufficient_balance"} and row.get("condition_id")
-        ))
-        if open_cids:
-            try:
-                live = client.gamma("/markets", condition_ids=open_cids, limit=max(1, len(open_cids)))
-                for market_row in (live or []):
-                    record = _market_price_record(market_row)
-                    cid = record.get("condition_id")
-                    if cid and record.get("outcome_prices"):
-                        live_prices_by_cid[cid] = record["outcome_prices"]
-            except Exception:
-                live_prices_by_cid = {}
+    open_cids = [
+        str(row.get("condition_id") or "")
+        for row in rows
+        if str(row.get("status") or "") in {"open", "insufficient_balance"} and row.get("condition_id")
+    ]
+    live_prices_by_cid = _live_outcome_prices(client, open_cids)
     # 脱榜标记:源钱包已不在当前 leaderboard(被刷新排除)。跟单仍跟至结算,但需清晰标出。
     active_leaderboard = {
         str(lb_row.get("wallet") or "").lower()
@@ -2047,12 +2036,20 @@ def _signal_follow_outcome_key(signal: dict[str, Any]) -> str:
     return f"{condition_id}:outcome:{str(signal.get('outcome') or '').strip().lower()}"
 
 
-def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path | None = None) -> dict[str, Any]:
+def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path | None = None, client: Any = None) -> dict[str, Any]:
     condition_id = condition_id.lower()
     result = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).load_dashboard_follow_detail(condition_id)
     signals = result.get("signals", [])
     _annotate_signal_quality(signals)
     market = _active_market_by_condition(data_dir, condition_id, follow_dir=follow_dir)
+    # 与列表口径一致:进行中(open)的盘渲染时拉一次实时盘口价覆盖缓存价(只读,不写库),
+    # 否则详情读缓存、列表读实时 → 同一盘两处价不一致。失败回退缓存价。
+    price_live = False
+    if any(str(signal.get("status") or "") in {"open", "insufficient_balance"} for signal in signals):
+        live = _live_outcome_prices(client, [condition_id]).get(condition_id)
+        if live:
+            market = {**market, "outcome_prices": live}
+            price_live = True
     logo_cache = _load_team_logo_cache(data_dir)
     leaderboard_ranks = _leaderboard_rank_by_wallet(data_dir, follow_dir=follow_dir)
     by_wallet: dict[str, dict[str, Any]] = {}
@@ -2173,6 +2170,7 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
         "team_logos": _team_logos_for_parts(match_parts, logo_cache),
         "outcomes": market.get("outcomes"),
         "outcome_prices": market.get("outcome_prices") or market.get("outcomePrices"),
+        "price_live": price_live,
         "wallets": list(by_wallet.values()),
         "signal_count": len(signals),
         "db_ready": bool(result.get("db_ready")),
@@ -2711,6 +2709,27 @@ def _market_price_record(market: dict[str, Any]) -> dict[str, Any]:
         "outcome_prices": [to_float(value) for value in parse_jsonish(market.get("outcomePrices") or market.get("outcome_prices"), [])],
         "updated_at": int(time.time()),
     }
+
+
+def _live_outcome_prices(client: Any, condition_ids: list[str]) -> dict[str, list[float]]:
+    """批量拉实时 Gamma 盘口价(只读,不写库)。返回 {condition_id: [prices]};无 client/失败 → {}。
+    列表与详情**共用**此函数,保证两处对同一盘显示同一价(原详情只读缓存价 → 与列表的实时价不一致)。"""
+    if client is None:
+        return {}
+    cids = list(dict.fromkeys(str(cid).lower() for cid in condition_ids if cid))
+    if not cids:
+        return {}
+    out: dict[str, list[float]] = {}
+    try:
+        live = client.gamma("/markets", condition_ids=cids, limit=max(1, len(cids)))
+        for market_row in (live or []):
+            record = _market_price_record(market_row)
+            cid = record.get("condition_id")
+            if cid and record.get("outcome_prices"):
+                out[cid] = record["outcome_prices"]
+    except Exception:
+        return {}
+    return out
 
 
 def _update_active_market_price_cache(data_dir: Path, condition_id: str, record: dict[str, Any], *, follow_dir: Path | None = None) -> None:
