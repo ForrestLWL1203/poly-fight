@@ -61,44 +61,59 @@ class WSClient:
         host = u.hostname
         port = u.port or (443 if u.scheme == "wss" else 80)
         proxy = self._proxy_for(u.scheme, host)
-        if proxy:
-            pu = urlparse(proxy)
-            raw = socket.create_connection((pu.hostname, pu.port or 80), timeout=self.connect_timeout)
-            req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
-            if pu.username:
-                token = base64.b64encode(f"{pu.username}:{pu.password or ''}".encode()).decode()
-                req += f"Proxy-Authorization: Basic {token}\r\n"
-            raw.sendall((req + "\r\n").encode())
-            buf = b""
-            while b"\r\n\r\n" not in buf:
-                chunk = raw.recv(4096)
-                if not chunk:
-                    raise WSError("proxy closed during CONNECT")
-                buf += chunk
-            status = buf.split(b"\r\n", 1)[0]
-            if b" 200 " not in status:
-                raise WSError(f"proxy CONNECT failed: {status.decode(errors='replace')}")
-        else:
-            raw = socket.create_connection((host, port), timeout=self.connect_timeout)
-        if u.scheme == "wss":
-            ctx = ssl.create_default_context()
-            raw = ctx.wrap_socket(raw, server_hostname=host)
-        self.sock = raw
-        key = base64.b64encode(os.urandom(16)).decode()
-        path = (u.path or "/") + (f"?{u.query}" if u.query else "")
-        req = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {host}\r\n"
-            f"Upgrade: websocket\r\n"
-            f"Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            f"Sec-WebSocket-Version: 13\r\n\r\n"
-        )
-        self.sock.sendall(req.encode())
-        head = self._read_handshake()
-        status = head.split(b"\r\n", 1)[0]
-        if b"101" not in status:
-            raise WSError(f"handshake failed: {status.decode(errors='replace')}")
+        # raw 跟踪已开的底层 socket:连接/SSL握手/WS握手任一步抛异常时必须关掉它,否则
+        # fd 泄漏 —— 重连反复失败(Alchemy WS 抖动/网络瞬断)会耗尽进程 fd → EMFILE,
+        # 之后连 SQLite 都 "unable to open database file",拖垮整个 runner。
+        raw = None
+        try:
+            if proxy:
+                pu = urlparse(proxy)
+                raw = socket.create_connection((pu.hostname, pu.port or 80), timeout=self.connect_timeout)
+                req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                if pu.username:
+                    token = base64.b64encode(f"{pu.username}:{pu.password or ''}".encode()).decode()
+                    req += f"Proxy-Authorization: Basic {token}\r\n"
+                raw.sendall((req + "\r\n").encode())
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = raw.recv(4096)
+                    if not chunk:
+                        raise WSError("proxy closed during CONNECT")
+                    buf += chunk
+                status = buf.split(b"\r\n", 1)[0]
+                if b" 200 " not in status:
+                    raise WSError(f"proxy CONNECT failed: {status.decode(errors='replace')}")
+            else:
+                raw = socket.create_connection((host, port), timeout=self.connect_timeout)
+            if u.scheme == "wss":
+                ctx = ssl.create_default_context()
+                raw = ctx.wrap_socket(raw, server_hostname=host)
+            self.sock = raw
+            key = base64.b64encode(os.urandom(16)).decode()
+            path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+            req = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            self.sock.sendall(req.encode())
+            head = self._read_handshake()
+            status = head.split(b"\r\n", 1)[0]
+            if b"101" not in status:
+                raise WSError(f"handshake failed: {status.decode(errors='replace')}")
+        except BaseException:
+            # 关掉已开 socket(self.sock 已赋值用它,否则用 raw),再抛出由 run() 重连。
+            target = self.sock if self.sock is not None else raw
+            if target is not None:
+                try:
+                    target.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            self.sock = None
+            raise
 
     def _read_handshake(self) -> bytes:
         while b"\r\n\r\n" not in self._buf:

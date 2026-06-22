@@ -403,8 +403,10 @@ class OnchainFollowCollector(threading.Thread):
         三层保活(主动 eth_blockNumber 心跳 / 无帧卡顿重连 / 满 session 时长主动重连)。
         退出本函数 = 需要重连(钱包变更 / 卡顿 / 定期 / 异常),由 run() 重连并再次回补。"""
         ws = WSClient(self.wss_url)
-        ws.connect()
         try:
+            # connect() 放进 try:连接失败时 finally 仍会 ws.close()(虽然 connect 内部已自关,
+            # 这里再兜一层,确保任何路径都不漏 socket fd)。
+            ws.connect()
             maker_topics = [topic_for_address(w) for w in wallets]
             ws.send_text(json.dumps({
                 "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe",

@@ -6,6 +6,7 @@ follow cursor + accessors (select_new_trades / trade_* helpers), so the detectio
 source can be swapped without touching process_follow_trades.
 """
 import json
+import ssl
 import time
 import unittest
 from unittest import mock
@@ -173,6 +174,46 @@ class TestTradeCompatibility(unittest.TestCase):
         new, _, cold = select_new_trades([onchain_newer], dataapi_cursor)
         self.assertFalse(cold)
         self.assertEqual([trade_id(x) for x in new], ["0xzzz"])
+
+
+class TestWSClientNoFdLeak(unittest.TestCase):
+    """回归:WS 连接/握手失败必须关掉已开 socket,否则反复重连耗尽 fd → EMFILE →
+    SQLite "unable to open database file" → runner 自停(实测多次拖垮生产 runner)。"""
+
+    class _FakeSock:
+        def __init__(self, handshake=b"HTTP/1.1 500 Bad\r\n\r\n"):
+            self.closed = False
+            self._hs = handshake
+        def sendall(self, data): pass
+        def settimeout(self, t): pass
+        def recv(self, n):
+            out, self._hs = self._hs[:n], self._hs[n:]
+            return out
+        def close(self): self.closed = True
+
+    def test_closes_socket_on_handshake_failure(self):
+        from poly_fight import ws_client
+        fake = self._FakeSock(b"HTTP/1.1 500 Internal\r\n\r\n")  # 非 101 → 握手失败
+        with mock.patch.object(ws_client.WSClient, "_proxy_for", return_value=None), \
+             mock.patch.object(ws_client.socket, "create_connection", return_value=fake):
+            client = ws_client.WSClient("ws://example.test/ws")  # ws:// 免 SSL
+            with self.assertRaises(ws_client.WSError):
+                client.connect()
+        self.assertTrue(fake.closed, "握手失败后 socket 未关闭 → fd 泄漏")
+        self.assertIsNone(client.sock)
+
+    def test_closes_raw_socket_on_ssl_failure(self):
+        from poly_fight import ws_client
+        fake = self._FakeSock()
+        def boom(*a, **k): raise ssl.SSLError("handshake boom")
+        with mock.patch.object(ws_client.WSClient, "_proxy_for", return_value=None), \
+             mock.patch.object(ws_client.socket, "create_connection", return_value=fake), \
+             mock.patch.object(ws_client.ssl, "create_default_context") as ctx:
+            ctx.return_value.wrap_socket.side_effect = boom
+            client = ws_client.WSClient("wss://example.test/ws")  # wss:// 触发 SSL 包装
+            with self.assertRaises(ssl.SSLError):
+                client.connect()
+        self.assertTrue(fake.closed, "SSL 包装失败后底层 socket 未关闭 → fd 泄漏")
 
 
 class TestPolling(unittest.TestCase):
