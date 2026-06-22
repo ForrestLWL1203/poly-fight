@@ -1426,12 +1426,36 @@ _PRICE_BAND_ORDER = ("<0.40", "0.40-0.55", "0.55-0.70", ">=0.70")
 _PRICE_BAND_UPPER = {"<0.40": 0.40, "0.40-0.55": 0.55, "0.55-0.70": 0.70, ">=0.70": 1.0}
 
 
-def _price_bands_for_display(metrics: dict[str, Any], *, follow_ceiling: float = 0.68) -> list[dict[str, Any]]:
+def _resolve_entry_price_buckets(row: dict[str, Any]) -> dict[str, Any] | None:
+    """取价档胜率的数据源 entry_price_buckets。
+
+    必须从 **per_game_type_grades[最佳eligible桶]** 取(那里稳定带 entry_price_buckets);
+    不能用 _eligible_display_metrics 的返回值——它对有 eligible 桶的钱包会走 bucket_scores
+    精简分支、**不含 entry_price_buckets**,导致正经钱包反而没价档条(实测 bug)。
+    回退:per_type_grades 最佳桶 → 钱包级顶层 entry_price_buckets。"""
+    def _best(grades: dict[str, Any], keys) -> dict[str, Any] | None:
+        cands = [grades[k] for k in keys
+                 if isinstance(grades.get(k), dict) and isinstance(grades[k].get("entry_price_buckets"), dict)]
+        if not cands:
+            return None
+        best = max(cands, key=lambda b: int(to_float(b.get("esports_closed_count"))))
+        return best.get("entry_price_buckets")
+    pgt = row.get("per_game_type_grades") or {}
+    epb = _best(pgt, row.get("eligible_buckets") or list(pgt.keys()))
+    if epb is None:
+        ptg = row.get("per_type_grades") or {}
+        epb = _best(ptg, list(ptg.keys()))
+    if epb is None and isinstance(row.get("entry_price_buckets"), dict):
+        epb = row["entry_price_buckets"]
+    return epb
+
+
+def _price_bands_for_display(row: dict[str, Any], *, follow_ceiling: float = 0.68) -> list[dict[str, Any]]:
     """展示用:把最佳 eligible 桶的 entry_price_buckets 拍平成有序价档胜率分布。
 
     纯展示——让用户一眼看出钱包在各价位的真实胜率(低价烂/中价金矿/高价薄),
     并标出"可跟区"(档上界 ≤ 跟单上限)。数据评分时已算好,这里不重算。"""
-    epb = metrics.get("entry_price_buckets")
+    epb = _resolve_entry_price_buckets(row)
     if not isinstance(epb, dict):
         return []
     out: list[dict[str, Any]] = []
@@ -1712,7 +1736,7 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
                 "esports_closed_count": metrics.get("esports_closed_count"),
                 "positive_market_rate": metrics.get("positive_market_rate"),
                 "followed_win_rate": followed_win_rate,  # 会跟桶的 θ̂(1 桶=该桶,多桶=平均)
-                "price_bands": _price_bands_for_display(metrics),  # 价档胜率分布(纯展示,标可跟区)
+                "price_bands": _price_bands_for_display(row),  # 价档胜率分布(纯展示,标可跟区)
                 # 以下几项前端不展示,但服务端需要:wallet_leaderboard_rank_key 排序读取
                 # wilson/entry_edge/capital_weighted_edge/median_market_roi/esports_loss_count;
                 # favorite_snapshot_only 供 active_rows 过滤。删了会坏排序/收藏过滤,保留。
