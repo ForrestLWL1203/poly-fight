@@ -262,6 +262,11 @@
       scope: (row.scope && row.scope.length)
         ? row.scope.map((s) => ({ game: normalizeGame(s.game) || s.game, market: MARKET_TYPE_LABELS[s.market_type] || s.market_type || "主盘" }))
         : scopeList(row),
+      // 价档胜率分布(纯展示):钱包在各入场价位的真实胜率 + 样本 + 可跟区标记。
+      priceBands: (row.price_bands || []).map((b) => ({
+        band: b.band, winRate: Math.round(pct(b.win_rate)), n: num(b.n),
+        holdPnl: num(b.hold_pnl), followable: b.followable || "none",
+      })),
       settled,
       open: num(obs.open),
       followRec: settled > 0 ? `${num(obs.wins)}-${num(obs.losses)}` : "—",

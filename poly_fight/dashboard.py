@@ -1421,6 +1421,39 @@ def _eligible_display_metrics(row: dict[str, Any]) -> dict[str, Any]:
     return max(buckets, key=lambda bucket: int(bucket.get("esports_closed_count") or 0))
 
 
+_PRICE_BAND_ORDER = ("<0.40", "0.40-0.55", "0.55-0.70", ">=0.70")
+# 价档上界(与 core.entry_price_buckets 分档一致),用于标"可跟区"(上界 ≤ 跟单上限)。
+_PRICE_BAND_UPPER = {"<0.40": 0.40, "0.40-0.55": 0.55, "0.55-0.70": 0.70, ">=0.70": 1.0}
+
+
+def _price_bands_for_display(metrics: dict[str, Any], *, follow_ceiling: float = 0.68) -> list[dict[str, Any]]:
+    """展示用:把最佳 eligible 桶的 entry_price_buckets 拍平成有序价档胜率分布。
+
+    纯展示——让用户一眼看出钱包在各价位的真实胜率(低价烂/中价金矿/高价薄),
+    并标出"可跟区"(档上界 ≤ 跟单上限)。数据评分时已算好,这里不重算。"""
+    epb = metrics.get("entry_price_buckets")
+    if not isinstance(epb, dict):
+        return []
+    out: list[dict[str, Any]] = []
+    for name in _PRICE_BAND_ORDER:
+        bucket = epb.get(name)
+        if not isinstance(bucket, dict):
+            continue
+        n = int(to_float(bucket.get("market_count")))
+        if n <= 0:
+            continue
+        out.append({
+            "band": name,
+            "win_rate": to_float(bucket.get("win_rate")),
+            "n": n,
+            "hold_pnl": round(to_float(bucket.get("hold_pnl")), 2),
+            # 档完全在可跟上限内 → 可跟;0.55-0.70 这种跨上限的标 partial。
+            "followable": "full" if _PRICE_BAND_UPPER.get(name, 1.0) <= follow_ceiling + 1e-9
+            else "partial" if name == "0.55-0.70" and follow_ceiling > 0.55 else "none",
+        })
+    return out
+
+
 def _market_type_labels(market_types: list[str]) -> list[str]:
     labels = {"main_match": "主盘", "game_winner": "单局", "map_winner": "地图"}
     return [labels.get(value, value) for value in market_types if value]
@@ -1679,6 +1712,7 @@ def build_wallets(data_dir: Path, *, follow_dir: Path | None = None) -> dict[str
                 "esports_closed_count": metrics.get("esports_closed_count"),
                 "positive_market_rate": metrics.get("positive_market_rate"),
                 "followed_win_rate": followed_win_rate,  # 会跟桶的 θ̂(1 桶=该桶,多桶=平均)
+                "price_bands": _price_bands_for_display(metrics),  # 价档胜率分布(纯展示,标可跟区)
                 # 以下几项前端不展示,但服务端需要:wallet_leaderboard_rank_key 排序读取
                 # wilson/entry_edge/capital_weighted_edge/median_market_roi/esports_loss_count;
                 # favorite_snapshot_only 供 active_rows 过滤。删了会坏排序/收藏过滤,保留。

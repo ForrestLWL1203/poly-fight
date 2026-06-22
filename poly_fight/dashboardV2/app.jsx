@@ -426,6 +426,29 @@ function scopeIcon(s) {
     ? <span className="ps-gameicon sz-sm" title="跨游戏盘口专家(跨游戏合并达标,无单一游戏专精)" style={{ fontSize: 10, fontWeight: 600, color: "var(--text-secondary)" }}>跨</span>
     : <GameIcon game={s.game} base={ASSET_BASE} size="sm" />;
 }
+// 价档胜率分布迷你条(纯展示):各段=一个入场价档,宽度∝样本、颜色∝胜率、
+// 灰淡=跟单上限外(跟不到)。让"低价烂/中价金矿/高价薄"一眼可见。
+function pbandColor(wr) {
+  const h = Math.max(0, Math.min(120, (wr - 30) * 2)); // 30%→红 90%→绿
+  return "hsl(" + h + ", 62%, 45%)";
+}
+function PriceBandStrip({ bands }) {
+  if (!bands || !bands.length) return null;
+  return (
+    <div className="pband-strip" title="各入场价位真实胜率（条宽=样本，灰淡=跟单上限外）"
+      style={{ display: "flex", gap: 1, marginTop: 4, height: 6, width: 88, borderRadius: 3, overflow: "hidden" }}>
+      {bands.map((b) => (
+        <span key={b.band}
+          title={"价 " + b.band + " · 胜率 " + b.winRate + "% · " + b.n + "场 · hold " + (b.holdPnl >= 0 ? "+" : "") + Math.round(b.holdPnl)}
+          style={{
+            flex: (b.n || 1), background: pbandColor(b.winRate),
+            opacity: b.followable === "full" ? 1 : b.followable === "partial" ? 0.62 : 0.26,
+          }} />
+      ))}
+    </div>
+  );
+}
+
 function ScopeCell({ scope }) {
   const items = scope || [];
   if (!items.length) return <span className="muted">–</span>;
@@ -569,7 +592,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                   <td><div className="wallet-cell"><WalletAddress address={w.addr} href={polymarketProfileUrl(w.addr)} onClick={(e) => e.stopPropagation()} copyable />{w.isNew && <span className="new-badge" title="动态观测刚发现并入榜（4 小时内）">NEW</span>}</div></td>
                   {q && <td><div className="cell-stack"><span className="strong" style={{ color: "var(--status-warn)" }}>{w.reason}</span><span className="muted">{w.reasonTime}</span></div></td>}
                   <td><div className="cell-stack"><span className="strong">{w.score != null ? w.score : "—"}</span><span className="muted">满分100</span></div></td>
-                  <td><div className="cell-stack"><span className="strong">{w.winRate != null ? w.winRate + "%" : "—"}</span>{w.closedCount > 0 && <span className="muted">{w.closedCount} 场</span>}</div></td>
+                  <td><div className="cell-stack"><span className="strong">{w.winRate != null ? w.winRate + "%" : "—"}</span>{w.closedCount > 0 && <span className="muted">{w.closedCount} 场</span>}<PriceBandStrip bands={w.priceBands} /></div></td>
                   <td className="num" title={money(w.avgCash)}>{compactMoney(w.avgCash)}</td>
                   <td><ScopeCell scope={w.scope} /></td>
                   {!q && <td className="strong">{w.followRec}</td>}
