@@ -1263,6 +1263,23 @@ def winner_outcome_index(market: dict[str, Any]) -> int | None:
     return best_index if to_float(prices[best_index]) >= 0.99 else None
 
 
+# 作废/退款结算:市场已关闭但无明确赢家([0.5,0.5],如横扫导致某 map 没打)→ CTF 每股赎回
+# $0.50。VOID_RESOLUTION_INDEX 作为 resolutions dict 的哨兵,与真实 outcome_index(≥0)区分。
+VOID_RESOLUTION_INDEX = -2
+VOID_REDEMPTION_PRICE = 0.5
+
+
+def is_void_market(market: dict[str, Any]) -> bool:
+    """作废/退款盘([0.5,0.5],如横扫导致某 map 没打):已 closed 且两价都 ≈$0.50。
+
+    必须用 closed 标志(比赛中途也可能 0.5/0.5 但未结算),不能只看价;只认接近均分的
+    [0.5,0.5](void 的明确信号),不把 closed 的偏价异常盘误判成 void。"""
+    if not market.get("closed"):
+        return False
+    prices = [to_float(value) for value in market.get("outcome_prices") or []]
+    return len(prices) == 2 and all(abs(price - 0.5) < 1e-3 for price in prices)
+
+
 def settle_open_signals(
     open_signals: list[dict[str, Any]],
     resolutions: dict[str, int],
@@ -1276,7 +1293,15 @@ def settle_open_signals(
         if winner is None:
             remaining.append(signal)
             continue
-        outcome_won = winner == to_int(signal.get("outcome_index"), -1)
+        is_void = winner == VOID_RESOLUTION_INDEX
+        outcome_won = (not is_void) and (winner == to_int(signal.get("outcome_index"), -1))
+
+        # void(作废/退款,[0.5,0.5])按每股 $0.50 赎回算盈亏;否则按赢/输二元赔付。
+        def _leg_pnl(entry_price: float, stake: float) -> float:
+            if is_void:
+                return paper_exit_pnl(entry_price, VOID_REDEMPTION_PRICE, stake)
+            return paper_pnl(entry_price, outcome_won, stake)
+
         if signal.get("legs") is not None:
             legs = signal.get("legs") or []
             # 部分跟卖后:只把"没卖完的余量"(1−our_sold_fraction)拿到结算,加上此前各次部分平仓的累计 PnL。
@@ -1286,21 +1311,21 @@ def settle_open_signals(
             partial_pnl = to_float(signal.get("our_partial_exit_pnl"))
             partial_pnl_hypo = to_float(signal.get("our_partial_exit_pnl_hypothetical"))
             wallet_pnl = round(
-                sum(paper_pnl(to_float(leg.get("wallet_fill_price")), outcome_won, leg_actual_stake(leg)) for leg in legs),
+                sum(_leg_pnl(to_float(leg.get("wallet_fill_price")), leg_actual_stake(leg)) for leg in legs),
                 8,
             )
             our_pnl = round(
                 partial_pnl
-                + remaining_frac * sum(paper_pnl(to_float(leg.get("our_entry_price")), outcome_won, leg_actual_stake(leg)) for leg in legs),
+                + remaining_frac * sum(_leg_pnl(to_float(leg.get("our_entry_price")), leg_actual_stake(leg)) for leg in legs),
                 8,
             )
             hypothetical_wallet_pnl = round(
-                sum(paper_pnl(to_float(leg.get("wallet_fill_price")), outcome_won, leg_hypothetical_stake(leg)) for leg in legs),
+                sum(_leg_pnl(to_float(leg.get("wallet_fill_price")), leg_hypothetical_stake(leg)) for leg in legs),
                 8,
             )
             hypothetical_pnl = round(
                 partial_pnl_hypo
-                + remaining_frac * sum(paper_pnl(to_float(leg.get("our_entry_price")), outcome_won, leg_hypothetical_stake(leg)) for leg in legs),
+                + remaining_frac * sum(_leg_pnl(to_float(leg.get("our_entry_price")), leg_hypothetical_stake(leg)) for leg in legs),
                 8,
             )
             compact = {
@@ -1308,6 +1333,7 @@ def settle_open_signals(
                 "status": "settled",
                 "settled_at": now_ts,
                 "outcome_won": outcome_won,
+                "void": is_void,
                 "wallet_paper_pnl_by_wallet": {normalize_wallet(signal.get("wallet")): wallet_pnl},
                 "our_paper_pnl": our_pnl,
                 "wallet_hypothetical_pnl_by_wallet": {normalize_wallet(signal.get("wallet")): hypothetical_wallet_pnl},

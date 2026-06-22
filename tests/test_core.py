@@ -13224,6 +13224,33 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(round(settled[0]["our_paper_pnl"], 8), 66.66666667)
         self.assertEqual(perf["wallets"]["0xa"]["signals"], 1)
 
+    def test_void_market_settles_at_half_dollar(self):
+        # 作废/退款盘([0.5,0.5],如横扫未打的 map):必须能结算掉(释放资金),按 $0.50 赎回算盈亏。
+        from poly_fight.follow import is_void_market, VOID_RESOLUTION_INDEX
+        from poly_fight.cli import account_result_ledger_entries
+        # 检测:closed + [0.5,0.5] → void;closed + [0,1] → 不是;未 closed → 不是
+        self.assertTrue(is_void_market({"closed": True, "outcome_prices": [0.5, 0.5]}))
+        self.assertFalse(is_void_market({"closed": True, "outcome_prices": [0.0, 1.0]}))
+        self.assertFalse(is_void_market({"closed": False, "outcome_prices": [0.5, 0.5]}))
+        signals = [{
+            "signal_id": "m4:0", "condition_id": "m4", "outcome_index": 0, "wallet": "0xA",
+            "our_entry_price": 0.55,
+            "legs": [{"stake": 39, "funded_stake": 39, "our_entry_price": 0.55, "wallet_fill_price": 0.55,
+                      "trade_id": "t1", "leg_at": 100}],
+        }]
+        remaining, settled = settle_open_signals(signals, {"m4": VOID_RESOLUTION_INDEX}, now_ts=200)
+        self.assertEqual(remaining, [])                          # 不再卡 open
+        self.assertEqual(settled[0]["status"], "settled")
+        self.assertTrue(settled[0]["void"])
+        self.assertFalse(settled[0]["outcome_won"])
+        # $39 @ 0.55 按 0.50 赎回:39×(0.5−0.55)/0.55 = −3.5454...
+        self.assertAlmostEqual(settled[0]["our_paper_pnl"], 39 * (0.5 - 0.55) / 0.55, places=6)
+        # 账本回笼 = funded + void盈亏(非按输算 -funded)
+        entries = account_result_ledger_entries(settled, created_at=200)
+        payout = sum(float(e["amount_usdc"]) for e in entries)
+        self.assertAlmostEqual(payout, 39 + 39 * (0.5 - 0.55) / 0.55, places=6)
+        self.assertGreater(payout, 0)                           # 退回大部分本金,不是 0
+
     def test_follow_aggregate_includes_mirror_exits(self):
         exited = {
             "status": "exited",

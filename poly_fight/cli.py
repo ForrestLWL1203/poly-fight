@@ -72,6 +72,7 @@ from .follow import (
     desired_tick_interval,
     eligible_follow_wallets,
     follow_signal_id,
+    is_void_market,
     leg_actual_stake,
     market_current_price,
     paper_exit_pnl,
@@ -84,6 +85,8 @@ from .follow import (
     trade_id,
     trade_timestamp,
     winner_outcome_index,
+    VOID_REDEMPTION_PRICE,
+    VOID_RESOLUTION_INDEX,
 )
 from .follow_strategy import strategy_from_legacy_args, strategy_summary, validate_follow_strategy
 from .onchain import (
@@ -2023,6 +2026,10 @@ def fetch_resolutions_for_open_signals(
         winner = winner_outcome_index(market)
         if winner is not None:
             resolutions[condition_id] = winner
+        elif is_void_market(market):
+            # 作废/退款盘([0.5,0.5],如横扫未打的 map):已结算但无赢家 → 哨兵,让
+            # settle_open_signals 按 $0.50 赎回结掉,释放卡死的资金。
+            resolutions[condition_id] = VOID_RESOLUTION_INDEX
     return resolutions
 
 
@@ -2130,6 +2137,7 @@ def account_result_ledger_entries(results: list[dict[str, Any]], *, created_at: 
         condition_id = str(result.get("condition_id") or "").lower()
         exit_price = to_float(result.get("exit_price"))
         outcome_won = bool(result.get("outcome_won"))
+        is_void = bool(result.get("void"))
         for leg in result.get("legs") or []:
             if not isinstance(leg, dict) or leg.get("funded_stake") is None:
                 continue
@@ -2137,7 +2145,10 @@ def account_result_ledger_entries(results: list[dict[str, Any]], *, created_at: 
             if funded_stake <= 0:
                 continue
             entry_price = to_float(leg.get("our_entry_price"))
-            if status == "exited":
+            if is_void:
+                # 作废/退款:每股按 $0.50 赎回(与 settle_open_signals 一致),回笼现金。
+                payout = funded_stake + paper_exit_pnl(entry_price, VOID_REDEMPTION_PRICE, funded_stake)
+            elif status == "exited":
                 payout = funded_stake + paper_exit_pnl(entry_price, exit_price, funded_stake)
             else:
                 payout = funded_stake + paper_pnl(entry_price, outcome_won, funded_stake)
