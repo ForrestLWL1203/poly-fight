@@ -8,16 +8,22 @@ from poly_fight import dashboard
 
 
 class _FakeClient:
-    def __init__(self, markets, *, raise_exc=False):
+    def __init__(self, markets, *, raise_exc=False, closed_markets=None):
         self._markets = markets
         self._raise = raise_exc
+        self._closed = closed_markets or []
         self.calls = []
+        self.closed_calls = []
 
     def gamma(self, path, **params):
         self.calls.append((path, params))
         if self._raise:
             raise RuntimeError("boom")
         return self._markets
+
+    def markets_by_condition_ids(self, condition_ids, *, limit=500):
+        self.closed_calls.append(list(condition_ids))
+        return self._closed
 
 
 class LiveOutcomePricesTest(unittest.TestCase):
@@ -53,6 +59,31 @@ class LiveOutcomePricesTest(unittest.TestCase):
             {"conditionId": "0xabc", "outcomes": ["A", "B"], "outcomePrices": []},
         ])
         self.assertEqual(dashboard._live_outcome_prices(client, ["0xabc"]), {})
+
+    def test_closed_market_falls_back_to_settlement_price(self):
+        # 普通查询返回空(结束盘),用 closed=true 兜底拿结算价 1/0。
+        client = _FakeClient([], closed_markets=[
+            {"conditionId": "0xabc", "outcomes": ["A", "B"], "outcomePrices": ["1", "0"]},
+        ])
+        out = dashboard._live_outcome_prices(client, ["0xabc"])
+        self.assertEqual(out, {"0xabc": [1.0, 0.0]})
+        self.assertEqual(client.closed_calls, [["0xabc"]])  # 只对查不到的 cid 兜底
+
+    def test_open_market_skips_closed_fallback(self):
+        # 实时价已拿到 → 不再发关闭盘兜底查询。
+        client = _FakeClient([
+            {"conditionId": "0xabc", "outcomes": ["A", "B"], "outcomePrices": ["0.6", "0.4"]},
+        ])
+        out = dashboard._live_outcome_prices(client, ["0xabc"])
+        self.assertEqual(out, {"0xabc": [0.6, 0.4]})
+        self.assertEqual(client.closed_calls, [])
+
+    def test_first_query_exception_still_tries_closed(self):
+        client = _FakeClient([], raise_exc=True, closed_markets=[
+            {"conditionId": "0xabc", "outcomes": ["A", "B"], "outcomePrices": ["0", "1"]},
+        ])
+        out = dashboard._live_outcome_prices(client, ["0xabc"])
+        self.assertEqual(out, {"0xabc": [0.0, 1.0]})
 
 
 if __name__ == "__main__":

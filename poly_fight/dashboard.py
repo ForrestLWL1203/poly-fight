@@ -2042,14 +2042,13 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
     signals = result.get("signals", [])
     _annotate_signal_quality(signals)
     market = _active_market_by_condition(data_dir, condition_id, follow_dir=follow_dir)
-    # 与列表口径一致:进行中(open)的盘渲染时拉一次实时盘口价覆盖缓存价(只读,不写库),
-    # 否则详情读缓存、列表读实时 → 同一盘两处价不一致。失败回退缓存价。
+    # 与列表口径一致:渲染时拉一次盘口价覆盖缓存价(只读,不写库)。open 盘取实时价,
+    # 已结束/已结算盘取结算价(1/0)——否则结束盘缓存被清空后详情不显示价。失败回退缓存价。
     price_live = False
-    if any(str(signal.get("status") or "") in {"open", "insufficient_balance"} for signal in signals):
-        live = _live_outcome_prices(client, [condition_id]).get(condition_id)
-        if live:
-            market = {**market, "outcome_prices": live}
-            price_live = True
+    live = _live_outcome_prices(client, [condition_id]).get(condition_id)
+    if live:
+        market = {**market, "outcome_prices": live}
+        price_live = True
     logo_cache = _load_team_logo_cache(data_dir)
     leaderboard_ranks = _leaderboard_rank_by_wallet(data_dir, follow_dir=follow_dir)
     by_wallet: dict[str, dict[str, Any]] = {}
@@ -2689,6 +2688,9 @@ def fetch_market_prices(data_dir: Path, client: Any, condition_id: str, *, follo
     condition_id = condition_id.lower()
     markets = client.gamma("/markets", condition_ids=condition_id, limit=1)
     if not isinstance(markets, list) or not markets:
+        # 已结算/已归档盘:普通查询返回空,改用 closed=true 拿结算价(1/0),刷新显示结算结果而非报错。
+        markets = client.markets_by_condition_ids([condition_id], limit=1)
+    if not isinstance(markets, list) or not markets:
         raise RuntimeError("market_not_found")
     market = markets[0]
     record = _market_price_record(market)
@@ -2712,23 +2714,33 @@ def _market_price_record(market: dict[str, Any]) -> dict[str, Any]:
 
 
 def _live_outcome_prices(client: Any, condition_ids: list[str]) -> dict[str, list[float]]:
-    """批量拉实时 Gamma 盘口价(只读,不写库)。返回 {condition_id: [prices]};无 client/失败 → {}。
-    列表与详情**共用**此函数,保证两处对同一盘显示同一价(原详情只读缓存价 → 与列表的实时价不一致)。"""
+    """批量拉盘口价(只读,不写库)。返回 {condition_id: [prices]};无 client → {}。
+    先查未关闭盘的**实时价**;对查不到的(已结算/已归档,普通查询不返回)再用 closed=true
+    兜底拿**结算价(1/0)**。列表与详情**共用**,保证两处同一盘同价,且结束盘也能正确显示。"""
     if client is None:
         return {}
     cids = list(dict.fromkeys(str(cid).lower() for cid in condition_ids if cid))
     if not cids:
         return {}
     out: dict[str, list[float]] = {}
-    try:
-        live = client.gamma("/markets", condition_ids=cids, limit=max(1, len(cids)))
-        for market_row in (live or []):
+
+    def _collect(markets: Any) -> None:
+        for market_row in (markets or []):
             record = _market_price_record(market_row)
             cid = record.get("condition_id")
             if cid and record.get("outcome_prices"):
                 out[cid] = record["outcome_prices"]
+
+    try:
+        _collect(client.gamma("/markets", condition_ids=cids, limit=max(1, len(cids))))
     except Exception:
-        return {}
+        pass
+    missing = [cid for cid in cids if cid not in out]
+    if missing:
+        try:
+            _collect(client.markets_by_condition_ids(missing, limit=len(missing)))
+        except Exception:
+            pass
     return out
 
 
