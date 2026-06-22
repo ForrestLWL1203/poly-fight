@@ -308,6 +308,10 @@ V2_INCLUDE_TECHNICAL = False
 # 榜单只发 grade-A(= 有 ≥1 个 A 级桶 = follow 实际跟单的集合)。B 档不跟单 → 不上榜、不展示,
 # 但仍保留在内部 profiles 池里(observer 去重必需 + 保留 B→A 晋升路径)。
 V2_LEADERBOARD_MIN_GRADE = "A"
+# 方案A(2026-06-22):上榜/跟单只认**单游戏 grade-A 桶**(逐桶评分=逐桶跟)。关闭"无单游戏
+# 够格桶时退到 per_type 跨游戏合并"的兜底——跨游戏合并会把单独表现差的游戏(如某钱包 cs2
+# θ̂=0.51)拖进可跟 scope、让我们尝试跟它的烂单。True=恢复旧的跨游戏兜底上榜。
+V2_ALLOW_CROSS_GAME_POOL = False
 # 统一单一 15 天窗口:发现=打分=近期,全部用最近 15 天。esports 比赛密集,实测 15 天
 # 即可把 6 个桶全部装满 100 场(瓶颈是 bucket_market_limit,不是窗口),故发现层无损;
 # 而窗口短 → 赛事新鲜 → 捞出的钱包原生活跃。近期复检自然内建(整个打分窗口就是 15 天)。
@@ -4984,10 +4988,9 @@ def build_collector_leaderboard_v2(
                 }
             )
         # Fallback:无任何 per-game-type 够格桶,但有 per-type(跨游戏盘口)够格桶 → 也上榜。
-        # 这类钱包在单个游戏样本不够,但同一盘口跨游戏合并后过了同一道 edge_lb+n_eff 门(经 Wilson
-        # 确认),是"跨游戏盘口专家"。follow 本就按 eligible_market_types 跟它们,这一步把上榜逻辑
-        # 与跟单逻辑对齐(此前能跟却不上榜)。质量门完全相同,只是专精维度从"游戏×盘口"放宽到"盘口"。
-        if not eligible:
+        # 方案A 默认关闭(V2_ALLOW_CROSS_GAME_POOL=False):跨游戏合并会把单独差的游戏拖进可跟
+        # scope(逐桶评分却跨桶跟),故只认单游戏 grade-A 桶;无则不上榜。True 恢复旧兜底。
+        if not eligible and V2_ALLOW_CROSS_GAME_POOL:
             per_type_grades = profile.get("per_type_grades") if isinstance(profile.get("per_type_grades"), dict) else {}
             for market_type, metrics in per_type_grades.items():
                 if not isinstance(metrics, dict) or _v2_grade_rank(metrics.get("grade")) < _v2_grade_rank(min_grade):

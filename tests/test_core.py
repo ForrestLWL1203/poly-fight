@@ -4099,10 +4099,10 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(adaptive.get("grade"), "A")
         self.assertNotIn("valorant:main_match", default.get("eligible_buckets") or [])
 
-    def test_v2_board_recovers_per_type_eligible_wallets(self):
-        # 跨游戏盘口专家:只有 per-type(跨游戏盘口)够格桶、无任何 per-game-type A 桶,
-        # 也必须上榜(此前 build_collector_leaderboard_v2 只看 per_game_type_grades → 漏掉)。
-        # 它们过的是和全榜完全相同的 grade-A 门,follow 本就按 eligible_market_types 跟它们。
+    def test_v2_board_excludes_cross_game_pool_only_wallets(self):
+        # 方案A(V2_ALLOW_CROSS_GAME_POOL=False):逐桶评分=逐桶跟。只认单游戏 grade-A 桶;
+        # 仅靠跨游戏 per_type 合并够格(无任何单游戏 A 桶)的钱包**不上榜、不跟**——否则会把它
+        # 单独表现差的游戏(如 cs2 θ̂=0.51)拖进可跟 scope。单游戏专精钱包不受影响。
         now = 1_000_000
         base = {
             "category": "esports",
@@ -4154,22 +4154,17 @@ class CoreTest(unittest.TestCase):
         result = build_collector_leaderboard_v2(profiles, now_ts=now)
         by_wallet = {normalize_wallet(r["wallet"]): r for r in result["leaderboard"]}
 
-        # per-type 合格钱包被捞上榜,标记为跨游戏
-        self.assertIn("0xcrossgame", by_wallet)
-        row = by_wallet["0xcrossgame"]
-        self.assertEqual(row["primary_game"], "multi")
-        self.assertEqual(row["best_bucket"], "multi:main_match")
-        self.assertIn("main_match", row["eligible_market_types"])
-        self.assertTrue(row["eligible_bucket_details"][0].get("cross_game"))
-        # 正常单游戏专精仍走 per-game-type 路径
+        # 方案A:仅靠跨游戏合并够格的钱包**不上榜**
+        self.assertNotIn("0xcrossgame", by_wallet)
+        # 单游戏专精(cs2:main_match grade-A)正常上榜
         self.assertIn("0xspecialist", by_wallet)
         self.assertEqual(by_wallet["0xspecialist"]["primary_game"], "cs2")
         # 没有任何 A 桶 → 不上榜
         self.assertNotIn("0xnone", by_wallet)
-        # 上榜集合 == follow 可跟集合(跨游戏钱包也必须可跟)
+        # 上榜集合 == follow 可跟集合;跨游戏钱包既不上榜也不可跟
         follow_rows = eligible_follow_wallets(result["leaderboard"], now_ts=now, recency_days=365)
         follow_set = {normalize_wallet(r.get("wallet")) for r in follow_rows}
-        self.assertIn("0xcrossgame", follow_set)
+        self.assertNotIn("0xcrossgame", follow_set)
         self.assertEqual(set(by_wallet), follow_set)
 
     def test_esports_leaderboard_requires_eligible_qualified_type_overlap(self):
