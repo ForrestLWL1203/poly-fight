@@ -6012,25 +6012,63 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
     return 0
 
 
+def _single_tick_observe_argv() -> list[str]:
+    """从本进程 argv 派生"单 tick"子命令:去掉 loop 控制旗标(及其值),让子进程跑一次即退。
+
+    保留所有其它旗标(--data-dir/--category/--follow-dir/...),用 `python -m poly_fight.cli`
+    重新拉起。loop-minutes 移除后回落默认 0 → command_observe_live 走单次分支。"""
+    import sys
+    value_flags = {"--loop-minutes", "--loop-max-iterations", "--loop-error-retry-seconds"}
+    bool_flags = {"--defer-first-tick"}
+    out: list[str] = []
+    skip_next = False
+    for tok in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        head = tok.split("=", 1)[0]
+        if head in value_flags:
+            if "=" not in tok:
+                skip_next = True   # "--flag value" 形式,跳过下一个 token
+            continue
+        if head in bool_flags:
+            continue
+        out.append(tok)
+    return [sys.executable, "-m", "poly_fight.cli", *out]
+
+
 def command_observe_live(args: argparse.Namespace, client: PolymarketClient | None = None) -> int:
     if float(getattr(args, "loop_minutes", 0) or 0) <= 0:
         return _command_observe_live(args, client=client)
-    cli_client = client or build_client(args)
+    # 循环模式 = **瘦监工**:每 interval spawn 一个"单 tick"子进程跑完即退,而不是在本进程内
+    # 反复调用 _command_observe_live。原因:单 tick 要 load 全量 profiles(~120MB JSON → 数百 MB
+    # 对象)重建榜,长驻进程峰值内存 Python 不还给 OS → RSS 永久卡 ~600MB,在小机上把别的进程
+    # (runner)压进 swap、SQLite 开库失败。子进程退出后内存被 OS 回收,监工自身只占几十 MB。
+    import subprocess
     interval = max(60, int(float(getattr(args, "loop_minutes", 0) or 0) * 60))
     retry = max(30, int(getattr(args, "loop_error_retry_seconds", 120) or 120))
     max_iter = int(getattr(args, "loop_max_iterations", 0) or 0)
+    child_timeout = max(900, interval)   # 单 tick 超此判卡死、杀掉、下轮再来
+    child_cmd = _single_tick_observe_argv()
     iterations = 0
     if getattr(args, "defer_first_tick", False):
-        print(json.dumps({"event": "observe_live_deferred", "first_tick_in_seconds": interval}))
+        print(json.dumps({"event": "observe_live_deferred", "first_tick_in_seconds": interval}), flush=True)
         time.sleep(interval)
     while True:
+        wait = interval
         try:
-            _command_observe_live(args, client=cli_client)
-            wait = interval
+            # 子进程继承本进程 stdout/stderr → 它的 observe_live_tick JSON 仍写进同一日志文件。
+            proc = subprocess.run(child_cmd, timeout=child_timeout, check=False)
+            if proc.returncode != 0:
+                print(json.dumps({"event": "observe_live_child_nonzero", "returncode": proc.returncode}), flush=True)
+                wait = min(interval, retry)
         except KeyboardInterrupt:
             return 0
-        except Exception as exc:
-            print(json.dumps({"event": "observe_live_loop_error", "error": str(exc)}))
+        except subprocess.TimeoutExpired:
+            print(json.dumps({"event": "observe_live_child_timeout", "timeout_s": child_timeout}), flush=True)
+            wait = min(interval, retry)
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"event": "observe_live_loop_error", "error": str(exc)}), flush=True)
             wait = min(interval, retry)
         iterations += 1
         if max_iter and iterations >= max_iter:

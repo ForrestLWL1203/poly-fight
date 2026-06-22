@@ -5607,6 +5607,45 @@ class CoreTest(unittest.TestCase):
             store.apply_account_ledger([credit])
             self.assertEqual(store.load_account_balance()["balance_usdc"], 115)
 
+    def test_single_tick_observe_argv_strips_loop_flags(self):
+        # 方案1:observe-live 循环外壳每 tick spawn 单次子进程;派生子命令必须剥离 loop 控制
+        # 旗标(及其值)、保留其它所有旗标,让子进程跑一次即退(loop-minutes 回落 0)。
+        from poly_fight import cli
+        import sys
+        orig = sys.argv
+        try:
+            sys.argv = [
+                "/x/poly_fight/cli.py", "--data-dir", "/opt/data/esports", "observe-live",
+                "--category", "esports", "--loop-minutes", "60", "--defer-first-tick",
+                "--loop-error-retry-seconds", "120", "--follow-dir", "/opt/data/follow",
+            ]
+            cmd = cli._single_tick_observe_argv()
+        finally:
+            sys.argv = orig
+        self.assertEqual(cmd[1:3], ["-m", "poly_fight.cli"])
+        # loop 控制旗标及其值全部剥离
+        for stripped in ("--loop-minutes", "60", "--defer-first-tick", "--loop-error-retry-seconds", "120"):
+            self.assertNotIn(stripped, cmd)
+        # 其它旗标原样保留
+        self.assertIn("observe-live", cmd)
+        self.assertIn("--follow-dir", cmd)
+        self.assertIn("/opt/data/follow", cmd)
+        self.assertIn("--category", cmd)
+        self.assertIn("esports", cmd)
+
+    def test_single_tick_observe_argv_handles_equals_form(self):
+        from poly_fight import cli
+        import sys
+        orig = sys.argv
+        try:
+            sys.argv = ["/x/cli.py", "observe-live", "--loop-minutes=10", "--category", "esports"]
+            cmd = cli._single_tick_observe_argv()
+        finally:
+            sys.argv = orig
+        self.assertFalse(any(t.startswith("--loop-minutes") for t in cmd))
+        self.assertIn("--category", cmd)
+        self.assertIn("esports", cmd)
+
     def test_save_strategy_does_not_repin_running_balance(self):
         # 回归:保存策略曾把运行现金 re-pin 回静态预设 → 抹掉未结算持仓扣款、现金虚高。
         # 现在仅首次未配置时 seed;之后保存策略不再覆盖运行余额。
