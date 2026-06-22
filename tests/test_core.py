@@ -3829,7 +3829,7 @@ class CoreTest(unittest.TestCase):
             {**base, "recency_weighted_win_rate": 0.90, "median_entry_price": 0.45},
             now_ts=now, min_sample=6, n_eff_anchor=10)
         self.assertEqual(strong["grade"], "A")
-        # 弱胜率:θ̂=0.78(过基础0.75,未过薄门0.80)、edge_lb 仍≥0.08 → 被薄门砍。
+        # 弱胜率:θ̂=0.78(过基础0.58,未过薄门0.80)、edge_lb 仍≥0.08 → 被薄门砍。
         weak_wr = classify_wallet_bucket(
             {**base, "recency_weighted_win_rate": 0.78, "median_entry_price": 0.30},
             now_ts=now, min_sample=6, n_eff_anchor=10)
@@ -4035,7 +4035,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual({r["condition_id"] for r in kept}, {"v-fresh", "c-fresh"})
 
     def test_win_rate_floor_excludes_low_winrate_high_edge_bucket(self):
-        # v23:桶内 θ̂ < 0.75 即使买得便宜、edge 充足,也判 C —— 不进榜、不跟单。
+        # v24:桶内 θ̂ < 0.58 即使买得便宜、edge 充足,也判 C —— 不进榜、不跟单。
         now = 1_000_000
 
         def summary(n, win_rate, avg_price):
@@ -4056,14 +4056,14 @@ class CoreTest(unittest.TestCase):
             )
             return {**s, "category": "esports"}
 
-        # θ̂≈0.60、买在 0.25(edge 充足)→ 胜率门拦下,不合格 + 明确拒因
-        low = classify_wallet(summary(20, 0.60, 0.25), now_ts=now)
+        # θ̂≈0.50(< 0.58)、买在 0.25(edge 充足)→ 胜率门拦下,不合格 + 明确拒因
+        low = classify_wallet(summary(20, 0.50, 0.25), now_ts=now)
         self.assertNotIn("cs2:main_match", low.get("eligible_buckets") or [])
         self.assertIn(
             "win_rate_below_floor",
             (low.get("per_game_type_grades") or {}).get("cs2:main_match", {}).get("reasons") or [],
         )
-        # θ̂≈0.85 同样买便宜 → 过胜率门(0.75) → 合格
+        # θ̂≈0.85 同样买便宜 → 过胜率门(0.58) → 合格
         high = classify_wallet(summary(20, 0.85, 0.25), now_ts=now)
         self.assertIn("cs2:main_match", high.get("eligible_buckets") or [])
 

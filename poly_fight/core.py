@@ -10,7 +10,7 @@ from typing import Any, Iterable
 SECONDS_PER_DAY = 86400
 # profile 复用以此为失效令牌:改任何评分口径(门槛/公式/n_eff 下限/basis)都要 +1,
 # 否则采集会复用旧口径的画像、新规则不生效。改完需全量重采一次,之后才走复用加速。
-SCORING_VERSION = 22
+SCORING_VERSION = 23
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 # v16:两边对冲(套利)门统一 0.20——bucket 排除(core)、systemic(cli)、v2 钱包级(V2_MAX_TWO_SIDED_RATE)同口径。
@@ -34,10 +34,13 @@ SPORTS_MIN_ROI = 0.15
 # (入场端靠 seed 0.35–0.75 预筛 + edge_lb 兜大热端);美元/PnL/ROI 仅作软 reason、不判定。
 ESPORTS_EDGE_LB_MIN = 0.05
 ESPORTS_N_EFF_FLOOR = 12
-# 桶内胜率硬门(v20;v23 2026-06-21 用户要求 0.68→0.75):进榜/跟单的专精桶,近期加权胜率 θ̂ 必须 ≥ 此值,
-# 否则判 C —— 不进榜、不跟单。用户取向:只跟历史胜率更高的钱包,edge 次要(高胜率优先于高 edge)。
-# 实测:0.75 把当前 83 个 A 收敛到 ~56 个(砍约 1/3,lol 收得最多)。
-ESPORTS_MIN_BUCKET_WIN_RATE = 0.75
+# 桶内胜率硬门(v20;v23 2026-06-21 0.68→0.75;v24 2026-06-22 0.75→0.58):进榜/跟单的专精桶,
+# 近期加权胜率 θ̂ 必须 ≥ 此值,否则判 C —— 不进榜、不跟单。
+# v24 复盘(review/follow-strategy-overhaul.md):跟单价格段门 [0.58,0.72] 上线后,θ̂ 这道"偏热门"
+# 胜率门与价格段高度冗余;实测(walk-forward)抬高 θ̂ 反而缩小 in-band edge、且白缩 ~半池子。
+# 真正的质量底座是 edge_lb(wilson_lb−中位价≥0.05)+ n_eff,不是裸 θ̂。降到 0.58 把 edge_lb 已合格、
+# 仅被 θ̂ 误杀的桶放回(实盘板 ~36→~66),质量仍由 edge_lb/n_eff 守。0.56 与 0.58 等价(空档),故取 0.58。
+ESPORTS_MIN_BUCKET_WIN_RATE = 0.58
 SPORTS_EDGE_LB_MIN = 0.03
 SPORTS_N_EFF_FLOOR = 12
 SPORTS_MIN_BUCKET_WIN_RATE = 0.60
