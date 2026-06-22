@@ -13247,7 +13247,21 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(remaining, [])
         self.assertEqual(settled[0]["wallet_paper_pnl_by_wallet"]["0xa"], 100)
         self.assertEqual(round(settled[0]["our_paper_pnl"], 8), 66.66666667)
+        # P0: 结算单的 our_realized_pnl 必须等于总盈亏(=our_paper_pnl),不再恒为 0。
+        self.assertEqual(settled[0]["our_realized_pnl"], settled[0]["our_paper_pnl"])
         self.assertEqual(perf["wallets"]["0xa"]["signals"], 1)
+
+    def test_settled_loss_writes_total_pnl_into_realized_field(self):
+        # 回归:扛到结算的【输单】其 our_realized_pnl 此前恒为 0,直接读库者会把整笔亏损看成 0。
+        signals = [{
+            "signal_id": "m9:1", "condition_id": "m9", "outcome_index": 1, "wallet": "0xB",
+            "our_entry_price": 0.55,
+            "legs": [{"stake": 50, "funded_stake": 50, "our_entry_price": 0.55, "wallet_fill_price": 0.55}],
+        }]
+        _, settled = settle_open_signals(signals, {"m9": 0}, now_ts=300)  # 赢家=0,我们押 1 → 输
+        self.assertFalse(settled[0]["outcome_won"])
+        self.assertEqual(settled[0]["our_realized_pnl"], -50)            # 不是 0
+        self.assertEqual(settled[0]["our_realized_pnl"], settled[0]["our_paper_pnl"])
 
     def test_void_market_settles_at_half_dollar(self):
         # 作废/退款盘([0.5,0.5],如横扫未打的 map):必须能结算掉(释放资金),按 $0.50 赎回算盈亏。

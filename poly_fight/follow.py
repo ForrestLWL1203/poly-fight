@@ -1336,6 +1336,10 @@ def settle_open_signals(
                 "void": is_void,
                 "wallet_paper_pnl_by_wallet": {normalize_wallet(signal.get("wallet")): wallet_pnl},
                 "our_paper_pnl": our_pnl,
+                # 单信号"最终总盈亏"权威字段:= 部分卖出 + 余量结算(=our_paper_pnl)。此前结算单的
+                # our_realized_pnl 只含卖出部分(扛到结算恒为 0),任何直接读库者(导出/回测/分析)会
+                # 把结算的输赢全看成 0。这里写回总额,让字段名副其实;聚合仍走 our_paper_pnl,不重复计数。
+                "our_realized_pnl": our_pnl,
                 "wallet_hypothetical_pnl_by_wallet": {normalize_wallet(signal.get("wallet")): hypothetical_wallet_pnl},
                 "hypothetical_pnl": hypothetical_pnl,
             }
