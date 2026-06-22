@@ -3400,7 +3400,9 @@ def start_wallet_refresh(
     max_profile_wallets = max(1, min(20000, int(max_profile_wallets or 2000)))  # 钳到 [1, 20000]
     command = [
         *base, "collect-v2", "--category", category,
-        "--refresh-classification", "--max-profile-wallets", str(max_profile_wallets),  # 由 dashboard 输入
+        # 注:--refresh-classification 已在 commit b6794a4 从 collect-v2 parser 删除(死开关),
+        # 此处遗留未同步 → 点"重采"时 argparse 报 unrecognized 秒退。已移除。
+        "--max-profile-wallets", str(max_profile_wallets),  # 由 dashboard 输入
         *(extra_args or []),
     ]
     status = {

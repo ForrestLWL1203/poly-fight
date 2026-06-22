@@ -5641,6 +5641,21 @@ class CoreTest(unittest.TestCase):
         self.assertIn("--category", cmd)
         self.assertIn("esports", cmd)
 
+    def test_dashboard_refresh_command_parses_against_cli(self):
+        # 回归:dashboard"重采"拉起的 collect-v2 参数必须能被真 CLI parser 接受。防 spawn 命令与
+        # parser 漂移——如 --refresh-classification 被 b6794a4 从 parser 删了、dashboard 仍传 →
+        # argparse unrecognized 秒退。镜像 dashboard.start_wallet_refresh 构造的参数(含 extra_args)。
+        from poly_fight.cli import build_parser
+        from poly_fight.dashboard import v2_refresh_extra_args
+        cli_args = [
+            "collect-v2", "--category", "esports",
+            "--max-profile-wallets", "4000",
+            *v2_refresh_extra_args({}),
+        ]
+        parsed = build_parser().parse_args(["--data-dir", "d", *cli_args])
+        self.assertEqual(parsed.func.__name__, "command_collect_v2")
+        self.assertEqual(parsed.max_profile_wallets, 4000)
+
     def test_connect_closes_after_with_block(self):
         # 回归:`with store.connect() as conn:` 退出后连接必须**关闭**(原生 sqlite3 的 with 只提交
         # 不关 → 长驻 runner 热路径 fd 越堆越多 → EMFILE → "unable to open database file" 自停)。
@@ -10828,7 +10843,10 @@ class CoreTest(unittest.TestCase):
                     time.sleep(0.01)
                     status = build_wallet_refresh_status(data_dir)
                 command = status["status"]["esports"]["command"]
-                self.assertIn("--refresh-classification", command)
+                # --refresh-classification 已从命令移除(parser 不再接受它,b6794a4 删了死开关)
+                self.assertNotIn("--refresh-classification", command)
+                self.assertIn("collect-v2", command)
+                self.assertIn("--max-profile-wallets", command)
                 self.assertEqual(status["status"]["esports"]["status"], "succeeded")
                 self.assertEqual(status["status"]["esports"]["returncode"], 0)
                 self.assertEqual(read_follow_control(data_dir)["wallet_refresh"]["esports"]["status"], "succeeded")
