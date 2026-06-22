@@ -1038,6 +1038,7 @@ const STRATEGY_DEFAULTS = {
   usableMode: "all", usableCap: "5000",
   minSignalOn: true, minSignal: "10",
   maxEntryOn: true, maxEntry: "0.68",
+  minEntryOn: false, minEntry: "0.58",
   perSignalPct: "1", perMatchPct: "1", minStake: "1",
   realtimeRefresh: false,
 };
@@ -1051,7 +1052,8 @@ function strategyDigest(s) {
   const sizing = `单笔 余额${s.perSignalPct || 0}%（每钱包每场≤余额${subTxt}${capTxt}）`;
   const filter = `门槛 ${usdInt(n(s.minSignal))}`;
   const maxEntry = s.maxEntryOn ? `现价 ≤ ${s.maxEntry}` : null;
-  return { sizing, chips: [filter, maxEntry].filter(Boolean) };
+  const minEntry = s.minEntryOn ? `现价 ≥ ${s.minEntry}` : null;
+  return { sizing, chips: [filter, minEntry, maxEntry].filter(Boolean) };
 }
 
 function NumField({ value, onChange, unit, width = 76, lead, disabled }) {
@@ -1128,6 +1130,7 @@ function strategyNodes(s) {
     { k: "资金池", v: s.usableMode === "all" ? "全部余额" : `上限 ${usdInt(n(s.usableCap))}` },
     { k: "信号门槛", v: s.minSignalOn ? `忽略 < ${usdInt(n(s.minSignal))}` : "不限" },
     { k: "现价上限", v: s.maxEntryOn ? `现价 ≤ ${s.maxEntry}` : "不限" },
+    { k: "现价下限", v: s.minEntryOn ? `现价 ≥ ${s.minEntry}` : "不限" },
     { k: "单笔金额", v: dg.sizing, key: true },
     { k: "单场预算", v: `主盘 ≤ 余额 ${s.perMatchPct || 0}% · 子盘 ≤ ${s.perMatchSubPct || 0}%` },
     { k: "每场笔数", v: (Number(s.maxOrdersPerMatch) || 0) > 0 ? `≤ ${s.maxOrdersPerMatch} 笔` : "不限" },
@@ -1194,6 +1197,16 @@ function StrategyEditor({ s, up, wallet, locked }) {
             </label>
             <NumField value={s.maxEntry} onChange={up("maxEntry")} lead="现价 >" unit="不跟" width={56} disabled={!s.maxEntryOn} />
             <p className="cfg-sub">跟单有延迟:发现时现价已高于此值则不跟,避免追高(0–1)。默认 0.68（评分价区）。</p>
+          </div>
+        </div>
+        <div className="cfg-mini">
+          <div className="cm-head"><Ico n="crosshair" /><span>现价下限</span></div>
+          <div className="cm-body">
+            <label className="check-row" onClick={(e) => e.stopPropagation()}>
+              <input type="checkbox" checked={s.minEntryOn} onChange={(e) => up("minEntryOn")(e.target.checked)} /><span className="cr-label">启用</span>
+            </label>
+            <NumField value={s.minEntry} onChange={up("minEntry")} lead="现价 <" unit="不跟" width={56} disabled={!s.minEntryOn} />
+            <p className="cfg-sub">现价低于此值则不跟,过滤低价冷门(回测里 &lt;0.5 段失血最重)。需 &lt; 上限,0/关=不限。默认关。</p>
           </div>
         </div>
         <div className="cfg-mini">

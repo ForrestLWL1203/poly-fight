@@ -416,6 +416,8 @@
     // 现价上限:字段缺失(老策略)→ 默认开 0.68(评分价区);显式 0 → 关。
     const maxEntryRaw = pre.max_follow_entry_price;
     const maxEntryVal = num(maxEntryRaw);
+    // 现价下限:默认关(0/缺失);显式 ∈(0,1) → 开。与上限对称,卡我方现价。
+    const minEntryVal = num(pre.min_follow_entry_price);
     return {
       usableMode: usable > 0 ? "cap" : "all",
       usableCap: str(usable || "", String(num(walletBalance) || 5000)),
@@ -423,6 +425,8 @@
       minSignal: str(minSignal || 10, "10"),
       maxEntryOn: maxEntryRaw === undefined || maxEntryRaw === null ? true : maxEntryVal > 0 && maxEntryVal < 1,
       maxEntry: str(maxEntryVal > 0 ? maxEntryVal : 0.68, "0.68"),
+      minEntryOn: minEntryVal > 0 && minEntryVal < 1,
+      minEntry: str(minEntryVal > 0 ? minEntryVal : 0.58, "0.58"),
       perSignalPct: str(num(perSignal) || 1, "1"),
       perMatchPct: str(num(perMatch) || 1, "1"),
       perMatchSubPct: str(num(perMatchSub) || num(perMatch) || 1, "1"),
@@ -447,6 +451,7 @@
       prefilters: {
         min_target_wallet_order_cash_usdc: k.minSignalOn ? num(k.minSignal) : 0,
         max_follow_entry_price: k.maxEntryOn ? num(k.maxEntry) : 0,
+        min_follow_entry_price: k.minEntryOn ? num(k.minEntry) : 0,
       },
       balance: { required: true, usable_balance_usdc: usable },
       realtime_refresh: !!k.realtimeRefresh,

@@ -10,7 +10,8 @@ from .core import to_float, to_int
 # ── 单一跟单下注模型(v2,2026-06-21 重构,删 kelly/fixed/ratio/balance_percent 多模式)──
 # 注码只有一条公式:stake = floor(余额 × per_signal_percent%)。无 ramp、无 kelly、无镜像、无按比例。
 # "门(是否跟)"与"注码(下多少)"彻底拆开,所有门一律生效:
-#   1) 入场价上限 max_follow_entry_price   2) 目标单太小 min_target_wallet_order_cash_usdc
+#   1) 入场价上限 max_follow_entry_price / 下限 min_follow_entry_price(对称,0=不限,卡我方现价)
+#   2) 目标单太小 min_target_wallet_order_cash_usdc
 #   3) edge 门 θ̂×THETA_FOLLOW_DISCOUNT > 现价   4) 每场总预算(每 conditionId 所有钱包/双边合计 ≤ 主盘 per_match_percent% / 子盘 per_match_percent_sub%)
 # 见 review/follow-sizing-refactor-plan.md / review/follow-optimization-plan.md。
 DEFAULT_FOLLOW_STRATEGY_SCHEMA_VERSION = 2
@@ -28,6 +29,7 @@ DEFAULT_MAX_FOLLOW_ORDERS_PER_MATCH = 0
 DEFAULT_MIN_STAKE_USDC = 1.0              # dust 地板(Polymarket CLOB 最小单),只防 <$1 废单
 DEFAULT_MIN_TARGET_ORDER_CASH_USDC = 10.0
 DEFAULT_MAX_FOLLOW_ENTRY_PRICE = 0.68     # 现价上限(评分价区);0 = 不限。动态可在面板改
+DEFAULT_MIN_FOLLOW_ENTRY_PRICE = 0.0      # 现价下限;0 = 不限(默认关,不改现状)。动态可在面板改
 # edge 门:有效胜率 = θ̂(近期加权点估) × 此折扣,现价需 < 该值才跟(留相对安全边际)。
 THETA_FOLLOW_DISCOUNT = 0.95
 
@@ -61,6 +63,7 @@ def default_follow_strategy(*, balance_usdc: float | None = None) -> dict[str, A
         "prefilters": {
             "min_target_wallet_order_cash_usdc": DEFAULT_MIN_TARGET_ORDER_CASH_USDC,
             "max_follow_entry_price": DEFAULT_MAX_FOLLOW_ENTRY_PRICE,
+            "min_follow_entry_price": DEFAULT_MIN_FOLLOW_ENTRY_PRICE,
         },
         "balance": {
             "required": True,
@@ -111,6 +114,8 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
                 out["prefilters"]["min_target_wallet_order_cash_usdc"] = mt
             if pf.get("max_follow_entry_price") is not None:
                 out["prefilters"]["max_follow_entry_price"] = pf["max_follow_entry_price"]
+            if pf.get("min_follow_entry_price") is not None:
+                out["prefilters"]["min_follow_entry_price"] = pf["min_follow_entry_price"]
 
         if isinstance(strategy.get("balance"), dict):
             out["balance"].update(strategy["balance"])
@@ -127,6 +132,7 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
     prefilters = out["prefilters"]
     prefilters["min_target_wallet_order_cash_usdc"] = round(to_float(prefilters.get("min_target_wallet_order_cash_usdc")), 8)
     prefilters["max_follow_entry_price"] = round(min(1.0, max(0.0, to_float(prefilters.get("max_follow_entry_price")))), 8)
+    prefilters["min_follow_entry_price"] = round(min(1.0, max(0.0, to_float(prefilters.get("min_follow_entry_price")))), 8)
 
     balance = out["balance"]
     balance["required"] = bool(balance.get("required", True))
@@ -162,7 +168,12 @@ def validate_follow_strategy(strategy: dict[str, Any] | None) -> tuple[bool, lis
         errors.append("sizing.min_stake_usdc")
     if not _finite_non_negative(prefilters.get("min_target_wallet_order_cash_usdc")):
         errors.append("prefilters.min_target_wallet_order_cash_usdc")
-    # max_follow_entry_price 由 normalize clamp 到 [0,1]。
+    # max/min_follow_entry_price 由 normalize clamp 到 [0,1];两者都启用(∈(0,1))时下限须 < 上限,
+    # 否则区间为空会拦掉一切 → 视为非法配置。
+    min_entry = to_float(prefilters.get("min_follow_entry_price"))
+    max_entry = to_float(prefilters.get("max_follow_entry_price"))
+    if 0.0 < min_entry < 1.0 and 0.0 < max_entry < 1.0 and min_entry >= max_entry:
+        errors.append("prefilters.min_follow_entry_price")
     # 注:不校验 balance —— 运行时 bankroll 取自 account_balance(动态权益),strategy.balance
     # 仅作展示/回退;evaluate 缺余额时按 no_bankroll 拦,无需在此硬卡。
     _ = balance
@@ -242,6 +253,11 @@ def evaluate_follow_candidate(
     if 0.0 < max_entry < 1.0 and p > max_entry:
         return _block("entry_above_ceiling", strategy=normalized)
 
+    # ── 门 3b:入场价下限(与上限对称,卡我方现价 p;0=不限)──
+    min_entry = to_float(prefilters.get("min_follow_entry_price"))
+    if 0.0 < min_entry < 1.0 and p < min_entry:
+        return _block("entry_below_floor", strategy=normalized)
+
     # ── 门 4:edge(θ̂×0.95 > 现价)──
     if to_float(bucket_win_rate) * THETA_FOLLOW_DISCOUNT - p <= 0:
         return _block("no_live_edge", strategy=normalized)
@@ -319,6 +335,9 @@ def strategy_summary(strategy: dict[str, Any] | None) -> str:
     max_entry = to_float(normalized["prefilters"].get("max_follow_entry_price"))
     if 0 < max_entry < 1:
         parts.append(f"现价上限 {max_entry:g}")
+    min_entry = to_float(normalized["prefilters"].get("min_follow_entry_price"))
+    if 0 < min_entry < 1:
+        parts.append(f"现价下限 {min_entry:g}")
     min_target = to_float(normalized["prefilters"].get("min_target_wallet_order_cash_usdc"))
     if min_target > 0:
         parts.append(f"目标单≥${min_target:g}")

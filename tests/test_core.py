@@ -5814,6 +5814,35 @@ class CoreTest(unittest.TestCase):
         s["prefilters"]["max_follow_entry_price"] = 0.7
         self.assertTrue(validate_follow_strategy(s)[0])
 
+    def test_follow_strategy_min_entry_price_floor(self):
+        # 现价下限:默认关(0=不限);开后卡我方现价 p;clamp[0,1];须 < 上限;与上限对称。
+        self.assertEqual(default_follow_strategy()["prefilters"]["min_follow_entry_price"], 0.0)
+        # 老策略缺字段 → 默认 0(不改现状)
+        miss = normalize_follow_strategy({"prefilters": {"max_follow_entry_price": 0.68}})
+        self.assertEqual(miss["prefilters"]["min_follow_entry_price"], 0.0)
+        # clamp
+        self.assertEqual(normalize_follow_strategy({"prefilters": {"min_follow_entry_price": 1.5}})["prefilters"]["min_follow_entry_price"], 1.0)
+
+        s = default_follow_strategy(balance_usdc=5000)
+        s["sizing"]["per_signal_percent"] = 1.0
+        s["sizing"]["per_match_percent"] = 2.0
+        s["prefilters"]["min_follow_entry_price"] = 0.58
+
+        def ev(p):
+            return evaluate_follow_candidate(
+                strategy=s, target_wallet_order_cash_usdc=200, available_balance_usdc=5000,
+                bucket_win_rate=0.90, entry_price=p, bankroll_usdc=5000,
+            )
+        # 现价 0.50 < 下限 0.58 → 拦;0.58/0.65 放行(0.65 仍 ≤ 默认上限 0.68)
+        self.assertEqual(ev(0.50)["block_reason"], "entry_below_floor")
+        self.assertTrue(ev(0.58)["would_follow"])
+        self.assertTrue(ev(0.65)["would_follow"])
+        # 下限 ≥ 上限 → 非法配置
+        bad = default_follow_strategy(balance_usdc=100)
+        bad["prefilters"]["min_follow_entry_price"] = 0.8
+        bad["prefilters"]["max_follow_entry_price"] = 0.7
+        self.assertFalse(validate_follow_strategy(bad)[0])
+
     def test_follow_store_allows_strategy_without_balance_limit(self):
         with TemporaryDirectory() as tmp:
             store = FollowStore(Path(tmp) / "follow.db")
