@@ -5646,6 +5646,18 @@ class CoreTest(unittest.TestCase):
         self.assertIn("--category", cmd)
         self.assertIn("esports", cmd)
 
+    def test_connect_closes_after_with_block(self):
+        # 回归:`with store.connect() as conn:` 退出后连接必须**关闭**(原生 sqlite3 的 with 只提交
+        # 不关 → 长驻 runner 热路径 fd 越堆越多 → EMFILE → "unable to open database file" 自停)。
+        import sqlite3 as _sqlite3
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            store.init_db()
+            with store.connect() as conn:
+                conn.execute("SELECT 1").fetchone()
+            with self.assertRaises(_sqlite3.ProgrammingError):
+                conn.execute("SELECT 1")   # 已关闭 → 再用即抛
+
     def test_save_strategy_does_not_repin_running_balance(self):
         # 回归:保存策略曾把运行现金 re-pin 回静态预设 → 抹掉未结算持仓扣款、现金虚高。
         # 现在仅首次未配置时 seed;之后保存策略不再覆盖运行余额。

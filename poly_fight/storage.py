@@ -11,6 +11,21 @@ from typing import Any
 
 from .follow_strategy import ACTIVE_FOLLOW_STRATEGY_ID, normalize_follow_strategy, validate_follow_strategy
 
+class _AutoCloseConnection(sqlite3.Connection):
+    """`with self.connect() as conn:` 退出时提交/回滚后**关闭连接**。
+
+    原生 sqlite3 的 connection-as-context-manager 只 commit/rollback、**不 close** →
+    连接靠引用计数/GC 回收,长驻 runner 的热路径里每 tick 开多个连接,GC 滞后时 fd
+    越堆越多 → 撞进程 fd 上限(1024)→ EMFILE → 连 SQLite 都 "unable to open database
+    file" → runner 连错自停(实测 ~25min 撞顶、多次拖垮生产)。此处用完即关,根治。"""
+
+    def __exit__(self, *exc: Any) -> Any:
+        try:
+            return super().__exit__(*exc)
+        finally:
+            self.close()
+
+
 LEADERBOARD_SCHEMA_VERSION = 2
 FOLLOW_SCHEMA_VERSION = 2
 
@@ -205,7 +220,7 @@ class LeaderboardStore:
 
     def connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, factory=_AutoCloseConnection)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -660,7 +675,7 @@ class FollowStore:
 
     def connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, factory=_AutoCloseConnection)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
