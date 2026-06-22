@@ -77,6 +77,8 @@ from poly_fight.cli import (
     calculate_seed_bucket_min_wins,
     collect_seed_positions,
     collect_live_seed_positions,
+    plan_seed_position_fetch,
+    prune_seed_position_cache,
     command_collect,
     filter_profile_seed_wallets_v2,
     ESPORTS_CANDIDATE_MARKET_TYPE_THRESHOLDS,
@@ -13749,6 +13751,19 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(rows[0]["seed_edge"], 0.4)
         self.assertEqual(rows[0]["seed_rank"], 1)
         self.assertTrue(rows[0]["seed_outcome_won"])
+
+    def test_seed_position_incremental_cache_plan_and_prune(self):
+        # 发现阶段增量:已缓存的 condition 跳过 API,只拉新出现的;轮窗外的从缓存裁掉。
+        m = lambda cid: {"condition_id": cid}
+        target = [m("0xA"), m("0xB"), m("0xC")]   # 大小写无关 → 归一小写
+        cache = {"0xa": [{"wallet": "w1"}], "0xb": []}   # A/B 已缓存,C 是新出现的
+        to_fetch, hits = plan_seed_position_fetch(target, cache)
+        self.assertEqual(hits, 2)                                   # A、B 命中
+        self.assertEqual([x["condition_id"] for x in to_fetch], ["0xC"])  # 只新拉 C
+        # 轮窗裁切:target 只剩 B、C → A(滑出窗口)从缓存消失
+        pruned = prune_seed_position_cache({"0xa": [1], "0xb": [2], "0xc": [3]}, {"0xb", "0xc"})
+        self.assertEqual(set(pruned), {"0xb", "0xc"})
+        self.assertNotIn("0xa", pruned)
 
     def test_seed_positions_dual_side_captures_profitable_loser(self):
         # v2 collect-v2: include_losing_side 同时采集负方盈利钱包(technical 型),

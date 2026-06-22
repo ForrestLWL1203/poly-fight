@@ -3615,6 +3615,31 @@ def effective_seed_bucket_min_wins(
     return thresholds
 
 
+def plan_seed_position_fetch(
+    target_markets: list[dict[str, Any]],
+    cached_by_condition: dict[str, list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], int]:
+    """发现阶段增量:已结算市场持仓终态、永不变,已缓存的 condition 跳过 market-positions API。
+    返回(需新拉的市场列表, 缓存命中数)。纯函数,便于测试。"""
+    to_fetch: list[dict[str, Any]] = []
+    hits = 0
+    for market in target_markets:
+        cid = str(market.get("condition_id") or "").lower()
+        if cid and cid in cached_by_condition:
+            hits += 1
+        else:
+            to_fetch.append(market)
+    return to_fetch, hits
+
+
+def prune_seed_position_cache(
+    cached_by_condition: dict[str, list[dict[str, Any]]],
+    target_condition_ids: set[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """轮窗裁切:只保留仍在当前 target(轮窗内)的 condition,滑出窗口的历史自然消失。纯函数。"""
+    return {cid: rows for cid, rows in cached_by_condition.items() if cid in target_condition_ids}
+
+
 def collect_seed_positions(
     market: dict[str, Any],
     market_positions_response: list[dict[str, Any]],
@@ -5207,6 +5232,32 @@ def _command_collect_wallets(
     write_json(output_dir / f"{prefix}_target_markets.json", target_markets)
     mark_stage("target_markets")
 
+    # ── 发现阶段增量缓存:target_markets 全是已结算市场(持仓终态、永不变)。按 condition_id 缓存
+    #    collect_seed_positions 的抽取结果;每轮只对【新出现】的 condition 打 market-positions API,
+    #    轮窗外的从缓存裁掉(历史自然消失)。把原本每轮全量 ~800 次 API(~80s)降到只拉增量。
+    #    抽取参数(positions_per_market / include_losing_side)变更 → 签名不符 → 整缓存失效全量重拉一次。──
+    seed_cache_path = output_dir / f"{prefix}_seed_positions_cache.json"
+    seed_cache_signature = {
+        "schema": 1,
+        "positions_per_market": int(getattr(args, "positions_per_market", 20)),
+        "include_losing_side": bool(include_losing_side),
+    }
+    try:
+        cached_seed_doc = read_json(seed_cache_path, None)
+    except Exception:
+        cached_seed_doc = None   # 缓存损坏(如崩溃中途写坏)→ 当无缓存,本轮全量重拉重建,不崩
+    cached_by_condition: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(cached_seed_doc, dict) and cached_seed_doc.get("signature") == seed_cache_signature:
+        raw_cache = cached_seed_doc.get("by_condition")
+        if isinstance(raw_cache, dict):
+            cached_by_condition = {
+                str(cid).lower(): rows for cid, rows in raw_cache.items() if isinstance(rows, list)
+            }
+
+    target_condition_ids = {str(m.get("condition_id") or "").lower() for m in target_markets}
+    market_by_id = {str(market.get("condition_id") or "").lower(): market for market in target_markets}
+    markets_to_fetch, seed_cache_hit_count = plan_seed_position_fetch(target_markets, cached_by_condition)
+
     def fetch_market_positions(market: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str | None]:
         condition_id = str(market.get("condition_id") or "").lower()
         try:
@@ -5221,12 +5272,10 @@ def _command_collect_wallets(
             return condition_id, [], str(exc)
 
     market_position_results = run_ordered_io_tasks(
-        target_markets,
+        markets_to_fetch,
         fetch_market_positions,
         max_workers=getattr(args, "max_workers", 8),
     )
-    market_by_id = {str(market.get("condition_id") or "").lower(): market for market in target_markets}
-    seed_positions: list[dict[str, Any]] = []
     market_position_errors: dict[str, str] = {}
     market_position_api_fetches = 0
     for result in market_position_results:
@@ -5237,14 +5286,21 @@ def _command_collect_wallets(
             market_position_errors[condition_id] = error
             continue
         market_position_api_fetches += 1
-        seed_positions.extend(
-            collect_seed_positions(
-                market_by_id.get(condition_id) or {"condition_id": condition_id},
-                response,
-                positions_per_market=getattr(args, "positions_per_market", 20),
-                include_losing_side=include_losing_side,
-            )
+        cached_by_condition[condition_id] = collect_seed_positions(
+            market_by_id.get(condition_id) or {"condition_id": condition_id},
+            response,
+            positions_per_market=getattr(args, "positions_per_market", 20),
+            include_losing_side=include_losing_side,
         )
+
+    # 轮窗裁切 + 持久化缓存;拼出本轮全量 seed_positions(缓存命中 + 新拉),按 target 顺序。
+    cached_by_condition = prune_seed_position_cache(cached_by_condition, target_condition_ids)
+    write_json(seed_cache_path, {"signature": seed_cache_signature, "by_condition": cached_by_condition})
+    seed_positions = [
+        row
+        for market in target_markets
+        for row in cached_by_condition.get(str(market.get("condition_id") or "").lower(), [])
+    ]
     write_json(output_dir / f"{prefix}_seed_positions.json", seed_positions)
     mark_stage("seed_positions")
 
@@ -5467,6 +5523,8 @@ def _command_collect_wallets(
         "leaderboard_wallet_count": len(leaderboard),
         "market_position_api_fetches": market_position_api_fetches,
         "market_position_errors": len(market_position_errors),
+        "seed_cache_hit_count": seed_cache_hit_count,          # 发现阶段:从缓存命中、免 API 的 condition 数
+        "seed_cache_fetch_count": len(markets_to_fetch),       # 本轮真正打 API 的(新出现的)condition 数
         "market_position_error_markets": market_position_errors,
         "raw_user_trade_errors": raw_user_trade_errors,
         "raw_user_trade_cache_hits": raw_user_trade_cache_hits,
