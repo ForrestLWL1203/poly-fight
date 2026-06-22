@@ -2114,7 +2114,7 @@ def classify_wallet_bucket(
     if bucket_edge_lb is None or bucket_edge_lb < min_edge_lb:
         reasons.append("weak_edge_lb")
     if win_rate < min_win_rate:
-        reasons.append("win_rate_below_floor")  # v20:桶内 θ̂ < 门(默认 0.75)→ 硬排除
+        reasons.append("win_rate_below_floor")  # v20:桶内 θ̂ < 门(默认 0.58,见 ESPORTS_MIN_BUCKET_WIN_RATE)→ 硬排除
     # 以下全是软 reason(仅展示/观测,不参与判定)。bucket_wilson_lb 不再单设门 —— 它已隐含在
     # edge_lb(= wilson_lb − 入场中位价)里,只作为字段留存展示,不重复扣一道独立胜率门。
     if loss_count > 0:
@@ -2146,7 +2146,7 @@ def classify_wallet_bucket(
         eff_sample_full >= min_eff   # v18:地板用全样本(活跃度);edge_lb 已含子集 Wilson 置信
         and eff_sample >= min_sub    # v19:可跟价区子集 ≥6,防太薄切片侥幸
         and edge_ok and bucket_edge_lb >= min_edge_lb
-        and win_rate >= min_win_rate  # v20:桶内胜率硬门(默认 0.75)
+        and win_rate >= min_win_rate  # v20:桶内胜率硬门(默认 0.58,见 ESPORTS_MIN_BUCKET_WIN_RATE)
         and thin_ok                   # v21:薄样本(贴放松地板)须更强信号
         and not stale
     ):

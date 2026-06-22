@@ -293,8 +293,8 @@ V2_MAX_BOT_SCORE = 70              # bot 评分硬排除阈
 # v21:board 级 tail 门已删(原 V2_MAX_TAIL_ENTRY_RATE=0.25)。其"整盘 avg≥0.75"定义把分批
 # 建仓误判成追高,且与 edge_lb 评级门 + 0.85 跟单执行上限三重冗余。discovery 种子预筛仍有独立
 # 的 tail 软门(默认 0.34,见下方 filter_profile_seed_wallets_*),那是另一层、阈值更松。
-# 钱包级硬门:最后一笔(scoped)交易超过这么多小时 → 直接不入榜(比逐桶 14 天门紧得多)。
-# 跟单要钱包当下活跃;沉寂 >72h 的不再上榜(collector 发现 + observer 重评共用)。
+# 钱包级硬门:最后一笔(scoped)交易超过这么多小时 → 直接不入榜(默认 14 天,见下方常量)。
+# 跟单要钱包当下活跃;沉寂超过此门的不再上榜(collector 发现 + observer 重评共用)。
 V2_MAX_LEADERBOARD_IDLE_HOURS = 336  # 14d:打分窗口(14-30d)已管"是否活跃",72h 过紧会误杀低频高手
 V2_PER_GAME_QUOTA = 0              # 0 = 不设每游戏上限(榜单=全部够格);>0 时才强制每游戏封顶
 V2_MAX_LEADERBOARD_WALLETS = 200   # 仅作安全上限(质量门已把关,大小不重要)
@@ -2624,7 +2624,7 @@ def _with_esports_followable_market_types(profile: dict[str, Any]) -> dict[str, 
             game_family, _market_type = split_bucket_key(key)
             if game_family and game_family not in ALLOWED_GAME_FAMILIES:
                 continue
-            # 不再用美元 ROI / 资金加权边际二次过滤:评分层的胜率(θ̂≥0.58)+ edge(θ̂−价格≥0.06)
+            # 不再用美元 ROI / 资金加权边际二次过滤:评分层的胜率(θ̂≥0.58)+ edge_lb(wilson_lb−中位价≥0.05)
             # 已是质量护栏。ROI 门槛会把"高胜率但因 sizing 亏/买热门 ROI 低"的钱包再次误杀。
             followable_buckets.append(key)
         if not followable_buckets:
@@ -4973,7 +4973,7 @@ def build_collector_leaderboard_v2(
         # v21:board 级 tail 门已删。它用"整盘 avg 买入价 ≥0.75"判定追高,会把分批建仓
         # (median 入场低、avg 被晚加仓拉高)的高手误判;且与 edge_lb 评级门 + 0.85 跟单执行
         # 现价上限三重冗余 —— 复制不了的高价买单本就被 edge_lb 刷掉 + 执行层不跟。交给那两道把关。
-        # 逐桶 = classify_wallet_bucket 已算好的逐桶 A(θ̂≥0.58 + n_eff≥10 + edge,非 esports/别桶已隔离)。
+        # 逐桶 = classify_wallet_bucket 已算好的逐桶 A(θ̂≥0.58 + n_eff≥自适应地板(基数12) + edge_lb,非 esports/别桶已隔离)。
         per_game_type_grades = profile.get("per_game_type_grades") if isinstance(profile.get("per_game_type_grades"), dict) else {}
         eligible: list[dict[str, Any]] = []
         for bucket_key, metrics in per_game_type_grades.items():
@@ -7736,7 +7736,7 @@ def build_parser() -> argparse.ArgumentParser:
         # V2 钱包级硬排除门(逐桶质量统一走 classify_wallet_bucket,不再有逐桶 ROI/Wilson 参数)。
         subparser.add_argument("--v2-max-two-sided-rate", type=float, default=V2_MAX_TWO_SIDED_RATE)
         subparser.add_argument("--v2-max-bot-score", type=int, default=V2_MAX_BOT_SCORE)
-        # 钱包级硬门:最后一笔交易超过这么多小时 → 不入榜(默认 72h;<=0 关闭)。
+        # 钱包级硬门:最后一笔交易超过这么多小时 → 不入榜(默认 336h=14天;<=0 关闭)。
         subparser.add_argument("--max-leaderboard-idle-hours", type=int, default=V2_MAX_LEADERBOARD_IDLE_HOURS)
         subparser.add_argument("--v2-per-game-quota", type=int, default=V2_PER_GAME_QUOTA)
         # 技术型(低买高卖)默认不纳入;加此 flag 一键开回。

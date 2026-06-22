@@ -147,7 +147,7 @@ scoring:
 
 ```text
 grade == A (B stays in pool, not on the board)
-recent category activity (idle hard cut, default 72h)
+recent category activity (idle hard cut, default 14d / 336h — see V2_MAX_LEADERBOARD_IDLE_HOURS)
 meaningful discovery participation / cash
 same-condition two-sided behavior excluded
 max exported wallets = 200 safety cap (quality gate is the real limiter)
