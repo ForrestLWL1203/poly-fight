@@ -7343,7 +7343,7 @@ def command_run(args: argparse.Namespace) -> int:
             ),
         )
         collector.start()
-        mode = "ws_subscribe+getlogs_backfill" if wss_url else "getlogs_poll"
+        mode = "ws_subscribe+dataapi_catchup" if wss_url else "getlogs_poll"
         print(json.dumps({"status": "onchain_collector_started", "mode": mode, "rpc": https_url.split("/v2/")[0] + "/v2/***"}, ensure_ascii=False), flush=True)
     else:
         print(json.dumps({"status": "onchain_disabled", "reason": "no secret/rpc; using data-api polling"}, ensure_ascii=False), flush=True)

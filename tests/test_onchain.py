@@ -296,25 +296,36 @@ class TestPolling(unittest.TestCase):
         return rpc_methods
 
     def test_cold_start_uses_dataapi_not_getlogs(self):
-        # 进程冷启动(cursor<=0)默认不烧 getLogs 全量回补:只把游标定到当前块头(1 次
+        # 进程冷启动(cursor<=0)默认不烧 getLogs:只把游标定到当前块头(1 次
         # eth_blockNumber),置 cold_catchup_pending,交给 runner 走 data-api 补单。
-        col, events = self._collector(wss_url="wss://x", cold_start_via_dataapi=True)
+        col, events = self._collector(wss_url="wss://x", catchup_via_dataapi=True)
         col._cursor = 0  # cold
         rpc_methods = self._run_one_session(col)
         self.assertTrue(col.cold_catchup_pending)
         self.assertEqual(col._cursor, 2000)                 # 游标定到块头
         self.assertNotIn("eth_getLogs", rpc_methods)        # 冷启动不发 getLogs
-        self.assertIn(("cold_start_dataapi", {"cursor": 2000}), events)
+        self.assertIn(("dataapi_catchup", {"cursor": 2000, "cold_start": True}), events)
         col.clear_cold_catchup()
         self.assertFalse(col.cold_catchup_pending)
 
-    def test_cold_start_legacy_getlogs_when_disabled(self):
-        # 关掉新行为(cold_start_via_dataapi=False)→ 回到旧版冷启动 getLogs 全量回补。
-        col, _ = self._collector(wss_url="wss://x", cold_start_via_dataapi=False)
+    def test_reconnect_also_uses_dataapi_not_getlogs(self):
+        # 重连(cursor>0,健康期 stale/recycle/异常/钱包集变更)默认也不烧 getLogs:同冷启动一样
+        # 定游标到块头 + 置 cold_catchup_pending,缺口交 data-api。这是省 Alchemy 额度的关键。
+        col, events = self._collector(wss_url="wss://x", catchup_via_dataapi=True)
+        col._cursor = 1500  # warm reconnect
+        rpc_methods = self._run_one_session(col)
+        self.assertTrue(col.cold_catchup_pending)
+        self.assertEqual(col._cursor, 2000)
+        self.assertNotIn("eth_getLogs", rpc_methods)        # 重连也不发 getLogs
+        self.assertIn(("dataapi_catchup", {"cursor": 2000, "cold_start": False}), events)
+
+    def test_legacy_getlogs_when_disabled(self):
+        # 关掉新行为(catchup_via_dataapi=False)→ 回到旧版冷启动/重连 getLogs 回补。
+        col, _ = self._collector(wss_url="wss://x", catchup_via_dataapi=False)
         col._cursor = 0
         rpc_methods = self._run_one_session(col)
         self.assertFalse(col.cold_catchup_pending)
-        self.assertIn("eth_getLogs", rpc_methods)           # 旧行为:冷启动仍 getLogs
+        self.assertIn("eth_getLogs", rpc_methods)           # 旧行为:仍 getLogs
 
     def test_backfill_buffers_fill_and_advances_cursor(self):
         col, events = self._collector()

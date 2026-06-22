@@ -266,7 +266,7 @@ class OnchainFollowCollector(threading.Thread):
         reconnect_rewind_blocks: int = 150,    # 每次重连 getLogs 回补时回退的窗口(抓近期静默漏单,~5min)
         reconnect_min: float = 1.0,
         reconnect_max: float = 30.0,
-        cold_start_via_dataapi: bool = True,   # 冷启动(进程首连)不烧 getLogs 全量回补,交给 runner 走免费 data-api 补单
+        catchup_via_dataapi: bool = True,      # 冷启动+重连都不烧 getLogs,缺口交给 runner 走免费 data-api 补单
         on_event: Callable[[str, dict], None] | None = None,
     ):
         super().__init__(daemon=True, name="onchain-follow-collector")
@@ -285,7 +285,7 @@ class OnchainFollowCollector(threading.Thread):
         self.reconnect_rewind_blocks = max(0, int(reconnect_rewind_blocks))
         self.reconnect_min = reconnect_min
         self.reconnect_max = reconnect_max
-        self.cold_start_via_dataapi = bool(cold_start_via_dataapi)
+        self.catchup_via_dataapi = bool(catchup_via_dataapi)
         self._cold_catchup_pending = False
         self.on_event = on_event or (lambda *_: None)
 
@@ -383,7 +383,7 @@ class OnchainFollowCollector(threading.Thread):
         self._healthy = False
 
     def _backfill(self, wallets: set[str], *, rewind: int = 0, cold_start: bool = False) -> None:
-        """每次(重)连用 getLogs 补 [cursor-rewind → 当前块] 的缺口。WS 健康期间不调用。"""
+        """仅 catchup_via_dataapi=False 的旧模式:(重)连用 getLogs 补 [cursor-rewind → 当前块] 缺口。"""
         current = block_number(self.https_url)
         if self._cursor <= 0:
             self._cursor = max(0, current - self.cold_start_lookback_blocks)
@@ -399,9 +399,9 @@ class OnchainFollowCollector(threading.Thread):
         self.on_event("backfill", {"fills": self._fill_count - before, "from": from_block, "to": current, "cold_start": cold_start})
 
     def _run_ws_session(self, wallets: set[str]) -> None:
-        """一次 WS 会话:订阅 OrderFilled logs → 连上即 getLogs 回补缺口 → 收推送 +
+        """一次 WS 会话:订阅 OrderFilled logs → 连上即把游标定到块头(缺口交 data-api 补)→ 收推送 +
         三层保活(主动 eth_blockNumber 心跳 / 无帧卡顿重连 / 满 session 时长主动重连)。
-        退出本函数 = 需要重连(钱包变更 / 卡顿 / 定期 / 异常),由 run() 重连并再次回补。"""
+        退出本函数 = 需要重连(钱包变更 / 卡顿 / 定期 / 异常),由 run() 重连并再次补缺口。"""
         ws = WSClient(self.wss_url)
         try:
             # connect() 放进 try:连接失败时 finally 仍会 ws.close()(虽然 connect 内部已自关,
@@ -413,15 +413,15 @@ class OnchainFollowCollector(threading.Thread):
                 "params": ["logs", {"address": list(EXCHANGE_ADDRESSES),
                                     "topics": [ORDER_FILLED_TOPIC, None, maker_topics, None]}],
             }))
-            # 连上即回补。**冷启动(进程首连,cursor<=0)默认不用 getLogs**:补单不要求时效,
-            # 交给 runner 走免费 data-api 兜(置 cold_catchup_pending,只用 1 次 eth_blockNumber 把游标
-            # 定到当前块头)。同进程内的**重连**(cursor>0,健康期 stale/recycle/异常)仍用 rewind 小窗
-            # getLogs 保证 live 续连的时效。这样 getLogs 只在"真有实时缺口"时发,重启不再烧全量回补。
+            # 连上即补缺口,但**默认完全不用 getLogs**(省 Alchemy 额度):冷启动和重连
+            # (stale/recycle/异常/钱包集变更)都只用 1 次 eth_blockNumber 把游标定到当前块头,
+            # 置 cold_catchup_pending,缺口交给 runner 下个 tick 走免费 data-api 补(各钱包持久化
+            # 游标兜底,不要求块级时效)。getLogs rewind 回补只在 catchup_via_dataapi=False 的旧模式下用。
             cold = self._cursor <= 0
-            if cold and self.cold_start_via_dataapi:
+            if self.catchup_via_dataapi:
                 self._cursor = block_number(self.https_url)
                 self._cold_catchup_pending = True
-                self.on_event("cold_start_dataapi", {"cursor": self._cursor})
+                self.on_event("dataapi_catchup", {"cursor": self._cursor, "cold_start": cold})
             else:
                 self._backfill(wallets, rewind=0 if cold else self.reconnect_rewind_blocks, cold_start=cold)
             self._dirty.clear()
