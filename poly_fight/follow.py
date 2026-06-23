@@ -609,8 +609,6 @@ def process_follow_trades(
     post_start_grace_seconds: int = 0,
     eligible_market_types: set[str] | None = None,
     eligible_buckets: set[str] | None = None,
-    bucket_theta: dict[str, float] | None = None,   # kelly:桶 → θ̂(近期加权点估胜率),策略内 ×0.95 作现价门
-    bucket_edge_lb: dict[str, float] | None = None,  # kelly:桶 → edge_lb(copy-edge 下界),实力乘数
     eligible_category: str | None = None,
     eligible_leagues: set[str] | None = None,
     conflict_policy: str = "dual_follow",
@@ -835,13 +833,6 @@ def process_follow_trades(
                 condition_funded_order_count=to_int(condition_counts["condition_funded_order_count"]),
                 wallet_condition_funded_order_count=to_int(condition_counts["wallet_condition_funded_order_count"]),
                 wallet_condition_funded_stake_usdc=to_float(condition_counts.get("wallet_condition_funded_stake_usdc")),
-                # kelly:被跟桶 θ̂(现价门)+ edge_lb(实力乘数)+ 实时价 → 信念×实力定额(其它 mode 忽略)
-                bucket_win_rate=to_float((bucket_theta or {}).get(market_bucket) or (bucket_theta or {}).get(market_type) or 0.0),
-                bucket_edge_lb=(
-                    (bucket_edge_lb or {}).get(market_bucket)
-                    if (bucket_edge_lb or {}).get(market_bucket) is not None
-                    else (bucket_edge_lb or {}).get(market_type)
-                ),
                 entry_price=to_float(current_price),
                 bankroll_usdc=to_float(bankroll_usdc) if bankroll_usdc != float("inf") else 0.0,
                 market_type=market_type,  # 主盘/子盘 → 选各自的每场预算 cap
@@ -918,7 +909,7 @@ def process_follow_trades(
                 elif reason == "invalid_strategy":
                     stats["strategy_invalid_count"] += 1
                 else:
-                    # 其余策略 block(no_live_edge / match_cap_reached / no_bankroll / no_live_price …)
+                    # 其余策略 block(match_budget_reached / no_bankroll / no_live_price …)
                     # 也计数,便于诊断"候选过滤但没开仓"卡在哪一道。
                     stats[f"{reason}_count"] = stats.get(f"{reason}_count", 0) + 1
                 funded_stake = 0.0

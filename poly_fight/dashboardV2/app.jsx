@@ -1220,9 +1220,9 @@ function StrategyEditor({ s, up, wallet, locked }) {
           </div>
         </div>
         <div className="cfg-mini">
-          <div className="cm-head"><Ico n="sparkles" /><span>edge 准入门（内置）</span></div>
+          <div className="cm-head"><Ico n="sparkles" /><span>卖出跟随（内置）</span></div>
           <div className="cm-body">
-            <p className="cfg-sub">仅当 钱包该桶胜率 θ̂ × 0.95 &gt; 现价 才跟（系统统一，无需配置）。卖出侧:目标卖价 ≥ 0.90 才镜像跟卖,否则持有到结算。</p>
+            <p className="cfg-sub">卖出侧:目标卖价 ≥ 0.90 才镜像跟卖,否则持有到结算（系统统一，无需配置）。</p>
           </div>
         </div>
       </div>

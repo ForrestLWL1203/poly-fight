@@ -18,7 +18,6 @@ def _strategy(**sizing_over):
 COMMON = dict(
     target_wallet_order_cash_usdc=100.0,
     available_balance_usdc=10000.0,
-    bucket_win_rate=0.9,
     entry_price=0.5,
     bankroll_usdc=10000.0,
 )
@@ -68,7 +67,7 @@ class TestCashBasedSizing(unittest.TestCase):
         s = _strategy(per_signal_percent=1.0, per_match_percent=100.0)
         r = evaluate_follow_candidate(
             strategy=s, market_type="main_match",
-            target_wallet_order_cash_usdc=100.0, bucket_win_rate=0.9, entry_price=0.5,
+            target_wallet_order_cash_usdc=100.0, entry_price=0.5,
             available_balance_usdc=3794.0, bankroll_usdc=6000.0,  # 权益更高但应被忽略
         )
         self.assertTrue(r["would_follow"])
@@ -78,7 +77,7 @@ class TestCashBasedSizing(unittest.TestCase):
         s = _strategy(per_signal_percent=1.0, per_match_percent=100.0)
         r = evaluate_follow_candidate(
             strategy=s, market_type="main_match",
-            target_wallet_order_cash_usdc=100.0, bucket_win_rate=0.9, entry_price=0.5,
+            target_wallet_order_cash_usdc=100.0, entry_price=0.5,
             available_balance_usdc=0.0, bankroll_usdc=6000.0,
         )
         self.assertFalse(r["would_follow"])

@@ -5776,11 +5776,11 @@ class CoreTest(unittest.TestCase):
         s["sizing"]["per_match_percent"] = 2.0    # 每场总预算 = 5000×2% = 100
         s["sizing"]["min_stake_usdc"] = 1.0
 
-        def ev(order_cash=200, theta=0.74, p=0.60, condition_funded=0.0, bankroll=5000):
+        def ev(order_cash=200, p=0.60, condition_funded=0.0, bankroll=5000):
             return evaluate_follow_candidate(
                 strategy=s, target_wallet_order_cash_usdc=order_cash, available_balance_usdc=bankroll,
                 condition_funded_stake_usdc=condition_funded,
-                bucket_win_rate=theta, entry_price=p, bankroll_usdc=bankroll,
+                entry_price=p, bankroll_usdc=bankroll,
             )
 
         # flat:不论目标下多大,单笔都是 50(无 ramp、不抄大小)
@@ -5793,12 +5793,12 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(ev(200, condition_funded=100)["block_reason"], "match_budget_reached")
         # 单笔/预算都随动态权益:bankroll 4000 → 单笔 40
         self.assertEqual(ev(200, bankroll=4000)["funded_stake"], 40)
-        # 门:目标单太小 / 入场价超上限(默认 0.68) / edge 不足
+        # 门:目标单太小 / 入场价超上限(默认 0.68)
         self.assertEqual(ev(5)["block_reason"], "small_target_wallet_order")
         self.assertEqual(ev(200, p=0.80)["block_reason"], "entry_above_ceiling")
-        # p≤0.68 过 ceiling,但 θ̂×0.95 ≤ p → edge 门拦
-        self.assertEqual(ev(200, theta=0.65, p=0.64)["block_reason"], "no_live_edge")
-        self.assertTrue(ev(200, theta=0.90, p=0.50)["would_follow"])
+        # edge 门已删:p≤0.68 过 ceiling 即放行,不再卡 θ̂
+        self.assertTrue(ev(200, p=0.64)["would_follow"])
+        self.assertTrue(ev(200, p=0.50)["would_follow"])
 
     def test_follow_strategy_max_entry_price_default_and_clamp(self):
         # 默认 0.68(评分价区);缺字段补默认;clamp 到 [0,1];0 = 不限(均 normalize 处理)。
@@ -5834,7 +5834,7 @@ class CoreTest(unittest.TestCase):
         def ev(p):
             return evaluate_follow_candidate(
                 strategy=s, target_wallet_order_cash_usdc=200, available_balance_usdc=5000,
-                bucket_win_rate=0.90, entry_price=p, bankroll_usdc=5000,
+                entry_price=p, bankroll_usdc=5000,
             )
         # 现价 0.50 < 下限 0.58 → 拦;0.58/0.65 放行(0.65 仍 ≤ 默认上限 0.68)
         self.assertEqual(ev(0.50)["block_reason"], "entry_below_floor")
@@ -6288,7 +6288,7 @@ class CoreTest(unittest.TestCase):
             strategy=capped_strategy,
             target_wallet_order_cash_usdc=200,
             available_balance_usdc=30,
-            bucket_win_rate=0.90, entry_price=0.50, bankroll_usdc=5000,
+            entry_price=0.50, bankroll_usdc=5000,
         )
         self.assertTrue(capped["would_follow"])
         self.assertEqual(capped["funded_stake"], 30)
@@ -6301,7 +6301,7 @@ class CoreTest(unittest.TestCase):
             strategy=broke_strategy,
             target_wallet_order_cash_usdc=200,
             available_balance_usdc=0.5,
-            bucket_win_rate=0.90, entry_price=0.50, bankroll_usdc=5000,
+            entry_price=0.50, bankroll_usdc=5000,
         )
         self.assertFalse(broke["would_follow"])
         self.assertEqual(broke["block_reason"], "insufficient_balance")
@@ -6725,7 +6725,6 @@ class CoreTest(unittest.TestCase):
             max_slippage=0.05,
             bankroll_usdc=990,
             follow_strategy=strategy,
-            bucket_theta={"main_match": 0.90},   # θ̂×0.95=0.855 > 现价 0.5 → 过 edge 门
         )
 
         leg = signals[0]["legs"][0]

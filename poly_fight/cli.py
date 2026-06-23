@@ -1972,8 +1972,7 @@ def watched_markets(
     post_start_grace_seconds: int = 0,
 ) -> dict[str, dict[str, Any]]:
     # Watchlist:未来 observe_window 内将开赛的盘 + 已开赛但**尚未结算**的盘。盘中持续 watch,
-    # 让目标钱包的盘中新成交也能进入跟单评估;要不要跟、跟多少由策略的 edge 闸决定
-    # (Kelly:edge_lb = 被跟桶 wilson_lb − 现价;≤0 即 no_live_edge 不跟 → 天然挡住"追已涨过把握的局")。
+    # 让目标钱包的盘中新成交也能进入跟单评估;要不要跟、跟多少由策略的现价上下限 + 预算门决定。
     # 已结算的盘剔除。post_start_grace_seconds 保留仅为签名兼容,不再用于截断 in-play 盘。
     window_end = now_ts + int(observe_window_hours * 3600)
     watched = {}
@@ -6278,8 +6277,8 @@ def build_position_backfill_trades(
     watch scope 的仓位,合成一笔 BUY trade 走同一条 process_follow_trades 管线建 paper
     leg —— 弥补"WS 只看订阅后新成交、漏掉启动前存量持仓"。
 
-    价格决策**完全交给** process_follow_trades / 策略(唯一现价门 = θ̂×0.95 edge 闸,
-    + FOLLOWABLE_PRICE_CEILING 0.85 上限),补单不再自带"成本×1.15"闸(已删,曾把仍 +EV
+    价格决策**完全交给** process_follow_trades / 策略(现价门 = 入场价上下限 prefilter;
+    θ̂ edge 闸已于 2026-06-23 删,纯冗余),补单不再自带"成本×1.15"闸(已删,曾把仍 +EV
     的补单因钱包买得更便宜而误杀)。trade.price=avgPrice(钱包成本);并把市场 outcome_prices[idx]
     设为现价 → process_follow_trades 以现价作为我们的 our_entry_price。
     返回 ({wallet:[trade,...]}, stats)。
@@ -6577,32 +6576,6 @@ def command_follow(
         for row in eligible_wallet_rows
         if row.get("eligible_buckets")
     }
-    # kelly 下注用:每钱包 桶→θ̂(近期加权点估胜率,与入榜轴一致)。键含 game:type(per_game_type)
-    # 与 type(per_type),follow 端按信号的 market_bucket 取,取不到回退 market_type。
-    # 现价门由策略内部 θ̂×0.95 实现(见 THETA_FOLLOW_DISCOUNT)。
-    def _theta_map(row: dict[str, Any]) -> dict[str, float]:
-        out: dict[str, float] = {}
-        for src in ("per_game_type_grades", "per_type_grades"):
-            for key, val in (row.get(src) or {}).items():
-                if isinstance(val, dict) and val.get("bucket_win_rate") is not None:
-                    out[str(key)] = to_float(val.get("bucket_win_rate"))
-        return out
-    # kelly 实力乘数:每钱包 桶→edge_lb(copy-edge 下界,含样本折扣 ≈ edge+wilson)。同 θ̂ 一样的键。
-    def _edge_lb_map(row: dict[str, Any]) -> dict[str, float]:
-        out: dict[str, float] = {}
-        for src in ("per_game_type_grades", "per_type_grades"):
-            for key, val in (row.get(src) or {}).items():
-                if isinstance(val, dict) and val.get("bucket_edge_lb") is not None:
-                    out[str(key)] = to_float(val.get("bucket_edge_lb"))
-        return out
-    bucket_theta_by_wallet = {
-        f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}": _theta_map(row)
-        for row in eligible_wallet_rows
-    }
-    bucket_edge_lb_by_wallet = {
-        f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}": _edge_lb_map(row)
-        for row in eligible_wallet_rows
-    }
     eligible_leagues_by_wallet = {
         f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}": {str(row.get("league") or "").lower()}
         for row in eligible_wallet_rows
@@ -6864,8 +6837,6 @@ def command_follow(
                     post_start_grace_seconds=args.post_start_trade_grace_seconds,
                     eligible_market_types=eligible_market_types_by_wallet.get(scope_key),
                     eligible_buckets=eligible_buckets_by_wallet.get(scope_key),
-                    bucket_theta=bucket_theta_by_wallet.get(scope_key),
-                    bucket_edge_lb=bucket_edge_lb_by_wallet.get(scope_key),
                     eligible_category=category,
                     eligible_leagues=eligible_leagues_by_wallet.get(scope_key),
                     conflict_policy="dual_follow",
@@ -6875,7 +6846,7 @@ def command_follow(
                     follow_strategy=follow_strategy,
                 )
                 backfill_legs_opened += len({signal.get("signal_id") for signal in open_signals} - before_ids)
-                # 汇总各候选未开仓的拦截原因(eligibility / low_entry / small_wallet / no_live_edge …),
+                # 汇总各候选未开仓的拦截原因(eligibility / low_entry / small_wallet / match_budget …),
                 # 便于诊断"candidates 多但 opened 少"卡在哪道闸。
                 for stat_key, stat_val in (_bf_pft_stats or {}).items():
                     if (stat_key.endswith("_count") and stat_key not in ("funded_stake_usdc",)
@@ -7060,8 +7031,6 @@ def command_follow(
                 post_start_grace_seconds=args.post_start_trade_grace_seconds,
                 eligible_market_types=eligible_market_types_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 eligible_buckets=eligible_buckets_by_wallet.get(scope_key) if wallet_can_open_new else None,
-                bucket_theta=bucket_theta_by_wallet.get(scope_key),
-                bucket_edge_lb=bucket_edge_lb_by_wallet.get(scope_key),
                 eligible_category=category if wallet_can_open_new else None,
                 eligible_leagues=eligible_leagues_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 conflict_policy="dual_follow",
