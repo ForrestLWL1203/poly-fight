@@ -7506,7 +7506,7 @@ def command_run(args: argparse.Namespace) -> int:
 
 
 def command_serve(args: argparse.Namespace) -> int:
-    from .dashboard import DashboardConfig, create_server, reap_orphan_follow_processes
+    from .dashboard import DashboardConfig, _adopted_follow_pids, build_runner_status, create_server, reap_orphan_follow_processes
 
     password = os.environ.get("POLY_FIGHT_DASH_PASSWORD", "")
     cookie_secret = os.environ.get("POLY_FIGHT_DASH_COOKIE_SECRET", "")
@@ -7534,12 +7534,16 @@ def command_serve(args: argparse.Namespace) -> int:
         stream_heartbeat_seconds=args.stream_heartbeat_seconds,
         max_stream_clients=args.max_stream_clients,
     )
-    # serve 启动即清掉上一代 serve 遗留的 runner/observe 孤儿(start_new_session 脱离会话,
-    # 重启 serve 时它们作为 systemd left-over 残留 → 面板"停止跟单"杀不掉)。新 serve = 干净起点;
-    # 代价:重启 serve 会顺带停掉正在跑的 runner,之后由用户在面板重新点"启动跟单"。
+    # serve 启动:清掉上一代遗留的 follow 孤儿,但**保留并接管**仍在合法运行的 runner(+observe)。
+    # KillMode=process + start_new_session 让 run/observe 活过 serve 重启,pid 落在控制文件(持久),
+    # build_runner_status 按命令扫描 + pid 比对即可自动续上(停止/日志/策略不丢)。只杀真正的孤儿。
+    adopted = _adopted_follow_pids(config)
     reaped_orphans = reap_orphan_follow_processes(config)
     if reaped_orphans:
         print(f"reaped {len(reaped_orphans)} left-over follow process(es) on startup: {reaped_orphans}", flush=True)
+    runner = build_runner_status(config)
+    if runner.get("status") in {"running", "stopping"} and int(runner.get("pid") or 0) in adopted:
+        print(f"adopted running runner pid={runner.get('pid')} across serve restart (log={runner.get('log_path')})", flush=True)
 
     server = create_server(config)
     host, port = server.server_address[:2]

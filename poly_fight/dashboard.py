@@ -3182,15 +3182,32 @@ def _reap_follow_processes(processes: list[dict[str, Any]]) -> list[int]:
     return reaped
 
 
-def reap_orphan_follow_processes(config: DashboardConfig) -> list[int]:
-    """serve 启动时调用:扫掉上一代 serve 遗留的 runner/observe 孤儿。
+def _adopted_follow_pids(config: DashboardConfig) -> set[int]:
+    """控制文件里记录的、仍合法运行的 runner + observe sidecar pid —— serve 重启后这些进程
+    pid 不变,留着让 ``build_runner_status`` 自动接管(source=dashboard,停止/日志/策略续上),
+    不当孤儿误杀。仅当 runner 状态为 running/stopping 时保留;否则回到"全清"的干净起点语义。"""
+    recorded = read_follow_control(_follow_dir(config)).get("runner")
+    if not isinstance(recorded, dict) or recorded.get("status") not in {"running", "stopping"}:
+        return set()
+    return {
+        pid
+        for pid in (int(recorded.get("pid") or 0), int(recorded.get("observe_live_pid") or 0))
+        if pid > 0
+    }
 
-    spawn 时用 ``start_new_session=True`` 让子进程脱离 serve 的会话,所以重启 serve
-    (systemd restart / 崩溃拉起)时,上一代的 run/observe 会作为 "left-over" 进程残留,
-    控制文件 pid 也对不上 → 面板"停止跟单"杀不掉、状态错乱。让每个新 serve 一起来就把
-    它们清干净 = 干净起点;代价是重启 serve 会顺带停掉正在跑的 runner(之后由用户重新启动)。
-    返回杀掉的 pid。"""
-    return _reap_follow_processes(_find_follow_processes(config))
+
+def reap_orphan_follow_processes(config: DashboardConfig) -> list[int]:
+    """serve 启动时调用:清掉上一代遗留的 follow 孤儿,但**保留并接管**仍在合法运行的 runner
+    (及其 observe sidecar)。
+
+    unit ``KillMode=process`` + spawn 时 ``start_new_session=True`` 让 run/observe 活过 serve
+    重启;它们的 pid/pgid 落在控制文件(磁盘持久),pid 不变 → ``build_runner_status`` 按命令
+    扫描 + 控制文件 pid 比对即可自动接管(停止按钮、日志、策略全续上)。所以这里只杀**真正的
+    孤儿**(pid 跟控制文件对不上的,例如 run 崩了只剩的 observe sidecar);留下合法 runner ——
+    "忘了停 runner 就重启 dashboard" 不再让它被误杀空跑。返回杀掉的 pid。"""
+    keep = _adopted_follow_pids(config)
+    orphans = [row for row in _find_follow_processes(config) if int(row.get("pid") or 0) not in keep]
+    return _reap_follow_processes(orphans)
 
 
 def _system_processes() -> list[dict[str, Any]]:

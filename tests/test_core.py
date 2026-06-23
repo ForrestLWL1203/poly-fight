@@ -9938,6 +9938,45 @@ class CoreTest(unittest.TestCase):
                                      runner_process_lister=lambda: [])
             self.assertEqual(reap_orphan_follow_processes(config), [])
 
+    def test_serve_startup_adopts_running_runner_reaps_only_orphan(self):
+        # 续上能力:忘了停 runner 就重启 dashboard 时,控制文件里记的合法 runner(+observe sidecar)
+        # 因 pid 不变被保留接管,只杀真正的孤儿(pid 跟控制文件对不上的残留 observe)。
+        from poly_fight.dashboard import reap_orphan_follow_processes
+        from poly_fight.control import write_follow_control
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp); follow_dir = data_dir / "follow"; eroot = data_dir / "esports"
+            write_follow_control(follow_dir, {"runner": {
+                "status": "running", "pid": 400, "pgid": 400,
+                "observe_live_pid": 402, "observe_live_pgid": 402,
+            }})
+            rows = [
+                {"pid": 400, "pgid": 400, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {data_dir} run --follow-dir {follow_dir}"},
+                {"pid": 402, "pgid": 402, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {eroot} observe-live --category esports"},
+                {"pid": 999, "pgid": 999, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {eroot} observe-live --category esports"},
+            ]
+            config = DashboardConfig(data_dir=data_dir, follow_dir=follow_dir, username="a", password="p", cookie_secret="s",
+                                     runner_process_lister=lambda: rows)
+            killed = []
+            with patch("poly_fight.dashboard._terminate_pgid_or_pid", side_effect=lambda pgid, pid: killed.append(pid)):
+                reaped = set(reap_orphan_follow_processes(config))
+            self.assertEqual(reaped, {999})       # 只收割孤儿 999
+            self.assertEqual(set(killed), {999})  # 合法 runner400+observe402 没被 kill,确实保留接管
+
+    def test_serve_startup_reaps_all_when_runner_status_stopped(self):
+        # 控制文件状态非 running/stopping(已停)时,回到"全清"语义:即便 pid 对得上也照杀,不误留。
+        from poly_fight.dashboard import reap_orphan_follow_processes
+        from poly_fight.control import write_follow_control
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp); follow_dir = data_dir / "follow"
+            write_follow_control(follow_dir, {"runner": {"status": "stopped", "pid": 400, "pgid": 400}})
+            rows = [
+                {"pid": 400, "pgid": 400, "stat": "S", "command": f"python -m poly_fight.cli --data-dir {data_dir} run --follow-dir {follow_dir}"},
+            ]
+            config = DashboardConfig(data_dir=data_dir, follow_dir=follow_dir, username="a", password="p", cookie_secret="s",
+                                     runner_process_lister=lambda: rows)
+            with patch("poly_fight.dashboard._terminate_pgid_or_pid", side_effect=lambda pgid, pid: None):
+                self.assertEqual(set(reap_orphan_follow_processes(config)), {400})
+
     def test_dashboard_runner_stopped_status_includes_default_runner_inputs(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
