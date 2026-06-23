@@ -207,7 +207,7 @@ function HealthPanel({ data }) {
   const obsRow = !running
     ? { dot: "off", chip: "未运行", tone: "neutral", detail: "—" }
     : rtOn
-      ? (runner.observe_running
+      ? (runner.observe_live_running
         ? { dot: "ok", chip: "已开启", tone: "up", detail: "每 2h 自动" }
         : { dot: "warn", chip: "已退出", tone: "warn", detail: "进程已退" })
       : { dot: "off", chip: "未开启", tone: "neutral", detail: "策略未勾" };
