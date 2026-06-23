@@ -7898,7 +7898,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8787)
     serve.add_argument("--user", default="admin")
-    serve.add_argument("--session-ttl-seconds", type=int, default=12 * 3600)
+    serve.add_argument("--session-ttl-seconds", type=int, default=7 * 24 * 3600)
     serve.add_argument("--cookie-secure", action="store_true")
     serve.add_argument("--observe-window-hours", type=float, default=24)
     serve.add_argument("--max-requests-per-second", type=float, default=10)
