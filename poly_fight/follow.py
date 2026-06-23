@@ -600,6 +600,7 @@ def process_follow_trades(
     max_signal_stake_usdc: float = 0.0,
     follow_strategy: dict[str, Any] | None = None,
     pending_small_buys: dict[str, dict[str, Any]] | None = None,   # 小单累加器(跨 tick 持久,由调用方 load/save)
+    held_pending_price: dict[str, dict[str, Any]] | None = None,   # 价格 held 暂存器(现价<下限的买单,等上穿;跨 tick 持久)
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     wallet = normalize_wallet(wallet)
     active_strategy = normalize_follow_strategy(follow_strategy) if isinstance(follow_strategy, dict) else None
@@ -654,6 +655,9 @@ def process_follow_trades(
             # 钱包卖出该 (cond,outcome):若有未凑够门槛的小单缓存,说明它没建够仓就跑了 → 清缓存,不补跟。
             if pending_small_buys is not None:
                 pending_small_buys.pop(f"{wallet}|{condition_id}|{outcome_index}", None)
+            # 同理:价格 held 暂存的买单,钱包又卖了 → 它没拿住,清掉不再等上穿。
+            if held_pending_price is not None:
+                held_pending_price.pop(f"{wallet}|{condition_id}|{outcome_index}", None)
             if existing:
                 # 等比例跟卖:目标累计卖到仓位 x% → 我们也卖到 x%(min $1,不够攒着;dust 全平)。
                 state = apply_follow_sell(existing, trade, current_price, now_ts)
@@ -839,6 +843,22 @@ def process_follow_trades(
                     # 也计数,便于诊断"候选过滤但没开仓"卡在哪一道。
                     stats[f"{reason}_count"] = stats.get(f"{reason}_count", 0) + 1
                 funded_stake = 0.0
+                # 价格 held 暂存:唯一拦路的是"现价低于下限"(entry_below_floor),且非下穿
+                # (钱包入场价 ≤ 上限、未被钱包低价/小单门挡)→ 存起来,等独立 held 刷新看价是否
+                # 上穿进区间再补跟(见 cli held-refresh)。下穿/钱包买太低/小单一律不 held。
+                if (
+                    held_pending_price is not None
+                    and side == "BUY"
+                    and reason == "entry_below_floor"
+                    and not ({"low_entry_price", "small_wallet_trade", "wallet_entry_above_ceiling"} & set(follow_block_reasons))
+                ):
+                    hk = f"{wallet}|{condition_id}|{outcome_index}"
+                    held_pending_price[hk] = {
+                        "trade": trade,
+                        "wallet_entry_price": round(to_float(wallet_fill_price), 8),
+                        "held_since": to_int((held_pending_price.get(hk) or {}).get("held_since")) or now_ts,
+                    }
+                    stats["price_held_count"] = stats.get("price_held_count", 0) + 1
             if funding_status == "funded" and not slippage["would_follow"]:
                 funded_stake = 0.0
                 funding_status = "blocked"
@@ -896,6 +916,9 @@ def process_follow_trades(
                 stats["signal_cap_limited_count"] += 1
         if not would_follow or funded_stake <= 0:
             continue
+        # 跟成了 → 该 (wallet,cond,outcome) 不再 held(价已上穿进区间或钱包又来一笔真单)。
+        if held_pending_price is not None:
+            held_pending_price.pop(f"{wallet}|{condition_id}|{outcome_index}", None)
         stats["funded_stake_usdc"] = round(to_float(stats.get("funded_stake_usdc")) + funded_stake, 8)
         leg = {
             "category": market_category,

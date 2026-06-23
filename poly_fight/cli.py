@@ -6262,6 +6262,9 @@ POSITION_BACKFILL_MAX_DRAWDOWN = 0.40
 # mark-to-market 放大成天文数字(0.0005 入场 → 任意上跳即虚增巨额未实现盈亏)。
 POSITION_BACKFILL_MIN_ENTRY = 0.05
 
+# 价格 held 放弃地板:held 期间跟单方现价 < 此(≈对手 > 0.8)→ 难翻盘,放弃等上穿(错过无所谓)。
+HELD_GIVE_UP_PRICE = 0.20
+
 
 def build_position_backfill_trades(
     client: PolymarketClient,
@@ -6584,6 +6587,7 @@ def command_follow(
     wallet_trade_state = store.load_wallet_trade_state()
     open_signals = prune_unfollowed_signals(store.load_open_signals())
     pending_small_buys = store.load_pending_small_buys()   # 小单累加器(跨 tick 持久)
+    held_pending_price = store.load_held_pending_price()   # 价格 held 暂存器(现价<下限的买单,等上穿;跨 tick 持久)
     performance = store.load_performance()
     account_balance = store.load_account_balance()
     account_balance_configured = bool(account_balance.get("configured"))
@@ -6841,6 +6845,7 @@ def command_follow(
                     max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
                     max_signal_stake_usdc=max_signal_stake_usdc,
                     follow_strategy=follow_strategy,
+                    held_pending_price=held_pending_price,
                 )
                 backfill_legs_opened += len({signal.get("signal_id") for signal in open_signals} - before_ids)
                 # 汇总各候选未开仓的拦截原因(eligibility / low_entry / small_wallet / match_budget …),
@@ -7036,6 +7041,7 @@ def command_follow(
                 max_signal_stake_usdc=max_signal_stake_usdc,
                 follow_strategy=follow_strategy,
                 pending_small_buys=pending_small_buys,
+                held_pending_price=held_pending_price,
             )
             after_ids = {signal.get("signal_id") for signal in open_signals}
             new_signal_count += len(after_ids - before_ids)
@@ -7073,6 +7079,110 @@ def command_follow(
 
     state["wallet_trade_state"] = wallet_trade_state
     state["updated_at"] = now_ts
+
+    # ── 价格 held 刷新(独立节奏,默认每 5min;随 runner 起停)──
+    # 现价低于下限被暂存的买单,这里给它们单独拉实时盘口价(与跟单详情同源:Gamma /markets):
+    #   价**上穿**进 [下限,上限] → 合成 BUY 补跟(跟成则在 process_follow_trades 内清缓存,回归正常刷新);
+    #   跟单方现价 < HELD_GIVE_UP_PRICE(0.2,≈对手>0.8,难翻盘)/ 冲破上限(超了不追)/ 盘已 closed /
+    #   已不在 watchlist → 放弃清缓存。仍 < 下限 → 留着等下次。
+    held_refresh_interval = int(getattr(args, "held_refresh_minutes", 5) or 0) * 60
+    price_held_followed_count = 0
+    price_held_dropped_count = 0
+    if held_pending_price and held_refresh_interval > 0 and (
+        now_ts - to_int(state.get("last_held_refresh_at")) >= held_refresh_interval
+    ):
+        state["last_held_refresh_at"] = now_ts
+        held_floor = to_float(((follow_strategy or {}).get("prefilters") or {}).get("min_follow_entry_price"))
+        held_ceiling = to_float(effective_max_entry_price)
+        watched_cids_held = {str(cid).lower() for cid in (watched or {})}
+        row_by_wallet = {normalize_wallet(r.get("wallet")): r for r in follow_wallets}
+        held_conds = sorted({k.split("|", 2)[1] for k in held_pending_price if "|" in k})
+        try:
+            live_markets = client.gamma("/markets", condition_ids=held_conds, limit=max(1, len(held_conds)))
+        except Exception:
+            live_markets = []
+        live_records = resolution_market_records_from_markets(live_markets or [])
+        crossings_by_scope: dict[str, list[dict[str, Any]]] = {}
+        for hk, entry in list(held_pending_price.items()):
+            parts = hk.split("|", 2)
+            if len(parts) != 3:
+                held_pending_price.pop(hk, None)
+                continue
+            wallet_h, cond_h, oidx_s = parts[0], parts[1].lower(), parts[2]
+            oidx_h = to_int(oidx_s, -1)
+            if cond_h not in watched_cids_held:           # 已不在 watchlist(结束/出范围)→ 放弃
+                held_pending_price.pop(hk, None); price_held_dropped_count += 1; continue
+            rec = live_records.get(cond_h)
+            if rec and rec.get("closed"):                 # 盘已 closed → 放弃
+                held_pending_price.pop(hk, None); price_held_dropped_count += 1; continue
+            prices = (rec or {}).get("outcome_prices") or []
+            cur = to_float(prices[oidx_h]) if 0 <= oidx_h < len(prices) else 0.0
+            if cur <= 0:                                  # 本轮没拿到价 → 留着等下次
+                continue
+            if cur < HELD_GIVE_UP_PRICE:                  # 跟单方<0.2(对手>0.8)难翻盘 → 放弃
+                held_pending_price.pop(hk, None); price_held_dropped_count += 1; continue
+            if held_ceiling > 0 and cur > held_ceiling:   # 冲破上限,超了不追(回落=下穿)→ 放弃
+                held_pending_price.pop(hk, None); price_held_dropped_count += 1; continue
+            if cur < held_floor:                          # 仍低于下限 → 留着等上穿
+                continue
+            # 上穿进 [下限,上限] → 合成 BUY 补跟。市场现价就地置为实时价,让 process 以现价为我方入场价。
+            market_h = active_markets_for_follow.get(cond_h) or (watched or {}).get(cond_h)
+            if not market_h:
+                continue
+            mprices = list(market_h.get("outcome_prices") or [])
+            while len(mprices) <= oidx_h:
+                mprices.append(0.0)
+            mprices[oidx_h] = round(cur, 8)
+            market_h["outcome_prices"] = mprices
+            orig = entry.get("trade") or {}
+            row_h = row_by_wallet.get(wallet_h) or {}
+            scope_key_h = str(row_h.get("scope_key") or f"{str(row_h.get('category') or 'esports').lower()}:{wallet_h}")
+            synth = {
+                "conditionId": cond_h, "outcomeIndex": oidx_h, "outcome_index": oidx_h,
+                "asset": orig.get("asset"), "side": "BUY",
+                "size": to_float(orig.get("size")),
+                "price": to_float(entry.get("wallet_entry_price") or orig.get("price")),  # 钱包成本(滑点/下穿门用)
+                "timestamp": to_int(orig.get("timestamp")) or now_ts,                     # 钱包真实建仓时间
+                "id": f"heldfollow:{hk}", "transactionHash": f"heldfollow:{hk}",
+                "source": "price_held",
+            }
+            crossings_by_scope.setdefault(scope_key_h, []).append(synth)
+        for scope_key_h, synth_trades in crossings_by_scope.items():
+            wallet_h = scope_key_h.split(":", 1)[1] if ":" in scope_key_h else scope_key_h
+            category_h = scope_key_h.split(":", 1)[0] if ":" in scope_key_h else "esports"
+            wallet_can_open_new_h = scope_key_h in eligible_wallet_set and category_h not in paused_new_signal_categories
+            if not wallet_can_open_new_h:
+                continue
+            before_ids_h = {s.get("signal_id") for s in open_signals}
+            open_signals, _held_stats = process_follow_trades(
+                open_signals,
+                wallet=wallet_h,
+                trades=synth_trades,
+                markets_by_condition=active_markets_for_follow or watched,
+                now_ts=now_ts,
+                stake_usdc=args.stake_usdc,
+                max_follow_legs=args.max_follow_legs,
+                max_slippage=1.0,
+                min_wallet_entry_price=args.min_wallet_entry_price,
+                max_entry_price=effective_max_entry_price,
+                stake_ratio_percent=args.stake_ratio_percent,
+                require_pre_match=args.require_pre_match,
+                post_start_grace_seconds=args.post_start_trade_grace_seconds,
+                eligible_market_types=eligible_market_types_by_wallet.get(scope_key_h),
+                eligible_buckets=eligible_buckets_by_wallet.get(scope_key_h),
+                eligible_category=category_h,
+                eligible_leagues=eligible_leagues_by_wallet.get(scope_key_h),
+                conflict_policy="dual_follow",
+                bankroll_usdc=bankroll_usdc,
+                max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
+                max_signal_stake_usdc=max_signal_stake_usdc,
+                follow_strategy=follow_strategy,
+                pending_small_buys=pending_small_buys,
+                held_pending_price=held_pending_price,
+            )
+            followed_h = len({s.get("signal_id") for s in open_signals} - before_ids_h)
+            price_held_followed_count += followed_h
+            new_signal_count += followed_h
 
     # 独立持仓对账兜底(非每 5s 主循环):WS 可能漏抓目标钱包卖出。每 reconcile_interval(默认
     # 60s)只对**最久未核对的最多 reconcile_batch(默认 20)笔** open 跟单查目标持仓 —— 目标已清仓
@@ -7112,6 +7222,7 @@ def command_follow(
                 max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
                 max_signal_stake_usdc=max_signal_stake_usdc,
                 follow_strategy=follow_strategy,
+                held_pending_price=held_pending_price,
             )
             exited_signal_count += _exit_pft_stats.get("exited_signal_count", 0)
         if emit and exit_reconcile_stats.get("synth_sells"):
@@ -7223,6 +7334,9 @@ def command_follow(
         "insufficient_balance_count": insufficient_balance_count,
         "market_type_not_eligible_count": market_type_not_eligible_count,
         "low_entry_price_blocked_count": low_entry_price_blocked_count,
+        "price_held_count": len(held_pending_price),
+        "price_held_followed_count": price_held_followed_count,
+        "price_held_dropped_count": price_held_dropped_count,
         "high_entry_price_blocked_count": high_entry_price_blocked_count,
         "wallet_entry_above_ceiling_blocked_count": wallet_entry_above_ceiling_blocked_count,
         "small_wallet_trade_blocked_count": small_wallet_trade_blocked_count,
@@ -7268,6 +7382,7 @@ def command_follow(
         },
     }
     store.save_pending_small_buys(pending_small_buys)
+    store.save_held_pending_price(held_pending_price)
     store.save_follow_snapshot(
         wallet_trade_state=wallet_trade_state,
         open_signals=open_signals,
@@ -7867,6 +7982,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=15,
         help="WS 健康期间也每 N 分钟强制走一次免费 data-api 兜底扫,补 WS 漏掉的推送;0 关闭",
+    )
+    run.add_argument(
+        "--held-refresh-minutes",
+        type=int,
+        default=5,
+        help="价格 held(现价<下限暂存的买单)的独立刷新周期(分);每 N 分钟拉实时价,上穿进区间即补跟;0 关闭",
     )
     run.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
     run.add_argument("--resolution-poll-seconds", type=int, default=300, help="已跟进行中赛事结算结果的轮询周期(秒);300s 均匀拉一次,降低 Gamma 调用")

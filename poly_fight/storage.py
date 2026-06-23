@@ -1029,6 +1029,24 @@ class FollowStore:
                 (_dumps(pending or {}),),
             )
 
+    def load_held_pending_price(self) -> dict[str, dict[str, Any]]:
+        """价格 held 暂存器:键 "wallet|condition_id|outcome_index" -> {trade, wallet_entry_price, held_since}。
+        目标钱包在【现价低于我们下限】时建仓 → 不跟、暂存;独立的 held 刷新(默认每 5min,见 cli)拉
+        实时价,价**上穿**进 [下限,上限] 即补跟并清缓存;跟单方现价<0.2/冲破上限/盘结束/出 watchlist
+        则放弃清缓存。存 meta JSON blob(仅 runner 读写,跨 tick/重启持久)。"""
+        self.init_db()
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = 'held_pending_price'").fetchone()
+        out = _loads(row["value"], {}) if row else {}
+        return out if isinstance(out, dict) else {}
+
+    def save_held_pending_price(self, pending: dict[str, Any]) -> None:
+        self.init_db()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('held_pending_price', ?)",
+                (_dumps(pending or {}),),
+            )
 
     def load_results(self) -> list[dict[str, Any]]:
         self.init_db()

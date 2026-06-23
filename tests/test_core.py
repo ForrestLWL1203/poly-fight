@@ -6766,6 +6766,80 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(leg["funded_stake"], 9)
         self.assertEqual(leg["stake_mode"], "unit_pct")
 
+    def _held_strategy(self):
+        s = default_follow_strategy(balance_usdc=5000)
+        s["sizing"]["per_signal_percent"] = 1.0
+        s["sizing"]["per_match_percent"] = 5.0
+        s["prefilters"]["min_target_wallet_order_cash_usdc"] = 0
+        s["prefilters"]["min_follow_entry_price"] = 0.56   # 下限
+        s["prefilters"]["max_follow_entry_price"] = 0.75   # 上限
+        return s
+
+    def _held_market(self, price, now):
+        return {
+            "condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [price, round(1 - price, 4)],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "Match", "market_type": "main_match",
+        }
+
+    def test_price_held_stash_below_floor_then_follow_on_upward_cross(self):
+        now = 1000
+        strategy = self._held_strategy()
+        held: dict = {}
+        # 现价 0.50 < 下限 0.56 → 不跟,存入 held(钱包价 0.50 ≤ 上限,非下穿)
+        trade = {"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.50, "size": 100, "timestamp": now}
+        signals, stats = process_follow_trades(
+            [], wallet="0xA", trades=[trade], markets_by_condition={"m1": self._held_market(0.50, now)},
+            now_ts=now, stake_usdc=1, max_follow_legs=10, max_slippage=1.0,
+            min_wallet_entry_price=0.4, max_entry_price=0.75, bankroll_usdc=5000,
+            follow_strategy=strategy, held_pending_price=held,
+        )
+        self.assertEqual(stats["new_leg_count"], 0)
+        self.assertEqual(signals, [])
+        self.assertIn("0xa|m1|0", held)
+        self.assertEqual(stats.get("price_held_count"), 1)
+
+        # 价上穿到 0.60 ∈ [0.56,0.75] → 复用 held 的 trade 补跟,leg 建成、held 清空
+        signals2, stats2 = process_follow_trades(
+            [], wallet="0xA", trades=[dict(held["0xa|m1|0"]["trade"])],
+            markets_by_condition={"m1": self._held_market(0.60, now)},
+            now_ts=now, stake_usdc=1, max_follow_legs=10, max_slippage=1.0,
+            min_wallet_entry_price=0.4, max_entry_price=0.75, bankroll_usdc=5000,
+            follow_strategy=strategy, held_pending_price=held,
+        )
+        self.assertEqual(stats2["new_leg_count"], 1)
+        self.assertNotIn("0xa|m1|0", held)   # 跟成 → 清缓存
+        self.assertAlmostEqual(signals2[0]["legs"][0]["our_entry_price"], 0.60)
+
+    def test_price_held_not_stashed_on_downward_crossing(self):
+        # 钱包买在 0.80(>上限),现价 0.50(<下限):下穿,wallet_entry_above_ceiling 挡 → 不 held。
+        now = 1000
+        strategy = self._held_strategy()
+        held: dict = {}
+        trade = {"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.80, "size": 100, "timestamp": now}
+        signals, stats = process_follow_trades(
+            [], wallet="0xA", trades=[trade], markets_by_condition={"m1": self._held_market(0.50, now)},
+            now_ts=now, stake_usdc=1, max_follow_legs=10, max_slippage=1.0,
+            min_wallet_entry_price=0.4, max_entry_price=0.75, bankroll_usdc=5000,
+            follow_strategy=strategy, held_pending_price=held,
+        )
+        self.assertEqual(signals, [])
+        self.assertEqual(held, {})                       # 下穿不缓存
+        self.assertEqual(stats.get("price_held_count", 0), 0)
+
+    def test_price_held_dropped_when_wallet_sells(self):
+        now = 1000
+        strategy = self._held_strategy()
+        held = {"0xa|m1|0": {"trade": {"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.50, "size": 100, "timestamp": now}, "wallet_entry_price": 0.50, "held_since": now}}
+        sell = {"id": "s1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "SELL", "price": 0.52, "size": 100, "timestamp": now + 10}
+        process_follow_trades(
+            [], wallet="0xA", trades=[sell], markets_by_condition={"m1": self._held_market(0.52, now)},
+            now_ts=now, stake_usdc=1, max_follow_legs=10, max_slippage=1.0,
+            min_wallet_entry_price=0.4, max_entry_price=0.75, bankroll_usdc=5000,
+            follow_strategy=strategy, held_pending_price=held,
+        )
+        self.assertNotIn("0xa|m1|0", held)   # 钱包卖了 → 清缓存,不再等上穿
+
     def test_process_follow_trades_caps_total_stake_per_signal(self):
         now = 1000
         market = {
