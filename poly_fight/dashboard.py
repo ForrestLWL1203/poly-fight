@@ -3553,6 +3553,7 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
                 "funded_open_leg_count": 0,
                 "insufficient_balance_leg_count": 0,
                 "settlement_type_counts": {},
+                "settled_by_price_count": 0,
                 "open_pnl_legs": [],
                 "our_realized_pnl": 0.0,
                 "wallet_basis_realized_pnl": 0.0,
@@ -3604,6 +3605,9 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
         settlement_type = _signal_settlement_type(signal)
         if settlement_type:
             bucket["settlement_type_counts"][settlement_type] = bucket["settlement_type_counts"].get(settlement_type, 0) + 1
+        # 价格隐含结算(盘口未 closed、靠实时价≈1.0 提前结)的审计标记,聚合到整场。
+        if signal.get("settled_by_price"):
+            bucket["settled_by_price_count"] += 1
         if status == "open":
             outcome_index = int(signal.get("outcome_index") or 0)
             for leg in legs:
@@ -3662,6 +3666,7 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
             bucket["settlement_type"] = "auto_settlement"
         else:
             bucket["settlement_type"] = ""
+        bucket["settled_by_price"] = bool(bucket.pop("settled_by_price_count", 0))
         _exit_stake = to_float(bucket.pop("_exit_stake", 0.0))
         _weighted_exit = to_float(bucket.pop("_weighted_exit", 0.0))
         bucket["follow_exit_price"] = round(_weighted_exit / _exit_stake, 8) if _exit_stake > 0 else None

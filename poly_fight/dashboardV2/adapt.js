@@ -378,6 +378,8 @@
       // 已平仓的细分:manual_exit=目标清仓/对账兜底,我们提前镜像平仓;
       // auto_settlement=等到市场结算;auto_and_manual=多信号混合。用于区分"提前卖出 vs 自动结算"。
       settlementType: open ? "" : String(row.settlement_type || ""),
+      // 价格隐含结算:盘口还没正式关闭,我们按实时盘口价≈1.0 提前结算这场。
+      settledByPrice: !open && !!row.settled_by_price,
       settlement,
       exitPrice: row.follow_exit_price != null ? num(row.follow_exit_price) : null,
       wallets: num(row.wallet_count),

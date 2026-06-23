@@ -7515,7 +7515,7 @@ class CoreTest(unittest.TestCase):
         state = {}
         client = FakeClient()
 
-        resolutions = fetch_resolutions_for_open_signals(
+        resolutions, price_settled = fetch_resolutions_for_open_signals(
             client,
             [signal],
             state=state,
@@ -7525,6 +7525,7 @@ class CoreTest(unittest.TestCase):
         )
 
         self.assertEqual(resolutions, {})
+        self.assertEqual(price_settled, set())
         self.assertEqual(client.calls, 0)
 
     def test_follow_resolution_lookup_queries_open_condition_ids_directly(self):
@@ -7552,7 +7553,7 @@ class CoreTest(unittest.TestCase):
         signal = {"condition_id": "m1", "match_start_time": datetime.fromtimestamp(500, timezone.utc).isoformat()}
         client = FakeClient()
 
-        resolutions = fetch_resolutions_for_open_signals(
+        resolutions, price_settled = fetch_resolutions_for_open_signals(
             client,
             [signal],
             state={},
@@ -7562,8 +7563,65 @@ class CoreTest(unittest.TestCase):
         )
 
         self.assertEqual(resolutions, {"m1": 1})
+        self.assertEqual(price_settled, set())  # m1 已由 closed 路径结算,无需价格兜底
         self.assertEqual(client.event_calls, 0)  # no broad closed-events pull
         self.assertEqual(client.market_calls, [["m1"]])
+
+    def test_follow_resolution_price_implied_settles_unclosed_market(self):
+        # 盘口关闭有延迟:closed=true 查询拿不到盘(返回空),但不带 closed 过滤的实时价查询
+        # 显示某边中间价 ≈1.0 → 价格隐含结算,赢家=该边,并标记进 price_settled。
+        class FakeClient:
+            def __init__(self):
+                self.market_calls = []
+                self.gamma_calls = []
+
+            def markets_by_condition_ids(self, condition_ids, *, limit=500):
+                self.market_calls.append(list(condition_ids))
+                return []  # Polymarket 尚未标记 closed
+
+            def gamma(self, path, **params):
+                self.gamma_calls.append((path, params))
+                return [{"conditionId": "m1", "outcomePrices": '["0.0005", "0.9995"]', "closed": False}]
+
+        signal = {"condition_id": "m1", "match_start_time": datetime.fromtimestamp(500, timezone.utc).isoformat()}
+        client = FakeClient()
+
+        resolutions, price_settled = fetch_resolutions_for_open_signals(
+            client,
+            [signal],
+            state={},
+            now_ts=1000,
+            gamma_pages=1,
+            ttl_seconds=900,
+        )
+
+        self.assertEqual(resolutions, {"m1": 1})
+        self.assertEqual(price_settled, {"m1"})
+        self.assertEqual(client.market_calls, [["m1"]])
+        self.assertEqual(len(client.gamma_calls), 1)
+
+    def test_follow_resolution_price_implied_skips_below_threshold(self):
+        # 直播中暂时领先(0.97 < 0.999)但尚未打完:不提前误结,等真正≈1.0 或 closed。
+        class FakeClient:
+            def markets_by_condition_ids(self, condition_ids, *, limit=500):
+                return []
+
+            def gamma(self, path, **params):
+                return [{"conditionId": "m1", "outcomePrices": '["0.03", "0.97"]', "closed": False}]
+
+        signal = {"condition_id": "m1", "match_start_time": datetime.fromtimestamp(500, timezone.utc).isoformat()}
+
+        resolutions, price_settled = fetch_resolutions_for_open_signals(
+            FakeClient(),
+            [signal],
+            state={},
+            now_ts=1000,
+            gamma_pages=1,
+            ttl_seconds=900,
+        )
+
+        self.assertEqual(resolutions, {})
+        self.assertEqual(price_settled, set())
 
     def test_follow_tick_does_not_write_performance_json(self):
         with TemporaryDirectory() as tmp:

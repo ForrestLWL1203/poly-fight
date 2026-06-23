@@ -1278,6 +1278,24 @@ def winner_outcome_index(market: dict[str, Any]) -> int | None:
     return best_index if to_float(prices[best_index]) >= 0.99 else None
 
 
+# 价格隐含结算阈值:比赛已结束但 Polymarket 盘口关闭有延迟,closed=true 查询此时拿不到该盘。
+# 用实时盘口价兜底——某一边中间价 ≥ 此阈值即认定该边为赢家并提前结算。阈值取严(0.999,≈1.0,
+# 高于 winner_outcome_index 对已关闭盘的 0.99),以免把直播中暂时领先、但尚未打完的赛事误结。
+PRICE_IMPLIED_SETTLE_THRESHOLD = 0.999
+
+
+def price_implied_winner_index(market: dict[str, Any]) -> int | None:
+    """未关闭盘的价格隐含结算:某一边中间价 ≥ PRICE_IMPLIED_SETTLE_THRESHOLD(≈1.0)即判该边赢家。
+
+    与 winner_outcome_index 的区别:后者作用于已 closed 的盘、用 0.99;这里作用于**尚未 closed**
+    的实时盘,故阈值更严(0.999),只在价已实质到 1 时才结,降低提前误结风险。"""
+    prices = market.get("outcome_prices") or []
+    if not prices:
+        return None
+    best_index = max(range(len(prices)), key=lambda index: to_float(prices[index]))
+    return best_index if to_float(prices[best_index]) >= PRICE_IMPLIED_SETTLE_THRESHOLD else None
+
+
 # 作废/退款结算:市场已关闭但无明确赢家([0.5,0.5],如横扫导致某 map 没打)→ CTF 每股赎回
 # $0.50。VOID_RESOLUTION_INDEX 作为 resolutions dict 的哨兵,与真实 outcome_index(≥0)区分。
 VOID_RESOLUTION_INDEX = -2

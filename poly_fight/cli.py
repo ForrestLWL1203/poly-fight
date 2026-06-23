@@ -77,6 +77,7 @@ from .follow import (
     market_current_price,
     paper_exit_pnl,
     paper_pnl,
+    price_implied_winner_index,
     process_follow_trades,
     prune_unfollowed_signals,
     select_new_trades,
@@ -1997,7 +1998,7 @@ def fetch_resolutions_for_open_signals(
     now_ts: int,
     gamma_pages: int,
     ttl_seconds: int,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], set[str]]:
     eligible_signals = []
     for signal in open_signals:
         start_dt = parse_dt(signal.get("match_start_time"))
@@ -2005,7 +2006,7 @@ def fetch_resolutions_for_open_signals(
             continue
         eligible_signals.append(signal)
     if not eligible_signals:
-        return {}
+        return {}, set()
     needed = sorted(
         {
             str(signal.get("condition_id") or "").lower()
@@ -2014,7 +2015,7 @@ def fetch_resolutions_for_open_signals(
         }
     )
     if not needed:
-        return {}
+        return {}, set()
     # Resolve exactly the started open signals' markets via a targeted batch query.
     # No broad closed-events pull and no scratch cache: winners are persisted into
     # signals/results by the caller, so there is nothing here worth retaining. With a
@@ -2034,7 +2035,30 @@ def fetch_resolutions_for_open_signals(
             # 作废/退款盘([0.5,0.5],如横扫未打的 map):已结算但无赢家 → 哨兵,让
             # settle_open_signals 按 $0.50 赎回结掉,释放卡死的资金。
             resolutions[condition_id] = VOID_RESOLUTION_INDEX
-    return resolutions
+
+    # 价格隐含结算:比赛已结束但 Polymarket 盘口关闭有延迟时,上面的 closed=true 查询拿不到这些盘
+    # (会一直显示"进行中")。对仍未结算的盘再发一次**不带 closed 过滤**的实时价查询,某一边中间价
+    # ≥0.999(≈1.0)即认定该边为赢家、提前结算。winner / void 已结的盘不重复处理;实时价查询失败
+    # (或 client 无 gamma)就跳过,退回原行为。
+    price_settled: set[str] = set()
+    unresolved = [condition_id for condition_id in needed if condition_id not in resolutions]
+    if unresolved:
+        try:
+            live_markets = client.gamma(
+                "/markets", condition_ids=unresolved, limit=max(1, len(unresolved))
+            )
+        except Exception:
+            live_markets = []
+        live_records = resolution_market_records_from_markets(live_markets or [])
+        for condition_id in unresolved:
+            market = live_records.get(condition_id)
+            if not market:
+                continue
+            winner = price_implied_winner_index(market)
+            if winner is not None:
+                resolutions[condition_id] = winner
+                price_settled.add(condition_id)
+    return resolutions, price_settled
 
 
 def fetch_user_trades_until_cursor(
@@ -7127,13 +7151,14 @@ def command_follow(
     # 游标用每信号 resolution_checked_at 持久化(随 open_signals 落库),全局闸 = max(stamp)。
     resolution_poll_interval = int(getattr(args, "resolution_poll_seconds", 300) or 0)
     resolutions: dict[str, int] = {}
+    price_settled_cids: set[str] = set()
     if open_signals and (
         resolution_poll_interval <= 0
         or now_ts - max((to_int(s.get("resolution_checked_at")) for s in open_signals), default=0) >= resolution_poll_interval
     ):
         for signal in open_signals:
             signal["resolution_checked_at"] = now_ts
-        resolutions = fetch_resolutions_for_open_signals(
+        resolutions, price_settled_cids = fetch_resolutions_for_open_signals(
             client,
             open_signals,
             state=state,
@@ -7143,6 +7168,15 @@ def command_follow(
             ttl_seconds=args.resolution_cache_ttl_seconds,
         )
     open_signals, settled = settle_open_signals(open_signals, resolutions, now_ts=now_ts)
+    # 价格隐含结算(盘口未 closed,靠实时价≈1.0 判定)的信号打审计标记,区别于 Polymarket
+    # 正式结算结果;后续 dashboard / 复盘可据此分辨"提前按盘口价结"的单。
+    if price_settled_cids:
+        for signal in settled:
+            if str(signal.get("condition_id") or "").lower() in price_settled_cids:
+                signal["settled_by_price"] = True
+                signal.setdefault("behavior_events", []).append(
+                    {"kind": "settled_by_price", "timestamp": now_ts}
+                )
     result_events = [*exited_signals, *settled]
     # 小单累加器清理:① 已结算/已离场的赛事 cid;② 已不在 watchlist 的赛事(结束/出范围,
     # 不会再有新 fill 触发)。凑够即跟时已就地清键,这里只兜底清理"凑不够就结束/卖光"的残留。

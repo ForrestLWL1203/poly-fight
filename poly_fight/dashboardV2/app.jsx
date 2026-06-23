@@ -121,13 +121,23 @@ function TeamLine({ ev, size = 26, held }) {
 }
 // 跟单状态徽标:区分"进行中 / 提前卖出(镜像清仓,非市场结算) / 已结算(市场结算)"。
 // 提前卖出沿用 warn 色徽标(同 源已脱榜),让列表一眼看出是我们主动平的还是等到结算。
+// settledByPrice:盘口还没正式关闭、我们按实时价≈1.0 提前结算的场,附一个小 "盘口价" 标记。
 function FollowStatusBadge({ f }) {
   if (f.status === "open") return <Badge tone="up" dot>进行中</Badge>;
+  let main;
   if (f.settlementType === "manual_exit")
-    return <Badge tone="warn" title="目标钱包在比赛结算前清仓(或对账兜底补平),我们已镜像平仓 — 非市场结算">提前卖出</Badge>;
-  if (f.settlementType === "auto_and_manual")
-    return <Badge tone="warn" title="多个信号:部分镜像平仓、部分等到市场结算">部分卖出</Badge>;
-  return <Badge tone="accent" dot title="持有到市场结算(自然结算)">自动结算</Badge>;
+    main = <Badge tone="warn" title="目标钱包在比赛结算前清仓(或对账兜底补平),我们已镜像平仓 — 非市场结算">提前卖出</Badge>;
+  else if (f.settlementType === "auto_and_manual")
+    main = <Badge tone="warn" title="多个信号:部分镜像平仓、部分等到市场结算">部分卖出</Badge>;
+  else
+    main = <Badge tone="accent" dot title="持有到市场结算(自然结算)">自动结算</Badge>;
+  if (!f.settledByPrice) return main;
+  return (
+    <React.Fragment>
+      {main}
+      <Badge tone="neutral" outline title="比赛已结束、但 Polymarket 盘口尚未正式关闭时,按实时盘口价≈1.0 提前结算(胜负/盈亏与官方结算一致)">盘口价</Badge>
+    </React.Fragment>
+  );
 }
 function MatchCell({ ev, tag, held }) {
   const dual = held && held.length >= 2;
