@@ -6431,6 +6431,47 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(signals[0]["legs"][0]["stake"], 300)
         self.assertEqual(signals[0]["legs"][0]["wallet_trade_cash"], 3000)
 
+    def test_process_follow_trades_skips_buy_already_covered_by_backfill_leg(self):
+        # 重启补单去重:持仓已由 backfill 腿覆盖(trade_id 前缀 backfill:),live/data-api 随后又看到
+        # 那笔真实买单(真 tx、时间戳 ≤ 补单建仓时间)→ 同一持仓不重复跟;补单之后的真·加仓仍跟。
+        from poly_fight.follow import process_follow_trades, follow_signal_id
+        now = 100000
+        wallet = "0xa"; cond = "m1"
+        market = {
+            "condition_id": cond, "outcomes": ["A", "B"], "outcome_prices": [0.5, 0.5],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "Match", "market_type": "main_match",
+        }
+        buy_ts = now - 1800
+        backfill_sig = {
+            "signal_id": follow_signal_id(wallet, cond, 0),
+            "wallet": wallet, "condition_id": cond, "outcome_index": 0, "status": "open",
+            "legs": [{
+                "trade_id": f"backfill:{wallet}:{cond}:0", "wallet_trade_at": buy_ts,
+                "stake": 50, "funded_stake": 50, "our_entry_price": 0.5, "wallet_fill_price": 0.5,
+                "wallet_trade_cash": 100, "wallet_trade_size": 100,
+            }],
+        }
+        real_trade = {"id": "0xrealtx", "proxyWallet": wallet, "market": cond, "outcomeIndex": 0,
+                      "side": "BUY", "price": 0.5, "size": 100, "timestamp": buy_ts}
+        signals, stats = process_follow_trades(
+            [dict(backfill_sig, legs=list(backfill_sig["legs"]))], wallet=wallet, trades=[real_trade],
+            markets_by_condition={cond: market}, now_ts=now, stake_usdc=1, stake_ratio_percent=10,
+            max_follow_legs=10, max_slippage=1.0, bankroll_usdc=1000,
+        )
+        self.assertEqual(len(signals[0]["legs"]), 1)              # 同一笔被去重,没新增腿
+        self.assertEqual(stats["backfill_dup_skipped_count"], 1)
+
+        # 补单之后的真·加仓(时间戳 > 补单建仓时间)→ 正常跟,新增一条腿
+        later = {"id": "0xlater", "proxyWallet": wallet, "market": cond, "outcomeIndex": 0,
+                 "side": "BUY", "price": 0.5, "size": 100, "timestamp": buy_ts + 600}
+        signals2, _ = process_follow_trades(
+            [dict(backfill_sig, legs=list(backfill_sig["legs"]))], wallet=wallet, trades=[later],
+            markets_by_condition={cond: market}, now_ts=now, stake_usdc=1, stake_ratio_percent=10,
+            max_follow_legs=10, max_slippage=1.0, bankroll_usdc=1000,
+        )
+        self.assertEqual(len(signals2[0]["legs"]), 2)             # 加仓被跟
+
     def test_process_follow_trades_records_observed_delay_diagnostics(self):
         now = 1000
         market = {
@@ -14952,7 +14993,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.host, "127.0.0.1")
         self.assertEqual(args.port, 8787)
         self.assertEqual(args.user, "admin")
-        self.assertEqual(args.session_ttl_seconds, 12 * 3600)
+        self.assertEqual(args.session_ttl_seconds, 7 * 24 * 3600)
         self.assertFalse(args.cookie_secure)
         self.assertEqual(args.max_requests_per_second, 10)
         self.assertEqual(args.stream_poll_seconds, 2.0)

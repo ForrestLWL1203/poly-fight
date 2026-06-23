@@ -653,6 +653,7 @@ def process_follow_trades(
         "veto_fade_skip_count": 0,
         "veto_no_data_count": 0,
         "veto_held_count": 0,
+        "backfill_dup_skipped_count": 0,
     }
     veto_cache: dict[str, Any] = {}  # 本 tick 内按比赛缓存 veto(Map1/2/3 同场复用,不重复打 bo3)
     # held-pending-veto 复跟:把本钱包上 tick 因「盘前」暂存的 cs2 map_winner 买单重新注入,
@@ -744,6 +745,20 @@ def process_follow_trades(
         if existing and len(existing.get("legs") or []) >= max_follow_legs:
             stats["ignored_trade_count"] += 1
             continue
+        # 补单去重:该持仓已被"启动持仓补单"建过腿(trade_id 前缀 backfill:,wallet_trade_at=
+        # 钱包真实建仓时间)。补单合成 id 与真实 tx 不同 → cursor 去重撞不上;若不显式拦,重启后
+        # live/data-api 再看到那笔真实买单会把同一持仓重复跟一次(实测 0x3e23… 同仓两条腿)。
+        # 规则:非补单交易,且其时间戳 ≤ 补单已覆盖的建仓时间 → 同一笔,跳过;之后的真·加仓仍跟。
+        if existing and not str(trade_id(trade)).startswith("backfill:"):
+            backfill_cover_ts = max(
+                (to_int(leg.get("wallet_trade_at")) for leg in (existing.get("legs") or [])
+                 if str(leg.get("trade_id") or "").startswith("backfill:")),
+                default=0,
+            )
+            if backfill_cover_ts and trade_ts and trade_ts <= backfill_cover_ts:
+                stats["backfill_dup_skipped_count"] += 1
+                stats["ignored_trade_count"] += 1
+                continue
         market_type = str(market.get("market_type") or "main_match")
         market_league = str(market.get("league") or "").lower()
         market_bucket = bucket_key(str(market.get("game_family") or market_league or "unknown"), market_type)
