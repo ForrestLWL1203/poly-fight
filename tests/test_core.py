@@ -14131,19 +14131,22 @@ class CoreTest(unittest.TestCase):
             # 不存在的 db → 空(不抛)
             self.assertEqual(storage_module.LeaderboardStore(Path(d) / "nope.db").load_observe_analyzed(now_ts=now), {})
 
-    def _setup_rescore_demote_case(self, root, *, now, favorite=None):
-        """Seed leaderboard_v2.db + 打分池 profiles + 0xdrop 原始交易缓存,返回常用路径。"""
+    def _setup_rescore_demote_case(self, root, *, now, favorite=None, extra=()):
+        """Seed leaderboard_v2.db + 已发布榜 JSON + 打分池 profiles + 0xdrop 原始交易缓存。
+        extra: 额外的"在榜无辜钱包",用于验证精准删除不波及它们。"""
         import poly_fight.storage as storage_module
         esports_dir = root / "esports"
         follow_dir = root / "follow"
         collector_dir = esports_dir / "collector_v2"
         collector_dir.mkdir(parents=True, exist_ok=True)
+        rows = [{"wallet": "0xdrop", "grade": "A"}, {"wallet": "0xkeep", "grade": "A"}]
+        rows += [{"wallet": w, "grade": "A"} for w in extra]
         storage_module.LeaderboardStore(esports_dir / "leaderboard_v2.db").replace_leaderboard(
-            [{"wallet": "0xdrop", "grade": "A"}, {"wallet": "0xkeep", "grade": "A"}],
-            category="esports", updated_at=now,
+            rows, category="esports", updated_at=now,
         )
-        (collector_dir / "collector_v2_wallet_profiles.json").write_text(
-            json.dumps([{"wallet": "0xdrop", "grade": "A"}, {"wallet": "0xkeep", "grade": "A"}]))
+        (collector_dir / "collector_v2_wallet_profiles.json").write_text(json.dumps(rows))
+        # 已发布榜 JSON:精准删除路径从这里摘人(publish 链路也读它)。
+        (collector_dir / "collector_v2_leaderboard.json").write_text(json.dumps(rows))
         from poly_fight.cli import user_trades_cache_path
         drop_cache = user_trades_cache_path(collector_dir, "0xdrop")
         drop_cache.parent.mkdir(parents=True, exist_ok=True)
@@ -14151,6 +14154,42 @@ class CoreTest(unittest.TestCase):
         if favorite:
             FollowStore(follow_dir / "follow.db").upsert_wallet_favorite(favorite, category="esports", ts=now)
         return esports_dir, follow_dir, collector_dir, drop_cache
+
+    def test_rescore_demote_surgical_keeps_innocent_onboard_wallet(self):
+        # 核心回归:M5 降级走"精准删除",只摘掉刚结算跌出 A 的钱包;即便此刻一次"弱重评"会让
+        # 全量重算把无辜的在榜钱包也排除,精准删除也不能波及它 —— 根治"榜单人数无故跳动"。
+        from unittest.mock import patch
+        from poly_fight.cli import rescore_demote_wallets, normalize_wallet
+        import poly_fight.storage as storage_module
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = 1_700_000_000
+            esports_dir, follow_dir, collector_dir, _drop_cache = self._setup_rescore_demote_case(
+                root, now=now, extra=["0xinnocent"])
+
+            class FakeClient:
+                def list_events_paginated(self, **_kwargs):
+                    return []
+
+            parser = build_parser()
+            args = parser.parse_args(["--data-dir", str(esports_dir), "run", "--stake-usdc", "1"])
+
+            # 弱重评:全量重算会把 0xdrop 和无辜的 0xinnocent 一起排除。但只有刚结算的 0xdrop 在
+            # targets 里 → 只它被判降级;0xinnocent 不在 targets,不该被这次发布抹掉。
+            def fake_build(profiles, **_kwargs):
+                return {"leaderboard": [{"wallet": w, "grade": "A"} for w in profiles if w not in ("0xdrop", "0xinnocent")]}
+
+            with patch("poly_fight.cli.build_collector_leaderboard_v2", side_effect=fake_build):
+                result = rescore_demote_wallets(
+                    FakeClient(), args, wallets={"0xdrop"}, follow_dir=follow_dir, now_ts=now,
+                )
+
+            self.assertEqual(set(result["demoted_wallets"]), {"0xdrop"})
+            board_rows, _meta = storage_module.LeaderboardStore(esports_dir / "leaderboard_v2.db").load_leaderboard(category="esports")
+            board = {normalize_wallet(r.get("wallet")) for r in board_rows}
+            self.assertNotIn("0xdrop", board)        # 被降级的精准删除
+            self.assertIn("0xkeep", board)            # 其余保留
+            self.assertIn("0xinnocent", board)        # 关键:无辜在榜钱包不被弱重评波及
 
     def test_rescore_demote_wallets_deletes_off_board_only(self):
         from unittest.mock import patch

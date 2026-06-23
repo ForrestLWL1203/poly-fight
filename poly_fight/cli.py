@@ -5722,13 +5722,26 @@ def _delete_wallets_from_leaderboard(
             output_dir / "collector_v2_wallet_profiles.json",
             [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
         )
-        leaderboard = build_collector_leaderboard_v2(
-            profiles_by_wallet, now_ts=now_ts,
-            per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
-            max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
-            include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
-            gate_kwargs=_v2_gate_kwargs_from_args(args),
-        )["leaderboard"]
+        # **精准删除**:只把被淘汰钱包从当前已发布榜里摘掉,其余行原样保留 —— 不再全量重算整张榜。
+        # 全量重算会让一次"弱重评"(某游戏当下样本不足等)顺手把无辜的边界钱包一起抹掉 → 榜单
+        # 人数无故跳动;M5 的职责只是摘掉刚结算跌出 A 的那几个,补位(空出名额谁上)是 observe/
+        # collect 的活。评分决策(谁该降)仍在调用方用同一套 build_collector_leaderboard_v2 判定,
+        # 三线(collect/observe/M5)评分口径不变,这里改的只是"发布"这一步。
+        current_board = read_json(output_dir / "collector_v2_leaderboard.json", [])
+        current_board = [row for row in current_board if isinstance(row, dict)] if isinstance(current_board, list) else []
+        if current_board:
+            leaderboard = [row for row in current_board if normalize_wallet(row.get("wallet")) not in set(targets)]
+            for new_rank, row in enumerate(leaderboard, start=1):
+                row["rank"] = new_rank
+        else:
+            # 退化兜底:榜 JSON 缺失时回退全量重算,避免发布空榜把 DB 榜清空。
+            leaderboard = build_collector_leaderboard_v2(
+                profiles_by_wallet, now_ts=now_ts,
+                per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
+                max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
+                include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
+                gate_kwargs=_v2_gate_kwargs_from_args(args),
+            )["leaderboard"]
         write_json(
             output_dir / "collector_v2_leaderboard.json",
             [slim_profile_for_storage(row) for row in leaderboard],
