@@ -7452,6 +7452,11 @@ def command_follow(
         "db_path": str(follow_dir / "follow.db"),
         "active_market_cache_path": str(active_cache_path),
         "schema_version": 1,
+        # 周期计时器必须跨 tick 持久:state 每 tick 从磁盘重读,这里若不带上,它们每跳归 0 →
+        # 判定永远满足 → sweep/held/stoploss 失去节流、每跳都触发(把 data-api 打成每 ~7s 一轮)。
+        "last_dataapi_sweep_at": to_int(state.get("last_dataapi_sweep_at")),
+        "last_held_refresh_at": to_int(state.get("last_held_refresh_at")),
+        "last_stop_loss_check_at": to_int(state.get("last_stop_loss_check_at")),
     }
     write_json(state_path, state)
 
