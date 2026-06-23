@@ -125,10 +125,12 @@ function TeamLine({ ev, size = 26, held }) {
 function FollowStatusBadge({ f }) {
   if (f.status === "open") return <Badge tone="up" dot>进行中</Badge>;
   let main;
-  if (f.settlementType === "manual_exit")
+  if (f.settlementType === "stop_loss")
+    main = <Badge tone="down" title="主盘止损:现价较入场跌幅达到策略阈值,按现价全平、不等结算归零">止损</Badge>;
+  else if (f.settlementType === "manual_exit")
     main = <Badge tone="warn" title="目标钱包在比赛结算前清仓(或对账兜底补平),我们已镜像平仓 — 非市场结算">提前卖出</Badge>;
   else if (f.settlementType === "auto_and_manual")
-    main = <Badge tone="warn" title="多个信号:部分镜像平仓、部分等到市场结算">部分卖出</Badge>;
+    main = <Badge tone="warn" title="多个信号:部分镜像平仓/止损、部分等到市场结算">部分卖出</Badge>;
   else
     main = <Badge tone="accent" dot title="持有到市场结算(自然结算)">自动结算</Badge>;
   if (!f.settledByPrice) return main;
@@ -1049,6 +1051,7 @@ const STRATEGY_DEFAULTS = {
   minSignalOn: true, minSignal: "10",
   maxEntryOn: true, maxEntry: "0.68",
   minEntryOn: false, minEntry: "0.58",
+  stopLossOn: false, stopLoss: "55",
   perSignalPct: "1", perMatchPct: "1", minStake: "1",
   realtimeRefresh: false,
 };
@@ -1063,7 +1066,8 @@ function strategyDigest(s) {
   const filter = `门槛 ${usdInt(n(s.minSignal))}`;
   const maxEntry = s.maxEntryOn ? `现价 ≤ ${s.maxEntry}` : null;
   const minEntry = s.minEntryOn ? `现价 ≥ ${s.minEntry}` : null;
-  return { sizing, chips: [filter, minEntry, maxEntry].filter(Boolean) };
+  const stopLoss = s.stopLossOn ? `主盘止损 -${s.stopLoss}%` : null;
+  return { sizing, chips: [filter, minEntry, maxEntry, stopLoss].filter(Boolean) };
 }
 
 function NumField({ value, onChange, unit, width = 76, lead, disabled }) {
@@ -1127,6 +1131,7 @@ function Ico({ n, className }) {
     case "square": return <svg {...p}><rect width="18" height="18" x="3" y="3" rx="2" /></svg>;
     case "refresh-cw": return <svg {...p}><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" /><path d="M8 16H3v5" /></svg>;
     case "activity": return <svg {...p}><path d="M22 12h-4l-3 9L9 3l-3 9H2" /></svg>;
+    case "trending-down": return <svg {...p}><polyline points="22 17 13.5 8.5 8.5 13.5 2 7" /><polyline points="16 17 22 17 22 11" /></svg>;
     case "radio": return <svg {...p}><path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9" /><path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5" /><circle cx="12" cy="12" r="2" /><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5" /><path d="M19.1 4.9C23 8.8 23 15.2 19.1 19.1" /></svg>;
     default: return null;
   }
@@ -1141,6 +1146,7 @@ function strategyNodes(s) {
     { k: "信号门槛", v: s.minSignalOn ? `忽略 < ${usdInt(n(s.minSignal))}` : "不限" },
     { k: "现价上限", v: s.maxEntryOn ? `现价 ≤ ${s.maxEntry}` : "不限" },
     { k: "现价下限", v: s.minEntryOn ? `现价 ≥ ${s.minEntry}` : "不限" },
+    { k: "主盘止损", v: s.stopLossOn ? `跌 ${s.stopLoss}% 平仓` : "不限" },
     { k: "单笔金额", v: dg.sizing, key: true },
     { k: "单场预算", v: `主盘 ≤ 余额 ${s.perMatchPct || 0}% · 子盘 ≤ ${s.perMatchSubPct || 0}%` },
     { k: "每场笔数", v: (Number(s.maxOrdersPerMatch) || 0) > 0 ? `≤ ${s.maxOrdersPerMatch} 笔` : "不限" },
@@ -1217,6 +1223,16 @@ function StrategyEditor({ s, up, wallet, locked }) {
             </label>
             <NumField value={s.minEntry} onChange={up("minEntry")} lead="现价 <" unit="不跟" width={56} disabled={!s.minEntryOn} />
             <p className="cfg-sub">现价低于此值则不跟,过滤低价冷门(回测里 &lt;0.5 段失血最重)。需 &lt; 上限,0/关=不限。默认关。</p>
+          </div>
+        </div>
+        <div className="cfg-mini">
+          <div className="cm-head"><Ico n="trending-down" /><span>主盘止损</span></div>
+          <div className="cm-body">
+            <label className="check-row" onClick={(e) => e.stopPropagation()}>
+              <input type="checkbox" checked={s.stopLossOn} onChange={(e) => up("stopLossOn")(e.target.checked)} /><span className="cr-label">启用</span>
+            </label>
+            <NumField value={s.stopLoss} onChange={up("stopLoss")} lead="跌" unit="% 平仓" width={56} disabled={!s.stopLossOn} />
+            <p className="cfg-sub">仅主盘:现价较加权入场跌幅达到此% → 按现价全平,不等结算归零(标记「止损」)。回测仅主盘净正、子盘净负,故只作用主盘。默认关。</p>
           </div>
         </div>
         <div className="cfg-mini">

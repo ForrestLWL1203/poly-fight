@@ -69,6 +69,8 @@ from .follow import (
     aggregate_follow_performance,
     apply_closing_line_snapshots,
     apply_contested_flags,
+    apply_stop_loss_exit,
+    signal_weighted_avg_entry,
     contested_markets,
     desired_tick_interval,
     eligible_follow_wallets,
@@ -6588,6 +6590,7 @@ def command_follow(
     open_signals = prune_unfollowed_signals(store.load_open_signals())
     pending_small_buys = store.load_pending_small_buys()   # 小单累加器(跨 tick 持久)
     held_pending_price = store.load_held_pending_price()   # 价格 held 暂存器(现价<下限的买单,等上穿;跨 tick 持久)
+    stop_loss_blocked = store.load_stop_loss_blocked()     # 止损黑名单:已止损平过的 (钱包|盘|outcome) 不再复跟
     performance = store.load_performance()
     account_balance = store.load_account_balance()
     account_balance_configured = bool(account_balance.get("configured"))
@@ -6846,6 +6849,7 @@ def command_follow(
                     max_signal_stake_usdc=max_signal_stake_usdc,
                     follow_strategy=follow_strategy,
                     held_pending_price=held_pending_price,
+                    stop_loss_blocked=stop_loss_blocked,
                 )
                 backfill_legs_opened += len({signal.get("signal_id") for signal in open_signals} - before_ids)
                 # 汇总各候选未开仓的拦截原因(eligibility / low_entry / small_wallet / match_budget …),
@@ -7042,6 +7046,7 @@ def command_follow(
                 follow_strategy=follow_strategy,
                 pending_small_buys=pending_small_buys,
                 held_pending_price=held_pending_price,
+                stop_loss_blocked=stop_loss_blocked,
             )
             after_ids = {signal.get("signal_id") for signal in open_signals}
             new_signal_count += len(after_ids - before_ids)
@@ -7179,6 +7184,7 @@ def command_follow(
                 follow_strategy=follow_strategy,
                 pending_small_buys=pending_small_buys,
                 held_pending_price=held_pending_price,
+                stop_loss_blocked=stop_loss_blocked,
             )
             followed_h = len({s.get("signal_id") for s in open_signals} - before_ids_h)
             price_held_followed_count += followed_h
@@ -7223,10 +7229,51 @@ def command_follow(
                 max_signal_stake_usdc=max_signal_stake_usdc,
                 follow_strategy=follow_strategy,
                 held_pending_price=held_pending_price,
+                stop_loss_blocked=stop_loss_blocked,
             )
             exited_signal_count += _exit_pft_stats.get("exited_signal_count", 0)
         if emit and exit_reconcile_stats.get("synth_sells"):
             print(json.dumps({"status": "position_exit_reconcile", **exit_reconcile_stats}, ensure_ascii=False), flush=True)
+
+    # 主盘止损(策略可调 prefilters.main_match_stop_loss_drop_pct,0=关):open 的 main_match 信号,
+    # 现价(CLOB 卖价)较加权入场跌幅 ≥ drop_pct% → 按现价全平,不等结算归零。回测仅主盘净正
+    # (系列赛大比分落后难翻盘),子盘净负故只作用 main_match;与镜像跟卖解耦、不受 0.90 高价门约束。
+    # 节流同 reconcile(默认 60s),用 state.last_stop_loss_check_at 计时。
+    stop_loss_pct = to_float(((follow_strategy or {}).get("prefilters") or {}).get("main_match_stop_loss_drop_pct"))
+    stop_loss_exit_count = 0
+    if stop_loss_pct > 0:
+        sl_interval = int(getattr(args, "reconcile_interval_seconds", 60) or 60)
+        sl_open = [
+            s for s in open_signals
+            if (s.get("status") or "open") == "open" and str(s.get("market_type") or "main_match") == "main_match"
+        ]
+        if sl_open and now_ts - to_int(state.get("last_stop_loss_check_at")) >= sl_interval:
+            state["last_stop_loss_check_at"] = now_ts
+            for signal in sl_open:
+                avg_entry = signal_weighted_avg_entry(signal)
+                if avg_entry <= 0:
+                    continue
+                oidx = to_int(signal.get("outcome_index"), -1)
+                market = (active_markets_for_follow or {}).get(str(signal.get("condition_id") or "").lower()) or {}
+                token = _market_outcome_token(market, oidx)
+                cur = 0.0
+                if token:
+                    try:
+                        cur = to_float(clob_price(token, "sell"))
+                    except Exception:
+                        cur = 0.0
+                if cur <= 0:
+                    cur = to_float(market_current_price(market, oidx))   # 退化到市场快照
+                if cur <= 0:
+                    continue
+                if cur <= avg_entry * (1.0 - stop_loss_pct / 100.0):
+                    apply_stop_loss_exit(signal, cur, now_ts, drop_pct=stop_loss_pct)
+                    stop_loss_exit_count += 1
+                    # 记入黑名单:该 (钱包|盘|outcome) 不再复跟,避免反复挨割。
+                    key = f"{normalize_wallet(signal.get('wallet'))}|{str(signal.get('condition_id') or '').lower()}|{to_int(signal.get('outcome_index'), -1)}"
+                    stop_loss_blocked[key] = {"stopped_at": now_ts, "exit_price": round(cur, 8)}
+            if stop_loss_exit_count and emit:
+                print(json.dumps({"status": "stop_loss_exit", "count": stop_loss_exit_count, "drop_pct": stop_loss_pct}, ensure_ascii=False), flush=True)
 
     settlement_started_mono = time.monotonic()
     open_signals, clv_stats = apply_closing_line_snapshots(open_signals, active_markets, now_ts=now_ts)
@@ -7278,6 +7325,14 @@ def command_follow(
             _cid = _key.split("|", 2)[1] if "|" in _key else ""
             if _cid in _settled_cids or _cid not in _watched_cids:
                 pending_small_buys.pop(_key, None)
+    # 止损黑名单清理:只在赛事【已不在 watchlist】(结束/出范围、不会再有买单)时才清键。
+    # 不能按 result_events 的 settled cid 清——刚止损的单就在 result_events 里,会被立刻清掉、失去拦截。
+    if stop_loss_blocked:
+        _watched_cids = {str(cid).lower() for cid in (watched or {})}
+        for _key in list(stop_loss_blocked):
+            _cid = _key.split("|", 2)[1] if "|" in _key else ""
+            if _cid not in _watched_cids:
+                stop_loss_blocked.pop(_key, None)
     if result_events:
         performance = aggregate_follow_performance(performance, result_events)
     else:
@@ -7356,6 +7411,7 @@ def command_follow(
         "opposite_blocked_count": opposite_blocked_count,
         "new_signal_count": new_signal_count,
         "exited_signal_count": exited_signal_count,
+        "stop_loss_exit_count": stop_loss_exit_count,
         "hedge_event_count": hedge_event_count,
         "contested_signal_count": contested_signal_count,
         "closing_line_snapshot_count": closing_line_snapshot_count,
@@ -7383,6 +7439,7 @@ def command_follow(
     }
     store.save_pending_small_buys(pending_small_buys)
     store.save_held_pending_price(held_pending_price)
+    store.save_stop_loss_blocked(stop_loss_blocked)
     store.save_follow_snapshot(
         wallet_trade_state=wallet_trade_state,
         open_signals=open_signals,

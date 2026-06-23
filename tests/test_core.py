@@ -154,6 +154,8 @@ from poly_fight.follow import (
     aggregate_follow_performance,
     apply_closing_line_snapshots,
     apply_contested_flags,
+    apply_stop_loss_exit,
+    signal_weighted_avg_entry,
     compute_clv,
     contested_markets,
     desired_tick_interval,
@@ -6826,6 +6828,54 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(signals, [])
         self.assertEqual(held, {})                       # 下穿不缓存
         self.assertEqual(stats.get("price_held_count", 0), 0)
+
+    def test_signal_weighted_avg_entry(self):
+        sig = {"legs": [
+            {"our_entry_price": 0.60, "stake": 50, "funded_stake": 50},
+            {"our_entry_price": 0.70, "stake": 50, "funded_stake": 50},
+        ]}
+        self.assertAlmostEqual(signal_weighted_avg_entry(sig), 0.65)
+
+    def test_apply_stop_loss_exit_closes_full_at_price(self):
+        now = 2000
+        sig = {"status": "open", "outcome_index": 0, "condition_id": "m1",
+               "legs": [{"our_entry_price": 0.65, "stake": 50, "funded_stake": 50}]}
+        apply_stop_loss_exit(sig, 0.26, now, drop_pct=60.0)
+        self.assertEqual(sig["status"], "exited")
+        self.assertEqual(sig["exit_reason"], "stop_loss")
+        self.assertEqual(sig["exit_price"], 0.26)
+        # paper_exit_pnl(0.65, 0.26, 50) = 50*(0.26-0.65)/0.65 = -30
+        self.assertAlmostEqual(sig["our_realized_pnl"], -30.0, places=4)
+        self.assertTrue(any(e.get("kind") == "stop_loss" for e in sig["behavior_events"]))
+
+    def test_process_follow_trades_skips_stop_loss_blocked_reentry(self):
+        # 止损过的 (钱包|盘|outcome) 在黑名单里 → 后续买单不再复跟。
+        now = 1000
+        market = {"condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [0.6, 0.4],
+                  "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+                  "title": "Match", "market_type": "main_match"}
+        trades = [{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.6, "size": 100, "timestamp": now}]
+        blocked = {"0xa|m1|0": {"stopped_at": now - 60}}
+        signals, stats = process_follow_trades(
+            [], wallet="0xA", trades=trades, markets_by_condition={"m1": market}, now_ts=now,
+            stake_usdc=1, max_follow_legs=10, max_slippage=1.0, min_wallet_entry_price=0.4,
+            max_entry_price=0.75, bankroll_usdc=5000, stop_loss_blocked=blocked,
+        )
+        self.assertEqual(signals, [])
+        self.assertEqual(stats["new_leg_count"], 0)
+        self.assertEqual(stats.get("stop_loss_reentry_blocked_count"), 1)
+
+    def test_strategy_main_match_stop_loss_normalize(self):
+        # 默认 0(关);normalize clamp 到 [0,100];旧策略缺字段→0
+        self.assertEqual(default_follow_strategy()["prefilters"]["main_match_stop_loss_drop_pct"], 0.0)
+        n = normalize_follow_strategy({"prefilters": {"main_match_stop_loss_drop_pct": 55}})
+        self.assertEqual(n["prefilters"]["main_match_stop_loss_drop_pct"], 55.0)
+        self.assertTrue(validate_follow_strategy(n)[0])
+        # 超界 clamp
+        self.assertEqual(normalize_follow_strategy({"prefilters": {"main_match_stop_loss_drop_pct": 150}})["prefilters"]["main_match_stop_loss_drop_pct"], 100.0)
+        self.assertEqual(normalize_follow_strategy({"prefilters": {"main_match_stop_loss_drop_pct": -5}})["prefilters"]["main_match_stop_loss_drop_pct"], 0.0)
+        # 旧策略无此字段 → 默认 0
+        self.assertEqual(normalize_follow_strategy({"sizing": {"per_signal_percent": 1}})["prefilters"]["main_match_stop_loss_drop_pct"], 0.0)
 
     def test_price_held_dropped_when_wallet_sells(self):
         now = 1000

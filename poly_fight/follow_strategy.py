@@ -32,6 +32,9 @@ DEFAULT_MIN_STAKE_USDC = 1.0              # dust 地板(Polymarket CLOB 最小�
 DEFAULT_MIN_TARGET_ORDER_CASH_USDC = 10.0
 DEFAULT_MAX_FOLLOW_ENTRY_PRICE = 0.68     # 现价上限(评分价区);0 = 不限。动态可在面板改
 DEFAULT_MIN_FOLLOW_ENTRY_PRICE = 0.0      # 现价下限;0 = 不限(默认关,不改现状)。动态可在面板改
+# 主盘止损跌幅%:仅 main_match 信号,现价较加权入场跌幅 ≥ 此% → 按现价全平,不等结算归零。
+# 0 = 关(默认)。回测:仅主盘净正(系列赛大比分落后难翻盘),子盘净负故只作用主盘。动态可在面板改。
+DEFAULT_MAIN_MATCH_STOP_LOSS_DROP_PCT = 0.0
 
 
 def _finite_positive(value: Any) -> bool:
@@ -64,6 +67,7 @@ def default_follow_strategy(*, balance_usdc: float | None = None) -> dict[str, A
             "min_target_wallet_order_cash_usdc": DEFAULT_MIN_TARGET_ORDER_CASH_USDC,
             "max_follow_entry_price": DEFAULT_MAX_FOLLOW_ENTRY_PRICE,
             "min_follow_entry_price": DEFAULT_MIN_FOLLOW_ENTRY_PRICE,
+            "main_match_stop_loss_drop_pct": DEFAULT_MAIN_MATCH_STOP_LOSS_DROP_PCT,
         },
         "balance": {
             "required": True,
@@ -116,6 +120,8 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
                 out["prefilters"]["max_follow_entry_price"] = pf["max_follow_entry_price"]
             if pf.get("min_follow_entry_price") is not None:
                 out["prefilters"]["min_follow_entry_price"] = pf["min_follow_entry_price"]
+            if pf.get("main_match_stop_loss_drop_pct") is not None:
+                out["prefilters"]["main_match_stop_loss_drop_pct"] = pf["main_match_stop_loss_drop_pct"]
 
         if isinstance(strategy.get("balance"), dict):
             out["balance"].update(strategy["balance"])
@@ -133,6 +139,8 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
     prefilters["min_target_wallet_order_cash_usdc"] = round(to_float(prefilters.get("min_target_wallet_order_cash_usdc")), 8)
     prefilters["max_follow_entry_price"] = round(min(1.0, max(0.0, to_float(prefilters.get("max_follow_entry_price")))), 8)
     prefilters["min_follow_entry_price"] = round(min(1.0, max(0.0, to_float(prefilters.get("min_follow_entry_price")))), 8)
+    # 主盘止损跌幅%:clamp 到 [0,100];缺省 0(关)。
+    prefilters["main_match_stop_loss_drop_pct"] = round(min(100.0, max(0.0, to_float(prefilters.get("main_match_stop_loss_drop_pct")))), 4)
 
     balance = out["balance"]
     balance["required"] = bool(balance.get("required", True))
@@ -335,6 +343,9 @@ def strategy_summary(strategy: dict[str, Any] | None) -> str:
     min_target = to_float(normalized["prefilters"].get("min_target_wallet_order_cash_usdc"))
     if min_target > 0:
         parts.append(f"目标单≥${min_target:g}")
+    stop_pct = to_float(normalized["prefilters"].get("main_match_stop_loss_drop_pct"))
+    if stop_pct > 0:
+        parts.append(f"主盘止损 -{stop_pct:g}%")
     balance = normalized["balance"]
     if to_float(balance.get("usable_balance_usdc")) > 0:
         parts.append(f"可用余额 {to_float(balance.get('usable_balance_usdc')):g}")

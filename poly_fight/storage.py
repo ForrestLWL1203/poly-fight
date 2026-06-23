@@ -1048,6 +1048,24 @@ class FollowStore:
                 (_dumps(pending or {}),),
             )
 
+    def load_stop_loss_blocked(self) -> dict[str, Any]:
+        """止损黑名单:键 "wallet|condition_id|outcome_index" -> {stopped_at,...}。被主盘止损平过的
+        持仓不再复跟(钱包仍持有/加仓/重启补单都会再触发买单 → 一律拦,避免反复挨割)。盘结算/出
+        watchlist 后清键。存 meta JSON blob(仅 runner 读写,跨 tick/重启持久)。"""
+        self.init_db()
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = 'stop_loss_blocked'").fetchone()
+        out = _loads(row["value"], {}) if row else {}
+        return out if isinstance(out, dict) else {}
+
+    def save_stop_loss_blocked(self, blocked: dict[str, Any]) -> None:
+        self.init_db()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('stop_loss_blocked', ?)",
+                (_dumps(blocked or {}),),
+            )
+
     def load_results(self) -> list[dict[str, Any]]:
         self.init_db()
         with self.connect() as conn:

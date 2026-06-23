@@ -429,6 +429,9 @@
       maxEntry: str(maxEntryVal > 0 ? maxEntryVal : 0.68, "0.68"),
       minEntryOn: minEntryVal > 0 && minEntryVal < 1,
       minEntry: str(minEntryVal > 0 ? minEntryVal : 0.58, "0.58"),
+      // 主盘止损跌幅%:默认关(0/缺失);>0 → 开。仅作用 main_match。
+      stopLossOn: num(pre.main_match_stop_loss_drop_pct) > 0,
+      stopLoss: str(num(pre.main_match_stop_loss_drop_pct) > 0 ? num(pre.main_match_stop_loss_drop_pct) : 55, "55"),
       perSignalPct: str(num(perSignal) || 1, "1"),
       perMatchPct: str(num(perMatch) || 1, "1"),
       perMatchSubPct: str(num(perMatchSub) || num(perMatch) || 1, "1"),
@@ -454,6 +457,7 @@
         min_target_wallet_order_cash_usdc: k.minSignalOn ? num(k.minSignal) : 0,
         max_follow_entry_price: k.maxEntryOn ? num(k.maxEntry) : 0,
         min_follow_entry_price: k.minEntryOn ? num(k.minEntry) : 0,
+        main_match_stop_loss_drop_pct: k.stopLossOn ? num(k.stopLoss) : 0,
       },
       balance: { required: true, usable_balance_usdc: usable },
       realtime_refresh: !!k.realtimeRefresh,

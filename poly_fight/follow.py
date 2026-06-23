@@ -445,6 +445,42 @@ def _exit_signal_for_opposite_buy(
     signal["wallet_behavior"] = wallet_behavior_summary(signal)
 
 
+def apply_stop_loss_exit(signal: dict[str, Any], exit_price: float, now_ts: int, *, drop_pct: float) -> None:
+    """主盘止损强平:现价较加权入场跌幅 ≥ drop_pct% → 按现价(CLOB 卖价)全平整仓、记 exited。
+    与镜像跟卖(apply_follow_sell)无关:不看钱包卖没卖、不受 0.90 高价门约束——这是我们自己的
+    风控止损(回测:仅主盘净正,子盘净负,故调用方只对 main_match 触发)。PnL 算法同
+    _exit_signal_for_opposite_buy(逐 leg paper_exit_pnl 在 exit_price 实现)。"""
+    signal["status"] = "exited"
+    signal["exit_price"] = round(to_float(exit_price), 8)
+    signal["exit_at"] = now_ts
+    signal["exit_reason"] = "stop_loss"
+    signal["would_follow"] = False
+    signal["updated_at"] = now_ts
+    signal.setdefault("behavior_events", []).append({
+        "kind": "stop_loss",
+        "timestamp": now_ts,
+        "price": round(to_float(exit_price), 8),
+        "drop_pct": round(to_float(drop_pct), 4),
+    })
+    signal["our_realized_pnl"] = round(
+        sum(paper_exit_pnl(to_float(leg.get("our_entry_price")), exit_price, leg_actual_stake(leg)) for leg in signal.get("legs") or []),
+        8,
+    )
+    signal["hypothetical_pnl"] = round(
+        sum(paper_exit_pnl(to_float(leg.get("our_entry_price")), exit_price, leg_hypothetical_stake(leg)) for leg in signal.get("legs") or []),
+        8,
+    )
+    signal["wallet_behavior"] = wallet_behavior_summary(signal)
+
+
+def signal_weighted_avg_entry(signal: dict[str, Any]) -> float:
+    """按各 leg 注码加权的我方入场均价(止损跌幅以此为基准)。"""
+    legs = signal.get("legs") or []
+    num = sum(to_float(leg.get("our_entry_price")) * leg_actual_stake(leg) for leg in legs)
+    den = sum(leg_actual_stake(leg) for leg in legs)
+    return round(num / den, 8) if den > 0 else 0.0
+
+
 def follow_stake_for_signal(
     *,
     wallet_trade_cash: float,
@@ -601,6 +637,7 @@ def process_follow_trades(
     follow_strategy: dict[str, Any] | None = None,
     pending_small_buys: dict[str, dict[str, Any]] | None = None,   # 小单累加器(跨 tick 持久,由调用方 load/save)
     held_pending_price: dict[str, dict[str, Any]] | None = None,   # 价格 held 暂存器(现价<下限的买单,等上穿;跨 tick 持久)
+    stop_loss_blocked: dict[str, Any] | None = None,               # 止损黑名单:已止损平过的 (钱包|盘|outcome) 不再复跟
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     wallet = normalize_wallet(wallet)
     active_strategy = normalize_follow_strategy(follow_strategy) if isinstance(follow_strategy, dict) else None
@@ -678,6 +715,13 @@ def process_follow_trades(
 
         if side != "BUY":
             stats["ignored_trade_count"] += 1
+            continue
+
+        # 止损黑名单:该 (钱包,盘,outcome) 已被主盘止损平过 → 不再复跟,避免反复挨割
+        # (钱包还持有/又加仓/重启补单都会再触发买单,这里一律拦掉)。
+        if stop_loss_blocked and f"{wallet}|{condition_id}|{outcome_index}" in stop_loss_blocked:
+            stats["ignored_trade_count"] += 1
+            stats["stop_loss_reentry_blocked_count"] = stats.get("stop_loss_reentry_blocked_count", 0) + 1
             continue
 
         market_open_signals = _open_market_signals(open_signals, condition_id)

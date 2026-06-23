@@ -2300,7 +2300,8 @@ def build_wallet_follow_detail(
 def _signal_settlement_type(signal: dict[str, Any]) -> str:
     status = str(signal.get("status") or "")
     if status == "exited":
-        return "manual_exit"
+        # 我们自己的主盘止损强平,区别于镜像钱包卖出的"提前卖出"(manual_exit)。
+        return "stop_loss" if str(signal.get("exit_reason") or "") == "stop_loss" else "manual_exit"
     if status == "settled":
         return "auto_settlement"
     return ""
@@ -3657,13 +3658,13 @@ def _follow_groups_from_signals(signals: list[dict[str, Any]]) -> dict[str, dict
             )
         else:
             bucket["status"] = "settled"
-        settlement_types = set(bucket.get("settlement_type_counts") or {})
-        if "auto_settlement" in settlement_types and "manual_exit" in settlement_types:
+        # 一个 bucket(同一 conditionId,多钱包/双边)可能混多种结算口径:stop_loss(止损)/
+        # manual_exit(镜像提前卖)/auto_settlement(持到结算)。纯一种 → 该种;混合 → 部分卖出。
+        settlement_types = set(bucket.get("settlement_type_counts") or {}) - {""}
+        if len(settlement_types) == 1:
+            bucket["settlement_type"] = next(iter(settlement_types))
+        elif settlement_types:
             bucket["settlement_type"] = "auto_and_manual"
-        elif "manual_exit" in settlement_types:
-            bucket["settlement_type"] = "manual_exit"
-        elif "auto_settlement" in settlement_types:
-            bucket["settlement_type"] = "auto_settlement"
         else:
             bucket["settlement_type"] = ""
         bucket["settled_by_price"] = bool(bucket.pop("settled_by_price_count", 0))
