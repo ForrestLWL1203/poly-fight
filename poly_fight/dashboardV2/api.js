@@ -7,6 +7,11 @@
   class AuthError extends Error {
     constructor() { super("unauthorized"); this.name = "AuthError"; }
   }
+
+  // 会话过期(cookie TTL 到期)全局钩子:任何 API(读/写)收到 401 时触发一次,让 app 立刻
+  // 切回登录页强制重登 —— 否则 mutation 静默失败、页面停在旧数据(停止/重采按钮像坏了)。
+  let onAuthExpired = null;
+
   class ApiError extends Error {
     constructor(error, detail, status, data) {
       super(error || "request_failed");
@@ -18,7 +23,10 @@
   async function parse(res) {
     let body = null;
     try { body = await res.json(); } catch (_e) { body = null; }
-    if (res.status === 401) throw new AuthError();
+    if (res.status === 401) {
+      if (onAuthExpired) { try { onAuthExpired(); } catch (_e) { /* never let the hook mask the error */ } }
+      throw new AuthError();
+    }
     if (body && typeof body === "object" && "ok" in body) {
       if (body.ok) return body.data;
       throw new ApiError(body.error, body.detail, res.status, body.data);
@@ -128,6 +136,8 @@
 
   const api = {
     AuthError, ApiError,
+    // 注册会话过期回调(传 null 注销)。app 用它在 401 时强制切登录页。
+    setAuthExpiredHandler: (fn) => { onAuthExpired = typeof fn === "function" ? fn : null; },
     get, post, login, logout,
     health, overview, wallets, events, runner, followStrategy, walletRefreshStatus,
     follows, followDetail, walletFollows, marketPrices, walletTrades,

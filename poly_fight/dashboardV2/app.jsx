@@ -1705,6 +1705,16 @@ function LoginPanel({ onSuccess, toast }) {
 function App() {
   const [auth, setAuth] = React.useState("checking"); // checking | out | in
   const { toasts, push } = useToasts();
+  const authRef = React.useRef(auth);
+  authRef.current = auth;
+  // 会话过期:任何 API 收到 401 → 立刻强制回登录页(否则停止/重采等 mutation 静默失败,
+  // 按钮像坏了)。只在当前已登录时切+提示一次,避免登录页上 health 401 重复弹。
+  React.useEffect(() => {
+    Api.setAuthExpiredHandler(() => {
+      if (authRef.current === "in") { setAuth("out"); push("登录已过期，请重新登录", "error"); }
+    });
+    return () => Api.setAuthExpiredHandler(null);
+  }, [push]);
   React.useEffect(() => {
     let alive = true;
     Api.health()
