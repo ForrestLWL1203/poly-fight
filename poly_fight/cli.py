@@ -6584,7 +6584,6 @@ def command_follow(
     wallet_trade_state = store.load_wallet_trade_state()
     open_signals = prune_unfollowed_signals(store.load_open_signals())
     pending_small_buys = store.load_pending_small_buys()   # 小单累加器(跨 tick 持久)
-    held_pending_veto = store.load_held_pending_veto()     # CS2 map-winner 盘前暂存器(跨 tick 持久)
     performance = store.load_performance()
     account_balance = store.load_account_balance()
     account_balance_configured = bool(account_balance.get("configured"))
@@ -6736,10 +6735,8 @@ def command_follow(
     insufficient_balance_count = 0
     low_entry_price_blocked_count = 0
     high_entry_price_blocked_count = 0
+    wallet_entry_above_ceiling_blocked_count = 0
     small_wallet_trade_blocked_count = 0
-    veto_fade_skip_count = 0
-    veto_no_data_count = 0
-    veto_held_count = 0
     small_add_blocked_count = 0
     signal_cap_limited_count = 0
     signal_cap_blocked_count = 0
@@ -7039,7 +7036,6 @@ def command_follow(
                 max_signal_stake_usdc=max_signal_stake_usdc,
                 follow_strategy=follow_strategy,
                 pending_small_buys=pending_small_buys,
-                held_pending_veto=held_pending_veto,
             )
             after_ids = {signal.get("signal_id") for signal in open_signals}
             new_signal_count += len(after_ids - before_ids)
@@ -7050,10 +7046,8 @@ def command_follow(
             market_type_not_eligible_count += stats.get("market_type_not_eligible_count", 0)
             low_entry_price_blocked_count += stats.get("low_entry_price_blocked_count", 0)
             high_entry_price_blocked_count += stats.get("high_entry_price_blocked_count", 0)
+            wallet_entry_above_ceiling_blocked_count += stats.get("wallet_entry_above_ceiling_blocked_count", 0)
             small_wallet_trade_blocked_count += stats.get("small_wallet_trade_blocked_count", 0)
-            veto_fade_skip_count += stats.get("veto_fade_skip_count", 0)
-            veto_no_data_count += stats.get("veto_no_data_count", 0)
-            veto_held_count += stats.get("veto_held_count", 0)
             small_add_blocked_count += stats.get("small_add_blocked_count", 0)
             signal_cap_limited_count += stats.get("signal_cap_limited_count", 0)
             signal_cap_blocked_count += stats.get("signal_cap_blocked_count", 0)
@@ -7173,15 +7167,6 @@ def command_follow(
             _cid = _key.split("|", 2)[1] if "|" in _key else ""
             if _cid in _settled_cids or _cid not in _watched_cids:
                 pending_small_buys.pop(_key, None)
-    # held-pending-veto 同样兜底清理:赛事已结算 / 已不在 watchlist(结束或出范围,再不会被复跟到)。
-    # 正常路径(开赛释放)在 process_follow_trades 里就地 pop;这里只清"过夜没释放/赛事消失"的残留。
-    if held_pending_veto:
-        _settled_cids = {str(s.get("condition_id") or "").lower() for s in result_events}
-        _watched_cids = {str(cid).lower() for cid in (watched or {})}
-        for _key in list(held_pending_veto):
-            _cid = _key.split("|", 2)[1] if "|" in _key else ""
-            if _cid in _settled_cids or _cid not in _watched_cids:
-                held_pending_veto.pop(_key, None)
     if result_events:
         performance = aggregate_follow_performance(performance, result_events)
     else:
@@ -7239,10 +7224,8 @@ def command_follow(
         "market_type_not_eligible_count": market_type_not_eligible_count,
         "low_entry_price_blocked_count": low_entry_price_blocked_count,
         "high_entry_price_blocked_count": high_entry_price_blocked_count,
+        "wallet_entry_above_ceiling_blocked_count": wallet_entry_above_ceiling_blocked_count,
         "small_wallet_trade_blocked_count": small_wallet_trade_blocked_count,
-        "veto_fade_skip_count": veto_fade_skip_count,
-        "veto_no_data_count": veto_no_data_count,
-        "veto_held_count": veto_held_count,
         "small_add_blocked_count": small_add_blocked_count,
         "signal_cap_limited_count": signal_cap_limited_count,
         "signal_cap_blocked_count": signal_cap_blocked_count,
@@ -7285,7 +7268,6 @@ def command_follow(
         },
     }
     store.save_pending_small_buys(pending_small_buys)
-    store.save_held_pending_veto(held_pending_veto)
     store.save_follow_snapshot(
         wallet_trade_state=wallet_trade_state,
         open_signals=open_signals,

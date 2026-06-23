@@ -6,26 +6,9 @@ from typing import Any
 
 from .core import SECONDS_PER_DAY, bucket_key, bucket_label, normalize_wallet, parse_dt, to_float, to_int, wallet_is_followable
 from .follow_strategy import evaluate_follow_candidate, normalize_follow_strategy
-from .veto import DECISION_SKIP as VETO_DECISION_SKIP, veto_gate
 
 MIN_ADD_RATIO_TO_FIRST = 0.10
 MIN_WALLET_TRADE_CASH_USDC = 10.0
-
-
-def _cs2_veto_corroboration_enabled(strategy: dict[str, Any] | None) -> bool:
-    """CS2 map-winner 旁路佐证门(含 held-pending-veto 暂存)总开关 —— 当前【默认关】。
-
-    2026-06-21:实测三个候选 veto 源全军覆没 —— bo3.gg 的 pick/ban(match_maps)对**进行中/赛前**
-    的比赛是空的(赛后才录入,实时拿不到)、HLTV 数据齐全且及时但被 Cloudflare 封死无法自动化、
-    Pinnacle 等盘口结构上根本没有选图归属。没有可靠且及时的数据源 → 整条 veto 佐证暂时停用,
-    cs2 map_winner 一律照常跟(等价于 veto 上线前的行为)。fetch/parse/corroborate/held 代码全保留,
-    找到新数据源后:把本函数默认翻回 True、或在策略 prefilters.cs2_veto_corroboration 显式置 True 即恢复。
-
-    仅当策略 prefilters.cs2_veto_corroboration 显式置 True 才开。"""
-    if not isinstance(strategy, dict):
-        return False
-    value = (strategy.get("prefilters") or {}).get("cs2_veto_corroboration")
-    return False if value is None else bool(value)
 
 
 def eligible_follow_wallets(
@@ -617,7 +600,6 @@ def process_follow_trades(
     max_signal_stake_usdc: float = 0.0,
     follow_strategy: dict[str, Any] | None = None,
     pending_small_buys: dict[str, dict[str, Any]] | None = None,   # 小单累加器(跨 tick 持久,由调用方 load/save)
-    held_pending_veto: dict[str, dict[str, Any]] | None = None,    # CS2 map-winner 盘前暂存器(跨 tick 持久,由调用方 load/save)
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     wallet = normalize_wallet(wallet)
     active_strategy = normalize_follow_strategy(follow_strategy) if isinstance(follow_strategy, dict) else None
@@ -634,6 +616,7 @@ def process_follow_trades(
         "opposite_blocked_count": 0,
         "low_entry_price_blocked_count": 0,
         "high_entry_price_blocked_count": 0,
+        "wallet_entry_above_ceiling_blocked_count": 0,
         "small_wallet_trade_blocked_count": 0,
         "insufficient_balance_count": 0,
         "small_add_blocked_count": 0,
@@ -648,23 +631,9 @@ def process_follow_trades(
         "unfunded_intent_count": 0,
         "small_buy_cached_count": 0,
         "small_buy_triggered_count": 0,
-        "veto_fade_skip_count": 0,
-        "veto_no_data_count": 0,
-        "veto_held_count": 0,
         "backfill_dup_skipped_count": 0,
     }
-    veto_cache: dict[str, Any] = {}  # 本 tick 内按比赛缓存 veto(Map1/2/3 同场复用,不重复打 bo3)
-    # held-pending-veto 复跟:把本钱包上 tick 因「盘前」暂存的 cs2 map_winner 买单重新注入,
-    # 这样开赛后(now>=start)无需等"钱包又来一笔",就能被时间驱动地重判 fade/跟。
     effective_trades = list(trades)
-    if held_pending_veto is not None:
-        existing_ids = {trade_id(t) for t in effective_trades}
-        for _key, _entry in held_pending_veto.items():
-            if not _key.startswith(f"{wallet}|"):
-                continue
-            _t = (_entry or {}).get("trade")
-            if isinstance(_t, dict) and trade_id(_t) not in existing_ids:
-                effective_trades.append(_t)
     for trade in sorted(effective_trades, key=lambda row: _trade_tuple(row)):
         condition_id = trade_condition_id(trade)
         outcome_index = trade_outcome_index(trade)
@@ -685,9 +654,6 @@ def process_follow_trades(
             # 钱包卖出该 (cond,outcome):若有未凑够门槛的小单缓存,说明它没建够仓就跑了 → 清缓存,不补跟。
             if pending_small_buys is not None:
                 pending_small_buys.pop(f"{wallet}|{condition_id}|{outcome_index}", None)
-            # 同理:盘前 held 暂存的买单,钱包又卖了 → 它没拿住,清掉不再复跟。
-            if held_pending_veto is not None:
-                held_pending_veto.pop(f"{wallet}|{condition_id}|{outcome_index}", None)
             if existing:
                 # 等比例跟卖:目标累计卖到仓位 x% → 我们也卖到 x%(min $1,不够攒着;dust 全平)。
                 state = apply_follow_sell(existing, trade, current_price, now_ts)
@@ -726,13 +692,7 @@ def process_follow_trades(
         start_ts = market_start_ts(market)
         trade_ts = trade_timestamp(trade)
         detected_after_start = False
-        # held-pending-veto 释放豁免:这笔若是上 tick 盘前暂存的 cs2 map 买单,它本就在开赛【前】被
-        # 检测到,只是我们刻意延到开赛后才执行 —— 不该被 require_pre_match 的"检测过晚"门当作 in-play 丢弃。
-        was_held_premarket = (
-            held_pending_veto is not None
-            and f"{wallet}|{condition_id}|{outcome_index}" in held_pending_veto
-        )
-        if require_pre_match and start_ts and now_ts >= start_ts and not was_held_premarket:
+        if require_pre_match and start_ts and now_ts >= start_ts:
             grace_seconds = max(0, int(post_start_grace_seconds))
             detected_after_start = bool(trade_ts and trade_ts < start_ts and now_ts <= start_ts + grace_seconds)
             if not detected_after_start:
@@ -772,28 +732,6 @@ def process_follow_trades(
             stats["ignored_trade_count"] += 1
             stats["league_not_eligible_count"] += 1
             continue
-
-        # CS2 map-winner 盘前暂存:开赛【前】(now < start)检测到的 map 买单先 held 住、本 tick 不开仓,
-        # 跨 tick 复跟(见函数顶部 re-inject)直到开赛,届时落到下方 veto_gate 判 fade/跟;开赛后仍无 veto
-        # → veto_gate 的 no_veto 分支按原逻辑跟。fade 拦在 veto 出来之后才生效,正是这次改动的目的。
-        is_cs2_map_winner = (
-            market_type == "map_winner"
-            and str(market.get("game_family") or "").lower() == "cs2"
-            and _cs2_veto_corroboration_enabled(active_strategy)
-        )
-        if is_cs2_map_winner and held_pending_veto is not None:
-            held_key = f"{wallet}|{condition_id}|{outcome_index}"
-            if start_ts and now_ts < start_ts:
-                held_pending_veto[held_key] = {
-                    "trade": trade,
-                    "condition_id": condition_id,
-                    "outcome_index": outcome_index,
-                    "start_ts": start_ts,
-                    "held_since": to_int(held_pending_veto.get(held_key, {}).get("held_since")) or now_ts,
-                }
-                stats["veto_held_count"] += 1
-                continue
-            held_pending_veto.pop(held_key, None)  # 已开赛 → 释放,落入下方 veto_gate 判定
 
         wallet_fill_price = trade_price(trade)
         wallet_cash = round(trade_size(trade) * wallet_fill_price, 8)
@@ -856,30 +794,18 @@ def process_follow_trades(
             slippage["would_follow"] = False
             follow_block_reasons.append("high_entry_price")
             stats["high_entry_price_blocked_count"] += 1
+        # 钱包入场价高于我们现价上限 → 不跟(下穿保护)。能走到这步说明现价已在区间内,而钱包买得
+        # 更高 → 价格是从上方"跌进"区间的,方向走弱、我们在追下跌(尤其 backfill/catch-up 这类延迟
+        # 路径:钱包早先买在区间上方,价格后来跌进来才被补)。实时跟单 wallet_fill_price≈current_price,
+        # 此门近乎 no-op(现价>上限那条会先拦)。阈值复用现价上限,无需新配置。
+        if max_entry_price > 0 and wallet_fill_price > max_entry_price:
+            slippage["would_follow"] = False
+            follow_block_reasons.append("wallet_entry_above_ceiling")
+            stats["wallet_entry_above_ceiling_blocked_count"] += 1
         if min_wallet_trade_cash > 0 and wallet_cash < min_wallet_trade_cash:
             slippage["would_follow"] = False
             follow_block_reasons.append("small_wallet_trade")
             stats["small_wallet_trade_blocked_count"] += 1
-        # CS2 map-winner 旁路佐证门:逆选图方(fade)→ 不跟。veto 不可得/非 fade → 放行(fail-open)。
-        # 走到这里必是开赛后(盘前已被上方 held 暂存 continue),故此刻 veto 通常已可查。
-        veto_corroboration = None
-        if is_cs2_map_winner:
-            outcomes_for_veto = market.get("outcomes") or []
-            backed_name = outcomes_for_veto[outcome_index] if 0 <= outcome_index < len(outcomes_for_veto) else None
-            start_iso_for_veto = market.get("match_start_time") or market.get("market_start_time")
-            if backed_name and start_iso_for_veto:
-                veto_corroboration = veto_gate(
-                    market.get("question"), backed_name, start_iso_for_veto,
-                    game_family="cs2", market_type=market_type, cache=veto_cache,
-                )
-                decision = veto_corroboration.get("decision")
-                if decision == VETO_DECISION_SKIP:
-                    slippage["would_follow"] = False
-                    follow_block_reasons.append("veto_fade_skip")
-                    stats["veto_fade_skip_count"] += 1
-                elif decision == "no_veto":
-                    # veto 不可得(api 不通/未发布/没对上)→ 已 fail-open 照常跟,仅计数供观测
-                    stats["veto_no_data_count"] += 1
         stake_mode = None
         stake_ratio = None
         available_balance = bankroll_usdc - _open_signals_exposure(open_signals)
@@ -1086,8 +1012,6 @@ def process_follow_trades(
             if strategy_decision is not None:
                 signal["strategy_schema_version"] = leg.get("strategy_schema_version")
                 signal["strategy_mode"] = leg.get("strategy_mode")
-            if veto_corroboration is not None and veto_corroboration.get("applies"):
-                signal["veto_corroboration"] = veto_corroboration  # 审计:选图佐证判定(决胜/顺选图等)
             if detected_after_start:
                 signal["detected_after_start"] = True
             open_signals.append(signal)

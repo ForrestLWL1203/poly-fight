@@ -6626,6 +6626,39 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(stats["new_leg_count"], 0)
         self.assertEqual(signals, [])
 
+    def test_process_follow_trades_blocks_wallet_entry_above_ceiling_downward_crossing(self):
+        # 下穿保护:钱包买在 0.80(高于上限 0.75),价格后来跌到 0.70 进区间(backfill/catch-up
+        # 才发现)。现价 0.70 ≤ 上限不会被 high_entry 拦,但钱包入场价 > 上限 → 追下跌,必须拦。
+        now = 1000
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.70, 0.30],   # 我方现价(跌进区间)
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "Match",
+            "market_type": "main_match",
+        }
+        # 钱包入场价 0.80(高于上限);现价 0.70。
+        trades = [{"id": "b1", "proxyWallet": "0xA", "market": "m1", "outcomeIndex": 0, "side": "BUY", "price": 0.80, "size": 100, "timestamp": now}]
+
+        signals, stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=trades,
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            stake_usdc=1,
+            max_follow_legs=10,
+            max_slippage=0.10,
+            min_wallet_entry_price=0.4,
+            max_entry_price=0.75,
+        )
+
+        self.assertEqual(stats["wallet_entry_above_ceiling_blocked_count"], 1)
+        self.assertEqual(stats["high_entry_price_blocked_count"], 0)  # 现价 0.70 ≤ 上限,非此门
+        self.assertEqual(stats["new_leg_count"], 0)
+        self.assertEqual(signals, [])
+
     def test_process_follow_trades_blocks_target_wallet_order_cash_under_threshold(self):
         now = 1000
         market = {
