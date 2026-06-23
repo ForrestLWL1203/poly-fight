@@ -62,7 +62,7 @@ class DashboardConfig:
     username: str = "admin"
     password: str = ""
     cookie_secret: str = ""
-    session_ttl_seconds: int = 12 * 3600
+    session_ttl_seconds: int = 7 * 24 * 3600  # 滑动续期下这是"真正闲置"超时(标签页开着会一直续)
     cookie_secure: bool = False
     static_dir: Path | None = None
     client: Any = None
@@ -703,16 +703,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         FAILED_LOGINS.pop(client, None)
         token = make_session_token(username, config.cookie_secret)
-        cookie = (
-            f"{COOKIE_NAME}={token}; Path=/; Max-Age={config.session_ttl_seconds}; "
-            "HttpOnly; SameSite=Lax"
-        )
-        if config.cookie_secure:
-            cookie += "; Secure"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Set-Cookie", cookie)
+        self.send_header("Set-Cookie", self._session_cookie(token))
         self.end_headers()
         self.wfile.write(b'{"ok":true}')
 
@@ -734,6 +728,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
             max_age_seconds=self.dashboard_config.session_ttl_seconds,
         )
         return username == self.dashboard_config.username
+
+    def _session_cookie(self, token: str) -> str:
+        cookie = (
+            f"{COOKIE_NAME}={token}; Path=/; Max-Age={self.dashboard_config.session_ttl_seconds}; "
+            "HttpOnly; SameSite=Lax"
+        )
+        if self.dashboard_config.cookie_secure:
+            cookie += "; Secure"
+        return cookie
+
+    def _maybe_renew_session_cookie(self) -> None:
+        """滑动续期:本次请求带着有效 session → 顺手重发 cookie 刷新有效期(issued_at 归零)。
+        在 _json(所有 API 响应出口)调用,故每次读/写都续期。只要 dashboard 标签页开着(会定时
+        轮询 API),会话就一直续命、不会过夜被踢;只有真正闲置超过 TTL 才需重登。"""
+        config = self.dashboard_config
+        if not config.cookie_secret:
+            return
+        token = _cookie_value(self.headers.get("Cookie", ""), COOKIE_NAME)
+        if not token:
+            return
+        if verify_session_token(token, config.cookie_secret, max_age_seconds=config.session_ttl_seconds) != config.username:
+            return
+        self.send_header("Set-Cookie", self._session_cookie(make_session_token(config.username, config.cookie_secret)))
 
     def _serve_static(self, path: str) -> None:
         static_dir = self.dashboard_config.static_dir or Path(__file__).with_name("dashboardV2")
@@ -845,6 +862,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self._maybe_renew_session_cookie()  # 滑动续期:已登录的每次 API 响应都刷新 cookie 有效期
         self.end_headers()
         self.wfile.write(body)
 

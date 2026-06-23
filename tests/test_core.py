@@ -9093,6 +9093,49 @@ class CoreTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_dashboard_session_cookie_sliding_renewal(self):
+        # 滑动续期:已登录的每次 API 响应都重发 cookie 刷新有效期(标签页开着即不会过期);
+        # 未带 cookie 的请求 401 且不续期。根治"过夜 cookie 过期 → 按钮静默失效"。
+        with TemporaryDirectory() as tmp:
+            server = create_server(
+                DashboardConfig(
+                    data_dir=Path(tmp), host="127.0.0.1", port=0,
+                    username="admin", password="pw", cookie_secret="secret",
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+
+                def call(method, path, body=None, cookie=None):
+                    conn = http.client.HTTPConnection(host, port, timeout=5)
+                    headers = {"Content-Type": "application/json"}
+                    if cookie:
+                        headers["Cookie"] = cookie
+                    conn.request(method, path, body=json.dumps(body) if body is not None else None, headers=headers)
+                    resp = conn.getresponse()
+                    resp.read()
+                    set_cookie = resp.getheader("Set-Cookie") or ""
+                    conn.close()
+                    return resp.status, set_cookie
+
+                _, login_cookie = call("POST", "/api/login", {"username": "admin", "password": "pw"})
+                self.assertIn("poly_fight_session=", login_cookie)
+                # 已登录 GET → 响应带续期 Set-Cookie(同名 + HttpOnly + Max-Age)
+                status, renew = call("GET", "/api/health", cookie=login_cookie)
+                self.assertEqual(status, 200)
+                self.assertIn("poly_fight_session=", renew)
+                self.assertIn("HttpOnly", renew)
+                self.assertIn("Max-Age=", renew)
+                # 未带 cookie → 401 且不续期(不会给未鉴权请求发会话)
+                status, renew2 = call("GET", "/api/health")
+                self.assertEqual(status, 401)
+                self.assertNotIn("poly_fight_session=", renew2)
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_dashboard_follow_strategy_library_endpoints(self):
         with TemporaryDirectory() as tmp:
             server = create_server(
