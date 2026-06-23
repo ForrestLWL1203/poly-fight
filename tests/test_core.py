@@ -168,6 +168,7 @@ from poly_fight.follow import (
     follow_stake_for_signal,
     quarantine_reason,
     select_new_trades,
+    _build_trade_cursor,
     settle_open_signals,
     summarize_wallet_fills,
     wallet_behavior_summary,
@@ -6140,6 +6141,25 @@ class CoreTest(unittest.TestCase):
         legacy_cursor = {"timestamp": 1000, "id": "0xee"}
         new2, _c, _ = select_new_trades(second, legacy_cursor)
         self.assertIn("0x0a", {row["id"] for row in new2})
+
+    def test_onchain_cursor_dedups_same_second_siblings_for_dataapi_catchup(self):
+        # 回归:WS(onchain)路径跟完同秒多笔后,游标须带 seen_ids,否则随后的 data-api
+        # catch-up(recycle/重启)会把同秒其余真单当新单重开 → 同一 tx 被跟两次(错价)。
+        ws_trades = [
+            {"id": "0xa1", "timestamp": 2000},
+            {"id": "0xb2", "timestamp": 2000},
+            {"id": "0xc3", "timestamp": 2000},
+        ]
+        # 修复后:onchain 分支用 _build_trade_cursor(带 seen_ids),与 data-api 路径一致。
+        fixed_cursor = _build_trade_cursor(ws_trades, None)
+        re_selected, _c, cold = select_new_trades(ws_trades, fixed_cursor)
+        self.assertFalse(cold)
+        self.assertEqual(re_selected, [])  # catch-up 再看到同样三笔 → 全部去重,不重开
+
+        # 对照旧 bug:只记 {timestamp, 最大 id} 的游标会把同秒其余两笔当新单重选。
+        legacy_cursor = {"timestamp": 2000, "id": "0xc3"}
+        leaked, _c2, _ = select_new_trades(ws_trades, legacy_cursor)
+        self.assertEqual({r["id"] for r in leaked}, {"0xa1", "0xb2"})
 
     def test_follow_user_trades_fetch_pages_until_cursor(self):
         class FakeClient:
@@ -14913,7 +14933,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.run_log_retention_days, 7)
         self.assertEqual(args.resolution_cache_ttl_seconds, 60)
         self.assertEqual(args.resolution_gamma_pages, 2)
-        self.assertEqual(args.event_cache_ttl_minutes, 60)
+        self.assertEqual(args.event_cache_ttl_minutes, 15)
         self.assertEqual(args.user_trades_limit, 50)
         self.assertEqual(args.user_trades_max_pages, 1)
         self.assertFalse(hasattr(args, "bootstrap_current_positions"))
@@ -14938,6 +14958,8 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(args.command, "run")
         self.assertEqual(args.stake_usdc, 1)
+        self.assertEqual(args.event_cache_ttl_minutes, 15)
+        self.assertEqual(args.dataapi_safety_sweep_minutes, 15)
         self.assertEqual(args.stake_ratio_percent, 10)
         self.assertEqual(args.strategy_source, "auto")
         self.assertEqual(args.max_stake_usdc, 0.0)
@@ -14958,7 +14980,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(args.max_slippage_over_entry, 0.10)
         self.assertEqual(args.max_entry_price, 0.85)
         self.assertEqual(args.min_wallet_entry_price, 0.4)
-        self.assertEqual(args.event_cache_ttl_minutes, 60)
+        self.assertEqual(args.event_cache_ttl_minutes, 15)
         self.assertEqual(args.resolution_cache_ttl_seconds, 60)
         self.assertEqual(args.resolution_gamma_pages, 2)
         self.assertEqual(args.tick_seconds, 60)

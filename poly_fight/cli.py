@@ -65,6 +65,7 @@ from .core import (
     winning_outcome_index,
 )
 from .follow import (
+    _build_trade_cursor,
     aggregate_follow_performance,
     apply_closing_line_snapshots,
     apply_contested_flags,
@@ -6719,6 +6720,19 @@ def command_follow(
     # 冷启动不再用 getLogs 全量回补,省 Alchemy 额度(重启频繁时尤甚)。
     if collector is not None and getattr(collector, "cold_catchup_pending", False):
         detection_source = "data_api"
+    # 周期性 data-api 兜底扫(默认 15min):WS(eth_subscribe)偶发会静默吞掉个别 OrderFilled 推送,
+    # 而 recycle 间(默认 1h)WS 健康时纯靠推送、无兜底 → 漏的单要拖到下次 recycle 才补。这里在
+    # WS 健康期间也每 sweep_minutes 强制走一次免费 data-api(/trades?user=,各钱包持久化游标增量,
+    # 不烧 Alchemy CU),把"盘已在 watchlist 但 WS 漏推送"的漏单恢复延迟压到 ≤sweep_minutes。
+    # 游标已带 seen_ids(见 onchain 分支),catch-up 不会把 WS 已抓的同秒单重复跟。注:决胜局等
+    # 还没进 watchlist 的盘不在此覆盖内(会被 watched 过滤),靠 event-cache-ttl 快刷解决。
+    sweep_minutes = int(getattr(args, "dataapi_safety_sweep_minutes", 0) or 0)
+    if detection_source == "onchain" and sweep_minutes > 0:
+        if now_ts - to_int(state.get("last_dataapi_sweep_at")) >= sweep_minutes * 60:
+            detection_source = "data_api"
+    # 任何 data-api tick(冷启动/重连 catch-up、WS 不健康、本兜底扫)都重置计时,避免刚 catch-up 完又扫。
+    if detection_source == "data_api":
+        state["last_dataapi_sweep_at"] = now_ts
     next_interval = desired_tick_interval(
         list(watched.values()),
         open_signals,
@@ -7006,8 +7020,11 @@ def command_follow(
                 new_trades = sorted(trades, key=lambda row: (trade_timestamp(row), trade_id(row)))
                 cold_start = False
                 if new_trades:
-                    last = new_trades[-1]
-                    next_cursor = {"timestamp": trade_timestamp(last), "id": trade_id(last)}
+                    # 游标必须与 data-api 路径一致地带上 seen_ids(该秒已见的所有 tx)。否则同秒多笔
+                    # 时只记下最大 id,后续 recycle/重启的 data-api catch-up 跑 select_new_trades 会把
+                    # 同秒其余真单当"新单"重开 → 同一 tx 被跟两次、还套用 catch-up 时的错价。
+                    # 见 review / 记忆 ws-residual-push-drop。
+                    next_cursor = _build_trade_cursor(new_trades, previous_cursor)
                 else:
                     next_cursor = previous_cursor
             else:
@@ -7720,7 +7737,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--bankroll-usdc", type=float, default=0.0, help="optional paper bankroll cap for total open exposure; 0 disables the cap")
         subparser.add_argument("--follow-recency-days", type=int, default=30)
         subparser.add_argument("--observe-window-hours", type=float, default=24)
-        subparser.add_argument("--event-cache-ttl-minutes", type=int, default=60)
+        subparser.add_argument("--event-cache-ttl-minutes", type=int, default=15)
         subparser.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
         subparser.add_argument("--resolution-poll-seconds", type=int, default=300, help="已跟进行中赛事结算结果的轮询周期(秒);300s 均匀拉一次")
         subparser.add_argument("--resolution-gamma-pages", type=int, default=2)
@@ -7893,7 +7910,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--bankroll-usdc", type=float, default=0.0, help="optional paper bankroll cap for total open exposure; 0 disables the cap")
     run.add_argument("--follow-recency-days", type=int, default=30)
     run.add_argument("--observe-window-hours", type=float, default=24)
-    run.add_argument("--event-cache-ttl-minutes", type=int, default=60)
+    run.add_argument("--event-cache-ttl-minutes", type=int, default=15)
+    run.add_argument(
+        "--dataapi-safety-sweep-minutes",
+        type=int,
+        default=15,
+        help="WS 健康期间也每 N 分钟强制走一次免费 data-api 兜底扫,补 WS 漏掉的推送;0 关闭",
+    )
     run.add_argument("--resolution-cache-ttl-seconds", type=int, default=60)
     run.add_argument("--resolution-poll-seconds", type=int, default=300, help="已跟进行中赛事结算结果的轮询周期(秒);300s 均匀拉一次,降低 Gamma 调用")
     run.add_argument("--reconcile-interval-seconds", type=int, default=60, help="持仓对账兜底周期(秒);每周期核对最久未核对的若干笔")
