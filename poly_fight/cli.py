@@ -7249,21 +7249,27 @@ def command_follow(
         ]
         if sl_open and now_ts - to_int(state.get("last_stop_loss_check_at")) >= sl_interval:
             state["last_stop_loss_check_at"] = now_ts
+            # 现价**必须**用实时盘口价(与跟单详情/held 同源:Gamma /markets 不带 closed 过滤),
+            # 不能用 clob_price——它对 in-play 盘常返回 None → 退化读 15min 陈旧缓存(卡在 entry 附近)
+            # → 止损永远不触发,直到盘结算价跳到 ~0 才"触发",算成 -100%、等于没止损(实测 2026-06-23
+            # Nigma/NaVi 三笔都在 exit_price=0.0005 才平)。
+            sl_conds = sorted({str(s.get("condition_id") or "").lower() for s in sl_open})
+            try:
+                sl_live = resolution_market_records_from_markets(
+                    client.gamma("/markets", condition_ids=sl_conds, limit=max(1, len(sl_conds))) or []
+                )
+            except Exception:
+                sl_live = {}
             for signal in sl_open:
                 avg_entry = signal_weighted_avg_entry(signal)
                 if avg_entry <= 0:
                     continue
+                cond = str(signal.get("condition_id") or "").lower()
                 oidx = to_int(signal.get("outcome_index"), -1)
-                market = (active_markets_for_follow or {}).get(str(signal.get("condition_id") or "").lower()) or {}
-                token = _market_outcome_token(market, oidx)
-                cur = 0.0
-                if token:
-                    try:
-                        cur = to_float(clob_price(token, "sell"))
-                    except Exception:
-                        cur = 0.0
-                if cur <= 0:
-                    cur = to_float(market_current_price(market, oidx))   # 退化到市场快照
+                prices = (sl_live.get(cond) or {}).get("outcome_prices") or []
+                cur = to_float(prices[oidx]) if 0 <= oidx < len(prices) else 0.0
+                if cur <= 0:   # 实时价缺失才退化到市场快照(不理想,但好过不查)
+                    cur = to_float(market_current_price((active_markets_for_follow or {}).get(cond) or {}, oidx))
                 if cur <= 0:
                     continue
                 if cur <= avg_entry * (1.0 - stop_loss_pct / 100.0):
