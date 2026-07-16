@@ -3006,6 +3006,10 @@ class CoreTest(unittest.TestCase):
             # 标记 s1/s2 已处理 → 只剩 s3
             self.assertEqual(store.mark_m5_results_processed(["s1", "s2"]), 2)
             self.assertEqual([p["signal_id"] for p in store.load_unprocessed_m5_results()], ["s3"])
+            # 每个 follow tick 都会重写完整结果快照；已处理标记必须随快照刷新保留，
+            # 否则历史结果会再次累计并提前触发下一轮 M5 重评。
+            store.save_follow_snapshot(wallet_trade_state={}, open_signals=[], result_events=results, performance={})
+            self.assertEqual([p["signal_id"] for p in store.load_unprocessed_m5_results()], ["s3"])
             # 模拟重启:新 store 实例读同库,已处理仍不计(持久化、不重复处理)
             self.assertEqual([p["signal_id"] for p in FollowStore(db_path).load_unprocessed_m5_results()], ["s3"])
 

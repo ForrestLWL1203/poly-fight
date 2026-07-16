@@ -2297,9 +2297,15 @@ class FollowStore:
         resolved_at = int(result.get("settled_at") or result.get("exit_at") or result.get("updated_at") or 0)
         conn.execute(
             """
-            INSERT OR REPLACE INTO follow_results
+            INSERT INTO follow_results
             (signal_id, status, wallet, condition_id, resolved_at, raw_json)
             VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(signal_id) DO UPDATE SET
+                status = excluded.status,
+                wallet = excluded.wallet,
+                condition_id = excluded.condition_id,
+                resolved_at = excluded.resolved_at,
+                raw_json = excluded.raw_json
             """,
             (
                 signal_id,
