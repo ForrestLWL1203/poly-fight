@@ -223,7 +223,7 @@ sub-min BUY fills accumulate per (wallet,cond,outcome) until >= min order, then 
 SELL mirrors exit proportionally (cumulative wallet_sold_frac; >= $1 min, hold/accumulate else, dust full-clear)
 post-start snapshot records CLV once
 same conditionId with both outcomes open marks contested
-settled markets move open signals to results; M5 demotion re-scores followed wallets every N settle events (--rescore-settled-threshold, default 5) and DELETES any that fall out of grade-A: leaderboard row + scoring profile + raw trade cache dropped (no quarantine middle state). Favorites are spared; follow.db research records are kept and open positions settle out. Re-discovery by the observer is the only way back onto the board.
+settled markets move open signals to results; M5 demotion re-scores followed wallets every N settle events (--rescore-settled-threshold, default 15) and DELETES any that fall out of grade-A: leaderboard row + scoring profile + raw trade cache dropped (no quarantine middle state). Favorites are spared; follow.db research records are kept and open positions settle out. Re-discovery by the observer is the only way back onto the board.
 ```
 
 Do not rely on `/trades` time-range params. Use local cursor `{timestamp, id}`

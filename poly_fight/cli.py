@@ -8079,7 +8079,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--ws-drain-seconds", type=int, default=5)
     # M5 动态降级:每累计这么多笔新结算跟单,就对那批被跟钱包重评一次,跌出 A 榜即隔离
     # (事件驱动,替代旧的固定 2h 定时降级扫描)。<=0 关闭 runner 侧降级。
-    run.add_argument("--rescore-settled-threshold", type=int, default=5)
+    run.add_argument("--rescore-settled-threshold", type=int, default=15)
     run.add_argument("--error-retry-seconds", type=int, default=180)
     run.add_argument("--max-consecutive-error-seconds", type=int, default=600)
     run.add_argument("--pool-refresh-hours", type=float, default=12)
