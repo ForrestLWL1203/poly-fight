@@ -11368,6 +11368,19 @@ class CoreTest(unittest.TestCase):
                         "settled_at": 130,
                     },
                     {
+                        "signal_id": "win-valorant",
+                        "wallet": "0xabc",
+                        "condition_id": "m-win-valorant",
+                        "status": "settled",
+                        "category": "esports",
+                        "game_family": "valorant",
+                        "market_type": "main_match",
+                        "outcome_won": True,
+                        "our_paper_pnl": 3.0,
+                        "legs": [{"stake": 5, "would_follow": True}],
+                        "settled_at": 135,
+                    },
+                    {
                         "signal_id": "win-nba",
                         "wallet": "0xabc",
                         "condition_id": "m-win-nba",
@@ -11391,6 +11404,7 @@ class CoreTest(unittest.TestCase):
                     {"timestamp": 110, "pnl": 0.5, "cumulative_pnl": 0.5},
                     {"timestamp": 120, "pnl": -1.0, "cumulative_pnl": -0.5},
                     {"timestamp": 130, "pnl": 2.0, "cumulative_pnl": 1.5},
+                    {"timestamp": 135, "pnl": 3.0, "cumulative_pnl": 4.5},
                 ],
                 overview["equity_points"],
             )
@@ -11401,6 +11415,8 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(win_rates["cs2"]["settled_count"], 2)
             self.assertEqual(win_rates["cs2"]["win_rate"], 0.5)
             self.assertEqual(win_rates["dota2"]["wins"], 1)
+            self.assertEqual(win_rates["valorant"]["game_label"], "Valorant")
+            self.assertEqual(win_rates["valorant"]["wins"], 1)
             self.assertNotIn("nba", win_rates)
 
             open_by_game = {row["game"]: row["count"] for row in overview["open_by_game"]}
@@ -11411,13 +11427,13 @@ class CoreTest(unittest.TestCase):
                 for row in overview["follow_type_distribution"]["segments"]
             }
             self.assertEqual(distribution["main_match"]["label"], "主盘")
-            self.assertEqual(distribution["main_match"]["count"], 2)
-            self.assertEqual(distribution["main_match"]["stake"], 2.0)
+            self.assertEqual(distribution["main_match"]["count"], 3)
+            self.assertEqual(distribution["main_match"]["stake"], 7.0)
             self.assertEqual(distribution["sub_game"]["label"], "Sub Game")
             self.assertEqual(distribution["sub_game"]["count"], 1)
             self.assertEqual(distribution["sub_game"]["stake"], 4.0)
-            self.assertEqual(overview["follow_type_distribution"]["total"], 3)
-            self.assertEqual(overview["follow_type_distribution"]["total_stake"], 6.0)
+            self.assertEqual(overview["follow_type_distribution"]["total"], 4)
+            self.assertEqual(overview["follow_type_distribution"]["total_stake"], 11.0)
             by_game = {
                 row["game"]: {item["type"]: item for item in row["types"]}
                 for row in overview["follow_type_distribution"]["by_game"]
@@ -11426,6 +11442,7 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(by_game["cs2"]["sub_game"]["count"], 0)
             self.assertEqual(by_game["dota2"]["main_match"]["count"], 0)
             self.assertEqual(by_game["dota2"]["sub_game"]["count"], 1)
+            self.assertEqual(by_game["valorant"]["main_match"]["count"], 1)
 
     def test_dashboard_overview_exposes_total_tracking_duration(self):
         with TemporaryDirectory() as tmp:
