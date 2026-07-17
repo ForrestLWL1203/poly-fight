@@ -128,11 +128,11 @@ python3 -m poly_fight.cli run --stake-usdc 1 --stake-ratio-percent 10 --bankroll
 ```
 
 Stake sizing: the runner sizes by a follow strategy stored in `follow.db`:
-`stake = per-match cap × conviction² × skill`. `conviction` derives from the
-target wallet's order cash relative to the configured fill line; `skill` derives
-from the followed bucket's copy-edge lower bound. Edge (`θ̂×0.95 − price`) is
-only the funded-entry gate, not a stake multiplier. The flags below are the
-legacy fallback when no strategy is configured:
+`stake = floor(current available balance × per-signal percent)`, capped by the
+remaining per-match budget. The target wallet's order size is only a minimum
+filter and never scales the stake. For example, $5,000 available at 2% produces
+a $100 next leg, unless the match budget or remaining cash is lower. The flags
+below are the legacy fallback when no strategy is configured:
 
 - `--stake-usdc` — minimum paper stake per BUY leg.
 - `--stake-ratio-percent` — target-wallet cash replication ratio:
@@ -144,8 +144,9 @@ Fills are detected from on-chain logs when an RPC is configured, falling back to
 `trades?user=<wallet>` polling otherwise. BUY trades in watched
 markets create paper legs; sub-minimum BUY fills accumulate per
 `(wallet, condition, outcome)` until they clear the minimum order, then follow
-(small-buy accumulator). The sole live price gate is the edge gate — current
-price must be `< θ̂×0.95`, else `no_live_edge`. Each newly-eligible wallet's
+(small-buy accumulator). Funded entries must pass both `θ̂×0.95 > price` and the
+strategy's configured observed-price floor/ceiling; neither gate scales the
+stake, and there is no target-order conviction multiplier. Each newly-eligible wallet's
 pre-existing positions are backfilled into legs once (startup and mid-run, when a
 wallet is promoted onto the leaderboard live). SELL trades mirror-exit
 proportionally. Quarantine is manual-only; score-driven demotion removes the

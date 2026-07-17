@@ -223,16 +223,16 @@
 
   /* ---- strategy / runner / health ---- */
   let strategy = {
-    configured: true, schema_version: 3, updated_at: ago(600),
+    configured: true, schema_version: 2, updated_at: ago(600),
     sizing: { per_signal_percent: 1, per_match_percent: 1, min_stake_usdc: 1 },
-    prefilters: { min_target_wallet_order_cash_usdc: 10, max_follow_entry_price: 0.68 },
+    prefilters: { min_target_wallet_order_cash_usdc: 10, max_follow_entry_price: 0.85 },
     balance: { required: true, usable_balance_usdc: 5000 },
   };
   /* ---- named strategy library (stateful: create/update/activate/delete) ---- */
   const mkStrat = (over) => Object.assign({
-    configured: true, schema_version: 3, updated_at: ago(600),
+    configured: true, schema_version: 2, updated_at: ago(600),
     sizing: { per_signal_percent: 1, per_match_percent: 1, min_stake_usdc: 1 },
-    prefilters: { min_target_wallet_order_cash_usdc: 10, max_follow_entry_price: 0.68 },
+    prefilters: { min_target_wallet_order_cash_usdc: 10, max_follow_entry_price: 0.85 },
     balance: { required: true, usable_balance_usdc: 5000 },
   }, over || {});
   let _slugSeq = 1;
@@ -286,7 +286,7 @@
     pid: 12345, source: "dashboard", started_at: ago(7445),
     stake_usdc: 1, stake_ratio_percent: 10,
     realtime_refresh: true, observe_live_running: true, observe_live_pid: 12346,
-    strategy_configured: true, strategy_updated_at: ago(600), strategy_summary: "conviction²×skill（每场预算 10%，最小$1）· 现价上限 0.85 · 目标单≥$10",
+    strategy_configured: true, strategy_updated_at: ago(600), strategy_summary: "单笔 余额1%（每场累计预算 余额1%）· 现价上限 0.85 · 目标单≥$10",
   };
   // stateful mock so the progress masks (sample / stop) animate end-to-end
   let runnerStatus = "running";

@@ -1060,7 +1060,7 @@ def process_follow_trades(
                 to_float(((active_strategy.get("prefilters") or {}).get("min_target_wallet_order_cash_usdc"))),
                 8,
             )
-            for key in ("theta", "live_edge", "bucket_edge_lb", "skill", "conviction", "per_match_cap_usdc", "fill_line_usdc"):
+            for key in ("theta", "live_edge", "bucket_edge_lb", "per_match_cap_usdc"):
                 leg[key] = strategy_decision.get(key)
         if funding_status == "signal_cap":
             leg["signal_cap_limited"] = True

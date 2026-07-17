@@ -430,12 +430,9 @@
       // 主盘止损跌幅%:默认关(0/缺失);>0 → 开。仅作用 main_match。
       stopLossOn: num(pre.main_match_stop_loss_drop_pct) > 0,
       stopLoss: str(num(pre.main_match_stop_loss_drop_pct) > 0 ? num(pre.main_match_stop_loss_drop_pct) : 55, "55"),
-      perSignalCapOn: !!sizing.per_signal_cap_enabled,
-      perSignalPct: str(num(perSignal) || 10, "10"),
-      perMatchPct: str(num(perMatch) || 10, "10"),
-      perMatchSubPct: str(num(perMatchSub) || num(perMatch) || 10, "10"),
-      fillLineXCap: str(num(sizing.fill_line_x_cap) || 10, "10"),
-      edgeRef: str(num(sizing.edge_ref) || 0.20, "0.20"),
+      perSignalPct: str(num(perSignal) || 1, "1"),
+      perMatchPct: str(num(perMatch) || 1, "1"),
+      perMatchSubPct: str(num(perMatchSub) || num(perMatch) || 1, "1"),
       maxOrdersPerMatch: str(num(sizing.max_follow_orders_per_match) || 0, "0"),
       minStake: str(num(sizing.min_stake_usdc) || 1, "1"),
       realtimeRefresh: !!s.realtime_refresh,
@@ -446,16 +443,13 @@
     const usable = k.usableMode === "cap" ? num(k.usableCap) : num(walletBalance);
     return {
       configured: true,
-      schema_version: 3,
+      schema_version: 2,
       sizing: {
         per_signal_percent: num(k.perSignalPct),
-        per_signal_cap_enabled: !!k.perSignalCapOn,
         per_match_percent: num(k.perMatchPct),
         per_match_percent_sub: num(k.perMatchSubPct) || num(k.perMatchPct),  // 空 → 回退主盘(防存成0=非法)
         max_follow_orders_per_match: num(k.maxOrdersPerMatch) || 0,
         min_stake_usdc: num(k.minStake),
-        fill_line_x_cap: num(k.fillLineXCap) || 10,
-        edge_ref: num(k.edgeRef) || 0.20,
       },
       prefilters: {
         min_target_wallet_order_cash_usdc: k.minSignalOn ? num(k.minSignal) : 0,
@@ -502,17 +496,14 @@
     const t = num(sample);
     const threshold = s.minSignalOn ? num(s.minSignal) : 0;
     if (threshold > 0 && t < threshold) return { ignored: true };
-    // 示例按 skill=1 展示；真实 skill 由目标钱包当前桶 edge_lb 决定。
+    // 单一模型:单笔 = 可用余额 × per_signal%(flat,与目标下单额无关),夹到 [min_stake, 每场预算]。
     const avail = strategyAvail(s, walletBalance);
     const budget = avail * num(s.perMatchPct) / 100;
-    const fillLine = Math.max(num(s.minStake) || 1, budget * (num(s.fillLineXCap) || 10));
-    const conviction = Math.min(1, Math.pow(t / fillLine, 2));
-    let raw = budget * Math.pow(conviction, 2);
-    if (s.perSignalCapOn) raw = Math.min(raw, avail * num(s.perSignalPct) / 100);
+    let raw = avail * num(s.perSignalPct) / 100;
     if (budget > 0) raw = Math.min(raw, budget);
     const minStake = num(s.minStake) || 1;
     if (raw > 0 && raw < minStake) raw = minStake;
-    const basis = `单场cap ${_usdInt(budget)} × conviction²（skill示例=1）`;
+    const basis = `余额${s.perSignalPct || 0}% × 可用 ${_usdInt(avail)}（本场累计≤余额${s.perMatchPct || 0}%）`;
     return { amount: Math.floor(Math.max(0, raw)), basis };
   }
 
@@ -520,11 +511,9 @@
      Empty array => ready. Order/labels match the StrategyPage 待完善 list. */
   function strategyIssues(s, walletBalance) {
     const issues = [];
-    if (s.perSignalCapOn && !(num(s.perSignalPct) > 0)) issues.push("单笔硬上限%");
+    if (!(num(s.perSignalPct) > 0)) issues.push("单笔基数%");
     if (!(num(s.perMatchPct) > 0)) issues.push("单场预算%");
-    else if (s.perSignalCapOn && num(s.perMatchPct) + 1e-9 < num(s.perSignalPct)) issues.push("单场预算不能小于单笔硬上限");
-    if (!(num(s.fillLineXCap) > 0)) issues.push("满 conviction 倍数");
-    if (!(num(s.edgeRef) > 0)) issues.push("skill 参考 edge");
+    else if (num(s.perMatchPct) + 1e-9 < num(s.perSignalPct)) issues.push("单场预算不能小于单笔基数");
     if (!(num(s.minStake) > 0)) issues.push("单笔下限");
     if (s.usableMode === "cap" && !(num(s.usableCap) > 0)) issues.push("可动用上限");
     else if (!(strategyAvail(s, walletBalance) > 0)) issues.push("可用余额");

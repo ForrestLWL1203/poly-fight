@@ -231,21 +231,18 @@ and recent pages (`--user-trades-limit` default 100,
 Stake sizing:
 
 The active runner sizes by a configurable follow strategy persisted in
-`follow.db` (mode `kelly`): **stake = per-match cap × conviction² × skill**,
+`follow.db`: **stake = floor(current available balance × per-signal percent)**,
 clamped to `[min_stake floor, per-match remaining]`.
-- `conviction = min(1, (wallet_order_cash / fill_line)²)`, fill_line =
-  `fill_line_x_cap`(10) × per-match cap — wallet must bet ~10× our cap to max out.
-- `skill = clamp(0, 1, bucket edge_lb / edge_ref)`, `edge_ref` = 0.20. `edge_lb`
-  is the followed bucket's copy-edge lower bound (sample-shrunk ≈ edge+Wilson).
-  Sizes by per-bet edge strength, NOT leaderboard rank. Missing edge_lb → skill 1.0.
-- edge (`θ̂×0.95 − price`) is only an entry GATE (`no_live_edge` if ≤ 0), it does
-  NOT scale the bet. (`kelly_fraction`/`follow_mirror_percent` are dormant fields.)
-- per-match cap (10% × dynamic bankroll) is the cumulative ceiling; an optional
-  per-signal hard cap (`per_signal_cap_enabled`, default OFF, set via dashboard
-  checkbox) caps a single leg. Each BUY leg is sized independently.
-
-See review/follow-sizing-conviction-and-dynamic-bankroll.md. (This is NOT
-"Kelly-on-edge" — that was an earlier draft; edge now only gates entry.)
+- Target-wallet order cash is only a minimum-order filter. It does not scale the
+  stake and is not treated as an absolute conviction score.
+- The per-match percentage is the cumulative ceiling for one conditionId across
+  all followed wallets and outcomes. Main and submarket caps are configurable
+  independently.
+- Example: with $5,000 available and a 2% per-signal setting, the next leg starts
+  at $100, unless the remaining match budget or cash balance is lower.
+- The live edge check (`θ̂×0.95 > price`) remains an entry gate, but it does not
+  scale the stake. Wallet quality and copy edge are also enforced when building
+  the grade-A leaderboard.
 
 ```text
 # legacy / no-strategy fallback only:
@@ -274,15 +271,13 @@ if sports follow is later enabled.
 NBA wallets follow NBA only. UFC wallets follow UFC only. Wallets no longer
 eligible can only affect already-open signal markets.
 
-Live price gate: the **sole** funded-follow price gate is the edge gate —
-current price must be `< θ̂×0.95` (`THETA_FOLLOW_DISCOUNT`), else blocked
-`no_live_edge`. `--max-entry-price` (default 0.85, or strategy
-`max_follow_entry_price`) is a hard ceiling on our observed buy price;
+Live price gate: current price must be `< θ̂×0.95`, otherwise the candidate is
+blocked as `no_live_edge`. `--max-entry-price` (default 0.85, or strategy
+`max_follow_entry_price`) is an additional hard ceiling on our observed buy price;
 `--min-wallet-entry-price` floors the target's fill price. The old
 `slippage_over_entry` and `cost_ratio_cap` (cost×1.15) gates were removed so the
-entry axis matches the leaderboard axis (θ̂); `--max-slippage-over-entry` remains
-as an accepted but non-blocking flag. Contested signals are recorded but not
-live-followable.
+entry axis matches the leaderboard axis; `--max-slippage-over-entry` remains as
+an accepted but non-blocking flag. Contested signals are recorded but not live-followable.
 
 Failure policy:
 

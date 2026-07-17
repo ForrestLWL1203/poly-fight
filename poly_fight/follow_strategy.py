@@ -7,21 +7,25 @@ from typing import Any
 from .core import to_float, to_int
 
 
-# 单一资金模型(v3):edge 只决定能否跟；注码由目标订单 conviction 与桶级 skill 决定。
-# stake = per_match_cap × conviction² × skill，最后夹到 [min_stake, 每场剩余额度]。
-# conviction=min(1,(wallet_order_cash/(fill_line_x_cap×per_match_cap))²)
-# skill=clamp(edge_lb/edge_ref,0,1)，edge_lb 缺失时按 1.0，避免旧榜单静默零注码。
-DEFAULT_FOLLOW_STRATEGY_SCHEMA_VERSION = 3
+# ── 单一跟单下注模型(v2,2026-06-21 重构,删 kelly/fixed/ratio/balance_percent 多模式)──
+# 注码只有一条公式:stake = floor(余额 × per_signal_percent%)。无 ramp、无 kelly、无镜像、无按比例。
+# "门(是否跟)"与"注码(下多少)"彻底拆开,所有门一律生效:
+#   1) 入场价上限 max_follow_entry_price / 下限 min_follow_entry_price(对称,0=不限,卡我方现价)
+#   2) 目标单太小 min_target_wallet_order_cash_usdc
+#   3) 每场总预算(每 conditionId 所有钱包/双边合计 ≤ 主盘 per_match_percent% / 子盘 per_match_percent_sub%)
+#   4) live edge 门 θ̂×0.95 > 当前价；它只决定是否跟，不参与注码缩放
+# 目标钱包下单额只用于第 2 项最低金额门槛，绝不映射 conviction 或改变下注金额。
+# 见 review/follow-sizing-refactor-plan.md / review/follow-optimization-plan.md。
+DEFAULT_FOLLOW_STRATEGY_SCHEMA_VERSION = 2
 ACTIVE_FOLLOW_STRATEGY_ID = "active"
 
-DEFAULT_PER_SIGNAL_PERCENT = 10.0         # 可选单笔硬上限；默认关闭
-DEFAULT_PER_SIGNAL_CAP_ENABLED = False
-DEFAULT_PER_MATCH_PERCENT = 10.0
+DEFAULT_PER_SIGNAL_PERCENT = 1.0          # 单笔 = 余额 × 1%
+# 【主盘】每场总预算 = 余额 × per_match_percent%。限额单位 = 单个 conditionId(一个市场,含双边两个
+# outcome);该 condition 所有钱包、两个方向合计 ≤ 此额(先到先得,只填到此不叠加)。
+DEFAULT_PER_MATCH_PERCENT = 1.0
 # 【子盘】(map/game winner 等非 main_match)每场总预算,与主盘解耦、单独可调;口径同上(每 condition
 # 总额,不汇总到系列)。默认 = 主盘值;调低它压制"一个队连押整个系列每局"的子盘堆叠。
-DEFAULT_PER_MATCH_PERCENT_SUB = 10.0
-DEFAULT_FILL_LINE_X_CAP = 10.0
-DEFAULT_EDGE_REF = 0.20
+DEFAULT_PER_MATCH_PERCENT_SUB = 1.0
 # 单钱包每场(单个市场/单局)最大跟单笔数,主/子盘同一上限。0 = 无限制(默认,不改现状)。
 DEFAULT_MAX_FOLLOW_ORDERS_PER_MATCH = 0
 DEFAULT_MIN_STAKE_USDC = 1.0              # dust 地板(Polymarket CLOB 最小单),只防 <$1 废单
@@ -54,11 +58,8 @@ def default_follow_strategy(*, balance_usdc: float | None = None) -> dict[str, A
         "realtime_refresh": False,
         "sizing": {
             "per_signal_percent": DEFAULT_PER_SIGNAL_PERCENT,
-            "per_signal_cap_enabled": DEFAULT_PER_SIGNAL_CAP_ENABLED,
             "per_match_percent": DEFAULT_PER_MATCH_PERCENT,            # 主盘每场总预算(每 conditionId 总额)
             "per_match_percent_sub": DEFAULT_PER_MATCH_PERCENT_SUB,    # 子盘每场总预算(map/game winner)
-            "fill_line_x_cap": DEFAULT_FILL_LINE_X_CAP,
-            "edge_ref": DEFAULT_EDGE_REF,
             "max_follow_orders_per_match": DEFAULT_MAX_FOLLOW_ORDERS_PER_MATCH,  # 每场最大跟单笔数(0=无限)
             "min_stake_usdc": DEFAULT_MIN_STAKE_USDC,
         },
@@ -76,7 +77,7 @@ def default_follow_strategy(*, balance_usdc: float | None = None) -> dict[str, A
 
 
 def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: int | None = None) -> dict[str, Any]:
-    """收敛到 v3 单一模型。容旧:v1/v2 sizing 字段，读到即映射后丢弃。"""
+    """收敛到 v2 单一模型。容旧:v1 的 stake_sizing(kelly/fixed/...) + condition_limits 读到即映射后丢弃。"""
     out = default_follow_strategy()
     if isinstance(strategy, dict):
         for key in ("configured", "schema_version", "updated_at", "realtime_refresh"):
@@ -102,9 +103,6 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
             ms = old_sz.get("min_stake_usdc")
 
         out["sizing"]["per_signal_percent"] = ps if ps is not None else DEFAULT_PER_SIGNAL_PERCENT
-        out["sizing"]["per_signal_cap_enabled"] = bool(
-            new_sz.get("per_signal_cap_enabled", old_sz.get("per_signal_cap_enabled", False))
-        )
         out["sizing"]["per_match_percent"] = pm if pm is not None else DEFAULT_PER_MATCH_PERCENT
         # 子盘预算:新字段优先;旧配置无此字段 → 回退主盘值。
         psub = new_sz.get("per_match_percent_sub")
@@ -112,8 +110,6 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
         mo = new_sz.get("max_follow_orders_per_match")
         out["sizing"]["max_follow_orders_per_match"] = mo if mo is not None else DEFAULT_MAX_FOLLOW_ORDERS_PER_MATCH
         out["sizing"]["min_stake_usdc"] = ms if ms is not None else DEFAULT_MIN_STAKE_USDC
-        out["sizing"]["fill_line_x_cap"] = new_sz.get("fill_line_x_cap", DEFAULT_FILL_LINE_X_CAP)
-        out["sizing"]["edge_ref"] = new_sz.get("edge_ref", DEFAULT_EDGE_REF)
 
         if isinstance(strategy.get("prefilters"), dict):
             pf = strategy["prefilters"]
@@ -132,15 +128,12 @@ def normalize_follow_strategy(strategy: dict[str, Any] | None, *, updated_at: in
 
     sizing = out["sizing"]
     sizing["per_signal_percent"] = round(to_float(sizing.get("per_signal_percent")), 8)
-    sizing["per_signal_cap_enabled"] = bool(sizing.get("per_signal_cap_enabled"))
     sizing["per_match_percent"] = round(to_float(sizing.get("per_match_percent")), 8)
     if sizing.get("per_match_percent_sub") is None:
         sizing["per_match_percent_sub"] = sizing["per_match_percent"]  # 默认 = 主盘
     sizing["per_match_percent_sub"] = round(to_float(sizing.get("per_match_percent_sub")), 8)
     sizing["max_follow_orders_per_match"] = max(0, to_int(sizing.get("max_follow_orders_per_match")))
     sizing["min_stake_usdc"] = round(to_float(sizing.get("min_stake_usdc")), 8)
-    sizing["fill_line_x_cap"] = round(to_float(sizing.get("fill_line_x_cap"), DEFAULT_FILL_LINE_X_CAP), 8)
-    sizing["edge_ref"] = round(to_float(sizing.get("edge_ref"), DEFAULT_EDGE_REF), 8)
 
     prefilters = out["prefilters"]
     prefilters["min_target_wallet_order_cash_usdc"] = round(to_float(prefilters.get("min_target_wallet_order_cash_usdc")), 8)
@@ -171,7 +164,7 @@ def validate_follow_strategy(strategy: dict[str, Any] | None) -> tuple[bool, lis
         errors.append("sizing.per_signal_percent")
     if not _finite_positive(sizing.get("per_match_percent")):
         errors.append("sizing.per_match_percent")
-    elif sizing.get("per_signal_cap_enabled") and to_float(sizing.get("per_match_percent")) + 1e-9 < to_float(sizing.get("per_signal_percent")):
+    elif to_float(sizing.get("per_match_percent")) + 1e-9 < to_float(sizing.get("per_signal_percent")):
         errors.append("sizing.per_match_percent")  # 每场预算不能小于单笔
     # 子盘预算只需 >0;允许小于单笔(把子盘单局压到低于一整注正是它的用途)。
     if not _finite_positive(sizing.get("per_match_percent_sub")):
@@ -181,10 +174,6 @@ def validate_follow_strategy(strategy: dict[str, Any] | None) -> tuple[bool, lis
         errors.append("sizing.max_follow_orders_per_match")
     if not _finite_positive(sizing.get("min_stake_usdc")):
         errors.append("sizing.min_stake_usdc")
-    if not _finite_positive(sizing.get("fill_line_x_cap")):
-        errors.append("sizing.fill_line_x_cap")
-    if not _finite_positive(sizing.get("edge_ref")):
-        errors.append("sizing.edge_ref")
     if not _finite_non_negative(prefilters.get("min_target_wallet_order_cash_usdc")):
         errors.append("prefilters.min_target_wallet_order_cash_usdc")
     # max/min_follow_entry_price 由 normalize clamp 到 [0,1];两者都启用(∈(0,1))时下限须 < 上限,
@@ -242,11 +231,11 @@ def evaluate_follow_candidate(
     condition_funded_order_count: int = 0,           # 保留入参,不使用
     wallet_condition_funded_order_count: int = 0,    # 该钱包该场(单市场)已资助笔数 → 每场最大笔数门
     entry_price: float = 0.0,                        # 跟单时实时价 p
-    bankroll_usdc: float = 0.0,                      # 动态权益，决定每场 cap；available 决定实际能否支付
+    bankroll_usdc: float = 0.0,                      # 旧入参:回退用;注码实际按 available_balance_usdc(现金)算
     wallet_condition_funded_stake_usdc: float = 0.0, # 保留入参(每钱包每场口径已弃用,改用整场总额),不使用
     market_type: str | None = None,                  # 市场类型;main_match=主盘,其余=子盘 → 选各自预算cap
     theta: float | None = None,                      # 该钱包当前桶的 recency-weighted win-rate
-    bucket_edge_lb: float | None = None,             # 当前桶 copy-edge lower bound；缺失→skill 1
+    bucket_edge_lb: float | None = None,             # 仅记录诊断，不参与注码缩放
 ) -> dict[str, Any]:
     normalized = normalize_follow_strategy(strategy)
     valid, _errors = validate_follow_strategy(normalized)
@@ -277,7 +266,7 @@ def evaluate_follow_candidate(
     if 0.0 < min_entry < 1.0 and p < min_entry:
         return _block("entry_below_floor", strategy=normalized)
 
-    # sole funded-follow value gate: current price must be below discounted θ̂.
+    # 价值门与注码解耦：θ̂ 只决定是否值得跟，不参与下注金额。
     theta_value = to_float(theta)
     if not (0.0 < theta_value <= 1.0):
         return _block("no_live_edge", strategy=normalized)
@@ -285,13 +274,12 @@ def evaluate_follow_candidate(
     if live_edge <= 0:
         return _block("no_live_edge", strategy=normalized)
 
-    # ── 动态权益决定每场 cap；available_balance_usdc 是本 tick 可实际支付现金。
-    #    若调用方没有提供动态权益，才回退到 available，兼容旧调用。现金耗尽时必须停手。──
-    available = to_float(available_balance_usdc)
-    equity = to_float(bankroll_usdc)
-    if equity <= 0:
-        equity = available
-    if available <= 0 or equity <= 0:
+    # ── 余额基准 = 可动用现金(买入即扣;单笔注码 + 每场预算都按现金算,不含未结算持仓)。
+    #    available_balance_usdc 已是"扣掉本 tick 已下新单后的现金"(runner 侧算好),故仓位越铺
+    #    开、现金越少、后续单笔自然递减。**现金 ≤ 0 即停手**——绝不回退到 strategy.balance 那个
+    #    静态预设(它不随现金变,回退会在现金耗尽后仍按预设超额下注)。bankroll_usdc 旧入参已弃用。──
+    bankroll = to_float(available_balance_usdc)
+    if bankroll <= 0:
         return _block("no_bankroll", strategy=normalized)
 
     min_stake = to_float(sizing.get("min_stake_usdc"))
@@ -305,20 +293,13 @@ def evaluate_follow_candidate(
     #         所有钱包、两个方向合计 ≤ 余额×cap%(先到先得,只填到此不叠加)。主盘/子盘各自独立 cap。──
     is_submarket = str(market_type or "main_match") != "main_match"
     match_percent = to_float(sizing.get("per_match_percent_sub")) if is_submarket else to_float(sizing.get("per_match_percent"))
-    budget = equity * match_percent / 100.0
+    budget = bankroll * match_percent / 100.0
     remaining = budget - to_float(condition_funded_stake_usdc)
     if remaining < min_stake:
         return _block("match_budget_reached", strategy=normalized)
 
-    fill_line = max(min_stake, to_float(sizing.get("fill_line_x_cap")) * budget)
-    conviction = min(1.0, (order_cash / fill_line) ** 2) if fill_line > 0 else 0.0
-    if bucket_edge_lb is None:
-        skill = 1.0
-    else:
-        skill = min(1.0, max(0.0, to_float(bucket_edge_lb) / to_float(sizing.get("edge_ref"))))
-    raw_stake = budget * (conviction ** 2) * skill
-    if sizing.get("per_signal_cap_enabled"):
-        raw_stake = min(raw_stake, equity * to_float(sizing.get("per_signal_percent")) / 100.0)
+    # ── 注码:单笔 = 余额 × per_signal_percent%,夹到 [min_stake, 预算剩余] ──
+    raw_stake = bankroll * to_float(sizing.get("per_signal_percent")) / 100.0
     raw_stake = min(raw_stake, remaining)
     raw_stake = max(raw_stake, min_stake)
 
@@ -326,7 +307,8 @@ def evaluate_follow_candidate(
     if target_stake < 1:
         return _block("stake_below_minimum", target_stake=target_stake, strategy=normalized)
 
-    stake_mode = "kelly"
+    available = to_float(available_balance_usdc)
+    stake_mode = "unit_pct"
     if available < target_stake:
         # 余额不足 target,但够最小额 → cap 到余额下单;低于 $1 才真 insufficient。
         capped = math.floor(available)
@@ -348,10 +330,7 @@ def evaluate_follow_candidate(
         "theta": round(theta_value, 8),
         "live_edge": round(live_edge, 8),
         "bucket_edge_lb": round(to_float(bucket_edge_lb), 8) if bucket_edge_lb is not None else None,
-        "skill": round(skill, 8),
-        "conviction": round(conviction, 8),
         "per_match_cap_usdc": round(budget, 8),
-        "fill_line_usdc": round(fill_line, 8),
     }
 
 
@@ -362,9 +341,10 @@ def strategy_summary(strategy: dict[str, Any] | None) -> str:
     pms = to_float(sizing.get('per_match_percent_sub'))
     budget_txt = (f"每场预算 主盘{pm:g}%/子盘{pms:g}%" if abs(pms - pm) > 1e-9
                   else f"每场预算 {pm:g}%(主子同)")
-    parts = [f"conviction²×skill（{budget_txt},最小${to_float(sizing.get('min_stake_usdc')):g}）"]
-    if sizing.get("per_signal_cap_enabled"):
-        parts.append(f"单笔≤余额{to_float(sizing.get('per_signal_percent')):g}%")
+    parts = [
+        f"单笔 余额{to_float(sizing.get('per_signal_percent')):g}%"
+        f"({budget_txt},最小${to_float(sizing.get('min_stake_usdc')):g})"
+    ]
     max_orders = to_int(sizing.get("max_follow_orders_per_match"))
     if max_orders > 0:
         parts.append(f"每场≤{max_orders}笔")

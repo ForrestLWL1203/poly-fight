@@ -5822,8 +5822,10 @@ class CoreTest(unittest.TestCase):
 
             self.assertFalse(store.load_follow_strategy()["configured"])
 
-    def test_sizing_uses_edge_conviction_and_skill_with_match_budget(self):
+    def test_sizing_flat_per_signal_with_match_budget(self):
+        # 单一模型:单笔 = 余额×per_signal%;每场总预算 = 余额×per_match%(整场所有钱包合计,只填到预算不叠加)。
         s = default_follow_strategy(balance_usdc=5000)
+        s["sizing"]["per_signal_percent"] = 2.0   # 单笔 = 5000×2% = 100
         s["sizing"]["per_match_percent"] = 2.0    # 每场总预算 = 5000×2% = 100
         s["sizing"]["min_stake_usdc"] = 1.0
 
@@ -5835,23 +5837,22 @@ class CoreTest(unittest.TestCase):
                 entry_price=p, bankroll_usdc=bankroll, theta=theta, bucket_edge_lb=edge_lb,
             )
 
-        # 小目标单只有 floor；达到 fill-line 后吃满 per-match cap。
-        self.assertEqual(ev(200)["funded_stake"], 1)
-        self.assertEqual(ev(1000)["funded_stake"], 100)
-        self.assertEqual(ev(1000)["stake_mode"], "kelly")
-        # edge_lb 是一半 edge_ref → skill=0.5 → 注码减半。
-        self.assertEqual(ev(1000, edge_lb=0.10)["funded_stake"], 50)
+        # flat:不论目标下多大,单笔都是 100(无 ramp、不抄大小)
+        self.assertEqual(ev(200)["funded_stake"], 100)
+        self.assertEqual(ev(99999)["funded_stake"], 100)
+        self.assertEqual(ev(200)["stake_mode"], "unit_pct")
         # 整场加到预算 100:整场已投 60(任意钱包合计)→ 剩 40 → 这笔 40(填满不叠加)
-        self.assertEqual(ev(1000, condition_funded=60)["funded_stake"], 40)
+        self.assertEqual(ev(200, condition_funded=60)["funded_stake"], 40)
         # 整场已投到顶(100) → 预算用完 → match_budget_reached
         self.assertEqual(ev(200, condition_funded=100)["block_reason"], "match_budget_reached")
-        # 单场预算随动态权益:bankroll 4000 → cap 80。
-        self.assertEqual(ev(800, bankroll=4000)["funded_stake"], 80)
-        # 门:目标单太小 / 入场价超上限。
+        # 单笔/预算都随动态余额:bankroll 4000 → 单笔 80
+        self.assertEqual(ev(200, bankroll=4000)["funded_stake"], 80)
+        # 门:目标单太小 / 入场价超上限 / 无正 live edge。
         self.assertEqual(ev(5)["block_reason"], "small_target_wallet_order")
         self.assertEqual(ev(200, p=0.86)["block_reason"], "entry_above_ceiling")
         self.assertEqual(ev(200, p=0.80, theta=0.80)["block_reason"], "no_live_edge")
-        self.assertTrue(ev(200, p=0.64, theta=0.80)["would_follow"])
+        self.assertTrue(ev(200, p=0.64)["would_follow"])
+        self.assertTrue(ev(200, p=0.50)["would_follow"])
 
     def test_follow_strategy_max_entry_price_default_and_clamp(self):
         # 默认 0.85 硬上限;缺字段补默认;clamp 到 [0,1];0 = 不限。
@@ -6377,9 +6378,8 @@ class CoreTest(unittest.TestCase):
         )
         valid, errors = validate_follow_strategy(strategy)
         self.assertTrue(valid, errors)
-        self.assertEqual(strategy["schema_version"], 3)
-        self.assertEqual(strategy["sizing"]["per_signal_percent"], 10.0)
-        self.assertFalse(strategy["sizing"]["per_signal_cap_enabled"])
+        self.assertEqual(strategy["schema_version"], 2)
+        self.assertEqual(strategy["sizing"]["per_signal_percent"], 1.0)
         self.assertEqual(strategy["prefilters"]["min_target_wallet_order_cash_usdc"], 10)
         self.assertNotIn("stake_sizing", strategy)
         self.assertNotIn("condition_limits", strategy)
@@ -6820,8 +6820,8 @@ class CoreTest(unittest.TestCase):
     def test_process_follow_trades_strategy_floors_stake_to_integer(self):
         now = 1000
         strategy = default_follow_strategy(balance_usdc=990)
+        strategy["sizing"]["per_signal_percent"] = 1.0    # 990×1% = 9.9 → floor 9
         strategy["sizing"]["per_match_percent"] = 5.0
-        strategy["sizing"]["fill_line_x_cap"] = 0.1       # 目标单足够大，raw=cap 49.5 → floor 49
         strategy["prefilters"]["min_target_wallet_order_cash_usdc"] = 0
         market = {
             "condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [0.5, 0.5],
@@ -6846,9 +6846,9 @@ class CoreTest(unittest.TestCase):
 
         leg = signals[0]["legs"][0]
         self.assertEqual(stats["new_leg_count"], 1)
-        self.assertEqual(leg["stake"], 49)
-        self.assertEqual(leg["funded_stake"], 49)
-        self.assertEqual(leg["stake_mode"], "kelly")
+        self.assertEqual(leg["stake"], 9)
+        self.assertEqual(leg["funded_stake"], 9)
+        self.assertEqual(leg["stake_mode"], "unit_pct")
 
     def _held_strategy(self):
         s = default_follow_strategy(balance_usdc=5000)
@@ -10752,10 +10752,10 @@ class CoreTest(unittest.TestCase):
             )
 
             self.assertIn("--strategy-source", calls[0][0])
-            self.assertIn("conviction²×skill", status["strategy_summary"])
+            self.assertIn("单笔 余额1%", status["strategy_summary"])
             self.assertIn("现价上限 0.85", status["strategy_summary"])
             self.assertIn("可用余额 250", status["strategy_summary"])
-            self.assertIn("conviction²×skill", read_follow_control(follow_dir)["runner"]["strategy_summary"])
+            self.assertIn("单笔 余额1%", read_follow_control(follow_dir)["runner"]["strategy_summary"])
 
     def test_dashboard_runner_start_allows_strategy_without_balance_limit(self):
         with TemporaryDirectory() as tmp:
