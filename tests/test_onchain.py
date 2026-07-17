@@ -175,6 +175,13 @@ class TestTradeCompatibility(unittest.TestCase):
         self.assertFalse(cold)
         self.assertEqual([trade_id(x) for x in new], ["0xzzz"])
 
+    def test_missing_block_timestamp_uses_fallback(self):
+        log = buy_log(price=0.62, shares=5, tx="0xno-ts")
+        log.pop("blockTimestamp")
+        fill = oc.decode_order_filled(log, wallets={WALLET}, asset_map=self.amap)
+        trade = oc.fill_to_trade(fill, fallback_ts=1781456123)
+        self.assertEqual(trade_timestamp(trade), 1781456123)
+
 
 class TestWSClientNoFdLeak(unittest.TestCase):
     """回归:WS 连接/握手失败必须关掉已开 socket,否则反复重连耗尽 fd → EMFILE →
@@ -359,4 +366,3 @@ class TestPolling(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

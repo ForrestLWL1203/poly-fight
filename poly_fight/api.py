@@ -204,7 +204,7 @@ class PolymarketClient:
         # MLBB/Overwatch/CoD/etc. (~40% of its pages), so querying the specific game
         # tags keeps the fetch matched to scope and gives deeper per-game history.
         # Keep in sync with cli.CATEGORY_TAG_SLUGS["esports"].
-        tag_slugs: tuple[str, ...] = ("counter-strike-2", "league-of-legends", "dota-2", "valorant"),
+        tag_slugs: tuple[str, ...] = ("counter-strike-2", "league-of-legends", "dota-2"),
     ) -> list[dict]:
         all_events: list[dict] = []
         limit = 100

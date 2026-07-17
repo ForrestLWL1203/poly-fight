@@ -190,7 +190,7 @@ def _cash_volume(row: dict[str, Any]) -> float:
 
 
 def _avg_market_cash(row: dict[str, Any]) -> float:
-    direct = _to_float(_first_value(row, ("avg_market_cash", "avg_market_usd", "avg_position_size")))
+    direct = _to_float(_first_value(row, ("avg_market_cash", "avg_market_usd")))
     if direct:
         return direct
     count = _market_count(row)
@@ -1207,10 +1207,24 @@ class FollowStore:
     def list_follow_strategies(self) -> dict[str, Any]:
         self.init_db()
         with self.connect() as conn:
-            rows = conn.execute(
+            return self._list_follow_strategies(conn)
+
+    def list_follow_strategies_readonly(self) -> dict[str, Any]:
+        conn = self.connect_readonly()
+        if conn is None:
+            return {"strategies": [], "active_slug": None}
+        try:
+            if "follow_strategy_library" not in _table_names(conn):
+                return {"strategies": [], "active_slug": None}
+            return self._list_follow_strategies(conn)
+        finally:
+            conn.close()
+
+    def _list_follow_strategies(self, conn: sqlite3.Connection) -> dict[str, Any]:
+        rows = conn.execute(
                 "SELECT slug, name, is_active, updated_at, raw_json FROM follow_strategy_library "
                 "ORDER BY updated_at ASC, slug ASC"
-            ).fetchall()
+        ).fetchall()
         strategies: list[dict[str, Any]] = []
         active_slug: str | None = None
         for row in rows:
@@ -1402,66 +1416,59 @@ class FollowStore:
 
     def apply_account_ledger(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
         self.init_db()
+        with self.connect() as conn:
+            return self._apply_account_ledger(conn, entries)
+
+    def _apply_account_ledger(
+        self, conn: sqlite3.Connection, entries: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         applied_count = 0
         applied_amount = 0.0
-        with self.connect() as conn:
-            state = self.load_account_balance(conn)
-            if not state.get("configured"):
-                return {"configured": False, "applied_count": 0, "applied_amount_usdc": 0.0}
-            balance = float(state.get("balance_usdc") or 0.0)
-            for entry in entries:
-                ledger_id = str(entry.get("ledger_id") or "").strip()
-                if not ledger_id:
-                    continue
-                exists = conn.execute(
-                    "SELECT 1 FROM account_balance_ledger WHERE ledger_id = ?",
-                    (ledger_id,),
-                ).fetchone()
-                if exists:
-                    continue
-                amount = round(float(entry.get("amount_usdc") or 0.0), 8)
-                balance = round(balance + amount, 8)
-                payload = dict(entry)
-                payload["amount_usdc"] = amount
-                payload["balance_after_usdc"] = balance
-                conn.execute(
-                    """
-                    INSERT INTO account_balance_ledger
-                    (ledger_id, kind, amount_usdc, balance_after_usdc, created_at, signal_id, trade_id, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        ledger_id,
-                        str(entry.get("kind") or ""),
-                        amount,
-                        balance,
-                        int(entry.get("created_at") or time.time()),
-                        str(entry.get("signal_id") or ""),
-                        str(entry.get("trade_id") or ""),
-                        _dumps(payload),
-                    ),
-                )
-                applied_count += 1
-                applied_amount = round(applied_amount + amount, 8)
-            if applied_count:
-                updated_at = int(time.time())
-                updated = {
-                    **state,
-                    "configured": True,
-                    "balance_usdc": balance,
-                    "updated_at": updated_at,
-                }
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO account_balance(id, balance_usdc, source, updated_at, raw_json)
-                    VALUES (1, ?, ?, ?, ?)
-                    """,
-                    (balance, str(updated.get("source") or "manual"), updated_at, _dumps(updated)),
-                )
+        state = self.load_account_balance(conn)
+        if not state.get("configured"):
+            return {"configured": False, "applied_count": 0, "applied_amount_usdc": 0.0}
+        balance = float(state.get("balance_usdc") or 0.0)
+        for entry in entries:
+            ledger_id = str(entry.get("ledger_id") or "").strip()
+            if not ledger_id:
+                continue
+            exists = conn.execute(
+                "SELECT 1 FROM account_balance_ledger WHERE ledger_id = ?", (ledger_id,)
+            ).fetchone()
+            if exists:
+                continue
+            amount = round(float(entry.get("amount_usdc") or 0.0), 8)
+            balance = round(balance + amount, 8)
+            payload = {**entry, "amount_usdc": amount, "balance_after_usdc": balance}
+            conn.execute(
+                """
+                INSERT INTO account_balance_ledger
+                (ledger_id, kind, amount_usdc, balance_after_usdc, created_at, signal_id, trade_id, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ledger_id, str(entry.get("kind") or ""), amount, balance,
+                    int(entry.get("created_at") or time.time()), str(entry.get("signal_id") or ""),
+                    str(entry.get("trade_id") or ""), _dumps(payload),
+                ),
+            )
+            applied_count += 1
+            applied_amount = round(applied_amount + amount, 8)
+        if applied_count:
+            updated_at = int(time.time())
+            updated = {**state, "configured": True, "balance_usdc": balance, "updated_at": updated_at}
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO account_balance(id, balance_usdc, source, updated_at, raw_json)
+                VALUES (1, ?, ?, ?, ?)
+                """,
+                (balance, str(updated.get("source") or "manual"), updated_at, _dumps(updated)),
+            )
         return {
             "configured": True,
             "applied_count": applied_count,
             "applied_amount_usdc": round(applied_amount, 8),
+            "balance_usdc": round(balance, 8),
         }
 
     def upsert_wallet_quarantine(
@@ -1777,6 +1784,10 @@ class FollowStore:
 
     def save_run_tick(self, row: dict[str, Any]) -> dict[str, Any]:
         self.init_db()
+        with self.connect() as conn:
+            return self._save_run_tick(conn, row)
+
+    def _save_run_tick(self, conn: sqlite3.Connection, row: dict[str, Any]) -> dict[str, Any]:
         payload = dict(row or {})
         created_at = _timestamp(payload.get("created_at")) or int(time.time())
         payload["created_at"] = created_at
@@ -1784,44 +1795,36 @@ class FollowStore:
         digest = hashlib.sha1(_dumps(payload).encode("utf-8")).hexdigest()[:12]
         tick_id = str(payload.get("tick_id") or f"{created_at}:{digest}")
         payload["tick_id"] = tick_id
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO run_ticks(
-                    tick_id, created_at, status, gate_open, watched_market_count,
-                    open_signal_count, new_signal_count, tick_runtime_seconds,
-                    desired_next_interval_seconds, error, raw_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    tick_id,
-                    created_at,
-                    str(payload.get("status") or "ok"),
-                    1 if payload.get("gate_open") else 0,
-                    _to_int(payload.get("watched_market_count")),
-                    _to_int(payload.get("open_signal_count")),
-                    _to_int(payload.get("new_signal_count")),
-                    _to_float(payload.get("tick_runtime_seconds")),
-                    _to_int(payload.get("desired_next_interval_seconds")),
-                    str(payload.get("error") or ""),
-                    _dumps(payload),
-                ),
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO run_ticks(
+                tick_id, created_at, status, gate_open, watched_market_count,
+                open_signal_count, new_signal_count, tick_runtime_seconds,
+                desired_next_interval_seconds, error, raw_json
             )
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('run_ticks_updated_at', ?)",
-                (str(max(created_at, int(time.time()))),),
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                tick_id, created_at, str(payload.get("status") or "ok"),
+                1 if payload.get("gate_open") else 0, _to_int(payload.get("watched_market_count")),
+                _to_int(payload.get("open_signal_count")), _to_int(payload.get("new_signal_count")),
+                _to_float(payload.get("tick_runtime_seconds")),
+                _to_int(payload.get("desired_next_interval_seconds")), str(payload.get("error") or ""),
+                _dumps(payload),
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('run_ticks_updated_at', ?)",
+            (str(max(created_at, int(time.time()))),),
+        )
+        conn.execute(
+            """
+            DELETE FROM run_ticks WHERE tick_id NOT IN (
+                SELECT tick_id FROM run_ticks ORDER BY created_at DESC, tick_id DESC LIMIT ?
             )
-            # 保留最近 RUN_TICKS_RETENTION 条,裁掉更旧的(与 load_run_ticks 同序)
-            conn.execute(
-                """
-                DELETE FROM run_ticks WHERE tick_id NOT IN (
-                    SELECT tick_id FROM run_ticks
-                    ORDER BY created_at DESC, tick_id DESC LIMIT ?
-                )
-                """,
-                (RUN_TICKS_RETENTION,),
-            )
+            """,
+            (RUN_TICKS_RETENTION,),
+        )
         return payload
 
     def load_run_ticks(self, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -1857,12 +1860,16 @@ class FollowStore:
             total = conn.execute("SELECT raw_json FROM performance_total WHERE id = 1").fetchone()
             wallet_rows = conn.execute("SELECT wallet, raw_json FROM wallet_performance").fetchall()
             updated = conn.execute("SELECT value FROM meta WHERE key = 'performance_updated_at'").fetchone()
+            extra = conn.execute("SELECT value FROM meta WHERE key = 'performance_extra'").fetchone()
         if not total and not wallet_rows:
             return {}
         performance = {
             "wallets": {str(row["wallet"]): _loads(row["raw_json"], {}) for row in wallet_rows},
             "total": _loads(total["raw_json"], {}) if total else {},
         }
+        extra_payload = _loads(extra["value"], {}) if extra else {}
+        if isinstance(extra_payload, dict):
+            performance.update(extra_payload)
         if updated:
             performance["updated_at"] = int(updated["value"] or 0)
         return performance
@@ -1917,6 +1924,7 @@ class FollowStore:
             total = conn.execute("SELECT raw_json FROM performance_total WHERE id = 1").fetchone()
             wallet_rows = conn.execute("SELECT wallet, raw_json FROM wallet_performance").fetchall()
             updated = conn.execute("SELECT value FROM meta WHERE key = 'performance_updated_at'").fetchone() if "meta" in tables else None
+            extra = conn.execute("SELECT value FROM meta WHERE key = 'performance_extra'").fetchone() if "meta" in tables else None
         except sqlite3.Error:
             return snapshot
         finally:
@@ -1927,6 +1935,9 @@ class FollowStore:
                 "wallets": {str(row["wallet"]): _loads(row["raw_json"], {}) for row in wallet_rows},
                 "total": _loads(total["raw_json"], {}) if total else {},
             }
+            extra_payload = _loads(extra["value"], {}) if extra else {}
+            if isinstance(extra_payload, dict):
+                performance.update(extra_payload)
             if updated:
                 performance["updated_at"] = int(updated["value"] or 0)
         return {
@@ -1988,6 +1999,7 @@ class FollowStore:
             total = conn.execute("SELECT raw_json FROM performance_total WHERE id = 1").fetchone()
             wallet_rows = conn.execute("SELECT wallet, raw_json FROM wallet_performance").fetchall()
             updated = conn.execute("SELECT value FROM meta WHERE key = 'performance_updated_at'").fetchone() if "meta" in tables else None
+            extra = conn.execute("SELECT value FROM meta WHERE key = 'performance_extra'").fetchone() if "meta" in tables else None
         except sqlite3.Error:
             return empty
         finally:
@@ -1998,6 +2010,9 @@ class FollowStore:
                 "wallets": {str(row["wallet"]): _loads(row["raw_json"], {}) for row in wallet_rows},
                 "total": _loads(total["raw_json"], {}) if total else {},
             }
+            extra_payload = _loads(extra["value"], {}) if extra else {}
+            if isinstance(extra_payload, dict):
+                performance.update(extra_payload)
             if updated:
                 performance["updated_at"] = int(updated["value"] or 0)
         return {"db_ready": True, "performance": performance}
@@ -2208,37 +2223,95 @@ class FollowStore:
         self.init_db()
         with self.connect() as conn:
             conn.execute("BEGIN")
-            conn.execute("DELETE FROM wallet_cursors")
-            for wallet, row in sorted(wallet_trade_state.items()):
-                cursor = row.get("last_trade_cursor") or {}
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO wallet_cursors
-                    (wallet, last_trade_timestamp, last_trade_id, last_seen_at, raw_json)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        wallet,
-                        int(cursor.get("timestamp") or 0),
-                        str(cursor.get("id") or ""),
-                        int(row.get("last_seen_at") or 0),
-                        _dumps(row),
-                    ),
-                )
-
-            conn.execute("DELETE FROM follow_signals WHERE status = 'open'")
-            for signal in open_signals:
-                self._upsert_signal(conn, signal)
-
-            for event in result_events:
-                self._upsert_result(conn, event)
-
-            self._save_performance(conn, performance)
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('follow_snapshot_updated_at', ?)",
-                (str(int(time.time())),),
+            self._save_follow_snapshot(
+                conn,
+                wallet_trade_state=wallet_trade_state,
+                open_signals=open_signals,
+                result_events=result_events,
+                performance=performance,
             )
             conn.commit()
+
+    def _save_follow_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        wallet_trade_state: dict[str, dict[str, Any]],
+        open_signals: list[dict[str, Any]],
+        result_events: list[dict[str, Any]],
+        performance: dict[str, Any],
+    ) -> None:
+        conn.execute("DELETE FROM wallet_cursors")
+        for wallet, row in sorted(wallet_trade_state.items()):
+            cursor = row.get("last_trade_cursor") or {}
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO wallet_cursors
+                (wallet, last_trade_timestamp, last_trade_id, last_seen_at, raw_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    wallet, int(cursor.get("timestamp") or 0), str(cursor.get("id") or ""),
+                    int(row.get("last_seen_at") or 0), _dumps(row),
+                ),
+            )
+        conn.execute("DELETE FROM follow_signals WHERE status = 'open'")
+        for signal in open_signals:
+            self._upsert_signal(conn, signal)
+        for event in result_events:
+            self._upsert_result(conn, event)
+        self._save_performance(conn, performance)
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('follow_snapshot_updated_at', ?)",
+            (str(int(time.time())),),
+        )
+
+    def commit_follow_tick(
+        self,
+        *,
+        ledger_entries: list[dict[str, Any]],
+        pending_small_buys: dict[str, Any],
+        held_pending_price: dict[str, Any],
+        stop_loss_blocked: dict[str, Any],
+        wallet_trade_state: dict[str, dict[str, Any]],
+        open_signals: list[dict[str, Any]],
+        result_events: list[dict[str, Any]],
+        performance: dict[str, Any],
+        run_tick: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically persist all business state produced by one follow tick."""
+        self.init_db()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            ledger_result = self._apply_account_ledger(conn, ledger_entries)
+            for key, value in (
+                ("pending_small_buys", pending_small_buys),
+                ("held_pending_price", held_pending_price),
+                ("stop_loss_blocked", stop_loss_blocked),
+            ):
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                    (key, _dumps(value or {})),
+                )
+            self._save_follow_snapshot(
+                conn,
+                wallet_trade_state=wallet_trade_state,
+                open_signals=open_signals,
+                result_events=result_events,
+                performance=performance,
+            )
+            persisted_tick = dict(run_tick or {})
+            persisted_tick["balance_ledger_applied_count"] = ledger_result.get("applied_count", 0)
+            persisted_tick["balance_ledger_applied_amount_usdc"] = ledger_result.get("applied_amount_usdc", 0.0)
+            if ledger_result.get("configured"):
+                persisted_tick["account_balance_usdc"] = ledger_result.get("balance_usdc")
+            persisted_tick = self._save_run_tick(conn, persisted_tick)
+            conn.commit()
+        return {
+            "ledger": ledger_result,
+            "account_balance": self.load_account_balance(),
+            "run_tick": persisted_tick,
+        }
 
     def _upsert_signal(self, conn: sqlite3.Connection, signal: dict[str, Any]) -> None:
         signal_id = str(signal.get("signal_id") or "")
@@ -2327,6 +2400,10 @@ class FollowStore:
         conn.execute(
             "INSERT OR REPLACE INTO performance_total(id, raw_json) VALUES (1, ?)",
             (_dumps(performance.get("total") or {}),),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('performance_extra', ?)",
+            (_dumps({key: performance.get(key) or {} for key in ("groups", "by_category") if key in performance}),),
         )
         if performance.get("updated_at") is not None:
             conn.execute(

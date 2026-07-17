@@ -126,6 +126,7 @@ SPORTS_FLAT_FOLLOW_MIN_MEDIAN_MARKET_ROI = 0.10
 SPORTS_FLAT_FOLLOW_MAX_MEDIAN_ENTRY = 0.68
 CATEGORY_REFRESH_OUTPUT_FILES = {
     "leaderboard.db",
+    "leaderboard_v2.db",  # legacy filename; cleanup/migration only
     "smart_wallet_leaderboard.json",
     "wallet_profiles.json",
     "candidate_wallets.json",
@@ -255,15 +256,14 @@ def build_client(args: argparse.Namespace) -> PolymarketClient:
 
 DATA_DIR = Path("data")
 CATEGORY_TAG_SLUGS = {
-    "esports": ("counter-strike-2", "league-of-legends", "dota-2", "valorant"),
+    "esports": ("counter-strike-2", "league-of-legends", "dota-2"),
 }
 # 每 scope(game_family)的 Gamma tag slug。校准器(及 P2 的 per-game 窗口/发现)按此逐游戏拉取。
-# 加新游戏在此登记即可被校准器自动测密度。valorant 已可测密度(分类注册是另一步)。
+# 加新游戏时在此登记，分类白名单仍是独立的安全边界。
 ESPORTS_GAME_TAGS = {
     "cs2": "counter-strike-2",
     "lol": "league-of-legends",
     "dota2": "dota-2",
-    "valorant": "valorant",
 }
 FOLLOW_SIGNAL_CATEGORIES = ("esports",)
 COLLECTOR_NAME = "wallet_collector"
@@ -352,8 +352,6 @@ COLLECTOR_BUCKETS = (
     ("dota2", GAME_WINNER),
     ("cs2", MAIN_MATCH),
     ("cs2", MAP_WINNER),
-    ("valorant", MAIN_MATCH),
-    ("valorant", MAP_WINNER),
 )
 ESPORTS_DEFAULT_CLASSIFICATION_LOOKBACK_DAYS = 60
 ESPORTS_DEFAULT_MIN_PROFILE_PARTICIPATED_MARKETS = 6
@@ -547,9 +545,10 @@ def category_data_dirs(root: Path) -> dict[str, Path]:
 
 
 def leaderboard_db_path(data_dir: Path) -> Path:
-    """优先 collect-v2 的 leaderboard_v2.db;不存在则回退 v1 leaderboard.db。"""
-    v2 = Path(data_dir) / "leaderboard_v2.db"
-    return v2 if v2.exists() else Path(data_dir) / "leaderboard.db"
+    """Return the canonical DB, with a legacy filename fallback for upgrades."""
+    canonical = Path(data_dir) / "leaderboard.db"
+    legacy = Path(data_dir) / "leaderboard_v2.db"
+    return canonical if canonical.exists() or not legacy.exists() else legacy
 
 
 def read_category_leaderboards(root: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
@@ -3739,6 +3738,64 @@ def collect_seed_positions(
     return rows
 
 
+def collect_trade_seed_positions(
+    market: dict[str, Any], market_trades: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Trades-based discovery rows for one closed market.
+
+    This is a recall source, not a quality score: wallet quality is determined
+    later from scoped history. We aggregate BUY cash per wallet/outcome so both
+    frequent participants and large orders remain discoverable without a
+    post-resolution top-PnL survivorship filter.
+    """
+    grouped: dict[tuple[str, int], dict[str, Any]] = {}
+    condition_id = str(market.get("condition_id") or "").lower()
+    for trade in market_trades or []:
+        if str(trade.get("side") or trade.get("type") or "").upper() != "BUY":
+            continue
+        wallet = normalize_wallet(trade.get("proxyWallet") or trade.get("wallet") or trade.get("user"))
+        outcome_index = to_int(trade.get("outcomeIndex", trade.get("outcome_index")), -1)
+        price = to_float(trade.get("price") or trade.get("avgPrice"))
+        size = to_float(trade.get("size") or trade.get("amount"))
+        cash = to_float(trade.get("cash")) or size * price
+        if not wallet or outcome_index < 0 or price <= 0 or size <= 0 or cash <= 0:
+            continue
+        row = grouped.setdefault(
+            (wallet, outcome_index),
+            {"wallet": wallet, "outcome_index": outcome_index, "cash": 0.0, "size": 0.0, "latest": 0},
+        )
+        row["cash"] += cash
+        row["size"] += size
+        row["latest"] = max(row["latest"], to_int(trade.get("timestamp")))
+    winner_index = winning_outcome_index(market)
+    rows: list[dict[str, Any]] = []
+    for row in grouped.values():
+        avg_price = row["cash"] / row["size"] if row["size"] > 0 else 0.0
+        rows.append(
+            {
+                "wallet": row["wallet"], "condition_id": condition_id,
+                "question": market.get("question") or market.get("title") or "",
+                "game_family": str(market.get("game_family") or "").lower(),
+                "market_type": str(market.get("market_type") or MAIN_MATCH),
+                "bucket_key": str(market.get("bucket_key") or bucket_key(market.get("game_family"), market.get("market_type"))),
+                "outcome_index": row["outcome_index"],
+                "seed_outcome_won": row["outcome_index"] == winner_index if winner_index is not None else None,
+                "avg_price": round(avg_price, 8), "total_bought": round(row["size"], 8),
+                "seed_cost": round(row["cash"], 8), "seed_pnl": 0.0, "seed_roi": 0.0,
+                "seed_edge": round(max(0.0, 1.0 - avg_price), 8),
+                "market_volume": to_float(market.get("volume")),
+                "timestamp": row["latest"] or (
+                    int(parse_dt(market.get("end_date")).timestamp()) if parse_dt(market.get("end_date")) else 0
+                ),
+                "seed_source": "market_trades",
+            }
+        )
+    rows.sort(key=lambda value: (to_float(value.get("seed_cost")), value.get("wallet")), reverse=True)
+    for rank, row in enumerate(rows, start=1):
+        row["seed_rank"] = rank
+    return rows
+
+
 def collect_live_seed_positions(
     market: dict[str, Any],
     market_positions_response: list[dict[str, Any]],
@@ -3899,6 +3956,7 @@ def aggregate_seed_wallets(seed_positions: list[dict[str, Any]]) -> dict[str, di
             ),
         }
         wallet_row["seed_score"] = round(seed_wallet_score(wallet_row), 8)
+        uses_trade_discovery = any(row.get("seed_source") == "market_trades" for row in rows)
         wallet_row["candidate"] = {
             "wallet": wallet,
             "participated_market_count": wallet_row["seed_market_count"],
@@ -3907,8 +3965,8 @@ def aggregate_seed_wallets(seed_positions: list[dict[str, Any]]) -> dict[str, di
             "max_single_market_cash": round(max((to_float(row.get("seed_cost")) for row in rows), default=0.0), 8),
             "avg_market_cash": round(seed_cost_total / len(condition_ids), 8) if condition_ids else 0.0,
             "seed_tail_entry_market_count": sum(1 for price in avg_prices if price > 0.85),
-            "candidate_reasons": ["profitable_winner_seed"],
-            "source": "collector_market_positions",
+            "candidate_reasons": ["market_trade_participation" if uses_trade_discovery else "profitable_winner_seed"],
+            "source": "collector_market_trades" if uses_trade_discovery else "collector_market_positions",
         }
         wallets[wallet] = wallet_row
     return wallets
@@ -4090,7 +4148,15 @@ def filter_profile_seed_wallets_v2(
         if market_count < min_seed_markets:
             continue
         avg_cash = to_float(row.get("seed_cost_total")) / market_count if market_count else 0.0
-        if avg_cash < min_avg_seed_cash:
+        max_single_cash = to_float((row.get("candidate") or {}).get("max_single_market_cash"))
+        # 高频只是召回信号，不足以让纯 dust 钱包占用深度 profiling 预算；给它保留
+        # 比 large-size 更宽松的半额现金底线。低频钱包仍可凭单场大额进入。
+        high_participation = (
+            market_count >= max(3, min_seed_markets)
+            and avg_cash >= min_avg_seed_cash * 0.5
+        )
+        large_size = max_single_cash >= min_avg_seed_cash
+        if not (high_participation or large_size):
             continue
         game_counts = row.get("seed_game_family_counts") if isinstance(row.get("seed_game_family_counts"), dict) else {}
         primary_game = max(game_counts, key=lambda g: game_counts[g]) if game_counts else "unknown"
@@ -4811,7 +4877,7 @@ def build_profile_candidate_from_trades(
         return {
             **seed_candidate,
             "wallet": wallet,
-            "candidate_reasons": sorted(set(seed_candidate.get("candidate_reasons") or []) | {"profitable_winner_seed"}),
+            "candidate_reasons": sorted(set(seed_candidate.get("candidate_reasons") or [])),
         }
     market_type_by_id = {
         condition_id: str(record.get("market_type") or MAIN_MATCH)
@@ -4849,14 +4915,14 @@ def build_profile_candidate_from_trades(
         return {
             **seed_candidate,
             "wallet": wallet,
-            "candidate_reasons": sorted(set(seed_candidate.get("candidate_reasons") or []) | {"profitable_winner_seed"}),
+            "candidate_reasons": sorted(set(seed_candidate.get("candidate_reasons") or [])),
         }
     merged = {**seed_candidate, **{key: value for key, value in deep_candidate.items() if key != "candidate_reasons"}}
     merged["wallet"] = wallet
     merged["candidate_reasons"] = sorted(
-        set(seed_candidate.get("candidate_reasons") or []) | {"profitable_winner_seed", "scoped_trade_behavior"}
+        set(seed_candidate.get("candidate_reasons") or []) | {"scoped_trade_behavior"}
     )
-    merged["source"] = "collector_market_positions+scoped_user_trades"
+    merged["source"] = f"{seed_candidate.get('source') or 'collector_seed'}+scoped_user_trades"
     return merged
 
 
@@ -5013,7 +5079,7 @@ def build_collector_leaderboard_v2(
                 continue
             # 专精桶场均地板:桶级 median 押注额 < 门 → 不算合格桶(防小注玩家靠 seed 大单溜进来)。
             # 字段缺失(None)时不拦(生产 profile 必有此字段;留宽容避免最小合成 profile 误伤)。
-            _bucket_med = metrics.get("median_position_size")
+            _bucket_med = metrics.get("median_position_cost_usdc")
             if _bucket_med is not None and to_float(_bucket_med) < min_bucket_median_cash:
                 rejected_counts["bucket_cash_below_floor"] = rejected_counts.get("bucket_cash_below_floor", 0) + 1
                 continue
@@ -5025,6 +5091,10 @@ def build_collector_leaderboard_v2(
                     "edge_type": bucket_edge,
                     "win_rate": round(to_float(metrics.get("bucket_win_rate")), 6),
                     "copy_edge": round(to_float(metrics.get("bucket_copy_edge")), 6),
+                    "bucket_edge_lb": (
+                        round(to_float(metrics.get("bucket_edge_lb")), 6)
+                        if metrics.get("bucket_edge_lb") is not None else None
+                    ),
                     "eff_sample": round(to_float(metrics.get("bucket_eff_sample")), 4),
                     "median_entry_price": round(to_float(metrics.get("median_entry_price")), 6),
                     "positive_market_rate": round(to_float(metrics.get("positive_market_rate")), 6),
@@ -5050,7 +5120,7 @@ def build_collector_leaderboard_v2(
                 if not include_technical and bucket_edge == "technical":
                     rejected_counts["technical_excluded"] = rejected_counts.get("technical_excluded", 0) + 1
                     continue
-                _bucket_med = metrics.get("median_position_size")
+                _bucket_med = metrics.get("median_position_cost_usdc")
                 if _bucket_med is not None and to_float(_bucket_med) < min_bucket_median_cash:
                     rejected_counts["bucket_cash_below_floor"] = rejected_counts.get("bucket_cash_below_floor", 0) + 1
                     continue
@@ -5063,6 +5133,10 @@ def build_collector_leaderboard_v2(
                         "cross_game": True,
                         "win_rate": round(to_float(metrics.get("bucket_win_rate")), 6),
                         "copy_edge": round(to_float(metrics.get("bucket_copy_edge")), 6),
+                        "bucket_edge_lb": (
+                            round(to_float(metrics.get("bucket_edge_lb")), 6)
+                            if metrics.get("bucket_edge_lb") is not None else None
+                        ),
                         "eff_sample": round(to_float(metrics.get("bucket_eff_sample")), 4),
                         "median_entry_price": round(to_float(metrics.get("median_entry_price")), 6),
                         "positive_market_rate": round(to_float(metrics.get("positive_market_rate")), 6),
@@ -5182,8 +5256,7 @@ def _command_collect_wallets(
     *,
     variant: str = "v2",
 ) -> int:
-    # collect-v2 是唯一管线 —— 双侧发现 + hold 口径打分 + V2 导出门 + 每游戏配额,
-    # 产出隔离到 collector_v2_* / leaderboard_v2.db。
+    # collect-v2 是唯一管线 —— 双侧发现 + hold 口径打分 + V2 导出门 + 每游戏配额。
     # hold 口径 = 按"方向是否猜对(持有到结算)"算胜率/ROI:技术型(靠出场盈利、方向常错)
     # 自然被算成亏损而出局,与我们"复制方向、跟随卖出"的策略一致。提前卖出是执行层的事。
     scoring_basis = "hold"
@@ -5258,9 +5331,46 @@ def _command_collect_wallets(
     write_json(output_dir / f"{prefix}_target_markets.json", target_markets)
     mark_stage("target_markets")
 
-    # ── 发现阶段增量缓存:target_markets 全是已结算市场(持仓终态、永不变)。按 condition_id 缓存
-    #    collect_seed_positions 的抽取结果;每轮只对【新出现】的 condition 打 market-positions API,
-    #    轮窗外的从缓存裁掉(历史自然消失)。把原本每轮全量 ~800 次 API(~80s)降到只拉增量。
+    # Primary recall: market trades (maker+taker). Quality is scored later from
+    # scoped wallet history; closed top-PnL positions are only an error/empty fallback.
+    def fetch_trade_seeds(market: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str, bool]:
+        condition_id = str(market.get("condition_id") or "").lower()
+        try:
+            trades, partial, source = fetch_market_trades_cached(
+                client, condition_id, data_dir=output_dir, now_ts=now_ts,
+                page_limit=1000, max_pages=getattr(args, "max_pages_per_market", 3),
+                min_trade_cash=getattr(args, "min_trade_cash", 50),
+                cache_ttl_days=getattr(args, "market_trades_cache_ttl_days", 7),
+            )
+            return condition_id, collect_trade_seed_positions(market, trades), source, partial
+        except Exception as exc:
+            return condition_id, [], f"error:{exc}", True
+
+    trade_seed_results = run_ordered_io_tasks(
+        target_markets, fetch_trade_seeds, max_workers=getattr(args, "max_workers", 8)
+    )
+    trade_seed_by_condition: dict[str, list[dict[str, Any]]] = {}
+    market_trade_errors: dict[str, str] = {}
+    market_trade_cache_hits = 0
+    market_trade_api_fetches = 0
+    for result in trade_seed_results:
+        if isinstance(result, Exception):
+            continue
+        condition_id, rows, source, _partial = result
+        if source == "cache":
+            market_trade_cache_hits += 1
+        elif source == "api":
+            market_trade_api_fetches += 1
+        elif source.startswith("error"):
+            market_trade_errors[condition_id] = source
+        if rows:
+            trade_seed_by_condition[condition_id] = rows
+    fallback_markets = [
+        market for market in target_markets
+        if str(market.get("condition_id") or "").lower() not in trade_seed_by_condition
+    ]
+
+    # ── Fallback cache: target_markets are settled, so market-position results are immutable.
     #    抽取参数(positions_per_market / include_losing_side)变更 → 签名不符 → 整缓存失效全量重拉一次。──
     seed_cache_path = output_dir / f"{prefix}_seed_positions_cache.json"
     seed_cache_signature = {
@@ -5282,7 +5392,7 @@ def _command_collect_wallets(
 
     target_condition_ids = {str(m.get("condition_id") or "").lower() for m in target_markets}
     market_by_id = {str(market.get("condition_id") or "").lower(): market for market in target_markets}
-    markets_to_fetch, seed_cache_hit_count = plan_seed_position_fetch(target_markets, cached_by_condition)
+    markets_to_fetch, seed_cache_hit_count = plan_seed_position_fetch(fallback_markets, cached_by_condition)
 
     def fetch_market_positions(market: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str | None]:
         condition_id = str(market.get("condition_id") or "").lower()
@@ -5322,11 +5432,13 @@ def _command_collect_wallets(
     # 轮窗裁切 + 持久化缓存;拼出本轮全量 seed_positions(缓存命中 + 新拉),按 target 顺序。
     cached_by_condition = prune_seed_position_cache(cached_by_condition, target_condition_ids)
     write_json(seed_cache_path, {"signature": seed_cache_signature, "by_condition": cached_by_condition})
-    seed_positions = [
-        row
-        for market in target_markets
-        for row in cached_by_condition.get(str(market.get("condition_id") or "").lower(), [])
-    ]
+    seed_positions = []
+    for market in target_markets:
+        condition_id = str(market.get("condition_id") or "").lower()
+        seed_positions.extend(
+            trade_seed_by_condition.get(condition_id)
+            or cached_by_condition.get(condition_id, [])
+        )
     write_json(output_dir / f"{prefix}_seed_positions.json", seed_positions)
     mark_stage("seed_positions")
 
@@ -5349,7 +5461,7 @@ def _command_collect_wallets(
         if row.get("condition_id")
     }
     profile_lookback_days = int(getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS) or V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
-    # 打分 scope 按 per-game 窗口收口(valorant 30d / cs2 14d…),无 per-game 配置回退全局默认。
+    # 打分 scope 按 per-game 窗口收口，无 per-game 配置回退全局默认。
     profile_classification_set = filter_classification_set_by_game_window(
         classification_set,
         now=now_dt,
@@ -5500,10 +5612,6 @@ def _command_collect_wallets(
         last_trade = to_int(cached.get("last_esports_trade_at"))
         if last_trade and last_trade >= prune_cutoff:
             profiles_by_wallet[wallet_key] = cached
-    write_json(
-        output_dir / f"{prefix}_wallet_profiles.json",
-        [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
-    )
     mark_stage("wallet_profiles")
 
     collector_result = build_collector_leaderboard_v2(
@@ -5515,10 +5623,6 @@ def _command_collect_wallets(
         gate_kwargs=_v2_gate_kwargs_from_args(args),
     )
     leaderboard = collector_result["leaderboard"]
-    write_json(
-        output_dir / f"{prefix}_leaderboard.json",
-        [slim_profile_for_storage(row) for row in leaderboard],
-    )
     mark_stage("leaderboard")
 
     summary = {
@@ -5552,6 +5656,12 @@ def _command_collect_wallets(
         "seed_cache_hit_count": seed_cache_hit_count,          # 发现阶段:从缓存命中、免 API 的 condition 数
         "seed_cache_fetch_count": len(markets_to_fetch),       # 本轮真正打 API 的(新出现的)condition 数
         "market_position_error_markets": market_position_errors,
+        "market_trade_api_fetches": market_trade_api_fetches,
+        "market_trade_cache_hits": market_trade_cache_hits,
+        "market_trade_error_count": len(market_trade_errors),
+        "market_trade_errors": market_trade_errors,
+        "trade_seed_market_count": len(trade_seed_by_condition),
+        "position_fallback_market_count": len(fallback_markets),
         "raw_user_trade_errors": raw_user_trade_errors,
         "raw_user_trade_cache_hits": raw_user_trade_cache_hits,
         "raw_user_trade_api_fetches": raw_user_trade_api_fetches,
@@ -5588,19 +5698,59 @@ def _command_collect_wallets(
             "v2_per_game_quota": getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
         }
     )
-    # 注:collect-v2 跑在 run-loop maybe_build 里(已 pause follow)、频率以小时计,且每次是
-    #     从共享 profiles 全量重建 → 与 sidecar(observe-live)的 publish 竞争窗口极小
-    #     且自愈;故此处暂未包 build lock(两个 sidecar 已互相串行化)。TODO 若未来观测到丢更新再补。
-    dashboard_publish = publish_collector_dashboard_outputs(
-        output_dir,
-        resolve_data_dir(args),
-        summary=summary,
-        now_ts=now_ts,
-        prefix=prefix,
-        db_filename="leaderboard_v2.db",
-        profiles_publish_name="wallet_profiles_v2.json",
-        collector_name=V2_COLLECTOR_NAME,
-    )
+    # Publish is a short serialized critical section shared with observe-live.
+    # Re-read inside the lock so promotions made during the long API/profile phase
+    # are merged instead of being overwritten by this collector's stale snapshot.
+    with acquire_build_lock(resolve_data_dir(args), blocking=True):
+        latest_profiles = load_collector_existing_profiles(
+            output_dir, resolve_data_dir(args), prefix=prefix
+        )
+        for wallet_key, latest in latest_profiles.items():
+            wallet_key = normalize_wallet(wallet_key or latest.get("wallet"))
+            if not wallet_key:
+                continue
+            current = profiles_by_wallet.get(wallet_key)
+            latest_ts = max(to_int(latest.get("profiled_at")), to_int(latest.get("observed_at")))
+            current_ts = max(to_int((current or {}).get("profiled_at")), to_int((current or {}).get("observed_at")))
+            if current is None or latest_ts > current_ts:
+                profiles_by_wallet[wallet_key] = latest
+        collector_result = build_collector_leaderboard_v2(
+            profiles_by_wallet,
+            now_ts=now_ts,
+            per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
+            max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
+            include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
+            gate_kwargs=_v2_gate_kwargs_from_args(args),
+        )
+        leaderboard = collector_result["leaderboard"]
+        write_json(
+            output_dir / f"{prefix}_wallet_profiles.json",
+            [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
+        )
+        write_json(
+            output_dir / f"{prefix}_leaderboard.json",
+            [slim_profile_for_storage(row) for row in leaderboard],
+        )
+        summary.update(
+            {
+                "profiled_wallet_count": len(profiles_by_wallet),
+                "leaderboard_wallet_count": len(leaderboard),
+                "v2_qualified_count": collector_result.get("qualified_count", 0),
+                "v2_per_game_counts": collector_result.get("per_game_counts", {}),
+                "v2_edge_type_counts": collector_result.get("edge_type_counts", {}),
+                "v2_rejected_counts": collector_result.get("rejected_counts", {}),
+            }
+        )
+        dashboard_publish = publish_collector_dashboard_outputs(
+            output_dir,
+            resolve_data_dir(args),
+            summary=summary,
+            now_ts=now_ts,
+            prefix=prefix,
+            db_filename="leaderboard.db",
+            profiles_publish_name="wallet_profiles_v2.json",
+            collector_name=V2_COLLECTOR_NAME,
+        )
     summary["dashboard_publish"] = dashboard_publish
     write_json(output_dir / f"{prefix}_build_summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
@@ -5675,7 +5825,7 @@ def run_collect_v2_loop(
     client: PolymarketClient,
     sleeper=time.sleep,
 ) -> int:
-    """定时自动重采:每 --loop-hours 跑一次 collect-v2 刷新 leaderboard_v2.db。
+    """定时自动重采:每 --loop-hours 跑一次 collect-v2 刷新 leaderboard.db。
 
     不依赖 follow 循环(M3 的 L2 单独形态)。单次失败不崩溃,退避后继续。
     --loop-max-iterations>0 时跑够即停(测试/有限轮用)。
@@ -5778,7 +5928,7 @@ def _delete_wallets_from_leaderboard(
             publish_collector_dashboard_outputs(
                 output_dir, data_dir,
                 summary={"collector": V2_COLLECTOR_NAME, "category": "esports", "source": source},
-                now_ts=now_ts, prefix="collector_v2", db_filename="leaderboard_v2.db",
+                now_ts=now_ts, prefix="collector_v2", db_filename="leaderboard.db",
                 profiles_publish_name="wallet_profiles_v2.json", collector_name=V2_COLLECTOR_NAME,
             )
         finally:
@@ -5834,7 +5984,7 @@ def rescore_demote_wallets(
     if not targets:
         return {"rescored": 0, "demoted": 0, "demoted_wallets": []}
 
-    # data_dir/output_dir target the esports category dir (leaderboard_v2.db +
+    # data_dir/output_dir target the esports category dir (leaderboard.db +
     # collector_v2 outputs); follow_dir is the SHARED follow dir (follow.db) —
     # the runner passes it explicitly since it differs from the category dir.
     data_dir = resolve_data_dir(args)
@@ -5843,7 +5993,7 @@ def rescore_demote_wallets(
     follow_store = FollowStore(follow_dir / "follow.db")
 
     # 只重评在榜且未隔离的目标(下榜的本就不跟,已隔离的已淘汰)。
-    observe_store = LeaderboardStore(data_dir / "leaderboard_v2.db")
+    observe_store = LeaderboardStore(leaderboard_db_path(data_dir))
     board_rows, _meta = observe_store.load_leaderboard(category="esports")
     board_wallets = {normalize_wallet(r.get("wallet")) for r in board_rows if normalize_wallet(r.get("wallet"))}
     quarantined = {
@@ -6101,7 +6251,7 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
                 publish_collector_dashboard_outputs(
                     output_dir, data_dir,
                     summary={"collector": V2_COLLECTOR_NAME, "category": "esports", "source": "observe_live"},
-                    now_ts=now_ts, prefix="collector_v2", db_filename="leaderboard_v2.db",
+                    now_ts=now_ts, prefix="collector_v2", db_filename="leaderboard.db",
                     profiles_publish_name="wallet_profiles_v2.json", collector_name=V2_COLLECTOR_NAME,
                 )
             finally:
@@ -6581,6 +6731,17 @@ def command_follow(
         for row in eligible_wallet_rows
         if row.get("eligible_buckets")
     }
+    bucket_metrics_by_wallet: dict[str, dict[str, dict[str, Any]]] = {}
+    for row in eligible_wallet_rows:
+        scope_key = f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}"
+        metrics: dict[str, dict[str, Any]] = {}
+        for detail in row.get("eligible_bucket_details") or []:
+            if isinstance(detail, dict) and detail.get("bucket_key"):
+                metrics[str(detail["bucket_key"])] = detail
+        for key, detail in (row.get("per_game_type_grades") or {}).items():
+            if isinstance(detail, dict):
+                metrics.setdefault(str(key), detail)
+        bucket_metrics_by_wallet[scope_key] = metrics
     eligible_leagues_by_wallet = {
         f"{str(row.get('category') or 'esports').lower()}:{row['wallet']}": {str(row.get("league") or "").lower()}
         for row in eligible_wallet_rows
@@ -6843,13 +7004,14 @@ def command_follow(
                     eligible_buckets=eligible_buckets_by_wallet.get(scope_key),
                     eligible_category=category,
                     eligible_leagues=eligible_leagues_by_wallet.get(scope_key),
-                    conflict_policy="dual_follow",
+                    conflict_policy="block_opposite",
                     bankroll_usdc=bankroll_usdc,
                     max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
                     max_signal_stake_usdc=max_signal_stake_usdc,
                     follow_strategy=follow_strategy,
                     held_pending_price=held_pending_price,
                     stop_loss_blocked=stop_loss_blocked,
+                    bucket_metrics=bucket_metrics_by_wallet.get(scope_key),
                 )
                 backfill_legs_opened += len({signal.get("signal_id") for signal in open_signals} - before_ids)
                 # 汇总各候选未开仓的拦截原因(eligibility / low_entry / small_wallet / match_budget …),
@@ -6894,14 +7056,12 @@ def command_follow(
 
         wallet_fetch_started_mono = time.monotonic()
         if detection_source == "onchain":
-            # Near-real-time path: drain on-chain fills (OrderFilled, deduped,
-            # maker=wallet). Each fill carries the EXACT on-chain fill price
-            # (USDC/shares) — no clob_price proxy. Sub-fills of one order (operator
-            # matched several makers) are aggregated per (tx, token, side) into one
-            # trade with the cash-weighted avg price. Our paper entry MIRRORS that
-            # real price (refresh the market snapshot so process_follow_trades reads it).
+            # Near-real-time path: OrderFilled gives the target wallet's exact fill.
+            # Our paper entry is the CLOB quote observable when we detect it; keeping
+            # those prices separate makes latency/slippage performance honest.
             drained = collector.drain()
             trade_results = []
+            observed_quote_cache: dict[tuple[str, str], float | None] = {}
             for row in follow_wallets:
                 wallet = normalize_wallet(row.get("wallet"))
                 scope_key = str(row.get("scope_key") or f"{str(row.get('category') or 'esports').lower()}:{wallet}")
@@ -6922,14 +7082,23 @@ def command_follow(
                     price = (bucket["cash"] / size) if size > 0 else to_float(base.get("price"))
                     merged = {**base, "size": round(size, 6), "price": round(price, 6), "cash": round(bucket["cash"], 6)}
                     market = active_markets_for_follow.get(base["conditionId"]) or watched.get(base["conditionId"]) or {}
-                    if market and price > 0:
-                        prices = list(market.get("outcome_prices") or [])
-                        idx = base["outcomeIndex"]
-                        while len(prices) <= idx:
-                            prices.append(0.0)
-                        prices[idx] = price
-                        market["outcome_prices"] = prices
-                    trades.append(fill_to_trade(merged))
+                    quote_side = "buy" if str(base.get("side") or "").upper() == "BUY" else "sell"
+                    quote_key = (str(base.get("tokenId") or ""), quote_side)
+                    if quote_key not in observed_quote_cache:
+                        observed_quote_cache[quote_key] = clob_price(quote_key[0], quote_side)
+                    observed_price = to_float(observed_quote_cache.get(quote_key))
+                    if observed_price <= 0:
+                        prices = market.get("outcome_prices") or []
+                        idx = to_int(base.get("outcomeIndex"), -1)
+                        observed_price = to_float(prices[idx]) if 0 <= idx < len(prices) else 0.0
+                        observed_source = "market_snapshot"
+                    else:
+                        observed_source = "clob_quote"
+                    trade = fill_to_trade(merged, fallback_ts=now_ts)
+                    if observed_price > 0:
+                        trade["observedPrice"] = round(observed_price, 8)
+                        trade["observedPriceSource"] = observed_source
+                    trades.append(trade)
                 meta = {
                     "fetch_started_at": now_ts,
                     "fetch_completed_at": now_ts,
@@ -7039,7 +7208,7 @@ def command_follow(
                 eligible_buckets=eligible_buckets_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 eligible_category=category if wallet_can_open_new else None,
                 eligible_leagues=eligible_leagues_by_wallet.get(scope_key) if wallet_can_open_new else None,
-                conflict_policy="dual_follow",
+                conflict_policy="block_opposite",
                 bankroll_usdc=bankroll_usdc,
                 max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
                 max_signal_stake_usdc=max_signal_stake_usdc,
@@ -7047,6 +7216,7 @@ def command_follow(
                 pending_small_buys=pending_small_buys,
                 held_pending_price=held_pending_price,
                 stop_loss_blocked=stop_loss_blocked,
+                bucket_metrics=bucket_metrics_by_wallet.get(scope_key),
             )
             after_ids = {signal.get("signal_id") for signal in open_signals}
             new_signal_count += len(after_ids - before_ids)
@@ -7177,7 +7347,7 @@ def command_follow(
                 eligible_buckets=eligible_buckets_by_wallet.get(scope_key_h),
                 eligible_category=category_h,
                 eligible_leagues=eligible_leagues_by_wallet.get(scope_key_h),
-                conflict_policy="dual_follow",
+                conflict_policy="block_opposite",
                 bankroll_usdc=bankroll_usdc,
                 max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
                 max_signal_stake_usdc=max_signal_stake_usdc,
@@ -7185,6 +7355,7 @@ def command_follow(
                 pending_small_buys=pending_small_buys,
                 held_pending_price=held_pending_price,
                 stop_loss_blocked=stop_loss_blocked,
+                bucket_metrics=bucket_metrics_by_wallet.get(scope_key_h),
             )
             followed_h = len({s.get("signal_id") for s in open_signals} - before_ids_h)
             price_held_followed_count += followed_h
@@ -7223,7 +7394,7 @@ def command_follow(
                 stake_ratio_percent=args.stake_ratio_percent,
                 require_pre_match=args.require_pre_match,
                 post_start_grace_seconds=args.post_start_trade_grace_seconds,
-                conflict_policy="dual_follow",
+                conflict_policy="block_opposite",
                 bankroll_usdc=bankroll_usdc,
                 max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
                 max_signal_stake_usdc=max_signal_stake_usdc,
@@ -7348,13 +7519,12 @@ def command_follow(
     # quarantine 入口现在只剩**人工按钮**一种。
     stage_seconds["settlement_and_quarantine"] = round(time.monotonic() - settlement_started_mono, 3)
     balance_ledger_result = {"configured": account_balance_configured, "applied_count": 0, "applied_amount_usdc": 0.0}
+    balance_ledger_entries: list[dict[str, Any]] = []
     if account_balance_configured:
         balance_ledger_entries = [
             *account_buy_ledger_entries([*open_signals, *result_events], created_at=now_ts),
             *account_result_ledger_entries(result_events, created_at=now_ts),
         ]
-        balance_ledger_result = store.apply_account_ledger(balance_ledger_entries)
-        account_balance = store.load_account_balance()
 
     def summarize_seconds(values: list[int] | list[float]) -> dict[str, Any]:
         clean = sorted(float(value) for value in values if value is not None and float(value) >= 0)
@@ -7443,16 +7613,20 @@ def command_follow(
             for category in ("esports", "sports")
         },
     }
-    store.save_pending_small_buys(pending_small_buys)
-    store.save_held_pending_price(held_pending_price)
-    store.save_stop_loss_blocked(stop_loss_blocked)
-    store.save_follow_snapshot(
+    commit_result = store.commit_follow_tick(
+        ledger_entries=balance_ledger_entries,
+        pending_small_buys=pending_small_buys,
+        held_pending_price=held_pending_price,
+        stop_loss_blocked=stop_loss_blocked,
         wallet_trade_state=wallet_trade_state,
         open_signals=open_signals,
         result_events=result_events,
         performance=performance,
+        run_tick=run_log_row,
     )
-    store.save_run_tick(run_log_row)
+    balance_ledger_result = commit_result["ledger"]
+    account_balance = commit_result["account_balance"]
+    run_log_row = commit_result["run_tick"]
     state = {
         "updated_at": now_ts,
         "db_path": str(follow_dir / "follow.db"),
@@ -7663,7 +7837,7 @@ def command_run(args: argparse.Namespace) -> int:
 
                     def _run_rescore(wallets: set[str] = batch) -> None:
                         try:
-                            # esports category dir for leaderboard_v2.db/collector outputs;
+                            # esports category dir for leaderboard.db/collector outputs;
                             # shared follow_dir for the quarantine write.
                             result = rescore_demote_wallets(
                                 client, category_args("esports"), wallets=wallets, follow_dir=follow_dir)
@@ -7934,6 +8108,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_collector_arguments(collect)
     collect.set_defaults(func=command_collect)
 
+    # Public compatibility name documented since the first collector version.
+    build_leaderboard = subparsers.add_parser("build-leaderboard", help="alias for collect")
+    add_build_arguments(build_leaderboard, include_category=True)
+    add_collector_arguments(build_leaderboard)
+    build_leaderboard.set_defaults(func=command_collect)
+
     def add_collector_v2_arguments(subparser: argparse.ArgumentParser) -> None:
         # V2 钱包级硬排除门(逐桶质量统一走 classify_wallet_bucket,不再有逐桶 ROI/Wilson 参数)。
         subparser.add_argument("--v2-max-two-sided-rate", type=float, default=V2_MAX_TWO_SIDED_RATE)
@@ -7944,7 +8124,7 @@ def build_parser() -> argparse.ArgumentParser:
         # 技术型(低买高卖)默认不纳入;加此 flag 一键开回。
         subparser.add_argument("--v2-include-technical", dest="v2_include_technical",
                                action="store_true", default=V2_INCLUDE_TECHNICAL)
-        # 定时自动重采(长驻进程):>0 时每 N 小时跑一次刷新 leaderboard_v2.db(0=一次性)。
+        # 定时自动重采(长驻进程):>0 时每 N 小时跑一次刷新 leaderboard.db(0=一次性)。
         # 循环期间会暂停 follow 开新单;--follow-dir 须指向 follow 循环的同一个 follow 目录。
         subparser.add_argument("--loop-hours", type=float, default=0)
         subparser.add_argument("--loop-error-retry-seconds", type=int, default=300)
@@ -7958,7 +8138,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     collect_v2 = subparsers.add_parser(
         "collect-v2",
-        help="collect-v2: dual-side discovery + actual-PnL scoring + per-game quota (isolated leaderboard_v2.db)",
+        help="collect-v2: dual-side discovery + actual-PnL scoring + per-game quota",
     )
     add_build_arguments(collect_v2, include_category=True)
     add_collector_arguments(collect_v2)

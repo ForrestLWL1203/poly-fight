@@ -46,15 +46,13 @@ collect-v2 / build-leaderboard (periodic full rebuild):
   closed in-scope markets -> dual-side discovery -> trades -> candidate wallets
   -> scoped wallet history -> score -> A-only leaderboard.db (per category)
 
-observe-v2 (sidecar, ~2h): newly-SETTLED markets -> top-PnL dual-side holders
-  -> score on history -> merge into leaderboard; also resolution/score freshness
-  refresh. Covers matches not seen live. (No demotion/recovery here — demoted
-  wallets are deleted by the follow runner; re-discovery is the only way back.)
+collect-v2 --loop-hours N / runner pool refresh: periodic full rebuild from
+  newly available settled history, including score freshness and re-discovery.
 
 observe-live (sidecar, ~10min): ACTIVE (unsettled) watched markets over a volume
   gate -> dual-side current holders -> score on history -> grade-A promoted into
   leaderboard EARLY (seed_source=observe_live). Lets follow act before settlement.
-  (observe-v2 + observe-live share leaderboard.db; their publish critical sections
+  (collect-v2 + observe-live share leaderboard.db; their publish critical sections
   serialize via acquire_build_lock.)
 
 follow / run:

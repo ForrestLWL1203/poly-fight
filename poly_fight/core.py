@@ -46,7 +46,7 @@ SPORTS_N_EFF_FLOOR = 12
 SPORTS_MIN_BUCKET_WIN_RATE = 0.60
 # v19:可跟价区(≤ceiling)子集最小厚度。全样本地板(12)管"真活跃",此项管"别拿太薄的可跟切片下判断"
 # (防 3–5 场侥幸过 edge_lb)。edge_lb 的 Wilson 仍在子集上算。
-# v22(病B,2026-06-21):6→8。scope 自适应把稀疏游戏(dota2/cs2/valorant)地板放宽到~7,导致
+# v22(病B,2026-06-21):6→8。scope 自适应把稀疏游戏(dota2/cs2)地板放宽到~7,导致
 # 半个榜单(41/81)靠 7–11 场可跟切片上榜,8 个是 7 场 100% 全胜——纯小样本运气,Wilson 在 n=7
 # 时(7/7→下界~0.65)惩罚不够。8 作硬地板覆盖自适应向下放宽,砍掉最薄的 ~19% 切片(实战 1/16
 # 的连胜运气钱包)。此门在 classify_wallet_bucket 内从常量取,三入口(collect/observe-live/降级)共用。
@@ -63,11 +63,11 @@ SCOPE_MARKET_TARGET = 180             # lookback 要装够多少 main 市场(稀
 SCOPE_LOOKBACK_MIN_DAYS = 14
 SCOPE_LOOKBACK_MAX_DAYS = 90
 # n_eff 地板按密度 λ(main 市场/天)分三档(老三家也一起自适应,量级不同同门不公平)。
-# 分档而非线性:目标值(cs2=10 / lol=8 / dota2·valorant=7)落不到一条直线(两段斜率不同),
+# 分档而非线性:目标值(cs2=10 / lol=8 / dota2=7)落不到一条直线(两段斜率不同),
 # 分档能精确命中且各游戏 λ 离阈值有 2-3 余量、不在边界抖动。实测 λ:cs2≈16 / lol≈12 / dota2·valo≈6。
 SCOPE_NEFF_DENSE = 10                 # λ ≥ λ_T2(密集,如 cs2)—— 满严格"锚点"
 SCOPE_NEFF_MID = 8                    # λ_T1 ≤ λ < λ_T2(中,如 lol)—— 满严格锚点
-SCOPE_NEFF_SPARSE = 7                 # λ < λ_T1(稀疏,如 dota2 / valorant)—— 满严格锚点
+SCOPE_NEFF_SPARSE = 7                 # λ < λ_T1(稀疏,如 dota2)—— 满严格锚点
 SCOPE_NEFF_LAMBDA_T1 = 9.0
 SCOPE_NEFF_LAMBDA_T2 = 14.0
 # v21 缓冲缩放:实际 n_eff 地板 = 基数 + round((锚点 − 基数) × scale)。
@@ -180,13 +180,12 @@ MATERIAL_TWO_SIDED_MIN_MINORITY_FRAC = 0.20
 MAIN_MATCH = "main_match"
 GAME_WINNER = "game_winner"
 MAP_WINNER = "map_winner"
-ALLOWED_GAME_FAMILIES = {"cs2", "dota2", "lol", "valorant"}
+ALLOWED_GAME_FAMILIES = {"cs2", "dota2", "lol"}
 ESPORTS_CATEGORY_TAGS = {
     "dota-2",
     "counter-strike-2",
     "cs2",
     "league-of-legends",
-    "valorant",
 }
 SPORTS_LEAGUE_TAGS = {
     "nba": "nba",
@@ -208,8 +207,6 @@ ESPORTS_DISCOVERY_GAME_MARKET_TYPE_LIMITS = {
     "lol:game_winner": 50,
     "dota2:game_winner": 50,
     "cs2:map_winner": 50,
-    "valorant:main_match": 100,
-    "valorant:map_winner": 50,
 }
 MARKET_TYPE_ORDER = {
     MAIN_MATCH: 0,
@@ -220,7 +217,6 @@ GAME_FAMILY_LABELS = {
     "cs2": "CS2",
     "dota2": "Dota2",
     "lol": "LoL",
-    "valorant": "Valorant",
     # 跨游戏盘口专家:在某盘口上跨游戏合并后达标(per-type 合格),无单一游戏专精桶。
     "multi": "跨游戏",
 }
@@ -333,8 +329,6 @@ def game_family_from_event(event: dict[str, Any]) -> str:
         return "dota2"
     if "league-of-legends" in tags or title.startswith("lol:"):
         return "lol"
-    if "valorant" in tags or title.startswith("valorant:") or "valorant" in title:
-        return "valorant"
     return "other"
 
 
@@ -509,9 +503,9 @@ def classify_market_type(event: dict[str, Any], market: dict[str, Any]) -> str |
         and not re.search(r"\b(game|map)\s+[1-5]\b", question_norm)
     ):
         return MAIN_MATCH
-    if game_family in {"dota2", "lol", "valorant"} and is_numbered_winner_question(question_norm, "game"):
+    if game_family in {"dota2", "lol"} and is_numbered_winner_question(question_norm, "game"):
         return GAME_WINNER
-    if game_family in {"cs2", "valorant"} and is_numbered_winner_question(question_norm, "map"):
+    if game_family == "cs2" and is_numbered_winner_question(question_norm, "map"):
         return MAP_WINNER
     return None
 
@@ -544,29 +538,21 @@ def event_to_market_records(
         market_type = classify_market_type(event, market)
         if not market_type or (allowed_market_types is not None and market_type not in allowed_market_types):
             continue
-        if category == "sports":
-            end_date = (
-                market.get("umaEndDate")
-                or market.get("closedTime")
-                or event.get("finishedTimestamp")
-                or event.get("closedTime")
-                or market.get("endDate")
-                or event.get("endDate")
-            )
-            match_start_time = (
-                market.get("eventStartTime")
-                or event.get("startTime")
-                or market.get("gameStartTime")
-                or end_date
-            )
-        else:
-            match_start_time = market.get("eventStartTime") or event.get("startTime") or market.get("gameStartTime")
-            end_date = event.get("endDate") or market.get("endDate")
-        market_start_time = (
-            match_start_time
-            if category == "sports"
-            else market.get("gameStartTime") or market.get("eventStartTime") or event.get("startTime")
+        end_date = (
+            market.get("umaEndDate")
+            or market.get("closedTime")
+            or event.get("finishedTimestamp")
+            or event.get("closedTime")
+            or market.get("endDate")
+            or event.get("endDate")
         )
+        match_start_time = (
+            market.get("eventStartTime")
+            or event.get("startTime")
+            or market.get("gameStartTime")
+            or end_date
+        )
+        market_start_time = match_start_time
         condition_id = str(market.get("conditionId")).lower()
         records[condition_id] = {
             "condition_id": condition_id,
@@ -1411,6 +1397,7 @@ def summarize_closed_positions(
         rois = [row["roi"] for row in bucket_rows]
         profits_per_share = [row["profit_per_share"] for row in bucket_rows]
         sizes = [row["total_bought"] for row in bucket_rows]
+        costs = [row["cost_basis"] for row in bucket_rows]
         entry_prices = [row["avg_price"] for row in bucket_rows if row["avg_price"] > 0]
         high_price_entries = sum(1 for row in bucket_rows if row["avg_price"] >= 0.90)
         low_edge_profits = sum(1 for row in bucket_rows if 0 < row["roi"] <= 0.03)
@@ -1537,6 +1524,7 @@ def summarize_closed_positions(
         "recency_half_life_days": ESPORTS_RECENCY_HALF_LIFE_DAYS,
         "avg_position_size": round(total_bought / count, 6) if count else 0.0,
         "median_position_size": round(median(sizes), 6) if sizes else 0.0,
+        "median_position_cost_usdc": round(median(costs), 6) if costs else 0.0,
         "avg_entry_price": round(sum(entry_prices) / len(entry_prices), 8) if entry_prices else 0.0,
         "median_entry_price": round(median(scoring_entry_prices), 8) if scoring_entry_prices else 0.0,  # v17:可跟价区中位价,评分用
         "median_entry_price_full": round(median(entry_prices), 8) if entry_prices else 0.0,

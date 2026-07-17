@@ -76,6 +76,7 @@ from poly_fight.cli import (
     slim_profile_for_storage,
     calculate_seed_bucket_min_wins,
     collect_seed_positions,
+    collect_trade_seed_positions,
     collect_live_seed_positions,
     plan_seed_position_fetch,
     prune_seed_position_cache,
@@ -363,12 +364,11 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(event_league(mlb_event), "other")
         self.assertEqual(event_category(cs_event), "esports")
         self.assertEqual(event_league(cs_event), "cs2")
-        # valorant 现为平级 in-scope 游戏(自适应采集参数落地后纳入)。
-        self.assertEqual(event_category(valorant_event), "esports")
-        self.assertEqual(event_league(valorant_event), "valorant")
-        self.assertIn("valorant", ALLOWED_GAME_FAMILIES)
+        self.assertIsNone(event_category(valorant_event))
+        self.assertEqual(event_league(valorant_event), "other")
+        self.assertNotIn("valorant", ALLOWED_GAME_FAMILIES)
 
-    def test_valorant_moneyline_is_in_scope(self):
+    def test_valorant_moneyline_is_out_of_scope(self):
         event = {
             "id": "valorant1",
             "slug": "valorant-nrg-leviatan-2026-06-08",
@@ -389,10 +389,24 @@ class CoreTest(unittest.TestCase):
 
         records = event_to_market_records(event)
 
-        self.assertEqual(classify_market_type(event, event["markets"][0]), "main_match")
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["game_family"], "valorant")
-        self.assertEqual(records[0]["market_type"], "main_match")
+        self.assertIsNone(classify_market_type(event, event["markets"][0]))
+        self.assertEqual(records, [])
+
+    def test_allowed_esports_uses_end_date_only_as_last_start_fallback(self):
+        event = {
+            "title": "League of Legends: A vs B (BO3)",
+            "endDate": "2026-06-08T20:00:00Z",
+            "tags": [{"slug": "league-of-legends"}],
+            "markets": [{
+                "conditionId": "lol-moneyline",
+                "question": "League of Legends: A vs B (BO3)",
+                "outcomes": '["A","B"]',
+                "outcomePrices": '["1","0"]',
+            }],
+        }
+        record = event_to_market_record(event)
+        self.assertEqual(record["match_start_time"], event["endDate"])
+        self.assertEqual(record["market_start_time"], event["endDate"])
 
     def test_nba_and_ufc_moneylines_are_main_match_and_record_league(self):
         nba_event = {
@@ -600,7 +614,7 @@ class CoreTest(unittest.TestCase):
         record = event_to_market_record(event)
 
         self.assertEqual(record["match_start_time"], "2026-06-01T12:00:00Z")
-        self.assertEqual(record["market_start_time"], "2026-06-01 12:05:00+00")
+        self.assertEqual(record["market_start_time"], "2026-06-01T12:00:00Z")
 
     def test_event_to_market_records_includes_winner_submarkets_and_excludes_props(self):
         event = {
@@ -641,7 +655,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(records["game1"]["market_type"], "game_winner")
         self.assertNotIn("kills", records)
 
-    def test_market_classifier_accepts_cs_and_valorant_map_winner(self):
+    def test_market_classifier_accepts_cs_and_rejects_valorant(self):
         cs_event = {
             "title": "Counter-Strike: 9z vs FlyQuest (BO1) - IEM Cologne",
             "tags": [{"slug": "counter-strike-2"}],
@@ -669,9 +683,8 @@ class CoreTest(unittest.TestCase):
         }
 
         self.assertEqual(classify_market_type(cs_event, cs_market), "map_winner")
-        # valorant 现为平级游戏:主盘 = main_match,Map N Winner = map_winner(同 cs2)。
-        self.assertEqual(classify_market_type(valorant_event, valorant_market), "main_match")
-        self.assertEqual(classify_market_type(valorant_event, valorant_map_market), "map_winner")
+        self.assertIsNone(classify_market_type(valorant_event, valorant_market))
+        self.assertIsNone(classify_market_type(valorant_event, valorant_map_market))
 
     def test_market_classifier_accepts_winner_alias_outcomes_but_rejects_prop_outcomes(self):
         event = {
@@ -1162,8 +1175,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(counts["dota2:game_winner"], 50)
         self.assertEqual(counts["cs2:map_winner"], 50)
         self.assertEqual(meta["selected_by_game_market_type"], counts)
-        # valorant 现已是配置桶(本用例未提供 valorant 市场 → 选中 0,不进 counts)。
-        self.assertIn("valorant:main_match", meta["game_market_buckets"])
+        self.assertNotIn("valorant:main_match", meta["game_market_buckets"])
 
     def test_candidate_wallets_use_participation_or_large_size(self):
         trades_by_market = {
@@ -2988,6 +3000,41 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(store.load_market_cache(cache_kind="closed", now_ts=200, ttl_seconds=900)[0]["m1"]["condition_id"], "m1")
             self.assertEqual(store.load_market_cache(cache_kind="active", now_ts=200, ttl_seconds=900)[0], {})
 
+    def test_commit_follow_tick_is_atomic_and_preserves_performance_dimensions(self):
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            store.set_account_balance(100, ts=1, source="manual")
+            perf = {
+                "wallets": {"0xabc": {"signals": 1}}, "total": {"signals": 1},
+                "groups": {"clean": {"signals": 1}},
+                "by_category": {"esports": {"signals": 1}}, "updated_at": 2,
+            }
+            result = store.commit_follow_tick(
+                ledger_entries=[{"ledger_id": "buy:s1:t1", "kind": "buy", "amount_usdc": -5,
+                                 "created_at": 2, "signal_id": "s1", "trade_id": "t1"}],
+                pending_small_buys={"p": {"cash": 2}}, held_pending_price={"h": {"held_since": 2}},
+                stop_loss_blocked={"s": {"stopped_at": 2}},
+                wallet_trade_state={"0xabc": {"last_trade_cursor": {"timestamp": 2, "id": "t1"}}},
+                open_signals=[{"signal_id": "s1", "wallet": "0xabc", "condition_id": "m1",
+                               "outcome_index": 0, "status": "open", "legs": [{"trade_id": "t1", "stake": 5}]}],
+                result_events=[], performance=perf,
+                run_tick={"created_at": 2, "gate_open": True, "new_signal_count": 1},
+            )
+            self.assertEqual(result["account_balance"]["balance_usdc"], 95)
+            self.assertEqual(store.load_performance(), perf)
+            self.assertEqual(store.load_pending_small_buys(), {"p": {"cash": 2}})
+            self.assertEqual(store.latest_run_tick()["balance_ledger_applied_count"], 1)
+
+            # A failure after the ledger mutation rolls the whole tick back.
+            with patch.object(store, "_save_follow_snapshot", side_effect=RuntimeError("boom")):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    store.commit_follow_tick(
+                        ledger_entries=[{"ledger_id": "buy:s2:t2", "kind": "buy", "amount_usdc": -7}],
+                        pending_small_buys={}, held_pending_price={}, stop_loss_blocked={},
+                        wallet_trade_state={}, open_signals=[], result_events=[], performance={}, run_tick={},
+                    )
+            self.assertEqual(store.load_account_balance()["balance_usdc"], 95)
+
     def test_m5_unprocessed_results_persist_and_mark(self):
         # M5 计数从 DB 派生:settled + exited 都算未处理;标记后不再计;跨"重启"(新 store 实例)持久。
         with TemporaryDirectory() as tmp:
@@ -3371,7 +3418,7 @@ class CoreTest(unittest.TestCase):
             cached = read_json(cache_path, {})
 
         self.assertEqual(source, "api")
-        self.assertIn(("counter-strike-2", "league-of-legends", "dota-2", "valorant"), client.tag_calls)
+        self.assertIn(("counter-strike-2", "league-of-legends", "dota-2"), client.tag_calls)
         self.assertNotIn(("nba", "ufc"), client.tag_calls)
         self.assertEqual(markets["esports-m1"]["category"], "esports")
         self.assertNotIn("sports-m1", markets)
@@ -5775,42 +5822,42 @@ class CoreTest(unittest.TestCase):
 
             self.assertFalse(store.load_follow_strategy()["configured"])
 
-    def test_sizing_flat_per_signal_with_match_budget(self):
-        # 单一模型:单笔 = 余额×per_signal%;每场总预算 = 余额×per_match%(整场所有钱包合计,只填到预算不叠加)。
+    def test_sizing_uses_edge_conviction_and_skill_with_match_budget(self):
         s = default_follow_strategy(balance_usdc=5000)
-        s["sizing"]["per_signal_percent"] = 1.0   # 单笔 = 5000×1% = 50
         s["sizing"]["per_match_percent"] = 2.0    # 每场总预算 = 5000×2% = 100
         s["sizing"]["min_stake_usdc"] = 1.0
 
-        def ev(order_cash=200, p=0.60, condition_funded=0.0, bankroll=5000):
+        def ev(order_cash=200, p=0.60, condition_funded=0.0, bankroll=5000,
+               theta=0.90, edge_lb=0.20):
             return evaluate_follow_candidate(
                 strategy=s, target_wallet_order_cash_usdc=order_cash, available_balance_usdc=bankroll,
                 condition_funded_stake_usdc=condition_funded,
-                entry_price=p, bankroll_usdc=bankroll,
+                entry_price=p, bankroll_usdc=bankroll, theta=theta, bucket_edge_lb=edge_lb,
             )
 
-        # flat:不论目标下多大,单笔都是 50(无 ramp、不抄大小)
-        self.assertEqual(ev(200)["funded_stake"], 50)
-        self.assertEqual(ev(99999)["funded_stake"], 50)
-        self.assertEqual(ev(200)["stake_mode"], "unit_pct")
+        # 小目标单只有 floor；达到 fill-line 后吃满 per-match cap。
+        self.assertEqual(ev(200)["funded_stake"], 1)
+        self.assertEqual(ev(1000)["funded_stake"], 100)
+        self.assertEqual(ev(1000)["stake_mode"], "kelly")
+        # edge_lb 是一半 edge_ref → skill=0.5 → 注码减半。
+        self.assertEqual(ev(1000, edge_lb=0.10)["funded_stake"], 50)
         # 整场加到预算 100:整场已投 60(任意钱包合计)→ 剩 40 → 这笔 40(填满不叠加)
-        self.assertEqual(ev(200, condition_funded=60)["funded_stake"], 40)
+        self.assertEqual(ev(1000, condition_funded=60)["funded_stake"], 40)
         # 整场已投到顶(100) → 预算用完 → match_budget_reached
         self.assertEqual(ev(200, condition_funded=100)["block_reason"], "match_budget_reached")
-        # 单笔/预算都随动态权益:bankroll 4000 → 单笔 40
-        self.assertEqual(ev(200, bankroll=4000)["funded_stake"], 40)
-        # 门:目标单太小 / 入场价超上限(默认 0.68)
+        # 单场预算随动态权益:bankroll 4000 → cap 80。
+        self.assertEqual(ev(800, bankroll=4000)["funded_stake"], 80)
+        # 门:目标单太小 / 入场价超上限。
         self.assertEqual(ev(5)["block_reason"], "small_target_wallet_order")
-        self.assertEqual(ev(200, p=0.80)["block_reason"], "entry_above_ceiling")
-        # edge 门已删:p≤0.68 过 ceiling 即放行,不再卡 θ̂
-        self.assertTrue(ev(200, p=0.64)["would_follow"])
-        self.assertTrue(ev(200, p=0.50)["would_follow"])
+        self.assertEqual(ev(200, p=0.86)["block_reason"], "entry_above_ceiling")
+        self.assertEqual(ev(200, p=0.80, theta=0.80)["block_reason"], "no_live_edge")
+        self.assertTrue(ev(200, p=0.64, theta=0.80)["would_follow"])
 
     def test_follow_strategy_max_entry_price_default_and_clamp(self):
-        # 默认 0.68(评分价区);缺字段补默认;clamp 到 [0,1];0 = 不限(均 normalize 处理)。
-        self.assertEqual(default_follow_strategy()["prefilters"]["max_follow_entry_price"], 0.68)
+        # 默认 0.85 硬上限;缺字段补默认;clamp 到 [0,1];0 = 不限。
+        self.assertEqual(default_follow_strategy()["prefilters"]["max_follow_entry_price"], 0.85)
         miss = normalize_follow_strategy({"prefilters": {"min_target_wallet_order_cash_usdc": 10}})
-        self.assertEqual(miss["prefilters"]["max_follow_entry_price"], 0.68)
+        self.assertEqual(miss["prefilters"]["max_follow_entry_price"], 0.85)
         self.assertEqual(
             normalize_follow_strategy({"prefilters": {"max_follow_entry_price": 1.5}})["prefilters"]["max_follow_entry_price"],
             1.0,
@@ -5827,7 +5874,7 @@ class CoreTest(unittest.TestCase):
         # 现价下限:默认关(0=不限);开后卡我方现价 p;clamp[0,1];须 < 上限;与上限对称。
         self.assertEqual(default_follow_strategy()["prefilters"]["min_follow_entry_price"], 0.0)
         # 老策略缺字段 → 默认 0(不改现状)
-        miss = normalize_follow_strategy({"prefilters": {"max_follow_entry_price": 0.68}})
+        miss = normalize_follow_strategy({"prefilters": {"max_follow_entry_price": 0.85}})
         self.assertEqual(miss["prefilters"]["min_follow_entry_price"], 0.0)
         # clamp
         self.assertEqual(normalize_follow_strategy({"prefilters": {"min_follow_entry_price": 1.5}})["prefilters"]["min_follow_entry_price"], 1.0)
@@ -5840,7 +5887,7 @@ class CoreTest(unittest.TestCase):
         def ev(p):
             return evaluate_follow_candidate(
                 strategy=s, target_wallet_order_cash_usdc=200, available_balance_usdc=5000,
-                entry_price=p, bankroll_usdc=5000,
+                entry_price=p, bankroll_usdc=5000, theta=0.90, bucket_edge_lb=0.20,
             )
         # 现价 0.50 < 下限 0.58 → 拦;0.58/0.65 放行(0.65 仍 ≤ 默认上限 0.68)
         self.assertEqual(ev(0.50)["block_reason"], "entry_below_floor")
@@ -6167,6 +6214,10 @@ class CoreTest(unittest.TestCase):
         leaked, _c2, _ = select_new_trades(ws_trades, legacy_cursor)
         self.assertEqual({r["id"] for r in leaked}, {"0xa1", "0xb2"})
 
+    def test_trade_cursor_never_rewinds_on_missing_ws_timestamp(self):
+        previous = {"timestamp": 2000, "id": "0xold", "seen_ids": ["0xold"]}
+        self.assertEqual(_build_trade_cursor([{"id": "0xws", "timestamp": 0}], previous), previous)
+
     def test_follow_user_trades_fetch_pages_until_cursor(self):
         class FakeClient:
             def __init__(self):
@@ -6295,6 +6346,7 @@ class CoreTest(unittest.TestCase):
             target_wallet_order_cash_usdc=200,
             available_balance_usdc=30,
             entry_price=0.50, bankroll_usdc=5000,
+            theta=0.90, bucket_edge_lb=0.20,
         )
         self.assertTrue(capped["would_follow"])
         self.assertEqual(capped["funded_stake"], 30)
@@ -6308,6 +6360,7 @@ class CoreTest(unittest.TestCase):
             target_wallet_order_cash_usdc=200,
             available_balance_usdc=0.5,
             entry_price=0.50, bankroll_usdc=5000,
+            theta=0.90, bucket_edge_lb=0.20,
         )
         self.assertFalse(broke["would_follow"])
         self.assertEqual(broke["block_reason"], "insufficient_balance")
@@ -6324,8 +6377,9 @@ class CoreTest(unittest.TestCase):
         )
         valid, errors = validate_follow_strategy(strategy)
         self.assertTrue(valid, errors)
-        self.assertEqual(strategy["schema_version"], 2)
-        self.assertEqual(strategy["sizing"]["per_signal_percent"], 1.0)
+        self.assertEqual(strategy["schema_version"], 3)
+        self.assertEqual(strategy["sizing"]["per_signal_percent"], 10.0)
+        self.assertFalse(strategy["sizing"]["per_signal_cap_enabled"])
         self.assertEqual(strategy["prefilters"]["min_target_wallet_order_cash_usdc"], 10)
         self.assertNotIn("stake_sizing", strategy)
         self.assertNotIn("condition_limits", strategy)
@@ -6497,6 +6551,29 @@ class CoreTest(unittest.TestCase):
             max_follow_legs=10, max_slippage=1.0, bankroll_usdc=1000,
         )
         self.assertEqual(len(signals2[0]["legs"]), 2)             # 加仓被跟
+
+    def test_process_follow_trades_is_idempotent_by_trade_id(self):
+        now = 1000
+        wallet = "0xa"
+        market = {
+            "condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [0.5, 0.5],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "Match", "market_type": "main_match",
+        }
+        trade = {"id": "0xsame", "proxyWallet": wallet, "market": "m1", "outcomeIndex": 0,
+                 "side": "BUY", "price": 0.5, "size": 100, "timestamp": now}
+        signals, _ = process_follow_trades(
+            [], wallet=wallet, trades=[trade], markets_by_condition={"m1": market}, now_ts=now,
+            stake_usdc=1, stake_ratio_percent=10, max_follow_legs=10, max_slippage=1.0,
+            bankroll_usdc=1000,
+        )
+        replayed, stats = process_follow_trades(
+            signals, wallet=wallet, trades=[dict(trade)], markets_by_condition={"m1": market}, now_ts=now + 1,
+            stake_usdc=1, stake_ratio_percent=10, max_follow_legs=10, max_slippage=1.0,
+            bankroll_usdc=1000,
+        )
+        self.assertEqual(len(replayed[0]["legs"]), 1)
+        self.assertEqual(stats["duplicate_trade_skipped_count"], 1)
 
     def test_process_follow_trades_records_observed_delay_diagnostics(self):
         now = 1000
@@ -6743,8 +6820,8 @@ class CoreTest(unittest.TestCase):
     def test_process_follow_trades_strategy_floors_stake_to_integer(self):
         now = 1000
         strategy = default_follow_strategy(balance_usdc=990)
-        strategy["sizing"]["per_signal_percent"] = 1.0    # 990×1% = 9.9 → floor 9
         strategy["sizing"]["per_match_percent"] = 5.0
+        strategy["sizing"]["fill_line_x_cap"] = 0.1       # 目标单足够大，raw=cap 49.5 → floor 49
         strategy["prefilters"]["min_target_wallet_order_cash_usdc"] = 0
         market = {
             "condition_id": "m1", "outcomes": ["A", "B"], "outcome_prices": [0.5, 0.5],
@@ -6764,13 +6841,14 @@ class CoreTest(unittest.TestCase):
             max_slippage=0.05,
             bankroll_usdc=990,
             follow_strategy=strategy,
+            bucket_metrics={"unknown:main_match": {"win_rate": 0.90, "bucket_edge_lb": 0.20}},
         )
 
         leg = signals[0]["legs"][0]
         self.assertEqual(stats["new_leg_count"], 1)
-        self.assertEqual(leg["stake"], 9)
-        self.assertEqual(leg["funded_stake"], 9)
-        self.assertEqual(leg["stake_mode"], "unit_pct")
+        self.assertEqual(leg["stake"], 49)
+        self.assertEqual(leg["funded_stake"], 49)
+        self.assertEqual(leg["stake_mode"], "kelly")
 
     def _held_strategy(self):
         s = default_follow_strategy(balance_usdc=5000)
@@ -6799,6 +6877,7 @@ class CoreTest(unittest.TestCase):
             now_ts=now, stake_usdc=1, max_follow_legs=10, max_slippage=1.0,
             min_wallet_entry_price=0.4, max_entry_price=0.75, bankroll_usdc=5000,
             follow_strategy=strategy, held_pending_price=held,
+            bucket_metrics={"unknown:main_match": {"win_rate": 0.90, "bucket_edge_lb": 0.20}},
         )
         self.assertEqual(stats["new_leg_count"], 0)
         self.assertEqual(signals, [])
@@ -6812,6 +6891,7 @@ class CoreTest(unittest.TestCase):
             now_ts=now, stake_usdc=1, max_follow_legs=10, max_slippage=1.0,
             min_wallet_entry_price=0.4, max_entry_price=0.75, bankroll_usdc=5000,
             follow_strategy=strategy, held_pending_price=held,
+            bucket_metrics={"unknown:main_match": {"win_rate": 0.90, "bucket_edge_lb": 0.20}},
         )
         self.assertEqual(stats2["new_leg_count"], 1)
         self.assertNotIn("0xa|m1|0", held)   # 跟成 → 清缓存
@@ -6828,6 +6908,7 @@ class CoreTest(unittest.TestCase):
             now_ts=now, stake_usdc=1, max_follow_legs=10, max_slippage=1.0,
             min_wallet_entry_price=0.4, max_entry_price=0.75, bankroll_usdc=5000,
             follow_strategy=strategy, held_pending_price=held,
+            bucket_metrics={"unknown:main_match": {"win_rate": 0.90, "bucket_edge_lb": 0.20}},
         )
         self.assertEqual(signals, [])
         self.assertEqual(held, {})                       # 下穿不缓存
@@ -7394,7 +7475,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(signals[0]["status"], "exited")
         self.assertGreater(signals[0]["our_realized_pnl"], 0)
 
-    def test_follow_v2_opposite_buy_dual_follows_by_default(self):
+    def test_follow_v2_opposite_buy_is_recorded_but_not_funded(self):
         now = 1000
         market = {
             "condition_id": "m1",
@@ -7426,18 +7507,11 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(stats["opposite_blocked_count"], 1)
         self.assertEqual(stats["exited_signal_count"], 0)
-        self.assertEqual(stats["new_leg_count"], 1)
-        self.assertEqual(len(signals), 2)
-        self.assertEqual({signal["outcome_index"] for signal in signals}, {0, 1})
-        self.assertTrue(all(signal["status"] == "open" for signal in signals))
-
-        contested = contested_markets(signals, now_ts=now + 1)
-        signals, contested_stats = apply_contested_flags(signals, contested, now_ts=now + 1)
-
-        self.assertEqual(contested, {"m1"})
-        self.assertEqual(contested_stats["contested_signal_count"], 2)
-        self.assertTrue(all(signal["contested"] for signal in signals))
-        self.assertTrue(all(leg["would_follow"] for signal in signals for leg in signal.get("legs") or []))
+        self.assertEqual(stats["new_leg_count"], 0)
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]["outcome_index"], 0)
+        self.assertTrue(signals[0]["contested"])
+        self.assertTrue(any(e.get("kind") == "opposite_buy_blocked" for e in signals[0]["behavior_events"]))
 
     def test_follow_v2_low_price_opposite_buy_is_skipped_without_quarantine(self):
         now = 1000
@@ -7472,11 +7546,11 @@ class CoreTest(unittest.TestCase):
         )
 
         self.assertEqual(stats["hedge_event_count"], 0)
-        self.assertEqual(stats["low_entry_price_blocked_count"], 1)
+        self.assertEqual(stats["opposite_blocked_count"], 1)
         self.assertEqual(stats["new_leg_count"], 0)
         self.assertEqual(len(signals), 1)
 
-    def test_follow_v2_opposite_wallet_buy_opens_other_side_by_default(self):
+    def test_follow_v2_opposite_wallet_buy_does_not_fund_other_side(self):
         now = 1000
         market = {
             "condition_id": "m1",
@@ -7508,10 +7582,10 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(stats["opposite_blocked_count"], 1)
         self.assertEqual(stats["exited_signal_count"], 0)
-        self.assertEqual(stats["new_leg_count"], 1)
-        self.assertEqual({signal["wallet"] for signal in signals}, {"0xa", "0xb"})
-        self.assertEqual({signal["outcome_index"] for signal in signals}, {0, 1})
-        self.assertTrue(all(signal["status"] == "open" for signal in signals))
+        self.assertEqual(stats["new_leg_count"], 0)
+        self.assertEqual({signal["wallet"] for signal in signals}, {"0xa"})
+        self.assertEqual({signal["outcome_index"] for signal in signals}, {0})
+        self.assertTrue(signals[0]["contested"])
 
     def test_follow_v2_opposite_buy_exit_on_opposite_legacy_mode(self):
         now = 1000
@@ -8131,7 +8205,7 @@ class CoreTest(unittest.TestCase):
             )
 
             fake_collector = FakeCollector()
-            with patch("poly_fight.cli.clob_price", return_value=0.55):
+            with patch("poly_fight.cli.clob_price", return_value=0.58):
                 summary = command_follow(args, client=FakeClient(), emit=False, collector=fake_collector)
 
             # build_asset_map wired the watched market's token ids into the collector.
@@ -8145,7 +8219,9 @@ class CoreTest(unittest.TestCase):
             open_signals = FollowStore(data_dir / "follow" / "follow.db").load_open_signals()
             self.assertEqual(len(open_signals), 1)
             leg = (open_signals[0].get("legs") or [open_signals[0]])[0]
-            self.assertAlmostEqual(float(leg.get("our_entry_price")), 0.55, places=4)
+            self.assertAlmostEqual(float(leg.get("our_entry_price")), 0.58, places=4)
+            self.assertAlmostEqual(float(leg.get("wallet_fill_price")), 0.55, places=4)
+            self.assertEqual(leg.get("price_source"), "clob_quote")
 
     def test_follow_tick_quarantine_takes_precedence_over_favorite(self):
         with TemporaryDirectory() as tmp:
@@ -8842,7 +8918,7 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(summary["new_signal_count"], 1)
             self.assertEqual(len(snapshot["open_signals"]), 1)
 
-    def test_follow_tick_dual_follows_opposite_wallet_buys(self):
+    def test_follow_tick_blocks_opposite_wallet_buy_funding(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             now = datetime.now(timezone.utc)
@@ -8916,11 +8992,11 @@ class CoreTest(unittest.TestCase):
 
             self.assertEqual(summary["opposite_blocked_count"], 1)
             self.assertEqual(summary["exited_signal_count"], 0)
-            self.assertEqual(summary["contested_signal_count"], 2)
-            self.assertEqual(summary["open_signal_count"], 2)
-            self.assertEqual(len(snapshot["open_signals"]), 2)
+            self.assertEqual(summary["contested_signal_count"], 0)
+            self.assertEqual(summary["open_signal_count"], 1)
+            self.assertEqual(len(snapshot["open_signals"]), 1)
             self.assertEqual(len(snapshot["results"]), 0)
-            self.assertEqual({signal["outcome_index"] for signal in snapshot["open_signals"]}, {0, 1})
+            self.assertEqual({signal["outcome_index"] for signal in snapshot["open_signals"]}, {0})
             self.assertTrue(all(signal["contested"] for signal in snapshot["open_signals"]))
 
     def test_follow_tick_logs_insufficient_balance_count(self):
@@ -10676,10 +10752,10 @@ class CoreTest(unittest.TestCase):
             )
 
             self.assertIn("--strategy-source", calls[0][0])
-            self.assertIn("单笔 余额1%", status["strategy_summary"])
-            self.assertIn("现价上限 0.68", status["strategy_summary"])
+            self.assertIn("conviction²×skill", status["strategy_summary"])
+            self.assertIn("现价上限 0.85", status["strategy_summary"])
             self.assertIn("可用余额 250", status["strategy_summary"])
-            self.assertIn("单笔 余额1%", read_follow_control(follow_dir)["runner"]["strategy_summary"])
+            self.assertIn("conviction²×skill", read_follow_control(follow_dir)["runner"]["strategy_summary"])
 
     def test_dashboard_runner_start_allows_strategy_without_balance_limit(self):
         with TemporaryDirectory() as tmp:
@@ -11408,7 +11484,6 @@ class CoreTest(unittest.TestCase):
                     {"timestamp": 110, "pnl": 0.5, "cumulative_pnl": 0.5},
                     {"timestamp": 120, "pnl": -1.0, "cumulative_pnl": -0.5},
                     {"timestamp": 130, "pnl": 2.0, "cumulative_pnl": 1.5},
-                    {"timestamp": 135, "pnl": 3.0, "cumulative_pnl": 4.5},
                 ],
                 overview["equity_points"],
             )
@@ -11419,8 +11494,7 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(win_rates["cs2"]["settled_count"], 2)
             self.assertEqual(win_rates["cs2"]["win_rate"], 0.5)
             self.assertEqual(win_rates["dota2"]["wins"], 1)
-            self.assertEqual(win_rates["valorant"]["game_label"], "Valorant")
-            self.assertEqual(win_rates["valorant"]["wins"], 1)
+            self.assertNotIn("valorant", win_rates)
             self.assertNotIn("nba", win_rates)
 
             open_by_game = {row["game"]: row["count"] for row in overview["open_by_game"]}
@@ -11431,13 +11505,13 @@ class CoreTest(unittest.TestCase):
                 for row in overview["follow_type_distribution"]["segments"]
             }
             self.assertEqual(distribution["main_match"]["label"], "主盘")
-            self.assertEqual(distribution["main_match"]["count"], 3)
-            self.assertEqual(distribution["main_match"]["stake"], 7.0)
+            self.assertEqual(distribution["main_match"]["count"], 2)
+            self.assertEqual(distribution["main_match"]["stake"], 2.0)
             self.assertEqual(distribution["sub_game"]["label"], "Sub Game")
             self.assertEqual(distribution["sub_game"]["count"], 1)
             self.assertEqual(distribution["sub_game"]["stake"], 4.0)
-            self.assertEqual(overview["follow_type_distribution"]["total"], 4)
-            self.assertEqual(overview["follow_type_distribution"]["total_stake"], 11.0)
+            self.assertEqual(overview["follow_type_distribution"]["total"], 3)
+            self.assertEqual(overview["follow_type_distribution"]["total_stake"], 6.0)
             by_game = {
                 row["game"]: {item["type"]: item for item in row["types"]}
                 for row in overview["follow_type_distribution"]["by_game"]
@@ -11446,7 +11520,6 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(by_game["cs2"]["sub_game"]["count"], 0)
             self.assertEqual(by_game["dota2"]["main_match"]["count"], 0)
             self.assertEqual(by_game["dota2"]["sub_game"]["count"], 1)
-            self.assertEqual(by_game["valorant"]["main_match"]["count"], 1)
 
     def test_dashboard_overview_exposes_total_tracking_duration(self):
         with TemporaryDirectory() as tmp:
@@ -12093,20 +12166,10 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(detail["outcomes"], ["A", "B"])
             self.assertEqual(detail["outcome_prices"], [0.42, 0.58])
 
-    def test_dashboard_fetch_market_prices_updates_active_cache(self):
+    def test_dashboard_fetch_market_prices_is_readonly_and_offline(self):
         class FakeClient:
             def gamma(self, path, **params):
-                self.path = path
-                self.params = params
-                return [
-                    {
-                        "conditionId": "m1",
-                        "question": "A vs B",
-                        "slug": "a-vs-b",
-                        "outcomes": json.dumps(["A", "B"]),
-                        "outcomePrices": json.dumps(["0.44", "0.56"]),
-                    }
-                ]
+                raise AssertionError("dashboard GET must not call Gamma")
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -12126,11 +12189,9 @@ class CoreTest(unittest.TestCase):
             result = fetch_market_prices(data_dir, client, "m1")
             cached = FollowStore(data_dir / "follow" / "follow.db").get_market_cache_item("active", "m1")
 
-            self.assertEqual(client.path, "/markets")
-            self.assertEqual(client.params["condition_ids"], "m1")
             self.assertEqual(result["outcomes"], ["A", "B"])
-            self.assertEqual(result["outcome_prices"], [0.44, 0.56])
-            self.assertEqual(cached["outcome_prices"], [0.44, 0.56])
+            self.assertEqual(result["outcome_prices"], [0.4, 0.6])
+            self.assertEqual(cached["outcome_prices"], [0.4, 0.6])
 
     def test_dashboard_follow_detail_uses_condition_sql_not_full_snapshot(self):
         with TemporaryDirectory() as tmp:
@@ -13860,19 +13921,17 @@ class CoreTest(unittest.TestCase):
             ]
         )
 
-        # valorant 纳入后桶限额求和变化:main 300→400(+valorant 100)、map 50→100(+valorant 50);
-        # game_winner 不变(valorant 无 game_winner 桶);submarket 是独立常量(150)不随桶和变。
         self.assertEqual(
             effective_discovery_defaults(esports),
             {
-                "target_markets": 400,
+                "target_markets": 300,
                 "submarket_target_markets": 150,
                 "game_winner_target_markets": 100,
-                "map_winner_target_markets": 100,
-                "max_markets_per_run": 400,
+                "map_winner_target_markets": 50,
+                "max_markets_per_run": 300,
                 "submarket_max_markets_per_run": 150,
                 "game_winner_max_markets_per_run": 100,
-                "map_winner_max_markets_per_run": 100,
+                "map_winner_max_markets_per_run": 50,
             },
         )
         self.assertEqual(
@@ -13892,9 +13951,13 @@ class CoreTest(unittest.TestCase):
         parser = build_parser()
 
         args = parser.parse_args(["collect", "--max-profiles-per-run", "3"])
+        alias_args = parser.parse_args(["build-leaderboard", "--max-profiles-per-run", "3"])
 
         self.assertEqual(args.command, "collect")
         self.assertEqual(args.max_profiles_per_run, 3)
+        self.assertEqual(alias_args.command, "build-leaderboard")
+        self.assertEqual(alias_args.max_profiles_per_run, 3)
+        self.assertIs(alias_args.func, command_collect)
 
     def test_rescore_command_is_not_registered(self):
         parser = build_parser()
@@ -14003,8 +14066,7 @@ class CoreTest(unittest.TestCase):
             ],
         )
         self.assertEqual(meta["bucket_counts"]["lol:main_match"], 2)
-        # valorant 现为配置桶,本用例无 valorant 市场 → 计 0(不再是"不存在")。
-        self.assertEqual(meta["bucket_counts"].get("valorant:main_match", 0), 0)
+        self.assertNotIn("valorant:main_match", meta["bucket_counts"])
 
     def test_select_collector_target_markets_can_take_one_hundred_per_bucket(self):
         now = datetime(2026, 6, 9, tzinfo=timezone.utc)
@@ -14039,7 +14101,6 @@ class CoreTest(unittest.TestCase):
         )
 
         self.assertEqual(len(selected), 600)
-        # valorant 现为配置桶,本用例未提供 valorant 市场 → 计 0 + 满额缺口。
         self.assertEqual(
             meta["bucket_counts"],
             {
@@ -14049,14 +14110,9 @@ class CoreTest(unittest.TestCase):
                 "dota2:game_winner": 100,
                 "cs2:main_match": 100,
                 "cs2:map_winner": 100,
-                "valorant:main_match": 0,
-                "valorant:map_winner": 0,
             },
         )
-        self.assertEqual(
-            meta["bucket_shortfalls"],
-            {"valorant:main_match": 100, "valorant:map_winner": 100},
-        )
+        self.assertEqual(meta["bucket_shortfalls"], {})
 
     def test_seed_bucket_min_wins_uses_ten_percent_without_floor(self):
         self.assertEqual(
@@ -14075,6 +14131,30 @@ class CoreTest(unittest.TestCase):
                 "dota2:game_winner": 3,
             },
         )
+
+    def test_trade_seed_positions_aggregate_split_buys_on_both_outcomes(self):
+        market = {
+            "condition_id": "0xM1",
+            "game_family": "lol",
+            "market_type": "main_match",
+            "outcome_prices": [1.0, 0.0],
+            "end_date": "2026-06-01T00:00:00Z",
+        }
+        rows = collect_trade_seed_positions(
+            market,
+            [
+                {"proxyWallet": "0xAAA", "side": "BUY", "outcomeIndex": 0, "price": 0.4, "size": 10, "timestamp": 1},
+                {"proxyWallet": "0xaaa", "side": "BUY", "outcomeIndex": 0, "price": 0.6, "size": 10, "timestamp": 2},
+                {"proxyWallet": "0xBBB", "side": "BUY", "outcomeIndex": 1, "price": 0.5, "size": 20, "timestamp": 3},
+                {"proxyWallet": "0xAAA", "side": "SELL", "outcomeIndex": 0, "price": 0.7, "size": 1, "timestamp": 4},
+            ],
+        )
+        by_wallet = {row["wallet"]: row for row in rows}
+        self.assertEqual(set(by_wallet), {"0xaaa", "0xbbb"})
+        self.assertEqual(by_wallet["0xaaa"]["seed_cost"], 10.0)
+        self.assertEqual(by_wallet["0xaaa"]["avg_price"], 0.5)
+        self.assertTrue(by_wallet["0xaaa"]["seed_outcome_won"])
+        self.assertFalse(by_wallet["0xbbb"]["seed_outcome_won"])
 
     def test_seed_positions_keep_only_profitable_winning_outcome(self):
         market = {
@@ -14302,6 +14382,7 @@ class CoreTest(unittest.TestCase):
             "bucket_eff_sample": 12.0,
             "bucket_copy_edge": round(wilson - 0.45, 6),
             "median_position_size": median_position_size,
+            "median_position_cost_usdc": median_position_size,
         }
         return {
             "wallet": wallet,
@@ -14471,7 +14552,7 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(storage_module.LeaderboardStore(Path(d) / "nope.db").load_observe_analyzed(now_ts=now), {})
 
     def _setup_rescore_demote_case(self, root, *, now, favorite=None, extra=()):
-        """Seed leaderboard_v2.db + 已发布榜 JSON + 打分池 profiles + 0xdrop 原始交易缓存。
+        """Seed leaderboard.db + 已发布榜 JSON + 打分池 profiles + 0xdrop 原始交易缓存。
         extra: 额外的"在榜无辜钱包",用于验证精准删除不波及它们。"""
         import poly_fight.storage as storage_module
         esports_dir = root / "esports"
@@ -14480,7 +14561,7 @@ class CoreTest(unittest.TestCase):
         collector_dir.mkdir(parents=True, exist_ok=True)
         rows = [{"wallet": "0xdrop", "grade": "A"}, {"wallet": "0xkeep", "grade": "A"}]
         rows += [{"wallet": w, "grade": "A"} for w in extra]
-        storage_module.LeaderboardStore(esports_dir / "leaderboard_v2.db").replace_leaderboard(
+        storage_module.LeaderboardStore(esports_dir / "leaderboard.db").replace_leaderboard(
             rows, category="esports", updated_at=now,
         )
         (collector_dir / "collector_v2_wallet_profiles.json").write_text(json.dumps(rows))
@@ -14524,7 +14605,7 @@ class CoreTest(unittest.TestCase):
                 )
 
             self.assertEqual(set(result["demoted_wallets"]), {"0xdrop"})
-            board_rows, _meta = storage_module.LeaderboardStore(esports_dir / "leaderboard_v2.db").load_leaderboard(category="esports")
+            board_rows, _meta = storage_module.LeaderboardStore(esports_dir / "leaderboard.db").load_leaderboard(category="esports")
             board = {normalize_wallet(r.get("wallet")) for r in board_rows}
             self.assertNotIn("0xdrop", board)        # 被降级的精准删除
             self.assertIn("0xkeep", board)            # 其余保留
@@ -14559,8 +14640,8 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(set(result["demoted_wallets"]), {"0xdrop"})
             # 不再写 quarantine 中间态
             self.assertEqual(FollowStore(follow_dir / "follow.db").load_wallet_quarantine(category="esports"), {})
-            # 直接下榜(从 leaderboard_v2.db 删除)
-            board_rows, _meta = storage_module.LeaderboardStore(esports_dir / "leaderboard_v2.db").load_leaderboard(category="esports")
+            # 直接下榜(从 leaderboard.db 删除)
+            board_rows, _meta = storage_module.LeaderboardStore(esports_dir / "leaderboard.db").load_leaderboard(category="esports")
             board = {normalize_wallet(r.get("wallet")) for r in board_rows}
             self.assertNotIn("0xdrop", board)
             self.assertIn("0xkeep", board)
@@ -14657,7 +14738,7 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(result["deleted"], 1)
             self.assertEqual(result["wallets"], ["0xdrop"])
             # 历史降级钱包:下榜 + profile/缓存删 + 隔离行清掉(不放回跟单集)
-            board_rows, _meta = storage_module.LeaderboardStore(esports_dir / "leaderboard_v2.db").load_leaderboard(category="esports")
+            board_rows, _meta = storage_module.LeaderboardStore(esports_dir / "leaderboard.db").load_leaderboard(category="esports")
             self.assertNotIn("0xdrop", {normalize_wallet(r.get("wallet")) for r in board_rows})
             self.assertFalse(bad_cache.exists())
             profiles = json.loads((collector_dir / "collector_v2_wallet_profiles.json").read_text())

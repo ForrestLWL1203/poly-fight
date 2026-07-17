@@ -49,7 +49,7 @@ _RANK_CACHE: dict[str, tuple[tuple[int, ...], dict[str, int]]] = {}
 _RANK_CACHE_LOCK = threading.Lock()
 _MATCH_TITLE_RE = re.compile(r"^([^:]+):\s+(.+?)\s+vs\s+(.+?)(\s+\([^)]+\))?\s+-\s+(.+)$", re.IGNORECASE)
 _SPORTS_TITLE_RE = re.compile(r"^(.+?)\s+vs\.?\s+(.+?)(?:\s+-\s+(.+))?$", re.IGNORECASE)
-_ESPORTS_GAME_ORDER = {"dota2": 0, "cs2": 1, "lol": 2, "valorant": 3}
+_ESPORTS_GAME_ORDER = {"dota2": 0, "cs2": 1, "lol": 2}
 
 
 @dataclass(frozen=True)
@@ -281,7 +281,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/follow-strategies":
             store = FollowStore(_follow_db_path(self.dashboard_config))
-            self._ok(store.list_follow_strategies())
+            self._ok(store.list_follow_strategies_readonly())
             return
         if parsed.path == "/api/wallets":
             self._ok(build_wallets(self.dashboard_config.data_dir, follow_dir=follow_dir))
@@ -1228,8 +1228,6 @@ def _normalize_esports_game(value: Any) -> str:
         return "dota2"
     if compact in {"lol", "leagueoflegends", "league"}:
         return "lol"
-    if compact in {"valorant", "valo"}:
-        return "valorant"
     return ""
 
 
@@ -2704,20 +2702,14 @@ def _active_market_by_condition(data_dir: Path, condition_id: str, *, follow_dir
 
 
 def fetch_market_prices(data_dir: Path, client: Any, condition_id: str, *, follow_dir: Path | None = None) -> dict[str, Any]:
-    if client is None:
-        raise RuntimeError("polymarket client unavailable")
+    """Return the runner-maintained SQLite snapshot without network or writes."""
     condition_id = condition_id.lower()
-    markets = client.gamma("/markets", condition_ids=condition_id, limit=1)
-    if not isinstance(markets, list) or not markets:
-        # 已结算/已归档盘:普通查询返回空,改用 closed=true 拿结算价(1/0),刷新显示结算结果而非报错。
-        markets = client.markets_by_condition_ids([condition_id], limit=1)
-    if not isinstance(markets, list) or not markets:
+    market = _active_market_by_condition(data_dir, condition_id, follow_dir=follow_dir)
+    if not market:
         raise RuntimeError("market_not_found")
-    market = markets[0]
     record = _market_price_record(market)
     if not record.get("outcomes") or not record.get("outcome_prices"):
         raise RuntimeError("market_prices_unavailable")
-    _update_active_market_price_cache(data_dir, condition_id, record, follow_dir=follow_dir)
     return record
 
 
@@ -2765,32 +2757,6 @@ def _live_outcome_prices(client: Any, condition_ids: list[str]) -> dict[str, lis
     return out
 
 
-def _update_active_market_price_cache(data_dir: Path, condition_id: str, record: dict[str, Any], *, follow_dir: Path | None = None) -> None:
-    store = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir))
-    current = store.get_market_cache_item("active", condition_id) or _active_market_by_condition(data_dir, condition_id, follow_dir=follow_dir)
-    if current:
-        market = dict(current)
-        market["outcomes"] = record.get("outcomes")
-        market["outcome_prices"] = record.get("outcome_prices")
-        market["price_refreshed_at"] = record.get("updated_at")
-        store.upsert_market_cache_item("active", condition_id, market, updated_at=int(record.get("updated_at") or time.time()))
-        return
-    store.upsert_market_cache_item(
-        "active",
-        condition_id,
-        {
-            "condition_id": condition_id,
-            "title": record.get("title"),
-            "question": record.get("question"),
-            "event_slug": record.get("event_slug"),
-            "outcomes": record.get("outcomes"),
-            "outcome_prices": record.get("outcome_prices"),
-            "price_refreshed_at": record.get("updated_at"),
-        },
-        updated_at=int(record.get("updated_at") or time.time()),
-    )
-
-
 CATEGORIES = ("esports",)   # sports 已退役;esports 是唯一类目
 
 
@@ -2834,9 +2800,10 @@ def _follow_db_file(data_dir: Path, *, follow_dir: Path | None = None) -> Path:
 
 
 def _leaderboard_db_file(data_dir: Path) -> Path:
-    """优先读 collect-v2 的 leaderboard_v2.db;不存在则回退 v1 的 leaderboard.db。"""
-    v2 = Path(data_dir) / "leaderboard_v2.db"
-    return v2 if v2.exists() else Path(data_dir) / "leaderboard.db"
+    """Read the canonical DB, with a legacy filename fallback for upgrades."""
+    canonical = Path(data_dir) / "leaderboard.db"
+    legacy = Path(data_dir) / "leaderboard_v2.db"
+    return canonical if canonical.exists() or not legacy.exists() else legacy
 
 
 class WalletRefreshAlreadyRunning(RuntimeError):
@@ -3025,7 +2992,7 @@ def start_runner(
         pid = int(process.pid)
         pgid = _process_group_id(pid) or pid
     # 实时刷新:勾选则随 runner 起 observe-live 快循环(从活跃/未结算 watchlist 盘提前发现优质
-    # 钱包并晋升,发布到 dashboard 读的同一个 esports/leaderboard_v2.db)。
+    # 钱包并晋升,发布到 dashboard 读的同一个 esports/leaderboard.db)。
     observe_live_pid = 0
     observe_live_pgid = 0
     observe_live_log_path = ""
@@ -3421,7 +3388,7 @@ def v2_refresh_extra_args(form: dict[str, Any]) -> list[str]:
 
 
 def _wipe_collector_data(category_dir: Path) -> None:
-    """完整重采:清空该类目采集目录(profiles / leaderboard_v2.db / 交易缓存 collector_v2 / 校准),
+    """完整重采:清空该类目采集目录(profiles / leaderboard.db / 交易缓存 collector_v2 / 校准),
     从 0 重建。**保留 follow.db** —— 它在独立的 follow_dir(data/follow),不在 category_dir 下。"""
     category_dir = Path(category_dir)
     if category_dir.exists():

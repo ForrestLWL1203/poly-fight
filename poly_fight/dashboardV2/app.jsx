@@ -567,7 +567,6 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                 <option value="dota2">Dota 2</option>
                 <option value="cs2">CS2</option>
                 <option value="lol">LoL</option>
-                <option value="valorant">Valorant</option>
               </select>
               <span className="lb-updated" style={{ marginRight: 4 }}>最后更新 {updatedLabel} · {lb.activeCount} 个活跃</span>
               <div className={"collect-square" + (refreshing || !maxSeedValid ? " is-disabled" : "")}
@@ -661,7 +660,7 @@ function EventsPage({ data }) {
             <div className="filter-group">
               <label htmlFor="game-f">项目</label>
               <select id="game-f" className="ps-select" value={game} onChange={(e) => setGame(e.target.value)}>
-                <option value="all">全部</option><option value="dota2">Dota 2</option><option value="cs2">CS2</option><option value="lol">LoL</option><option value="valorant">Valorant</option>
+                <option value="all">全部</option><option value="dota2">Dota 2</option><option value="cs2">CS2</option><option value="lol">LoL</option>
               </select>
             </div>
           </div>
@@ -1049,10 +1048,11 @@ function WalletFollowsModal({ wallet, onClose }) {
 const STRATEGY_DEFAULTS = {
   usableMode: "all", usableCap: "5000",
   minSignalOn: true, minSignal: "10",
-  maxEntryOn: true, maxEntry: "0.68",
+  maxEntryOn: true, maxEntry: "0.85",
   minEntryOn: false, minEntry: "0.58",
   stopLossOn: false, stopLoss: "55",
-  perSignalPct: "1", perMatchPct: "1", minStake: "1",
+  perSignalCapOn: false, perSignalPct: "10", perMatchPct: "10", perMatchSubPct: "10",
+  fillLineXCap: "10", edgeRef: "0.20", maxOrdersPerMatch: "0", minStake: "1",
   realtimeRefresh: false,
 };
 const clampNum = (v) => String(v).replace(/[^\d.]/g, "");
@@ -1062,7 +1062,8 @@ function strategyDigest(s) {
   const subTxt = (Number(s.perMatchSubPct) || 0) !== (Number(s.perMatchPct) || 0)
     ? `主盘${s.perMatchPct || 0}%/子盘${s.perMatchSubPct || 0}%` : `${s.perMatchPct || 0}%`;
   const capTxt = (Number(s.maxOrdersPerMatch) || 0) > 0 ? `，每场≤${s.maxOrdersPerMatch}笔` : "";
-  const sizing = `单笔 余额${s.perSignalPct || 0}%（每钱包每场≤余额${subTxt}${capTxt}）`;
+  const signalCap = s.perSignalCapOn ? `，单笔≤余额${s.perSignalPct || 0}%` : "";
+  const sizing = `cap×conviction²×skill（单场≤余额${subTxt}${signalCap}${capTxt}）`;
   const filter = `门槛 ${usdInt(n(s.minSignal))}`;
   const maxEntry = s.maxEntryOn ? `现价 ≤ ${s.maxEntry}` : null;
   const minEntry = s.minEntryOn ? `现价 ≥ ${s.minEntry}` : null;
@@ -1177,20 +1178,23 @@ function StrategyEditor({ s, up, wallet, locked }) {
             {s.usableMode === "cap" ? <NumField value={s.usableCap} onChange={up("usableCap")} unit="USDC" width={84} /> : <span className="mc-note">钱包 {wallet > 0 ? money(wallet) : "未设置"}</span>}
           </div>
         </div>
-        <div className="cfg-head"><h3>单笔跟单金额</h3><Badge tone="up" outline>必填</Badge></div>
-        <p className="cfg-sub">注码 = 余额 × 单笔基数%（动态随余额，不抄目标仓位大小）· 每钱包每场累计 ≤ 单场预算（加仓只填到预算，不叠加）· 主盘/子盘预算解耦 · 金额向下取整规避下单异常</p>
+        <div className="cfg-head"><h3>跟单注码</h3><Badge tone="up" outline>必填</Badge></div>
+        <p className="cfg-sub">注码 = 单场上限 × conviction² × skill；conviction 来自目标订单金额，skill 来自该钱包当前盘口桶的 edge 下界。</p>
         <div className="opt-card is-active">
           <div className="opt-body" onClick={(e) => e.stopPropagation()}>
             <div className="ctrl-row">
-              <NumField value={s.perSignalPct} onChange={up("perSignalPct")} unit="%" lead="单笔基数（余额）" width={60} />
               <NumField value={s.perMatchPct} onChange={up("perMatchPct")} unit="%" lead="主盘单场预算（余额）" width={60} />
               <NumField value={s.perMatchSubPct} onChange={up("perMatchSubPct")} unit="%" lead="子盘单场预算（余额）" width={60} />
+              <NumField value={s.fillLineXCap} onChange={up("fillLineXCap")} unit="×cap" lead="满 conviction 目标单" width={60} />
+              <NumField value={s.edgeRef} onChange={up("edgeRef")} unit="edge" lead="满 skill 参考值" width={60} />
             </div>
             <div className="ctrl-row">
+              <label className="check-row"><input type="checkbox" checked={s.perSignalCapOn} onChange={(e) => up("perSignalCapOn")(e.target.checked)} /><span className="cr-label">启用单笔硬上限</span></label>
+              <NumField value={s.perSignalPct} onChange={up("perSignalPct")} unit="%" lead="单笔≤余额" width={60} disabled={!s.perSignalCapOn} />
               <NumField value={s.maxOrdersPerMatch} onChange={up("maxOrdersPerMatch")} unit="笔" lead="每场最大笔数（0=无限）" width={60} />
               <NumField value={s.minStake} onChange={up("minStake")} unit="USDC" lead="单笔下限" width={72} />
             </div>
-            <p className="cfg-sub">单笔基数 = 每笔下注占余额%；主盘单场预算 = 主盘（系列胜者）每钱包每场累计上限%；子盘单场预算 = map/game winner 每个单局独立上限%（可调低压制连押系列堆叠，不汇总）；每场最大笔数 = 单钱包同一市场最多跟几笔（主子同限，0=无限）；单笔下限 = dust 地板，仅防 &lt;$1 废单。</p>
+            <p className="cfg-sub">默认目标订单约为单场 cap 的 10 倍时 conviction=1；edge_lb 达 0.20 时 skill=1。单笔硬上限默认关闭；单笔下限只作为 dust 地板。</p>
           </div>
         </div>
       </div>

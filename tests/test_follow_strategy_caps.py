@@ -11,6 +11,8 @@ from poly_fight.follow_strategy import (
 
 def _strategy(**sizing_over):
     s = default_follow_strategy(balance_usdc=10000)
+    # 预算/限额测试让目标单达到满 conviction；公式本身另有专门测试。
+    s["sizing"]["fill_line_x_cap"] = 0.1
     s["sizing"].update(sizing_over)
     return s
 
@@ -20,6 +22,8 @@ COMMON = dict(
     available_balance_usdc=10000.0,
     entry_price=0.5,
     bankroll_usdc=10000.0,
+    theta=0.9,
+    bucket_edge_lb=0.2,
 )
 
 
@@ -60,18 +64,18 @@ class TestBudgetSplit(unittest.TestCase):
 
 
 class TestCashBasedSizing(unittest.TestCase):
-    """单笔注码 = per_signal_percent% × 可动用现金(available),不含未结算持仓权益。"""
+    """动态权益决定每场 cap，可用现金只限制实际支付。"""
 
-    def test_sizes_off_available_cash_not_equity(self):
-        # 现金 3794(< 旧 bankroll/权益 6000)→ 1% 按现金算 = $37,不是 $60。
-        s = _strategy(per_signal_percent=1.0, per_match_percent=100.0)
+    def test_sizes_off_equity_then_checks_available_cash(self):
+        s = _strategy(per_match_percent=1.0)
         r = evaluate_follow_candidate(
             strategy=s, market_type="main_match",
             target_wallet_order_cash_usdc=100.0, entry_price=0.5,
-            available_balance_usdc=3794.0, bankroll_usdc=6000.0,  # 权益更高但应被忽略
+            available_balance_usdc=3794.0, bankroll_usdc=6000.0,
+            theta=0.9, bucket_edge_lb=0.2,
         )
         self.assertTrue(r["would_follow"])
-        self.assertEqual(r["target_stake"], 37)  # floor(3794 × 1%)
+        self.assertEqual(r["target_stake"], 60)
 
     def test_no_cash_blocks(self):
         s = _strategy(per_signal_percent=1.0, per_match_percent=100.0)
@@ -79,6 +83,7 @@ class TestCashBasedSizing(unittest.TestCase):
             strategy=s, market_type="main_match",
             target_wallet_order_cash_usdc=100.0, entry_price=0.5,
             available_balance_usdc=0.0, bankroll_usdc=6000.0,
+            theta=0.9, bucket_edge_lb=0.2,
         )
         self.assertFalse(r["would_follow"])
         self.assertEqual(r["block_reason"], "no_bankroll")
@@ -112,7 +117,7 @@ class TestPerMatchTotalBudget(unittest.TestCase):
                                       condition_funded_stake_usdc=100.0,
                                       wallet_condition_funded_stake_usdc=480.0, **COMMON)
         self.assertTrue(r["would_follow"])  # 整场未满 → 放行(证明不再看每钱包)
-        self.assertEqual(r["target_stake"], 100)
+        self.assertEqual(r["target_stake"], 400)
 
 
 class TestMaxOrdersPerMatch(unittest.TestCase):

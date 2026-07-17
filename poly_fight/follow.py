@@ -95,10 +95,17 @@ def esports_match_imminent(
 
 
 def market_current_price(market: dict[str, Any], outcome_index: int, price_row: dict[str, Any] | None = None) -> float:
+    price_row = price_row or {}
+    observed_price = to_float(
+        price_row.get("observedPrice")
+        or price_row.get("observed_price")
+        or price_row.get("ourObservedPrice")
+    )
+    if observed_price > 0:
+        return observed_price
     prices = market.get("outcome_prices") or []
     if 0 <= outcome_index < len(prices):
         return to_float(prices[outcome_index])
-    price_row = price_row or {}
     return to_float(price_row.get("curPrice") or price_row.get("currentPrice") or price_row.get("price"))
 
 
@@ -193,6 +200,11 @@ def _build_trade_cursor(
     latest_ts = max((trade_timestamp(trade) for trade in trades), default=None)
     if latest_ts is None:
         return previous_cursor
+    previous_ts = to_int((previous_cursor or {}).get("timestamp"))
+    # WS log objects do not universally include blockTimestamp. A missing timestamp
+    # must never rewind a healthy Data API/WS cursor and cause historical replay.
+    if previous_cursor and latest_ts < previous_ts:
+        return previous_cursor
     ids_at_latest = {trade_id(trade) for trade in trades if trade_timestamp(trade) == latest_ts}
     # cursor 停在同一秒 → 累积该秒已见过的 id(否则同秒、后到、id 更小的交易会被漏)
     if previous_cursor and to_int(previous_cursor.get("timestamp")) == latest_ts:
@@ -202,6 +214,19 @@ def _build_trade_cursor(
         "id": max(ids_at_latest) if ids_at_latest else "",  # 保留单 id 供旧读取方/索引列
         "seen_ids": sorted(ids_at_latest),
     }
+
+
+def _signal_has_trade_id(signal: dict[str, Any] | None, value: str) -> bool:
+    """Whether a source trade was already applied to this signal.
+
+    Cursor dedupe is the fast path; this signal-level check is the durable second
+    line of defence across WS/Data API source switches and crash replay.
+    """
+    if not signal or not value:
+        return False
+    if any(str(leg.get("trade_id") or "") == value for leg in signal.get("legs") or []):
+        return True
+    return any(str(event.get("trade_id") or "") == value for event in signal.get("behavior_events") or [])
 
 
 def select_new_trades(
@@ -630,7 +655,7 @@ def process_follow_trades(
     eligible_buckets: set[str] | None = None,
     eligible_category: str | None = None,
     eligible_leagues: set[str] | None = None,
-    conflict_policy: str = "dual_follow",
+    conflict_policy: str = "block_opposite",
     bankroll_usdc: float = float("inf"),
     max_stake_usdc: float = 0.0,
     max_signal_stake_usdc: float = 0.0,
@@ -638,6 +663,7 @@ def process_follow_trades(
     pending_small_buys: dict[str, dict[str, Any]] | None = None,   # 小单累加器(跨 tick 持久,由调用方 load/save)
     held_pending_price: dict[str, dict[str, Any]] | None = None,   # 价格 held 暂存器(现价<下限的买单,等上穿;跨 tick 持久)
     stop_loss_blocked: dict[str, Any] | None = None,               # 止损黑名单:已止损平过的 (钱包|盘|outcome) 不再复跟
+    bucket_metrics: dict[str, dict[str, Any]] | None = None,       # eligible bucket -> θ̂/edge_lb
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     wallet = normalize_wallet(wallet)
     active_strategy = normalize_follow_strategy(follow_strategy) if isinstance(follow_strategy, dict) else None
@@ -687,6 +713,11 @@ def process_follow_trades(
         current_price = market_current_price(market, outcome_index, trade)
         sid = follow_signal_id(wallet, condition_id, outcome_index)
         existing = _open_signal_by_id(open_signals, sid)
+        source_trade_id = trade_id(trade)
+        if _signal_has_trade_id(existing, source_trade_id):
+            stats["ignored_trade_count"] += 1
+            stats["duplicate_trade_skipped_count"] = stats.get("duplicate_trade_skipped_count", 0) + 1
+            continue
 
         if side == "SELL":
             # 钱包卖出该 (cond,outcome):若有未凑够门槛的小单缓存,说明它没建够仓就跑了 → 清缓存,不补跟。
@@ -736,6 +767,16 @@ def process_follow_trades(
                 stats["exited_signal_count"] += len(market_open_signals)
                 stats["ignored_trade_count"] += 1
                 continue
+            # Keep the observation on the already-funded side, but never fund the
+            # second outcome of the same condition.
+            for signal in market_open_signals:
+                signal["contested"] = True
+                signal.setdefault("behavior_events", []).append(
+                    _behavior_event("opposite_buy_blocked", trade)
+                )
+                signal["updated_at"] = now_ts
+            stats["ignored_trade_count"] += 1
+            continue
 
         start_ts = market_start_ts(market)
         trade_ts = trade_timestamp(trade)
@@ -768,6 +809,9 @@ def process_follow_trades(
         market_type = str(market.get("market_type") or "main_match")
         market_league = str(market.get("league") or "").lower()
         market_bucket = bucket_key(str(market.get("game_family") or market_league or "unknown"), market_type)
+        current_bucket_metrics = (bucket_metrics or {}).get(market_bucket)
+        if current_bucket_metrics is None:
+            current_bucket_metrics = (bucket_metrics or {}).get(f"multi:{market_type}") or {}
         if not existing and eligible_buckets is not None and market_bucket not in eligible_buckets:
             stats["ignored_trade_count"] += 1
             stats["market_type_not_eligible_count"] += 1
@@ -822,6 +866,14 @@ def process_follow_trades(
                 entry_price=to_float(current_price),
                 bankroll_usdc=to_float(bankroll_usdc) if bankroll_usdc != float("inf") else 0.0,
                 market_type=market_type,  # 主盘/子盘 → 选各自的每场预算 cap
+                theta=(
+                    current_bucket_metrics.get("recency_weighted_win_rate")
+                    if current_bucket_metrics.get("recency_weighted_win_rate") is not None
+                    else current_bucket_metrics.get("bucket_win_rate", current_bucket_metrics.get("win_rate"))
+                ),
+                bucket_edge_lb=current_bucket_metrics.get(
+                    "bucket_edge_lb", current_bucket_metrics.get("edge_lb")
+                ),
             )
             if strategy_decision.get("block_reason") == "small_target_wallet_order":
                 stats["small_wallet_trade_blocked_count"] += 1
@@ -994,6 +1046,11 @@ def process_follow_trades(
             "condition_funded_order_count_before": to_int(condition_counts["condition_funded_order_count"]),
             "wallet_condition_funded_order_count_before": to_int(condition_counts["wallet_condition_funded_order_count"]),
             "observed_at": observed_ts,
+            "price_source": str(
+                trade.get("observedPriceSource")
+                or trade.get("observed_price_source")
+                or "market_snapshot"
+            ),
         }
         if strategy_decision is not None:
             leg["strategy_schema_version"] = to_int(strategy_decision.get("strategy_schema_version"))
@@ -1003,6 +1060,8 @@ def process_follow_trades(
                 to_float(((active_strategy.get("prefilters") or {}).get("min_target_wallet_order_cash_usdc"))),
                 8,
             )
+            for key in ("theta", "live_edge", "bucket_edge_lb", "skill", "conviction", "per_match_cap_usdc", "fill_line_usdc"):
+                leg[key] = strategy_decision.get(key)
         if funding_status == "signal_cap":
             leg["signal_cap_limited"] = True
         if add_ratio_to_first is not None:

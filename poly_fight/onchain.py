@@ -102,8 +102,8 @@ def block_number(https_url: str) -> int:
 def clob_price(token_id: str, side: str = "buy", *, base: str = CLOB_BASE, timeout: float = 8.0) -> float | None:
     """Live CLOB price for a token id. side=buy -> the ask we'd pay to follow.
 
-    Retained as a utility; the follow path no longer uses it for entry price
-    (we read the exact on-chain fill price from OrderFilled instead)."""
+    The target wallet's exact OrderFilled price and our executable observation
+    price are different facts; the live follow path uses this quote for ours."""
     url = f"{base}/price?token_id={token_id}&side={side.lower()}"
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})

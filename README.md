@@ -60,7 +60,8 @@ password.
 ## Commands
 
 All commands run through `python3 -m poly_fight.cli <subcommand>`. Global options
-(`--data-dir`, rate limits) go **before** the subcommand:
+such as `--data-dir` go **before** the subcommand; command-specific rate limits
+go after it:
 
 ```bash
 python3 -m poly_fight.cli --data-dir data_smoke build-leaderboard
@@ -72,7 +73,6 @@ python3 -m poly_fight.cli --data-dir data_smoke build-leaderboard
 python3 -m poly_fight.cli build-leaderboard
 python3 -m poly_fight.cli collect
 python3 -m poly_fight.cli collect --category sports
-python3 -m poly_fight.cli collect --discovery-source holders   # experimental; biased after resolution
 ```
 
 Collection uses bounded network concurrency by default:
@@ -93,12 +93,11 @@ python3 -m poly_fight.cli collect --classification-lookback-days 15 --market-bat
 python3 -m poly_fight.cli collect --classification-lookback-days 15 --market-batch-size 50 --market-batch-index 1
 ```
 
-Continuous discovery (sidecars to the runner; the dashboard's "realtime refresh"
-toggle starts both):
+Continuous refresh:
 
 ```bash
-# ~2h: incremental discovery from newly-SETTLED matches + score-freshness refresh
-python3 -m poly_fight.cli observe-v2 --loop-hours 2 --follow-dir data/follow
+# periodic full rebuild from settled in-scope markets
+python3 -m poly_fight.cli collect-v2 --loop-hours 2 --follow-dir data/follow
 
 # ~10min: discover from ACTIVE (unsettled) watched markets over a volume gate and
 # promote grade-A wallets EARLY so the follow loop can act before settlement
@@ -106,9 +105,9 @@ python3 -m poly_fight.cli observe-live --loop-minutes 10 --follow-dir data/follo
 ```
 
 Both publish into the same per-category `leaderboard.db`; their publish critical
-sections serialize via a build lock. `observe-live` reads the runner's active
-market cache read-only and only profiles wallets not already known (dedup), so
-most ticks are cheap.
+sections serialize via a build lock. The dashboard's realtime-refresh toggle
+starts `observe-live`; periodic full rebuilds are also driven by the runner's
+pool-refresh cycle.
 
 ### Analyze an event
 
@@ -128,10 +127,12 @@ python3 -m poly_fight.cli follow --stake-usdc 1 --stake-ratio-percent 10 --bankr
 python3 -m poly_fight.cli run --stake-usdc 1 --stake-ratio-percent 10 --bankroll-usdc 1000
 ```
 
-Stake sizing: the runner sizes by a follow strategy stored in `follow.db`
-(**Kelly-on-edge**: `edge = θ̂×0.95 − price`, ¼-Kelly, bounded by per-signal /
-per-match caps and a min-stake floor). The flags below are the legacy fallback
-when no strategy is configured:
+Stake sizing: the runner sizes by a follow strategy stored in `follow.db`:
+`stake = per-match cap × conviction² × skill`. `conviction` derives from the
+target wallet's order cash relative to the configured fill line; `skill` derives
+from the followed bucket's copy-edge lower bound. Edge (`θ̂×0.95 − price`) is
+only the funded-entry gate, not a stake multiplier. The flags below are the
+legacy fallback when no strategy is configured:
 
 - `--stake-usdc` — minimum paper stake per BUY leg.
 - `--stake-ratio-percent` — target-wallet cash replication ratio:
@@ -139,21 +140,20 @@ when no strategy is configured:
 - `--bankroll-usdc` — caps total open paper exposure. If the bankroll cannot
   cover the proportional stake it is capped to the minimum (flagged), or skipped.
 
-Fills are detected on-chain via WebSocket (sub-second) when an RPC is configured,
-falling back to `trades?user=<wallet>` polling otherwise. BUY trades in watched
+Fills are detected from on-chain logs when an RPC is configured, falling back to
+`trades?user=<wallet>` polling otherwise. BUY trades in watched
 markets create paper legs; sub-minimum BUY fills accumulate per
 `(wallet, condition, outcome)` until they clear the minimum order, then follow
 (small-buy accumulator). The sole live price gate is the edge gate — current
 price must be `< θ̂×0.95`, else `no_live_edge`. Each newly-eligible wallet's
 pre-existing positions are backfilled into legs once (startup and mid-run, when a
 wallet is promoted onto the leaderboard live). SELL trades mirror-exit
-proportionally. Material same-market SELLs (cumulative size over
-`--quarantine-sell-frac`, default 0.2) and opposite-side BUYs quarantine a wallet
-until the next clean leaderboard cycle.
+proportionally. Quarantine is manual-only; score-driven demotion removes the
+wallet from the leaderboard and scoring cache, while preserving paper records.
 
 The loop keeps tracking markets that already have open signals. Strict wallets
-appearing on opposite outcomes of the same `conditionId` mark both sides
-`contested=True`. The first post-start price snapshot is stored as closing-line
+appearing on opposite outcomes of the same `conditionId` mark the condition
+contested and block funding the second direction. The first post-start price snapshot is stored as closing-line
 value (`wallet_clv` / `our_clv`). REST failures are isolated: per-wallet errors
 don't stop the tick; broader errors are retried after `--error-retry-seconds`
 (default 180) and only halt the process after `--max-consecutive-error-seconds`
@@ -220,13 +220,13 @@ are git-ignored — they persist locally but are never committed.
 ### Leaderboard strictness
 
 The exported leaderboard (persisted to `leaderboard.db`) is intentionally
-strict: by default it keeps only the top ~30 A-grade wallets that are recently
+strict: it exports only A-grade wallets that are recently
 active, participate in enough
 discovery-window markets, carry meaningful average market size, and have no
-same-condition two-sided or tail-entry flags. Scoring uses a Wilson lower bound
-at 80% confidence (`z=1.28`) so strong wallets with a few historical losses are
-not treated as noise. Entry timing uses the real match start time when Gamma
-provides it, not market end time.
+same-condition two-sided or tail-entry flags, with a 200-wallet safety cap.
+Scoring uses recency-weighted point win rate, effective sample size and copy edge;
+entry timing uses the real match start time when Gamma provides it, with market
+end time only as the final fallback.
 
 ---
 
