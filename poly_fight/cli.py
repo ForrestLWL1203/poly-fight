@@ -357,14 +357,20 @@ V2_MAX_BOT_SCORE = 70              # bot 评分硬排除阈
 # v21:board 级 tail 门已删(原 V2_MAX_TAIL_ENTRY_RATE=0.25)。其"整盘 avg≥0.75"定义把分批
 # 建仓误判成追高,且与 edge_lb 评级门 + 0.85 跟单执行上限三重冗余。discovery 种子预筛仍有独立
 # 的 tail 软门(默认 0.34,见下方 filter_profile_seed_wallets_*),那是另一层、阈值更松。
-# 钱包级硬门:最后一笔(scoped)交易超过这么多小时 → 直接不入榜(默认 14 天,见下方常量)。
+# 钱包级硬门:最后一笔(scoped)交易超过这么多小时 → 直接不入榜(默认 5 天,见下方常量)。
 # 跟单要钱包当下活跃;沉寂超过此门的不再上榜(collector 发现 + observer 重评共用)。
-V2_MAX_LEADERBOARD_IDLE_HOURS = 336  # 14d:打分窗口(14-30d)已管"是否活跃",72h 过紧会误杀低频高手
+V2_MAX_LEADERBOARD_IDLE_HOURS = 120  # 5d:剔除已停止下注的钱包;恢复活跃后下一轮可重新评分入榜
 V2_PER_GAME_QUOTA = 0              # 0 = 不设每游戏上限(榜单=全部够格);>0 时才强制每游戏封顶
 V2_MAX_LEADERBOARD_WALLETS = 200   # 仅作安全上限(质量门已把关,大小不重要)
 # M5 自动降级删除后的冷却期:此窗口内 observer(observe-live)不重新发现加回被降级的
 # 钱包,堵「贴门钱包 2 输降级 → 下次赢 observer 立刻拉回」的 demote↔readd 抖动(2026-06-21 用户要求)。
 M5_DEMOTE_COOLDOWN_SECONDS = 24 * 3600
+# 实跟表现熔断:链上历史评分是"过去质量",真实跟单结果是"复制后是否仍有效"。至少积累 2 笔，
+# 且胜率不高于 50%、按实际注码计算的累计 ROI ≤ -25% 时直接下榜。三门同时满足，避免单笔
+# 偶然亏损或小幅回撤误杀；被删钱包保留研究记录，冷却后若恢复活跃/质量仍强可重新发现。
+M5_FOLLOW_BREAKER_MIN_RESULTS = 2
+M5_FOLLOW_BREAKER_MAX_WIN_RATE = 0.50
+M5_FOLLOW_BREAKER_MAX_ROI = -0.25
 # 技术型(低买高卖/靠出场)默认不纳入:占比极低 + 我们 follow 延迟高跟不准卖点,风险大。
 # 路径保留(--v2-include-technical 可一键开回)。scoring_basis 用 hold(方向正确性):
 # 技术型方向常错 → hold 口径下算亏损,自然出局,与"复制方向"一致。
@@ -5131,6 +5137,19 @@ def _v2_grade_rank(grade: Any) -> int:
     return _V2_GRADE_RANK.get(str(grade or "").lower(), 0)
 
 
+def profile_is_idle_over_limit(
+    profile: dict[str, Any],
+    *,
+    now_ts: int,
+    max_idle_hours: int = V2_MAX_LEADERBOARD_IDLE_HOURS,
+) -> bool:
+    """最后一笔 scoped 交易缺失或超过活跃门槛即视为不活跃。"""
+    if int(max_idle_hours) <= 0:
+        return False
+    last_trade_at = to_int((profile or {}).get("last_esports_trade_at"))
+    return not last_trade_at or (int(now_ts) - last_trade_at) > int(max_idle_hours) * 3600
+
+
 def build_collector_leaderboard_v2(
     profiles_by_wallet: dict[str, dict[str, Any]],
     *,
@@ -5168,11 +5187,9 @@ def build_collector_leaderboard_v2(
             rejected_counts["bot_like"] = rejected_counts.get("bot_like", 0) + 1
             continue
         # 钱包级沉寂硬门:最后一笔 scoped 交易超过 max_idle_hours → 不入榜(无最近交易记录同样排除)。
-        if max_idle_hours > 0:
-            last_trade_at = to_int(profile.get("last_esports_trade_at"))
-            if not last_trade_at or (now_ts - last_trade_at) > max_idle_hours * 3600:
-                rejected_counts["idle_over_limit"] = rejected_counts.get("idle_over_limit", 0) + 1
-                continue
+        if profile_is_idle_over_limit(profile, now_ts=now_ts, max_idle_hours=max_idle_hours):
+            rejected_counts["idle_over_limit"] = rejected_counts.get("idle_over_limit", 0) + 1
+            continue
         # 榜单只发 grade ≥ 下限(默认 A):B 档不跟单 → 不上榜(profiles 池仍保留它)。
         if _v2_grade_rank(profile.get("grade")) < _v2_grade_rank(min_grade):
             rejected_counts["grade_below_floor"] = rejected_counts.get("grade_below_floor", 0) + 1
@@ -5987,6 +6004,121 @@ def command_collect_v2(args: argparse.Namespace, client: PolymarketClient | None
 # ============================================================
 # M5 降级重评 —— 由 follow runner 按结算笔数事件触发(直接删除淘汰,无 quarantine 中间态)
 # ============================================================
+def _follow_result_pnl(result: dict[str, Any]) -> float:
+    if result.get("_breaker_pnl") is not None:
+        return to_float(result.get("_breaker_pnl"))
+    status = str((result or {}).get("status") or "")
+    if status == "settled" and result.get("our_paper_pnl") is not None:
+        return to_float(result.get("our_paper_pnl"))
+    if result.get("our_realized_pnl") is not None:
+        return to_float(result.get("our_realized_pnl"))
+    return to_float(result.get("our_paper_pnl"))
+
+
+def normalize_follow_results_for_breaker(
+    client: PolymarketClient | None,
+    results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """止损退出按最终赛果还原为持有到结算 PnL，再用于评价目标钱包。
+
+    止损是我们自己的执行规则，不能把被盘中波动误杀的最终赢家算成钱包质量差。尚未结算或
+    Gamma 查询失败的止损结果暂不参与熔断；普通自然结算/钱包跟卖仍按真实已实现 PnL。
+    """
+    rows = [row for row in results or [] if isinstance(row, dict)]
+    stop_condition_ids = sorted({
+        str(row.get("condition_id") or "").lower()
+        for row in rows
+        if str(row.get("exit_reason") or "") == "stop_loss" and row.get("condition_id")
+    })
+    resolved: dict[str, dict[str, Any]] = {}
+    if client is not None:
+        for index in range(0, len(stop_condition_ids), 50):
+            chunk = stop_condition_ids[index : index + 50]
+            try:
+                fetched = client.markets_by_condition_ids(chunk, limit=len(chunk))
+            except Exception:
+                continue
+            resolved.update(resolution_market_records_from_markets(fetched or []))
+
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if str(row.get("exit_reason") or "") != "stop_loss":
+            normalized.append(row)
+            continue
+        condition_id = str(row.get("condition_id") or "").lower()
+        market = resolved.get(condition_id) or {}
+        prices = market.get("outcome_prices") or []
+        is_void = bool(market.get("closed")) and len(prices) == 2 and all(abs(to_float(price) - 0.5) < 1e-3 for price in prices)
+        winner = winner_outcome_index(market)
+        if winner is None and not is_void:
+            continue
+        outcome_index = to_int(row.get("outcome_index"), -1)
+        hold_pnl = 0.0
+        for leg in row.get("legs") or []:
+            stake = leg_actual_stake(leg)
+            entry = to_float(leg.get("our_entry_price"))
+            if is_void:
+                hold_pnl += paper_exit_pnl(entry, VOID_REDEMPTION_PRICE, stake)
+            else:
+                hold_pnl += paper_pnl(entry, outcome_index == winner, stake)
+        normalized.append({**row, "_breaker_pnl": round(hold_pnl, 8)})
+    return normalized
+
+
+def follow_performance_breaker_metrics(
+    results: list[dict[str, Any]],
+    *,
+    demoted_at_by_wallet: dict[str, int] | None = None,
+    min_results: int = M5_FOLLOW_BREAKER_MIN_RESULTS,
+    max_win_rate: float = M5_FOLLOW_BREAKER_MAX_WIN_RATE,
+    max_roi: float = M5_FOLLOW_BREAKER_MAX_ROI,
+) -> dict[str, dict[str, Any]]:
+    """返回触发实跟表现熔断的钱包及指标。
+
+    只统计实际出资的 settled/exited 结果，并从该钱包上次被淘汰之后重新起算。这样旧亏损
+    能触发一次删除，却不会在钱包冷却后重新达标入榜时造成永久循环删除。
+    """
+    demoted_at_by_wallet = {
+        normalize_wallet(wallet): to_int(ts)
+        for wallet, ts in (demoted_at_by_wallet or {}).items()
+        if normalize_wallet(wallet)
+    }
+    stats: dict[str, dict[str, Any]] = {}
+    for result in results or []:
+        if not isinstance(result, dict) or str(result.get("status") or "") not in {"settled", "exited"}:
+            continue
+        wallet = normalize_wallet(result.get("wallet"))
+        if not wallet:
+            continue
+        resolved_at = to_int(result.get("settled_at") or result.get("exit_at") or result.get("updated_at"))
+        if resolved_at <= demoted_at_by_wallet.get(wallet, 0):
+            continue
+        stake = round(sum(leg_actual_stake(leg) for leg in result.get("legs") or []), 8)
+        if stake <= 0:
+            continue
+        pnl = _follow_result_pnl(result)
+        row = stats.setdefault(wallet, {"results": 0, "wins": 0, "stake": 0.0, "pnl": 0.0})
+        row["results"] += 1
+        row["wins"] += 1 if pnl > 0 else 0
+        row["stake"] = round(to_float(row.get("stake")) + stake, 8)
+        row["pnl"] = round(to_float(row.get("pnl")) + pnl, 8)
+
+    breakers: dict[str, dict[str, Any]] = {}
+    for wallet, row in stats.items():
+        count = to_int(row.get("results"))
+        stake = to_float(row.get("stake"))
+        win_rate = to_float(row.get("wins")) / count if count else 0.0
+        roi = to_float(row.get("pnl")) / stake if stake > 0 else 0.0
+        metrics = {
+            **row,
+            "win_rate": round(win_rate, 8),
+            "roi": round(roi, 8),
+        }
+        if count >= int(min_results) and win_rate <= float(max_win_rate) and roi <= float(max_roi):
+            breakers[wallet] = metrics
+    return breakers
+
+
 def _delete_wallets_from_leaderboard(
     args: argparse.Namespace,
     *,
@@ -6052,6 +6184,49 @@ def _delete_wallets_from_leaderboard(
             for category in FOLLOW_SIGNAL_CATEGORIES:
                 set_pause_new_signals(follow_dir, category, None)
     return targets
+
+
+def demote_follow_underperformers(
+    client: PolymarketClient | None,
+    args: argparse.Namespace,
+    *,
+    follow_dir: Path | str,
+    now_ts: int,
+) -> dict[str, Any]:
+    """按我们自己的实际跟单结果执行快速熔断，不等待下一轮链上历史评分跌出 A。"""
+    follow_dir = Path(follow_dir)
+    store = FollowStore(follow_dir / "follow.db")
+    metrics = follow_performance_breaker_metrics(
+        normalize_follow_results_for_breaker(client, store.load_results()),
+        demoted_at_by_wallet=store.load_m5_demote_history(),
+    )
+    if not metrics:
+        return {"demoted": 0, "demoted_wallets": [], "metrics": {}}
+
+    data_dir = resolve_data_dir(args)
+    board_rows, _meta = LeaderboardStore(leaderboard_db_path(data_dir)).load_leaderboard(category="esports")
+    board_wallets = {normalize_wallet(row.get("wallet")) for row in board_rows if normalize_wallet(row.get("wallet"))}
+    favorites = {
+        normalize_wallet((info or {}).get("wallet") or key)
+        for key, info in store.load_wallet_favorites(category="esports").items()
+    }
+    targets = (set(metrics) & board_wallets) - favorites
+    if not targets:
+        return {"demoted": 0, "demoted_wallets": [], "metrics": {}}
+
+    removed = _delete_wallets_from_leaderboard(
+        args,
+        wallets=targets,
+        follow_dir=follow_dir,
+        now_ts=int(now_ts),
+        source="follow_performance_breaker",
+    )
+    store.record_m5_demote_cooldown(removed, ts=int(now_ts))
+    return {
+        "demoted": len(removed),
+        "demoted_wallets": removed,
+        "metrics": {wallet: metrics[wallet] for wallet in removed if wallet in metrics},
+    }
 
 
 def purge_legacy_demote_quarantine(
@@ -6272,12 +6447,23 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
         seed_positions.extend(collect_live_seed_positions(market, response, positions_per_market=positions_per_market))
     seed_wallets = aggregate_seed_wallets(seed_positions)
 
-    # 3) 钱包级去重:只 profile 既有 collector_v2 profiles 没有的新钱包(已打过分的进 profiles
-    #    持久化 → 天然负缓存,后续轮次只是集合查找)。无新候选 → early-exit(常态,廉价)。
+    # 3) 钱包级去重:新钱包直接 profile；已因沉寂出榜、但重新出现在活跃盘 holder 中的钱包，
+    #    最多每天重评一次。这样恢复活跃且质量仍强的钱包可以自然回榜，又不会每轮重复深扫。
     existing = load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2")
     # M5 降级冷却:窗口内不重新发现刚被降级删除的钱包(防 demote↔readd ping-pong)。
     cooled = store.load_m5_demote_cooldown_wallets(now_ts=now_ts, cooldown_seconds=M5_DEMOTE_COOLDOWN_SECONDS)
-    new_seed_pool = {wallet: sw for wallet, sw in seed_wallets.items() if wallet not in existing and wallet not in cooled}
+    max_idle_hours = int(getattr(args, "max_leaderboard_idle_hours", V2_MAX_LEADERBOARD_IDLE_HOURS))
+    idle_refresh_due = {
+        wallet
+        for wallet, profile in existing.items()
+        if profile_is_idle_over_limit(profile, now_ts=now_ts, max_idle_hours=max_idle_hours)
+        and now_ts - to_int(profile.get("profiled_at") or profile.get("observed_at")) >= 24 * 3600
+    }
+    new_seed_pool = {
+        wallet: sw
+        for wallet, sw in seed_wallets.items()
+        if (wallet not in existing or wallet in idle_refresh_due) and wallet not in cooled
+    }
     new_seed_wallets = filter_profile_seed_wallets_v2(
         new_seed_pool,
         max_wallets=resolve_collector_profile_wallet_limit(args),
@@ -7842,6 +8028,7 @@ def command_run(args: argparse.Namespace) -> int:
     rescore_threshold = int(getattr(args, "rescore_settled_threshold", 10) or 0)
     rescore_thread: threading.Thread | None = None
     m5_store = FollowStore(follow_dir / "follow.db")   # M5 计数从 DB 派生(持久化、含 exited)
+    last_follow_breaker_result_count = -1
 
     def sleep_or_stop(seconds: int) -> None:
         # Event.wait 收到停止信号立即返回(不像 time.sleep 会睡满整段),所以 SIGTERM/停跟单秒停。
@@ -7942,6 +8129,22 @@ def command_run(args: argparse.Namespace) -> int:
                 continue
             first_error_at = None
             tick_count += 1
+
+            # 实跟表现快速熔断:只在终态结果总数变化(以及 runner 启动首 tick)时扫描，避免健康的
+            # 5s drain tick 反复读全表。它使用我们实际注码/PnL，不被钱包过去仍为 A 的链上历史
+            # 掩盖；触发后直接下榜。失败不更新水位，下一 tick 自动重试。
+            terminal_result_count = to_int(summary.get("settled_result_count_total"))
+            if terminal_result_count != last_follow_breaker_result_count:
+                try:
+                    breaker_result = demote_follow_underperformers(
+                        client, category_args("esports"), follow_dir=follow_dir,
+                        now_ts=int(datetime.now(timezone.utc).timestamp()),
+                    )
+                    last_follow_breaker_result_count = terminal_result_count
+                    if breaker_result.get("demoted"):
+                        print(json.dumps({"status": "follow_performance_demote", **breaker_result}, ensure_ascii=False), flush=True)
+                except Exception as exc:  # noqa: BLE001
+                    print(json.dumps({"status": "follow_performance_demote_error", "error": str(exc)}, ensure_ascii=False), flush=True)
 
             # M5 计数从 DB 派生:未处理的终态结果(settled + exited,均有真实盈亏)。持久化
             # 跨重启累加、含提前卖出。达阈值即把这批标记已处理(防重启重复)+ off-thread
@@ -8235,7 +8438,7 @@ def build_parser() -> argparse.ArgumentParser:
         # V2 钱包级硬排除门(逐桶质量统一走 classify_wallet_bucket,不再有逐桶 ROI/Wilson 参数)。
         subparser.add_argument("--v2-max-two-sided-rate", type=float, default=V2_MAX_TWO_SIDED_RATE)
         subparser.add_argument("--v2-max-bot-score", type=int, default=V2_MAX_BOT_SCORE)
-        # 钱包级硬门:最后一笔交易超过这么多小时 → 不入榜(默认 336h=14天;<=0 关闭)。
+        # 钱包级硬门:最后一笔交易超过这么多小时 → 不入榜(默认 120h=5天;<=0 关闭)。
         subparser.add_argument("--max-leaderboard-idle-hours", type=int, default=V2_MAX_LEADERBOARD_IDLE_HOURS)
         subparser.add_argument("--v2-per-game-quota", type=int, default=V2_PER_GAME_QUOTA)
         # 技术型(低买高卖)默认不纳入;加此 flag 一键开回。

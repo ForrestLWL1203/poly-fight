@@ -145,7 +145,7 @@ scoring:
 
 ```text
 grade == A (B stays in pool, not on the board)
-recent category activity (idle hard cut, default 14d / 336h — see V2_MAX_LEADERBOARD_IDLE_HOURS)
+recent category activity (idle hard cut, default 5d / 120h — see V2_MAX_LEADERBOARD_IDLE_HOURS)
 meaningful discovery participation / cash
 same-condition two-sided behavior excluded
 max exported wallets = 200 safety cap (quality gate is the real limiter)
@@ -221,7 +221,7 @@ sub-min BUY fills accumulate per (wallet,cond,outcome) until >= min order, then 
 SELL mirrors exit proportionally (cumulative wallet_sold_frac; >= $1 min, hold/accumulate else, dust full-clear)
 post-start snapshot records CLV once
 same conditionId with both outcomes open marks contested
-settled markets move open signals to results; M5 demotion re-scores followed wallets every N settle events (--rescore-settled-threshold, default 15) and DELETES any that fall out of grade-A: leaderboard row + scoring profile + raw trade cache dropped (no quarantine middle state). Favorites are spared; follow.db research records are kept and open positions settle out. Re-discovery by the observer is the only way back onto the board.
+settled markets move open signals to results; a fast observed-performance breaker deletes non-favorite wallets after >=2 actual followed results when win-rate <=50% and stake-weighted realized ROI <=-25%; independently, M5 re-scores followed wallets every N settle events (--rescore-settled-threshold, default 15) and DELETES any that fall out of grade-A: leaderboard row + scoring profile + raw trade cache dropped (no quarantine middle state). Favorites are spared; follow.db research records are kept and open positions settle out. Re-discovery by the observer is the only way back onto the board, and prior results before the last demotion do not retrigger the breaker.
 ```
 
 Do not rely on `/trades` time-range params. Use local cursor `{timestamp, id}`

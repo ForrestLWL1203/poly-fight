@@ -1543,6 +1543,21 @@ class FollowStore:
             ).fetchall()
         return {str(row["wallet"]).lower() for row in rows if row["wallet"]}
 
+    def load_m5_demote_history(self) -> dict[str, int]:
+        """所有 M5 淘汰时间戳(不按冷却窗裁切)。
+
+        实跟表现熔断只统计上次淘汰之后的新结果；否则钱包冷却后被 observer 重新发现，
+        会被同一批旧亏损永久、反复删除，失去用新质量重新证明自己的机会。
+        """
+        self.init_db()
+        with self.connect() as conn:
+            rows = conn.execute("SELECT wallet, demoted_at FROM m5_demote_cooldown").fetchall()
+        return {
+            str(row["wallet"]).lower(): int(row["demoted_at"] or 0)
+            for row in rows
+            if row["wallet"]
+        }
+
     def clear_wallet_quarantine_reasons(self, reasons: set[str]) -> None:
         self.init_db()
         clean = {str(reason).strip() for reason in reasons if str(reason).strip()}

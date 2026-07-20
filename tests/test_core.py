@@ -3169,6 +3169,8 @@ class CoreTest(unittest.TestCase):
             self.assertEqual([p["signal_id"] for p in store.load_unprocessed_m5_results()], ["s3"])
             # 模拟重启:新 store 实例读同库,已处理仍不计(持久化、不重复处理)
             self.assertEqual([p["signal_id"] for p in FollowStore(db_path).load_unprocessed_m5_results()], ["s3"])
+            store.record_m5_demote_cooldown(["0xA"], ts=200)
+            self.assertEqual(store.load_m5_demote_history(), {"0xa": 200})
 
     def test_follow_store_market_cache_migrates_to_cache_kind_primary_key(self):
         with TemporaryDirectory() as tmp:
@@ -14584,22 +14586,22 @@ class CoreTest(unittest.TestCase):
     def test_v2_leaderboard_excludes_wallets_idle_over_limit(self):
         now = 1_700_000_000
         fresh = self._v2_profile("0xfresh", "lol", wilson=0.70, now=now)   # last trade 24h ago
-        # 低频但 14d 内(8 天前):72h 旧门会误杀,336h 新门保留 → 应上榜。
+        # 低频但 5d 内(4 天前)仍保留；超过 5d 的停止下注钱包退出榜单。
         infrequent = self._v2_profile("0xinfreq", "lol", wilson=0.70, now=now)
-        infrequent["last_esports_trade_at"] = now - 8 * 24 * 3600           # 8d ago < 14d
+        infrequent["last_esports_trade_at"] = now - 4 * 24 * 3600           # 4d ago < 5d
         stale = self._v2_profile("0xstale", "lol", wilson=0.70, now=now)
-        stale["last_esports_trade_at"] = now - 20 * 24 * 3600               # 20d ago > 14d
+        stale["last_esports_trade_at"] = now - 6 * 24 * 3600                # 6d ago > 5d
         out = build_collector_leaderboard_v2(
             {"0xfresh": fresh, "0xinfreq": infrequent, "0xstale": stale}, now_ts=now)
         self.assertEqual({row["wallet"] for row in out["leaderboard"]}, {"0xfresh", "0xinfreq"})
-        self.assertEqual(out["rejected_counts"].get("idle_over_limit"), 1)  # 只砍 20d 的
+        self.assertEqual(out["rejected_counts"].get("idle_over_limit"), 1)  # 只砍 6d 的
         # 一笔交易记录都没有 → 同样排除
         no_trade = self._v2_profile("0xnone", "lol", wilson=0.70, now=now)
         no_trade["last_esports_trade_at"] = 0
         out_n = build_collector_leaderboard_v2({"0xnone": no_trade}, now_ts=now)
         self.assertEqual(out_n["leaderboard"], [])
         # 可配置:放宽阈值 / 关闭(0)后沉寂钱包可入榜
-        out_loose = build_collector_leaderboard_v2({"0xstale": stale}, now_ts=now, gate_kwargs={"max_idle_hours": 30 * 24})
+        out_loose = build_collector_leaderboard_v2({"0xstale": stale}, now_ts=now, gate_kwargs={"max_idle_hours": 10 * 24})
         self.assertEqual({row["wallet"] for row in out_loose["leaderboard"]}, {"0xstale"})
         out_off = build_collector_leaderboard_v2({"0xstale": stale}, now_ts=now, gate_kwargs={"max_idle_hours": 0})
         self.assertEqual({row["wallet"] for row in out_off["leaderboard"]}, {"0xstale"})
@@ -14687,6 +14689,99 @@ class CoreTest(unittest.TestCase):
         if favorite:
             FollowStore(follow_dir / "follow.db").upsert_wallet_favorite(favorite, category="esports", ts=now)
         return esports_dir, follow_dir, collector_dir, drop_cache
+
+    def test_follow_performance_breaker_requires_repeated_large_underperformance(self):
+        from poly_fight.cli import follow_performance_breaker_metrics
+
+        def result(signal_id, wallet, pnl, *, stake=100, resolved_at=100):
+            return {
+                "signal_id": signal_id,
+                "wallet": wallet,
+                "status": "settled",
+                "settled_at": resolved_at,
+                "our_paper_pnl": pnl,
+                "legs": [{"trade_id": signal_id, "stake": stake, "funded_stake": stake}],
+            }
+
+        rows = [
+            result("b1", "0xbad", 20, resolved_at=101),
+            result("b2", "0xbad", -100, resolved_at=102),       # 1-1, ROI -40% → 熔断
+            result("s1", "0xsingle", -100, resolved_at=103),    # 单笔不误杀
+            result("m1", "0xmild", 80, resolved_at=104),
+            result("m2", "0xmild", -100, resolved_at=105),     # 1-1, ROI -10% → 正常回撤
+        ]
+        breakers = follow_performance_breaker_metrics(rows)
+        self.assertEqual(set(breakers), {"0xbad"})
+        self.assertEqual(breakers["0xbad"]["results"], 2)
+        self.assertEqual(breakers["0xbad"]["win_rate"], 0.5)
+        self.assertEqual(breakers["0xbad"]["roi"], -0.4)
+
+        # 上次淘汰以前的旧结果不再重复触发；只有恢复回榜后的新结果重新累计。
+        self.assertEqual(
+            follow_performance_breaker_metrics(rows, demoted_at_by_wallet={"0xbad": 102}),
+            {},
+        )
+
+    def test_follow_performance_breaker_scores_stop_loss_by_final_resolution(self):
+        from poly_fight.cli import follow_performance_breaker_metrics, normalize_follow_results_for_breaker
+
+        class FakeClient:
+            def markets_by_condition_ids(self, condition_ids, *, limit):
+                markets = {
+                    "win": {"conditionId": "win", "closed": True, "outcomePrices": "[\"1\", \"0\"]"},
+                    "lose": {"conditionId": "lose", "closed": True, "outcomePrices": "[\"0\", \"1\"]"},
+                }
+                return [markets[cid] for cid in condition_ids if cid in markets]
+
+        def settled(signal_id, wallet):
+            return {"signal_id": signal_id, "wallet": wallet, "status": "settled", "settled_at": 10,
+                    "our_paper_pnl": 20, "legs": [{"trade_id": signal_id, "stake": 100,
+                                                     "funded_stake": 100, "our_entry_price": 0.5}]}
+
+        def stopped(signal_id, wallet, condition_id):
+            return {"signal_id": signal_id, "wallet": wallet, "condition_id": condition_id,
+                    "outcome_index": 0, "status": "exited", "exit_reason": "stop_loss", "exit_at": 11,
+                    "our_realized_pnl": -80, "legs": [{"trade_id": signal_id, "stake": 100,
+                                                         "funded_stake": 100, "our_entry_price": 0.5}]}
+
+        normalized = normalize_follow_results_for_breaker(FakeClient(), [
+            settled("g1", "0xgood"), stopped("g2", "0xgood", "win"),
+            settled("b1", "0xbad"), stopped("b2", "0xbad", "lose"),
+            stopped("u1", "0xunresolved", "pending"),
+        ])
+        breakers = follow_performance_breaker_metrics(normalized)
+        self.assertEqual(set(breakers), {"0xbad"})
+        self.assertEqual(breakers["0xbad"]["pnl"], -80.0)
+        self.assertEqual(breakers["0xbad"]["roi"], -0.4)
+        self.assertNotIn("0xunresolved", breakers)
+
+    def test_follow_performance_breaker_deletes_bad_wallet_from_board(self):
+        from poly_fight.cli import demote_follow_underperformers, normalize_wallet
+        import poly_fight.storage as storage_module
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = 1_700_000_000
+            esports_dir, follow_dir, _collector_dir, _drop_cache = self._setup_rescore_demote_case(
+                root, now=now,
+            )
+            store = FollowStore(follow_dir / "follow.db")
+            results = [
+                {"signal_id": "bad-1", "wallet": "0xdrop", "condition_id": "c1", "status": "settled",
+                 "settled_at": now - 2, "our_paper_pnl": 20,
+                 "legs": [{"trade_id": "t1", "stake": 100, "funded_stake": 100}]},
+                {"signal_id": "bad-2", "wallet": "0xdrop", "condition_id": "c2", "status": "settled",
+                 "settled_at": now - 1, "our_paper_pnl": -100,
+                 "legs": [{"trade_id": "t2", "stake": 100, "funded_stake": 100}]},
+            ]
+            store.save_follow_snapshot(wallet_trade_state={}, open_signals=[], result_events=results, performance={})
+            args = build_parser().parse_args(["--data-dir", str(esports_dir), "run", "--stake-usdc", "1"])
+
+            result = demote_follow_underperformers(None, args, follow_dir=follow_dir, now_ts=now)
+            self.assertEqual(result["demoted_wallets"], ["0xdrop"])
+            rows, _meta = storage_module.LeaderboardStore(esports_dir / "leaderboard.db").load_leaderboard(category="esports")
+            self.assertEqual({normalize_wallet(row.get("wallet")) for row in rows}, {"0xkeep"})
+            self.assertEqual(store.load_m5_demote_history(), {"0xdrop": now})
 
     def test_rescore_demote_surgical_keeps_innocent_onboard_wallet(self):
         # 核心回归:M5 降级走"精准删除",只摘掉刚结算跌出 A 的钱包;即便此刻一次"弱重评"会让

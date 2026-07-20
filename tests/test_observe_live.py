@@ -126,8 +126,10 @@ class TestObserveLiveGates(unittest.TestCase):
             }
             # 该参与者已在 collector_v2 profiles 里 → 去重后无新候选 → early-exit,不进评分
             (data_dir / "collector_v2").mkdir(parents=True, exist_ok=True)
+            now_ts = int(datetime.now(timezone.utc).timestamp())
             write_json(data_dir / "collector_v2" / "collector_v2_wallet_profiles.json",
-                       [{"wallet": "0xseen", "grade": "A"}])
+                       [{"wallet": "0xseen", "grade": "A", "last_esports_trade_at": now_ts - 3600,
+                         "profiled_at": now_ts}])
             client = _FakeClient({"m_live": [
                 {"positions": [{"proxyWallet": "0xSEEN", "outcomeIndex": 0,
                                 "avgPrice": 0.5, "totalBought": 1000, "totalPnl": 100}]},
@@ -140,6 +142,32 @@ class TestObserveLiveGates(unittest.TestCase):
             self.assertEqual(client.last_sort_by, "TOTAL_PNL")
             self.assertEqual(event["new_candidates"], 0)                  # 去重后无新候选
             self.assertEqual(client.list_events_calls, 0)                 # early-exit:没进评分(无分类集拉取)
+
+    def test_idle_existing_wallet_is_eligible_for_daily_live_reprofile(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            start = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+            markets = {
+                "m_live": {
+                    "condition_id": "m_live", "outcome_prices": [0.5, 0.5], "volume": 100000,
+                    "game_family": "lol", "market_type": "main_match", "match_start_time": start,
+                },
+            }
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            (data_dir / "collector_v2").mkdir(parents=True, exist_ok=True)
+            write_json(data_dir / "collector_v2" / "collector_v2_wallet_profiles.json", [{
+                "wallet": "0xreturn", "grade": "A",
+                "last_esports_trade_at": now_ts - 6 * 86400,
+                "profiled_at": now_ts - 25 * 3600,
+            }])
+            client = _FakeClient({"m_live": [
+                {"positions": [{"proxyWallet": "0xRETURN", "outcomeIndex": 0,
+                                "avgPrice": 0.5, "totalBought": 1000, "totalPnl": 100}]},
+                {"positions": []},
+            ]})
+            event = self._run(data_dir, markets, client)
+            self.assertEqual(event["new_candidates"], 1)
+            self.assertGreater(client.list_events_calls, 0)
 
 
 if __name__ == "__main__":
