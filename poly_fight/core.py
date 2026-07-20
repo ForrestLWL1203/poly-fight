@@ -217,6 +217,8 @@ GAME_FAMILY_LABELS = {
     "cs2": "CS2",
     "dota2": "Dota2",
     "lol": "LoL",
+    # 历史跟单展示兼容；不代表恢复 Valorant 的采集、榜单或新跟单范围。
+    "valorant": "Valorant",
     # 跨游戏盘口专家:在某盘口上跨游戏合并后达标(per-type 合格),无单一游戏专精桶。
     "multi": "跨游戏",
 }

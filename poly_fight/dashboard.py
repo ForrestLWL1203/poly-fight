@@ -49,7 +49,7 @@ _RANK_CACHE: dict[str, tuple[tuple[int, ...], dict[str, int]]] = {}
 _RANK_CACHE_LOCK = threading.Lock()
 _MATCH_TITLE_RE = re.compile(r"^([^:]+):\s+(.+?)\s+vs\s+(.+?)(\s+\([^)]+\))?\s+-\s+(.+)$", re.IGNORECASE)
 _SPORTS_TITLE_RE = re.compile(r"^(.+?)\s+vs\.?\s+(.+?)(?:\s+-\s+(.+))?$", re.IGNORECASE)
-_ESPORTS_GAME_ORDER = {"dota2": 0, "cs2": 1, "lol": 2}
+_ESPORTS_GAME_ORDER = {"dota2": 0, "cs2": 1, "lol": 2, "valorant": 3}
 
 
 @dataclass(frozen=True)
@@ -1228,6 +1228,8 @@ def _normalize_esports_game(value: Any) -> str:
         return "dota2"
     if compact in {"lol", "leagueoflegends", "league"}:
         return "lol"
+    if compact in {"valorant", "valo"}:
+        return "valorant"
     return ""
 
 

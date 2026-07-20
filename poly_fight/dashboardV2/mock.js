@@ -42,19 +42,20 @@
   /* ---- overview ---- */
   const overview = {
     db_ready: true,
-    open_signal_count: 7, result_count: 52, settled_count: 42, exited_count: 10,
-    win_rate: 0.73, our_realized_pnl: 2481.5, hypothetical_pnl: 2600.0, wallet_basis_realized_pnl: 2500.0,
-    total_stake: 20100.0, resolved_stake: 16920.0, realized_roi: 0.1234, wallet_basis_realized_roi: 0.1477,
+    open_signal_count: 7, result_count: 64, settled_count: 54, exited_count: 10,
+    win_rate: 0.71875, our_realized_pnl: 2481.5, hypothetical_pnl: 2600.0, wallet_basis_realized_pnl: 2500.0,
+    total_stake: 21900.0, resolved_stake: 18720.0, realized_roi: 0.1326, wallet_basis_realized_roi: 0.1335,
     open_exposure: 3180.0, account_total_equity_usdc: 8642.18,
     account_balance: { configured: true, balance_usdc: 5462.18, source: "manual", updated_at: ago(3600) },
     clean_signal_count: 14, two_sided_signal_count: 2, disagreement_signal_count: 2,
     win_rates_by_game: [
       { game: "dota2", game_label: "Dota 2", wins: 18, losses: 7, settled_count: 25, win_rate: 0.72 },
-      { game: "lol", game_label: "LoL", wins: 9, losses: 5, settled_count: 14, win_rate: 0.64 },
       { game: "cs2", game_label: "CS2", wins: 11, losses: 2, settled_count: 13, win_rate: 0.85 },
+      { game: "lol", game_label: "LoL", wins: 9, losses: 5, settled_count: 14, win_rate: 0.64 },
+      { game: "valorant", game_label: "Valorant", wins: 8, losses: 4, settled_count: 12, win_rate: 0.67 },
     ],
     follow_type_distribution: {
-      total: 62, total_stake: 20100,
+      total: 70, total_stake: 21900,
       by_game: [
         { game: "dota2", game_label: "Dota 2", total: 21, total_stake: 7050, types: [
           { type: "main_match", label: "主盘", count: 14, stake: 5200 }, { type: "sub_game", label: "Sub Game", count: 7, stake: 1850 }] },
@@ -62,6 +63,8 @@
           { type: "main_match", label: "主盘", count: 12, stake: 4400 }, { type: "sub_game", label: "Sub Game", count: 9, stake: 2600 }] },
         { game: "lol", game_label: "LoL", total: 20, total_stake: 6050, types: [
           { type: "main_match", label: "主盘", count: 11, stake: 3650 }, { type: "sub_game", label: "Sub Game", count: 9, stake: 2400 }] },
+        { game: "valorant", game_label: "Valorant", total: 8, total_stake: 1800, types: [
+          { type: "main_match", label: "主盘", count: 8, stake: 1800 }, { type: "sub_game", label: "Sub Game", count: 0, stake: 0 }] },
       ],
     },
     open_by_game: [

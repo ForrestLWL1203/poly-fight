@@ -259,7 +259,6 @@ function OverviewPage({ data, onNav, onOpenFollow }) {
   const equity = Adapt.equitySeries(raw, winMs[pnlWin]);
   const winPnl = equity.length ? equity[equity.length - 1] : 0;
   const nav = onNav || (() => {});
-  const runnerLive = data.runner && data.runner.status === "running";
 
   const distSegments = ft.segments.map((s) => ({ ...s, value: distMetric === "stake" ? s.stake : s.value }));
   const distCenter = distMetric === "stake" ? compactMoney(ft.totalStake) : ft.total;
@@ -272,131 +271,112 @@ function OverviewPage({ data, onNav, onOpenFollow }) {
     group, gameId: (distSegments.find((s) => s.group === group) || {}).gameId,
   }));
   const hasDist = distSegments.length > 0;
+  const winRateByGame = {};
+  winRates.forEach((g) => { winRateByGame[g.game] = g; });
+  const displayedWinRates = ["dota2", "cs2", "lol", "valorant"].map((game) => (
+    winRateByGame[game] || { game, name: Adapt.gameLabel(game), wins: 0, losses: 0, empty: true }
+  ));
 
   return (
     <div className="page-inner">
-      <div className="ov-grid">
-        <Card pad="lg" className="ov-herocard">
-          <div className="ov-hero">
-            <div className="ov-hero-top">
-              <StatTile size="lg" tone={o.realizedPnl > 0 ? "up" : o.realizedPnl < 0 ? "down" : "default"} label="已结算盈亏" value={signedMoney(o.realizedPnl)} delta={<TrendValue value={o.realizedRoi} percent chip />} sub={`累计投入 ${money(o.totalStake)}`} />
-            </div>
-            <div className="ov-metricbar">
-              <div className="m"><span>已结算 ROI</span><b className={pnlClass(o.realizedPnl)}>{o.realizedRoi > 0 ? "+" : ""}{o.realizedRoi}%</b></div>
-              <div className="m"><span>结算场次</span><b>{o.settledCount}</b></div>
-              <div className="m"><span>当前持仓</span><b>{money(o.openExposure)}</b></div>
-              <div className="m"><span>钱包余额</span><b>{o.walletConfigured ? money(o.walletBalance) : "—"}</b></div>
-            </div>
-            <HealthPanel data={data} />
-            {hasDist && (
-              <div className="ov-herodist">
-                <div className="ov-herodist-head">
-                  <div>
-                    <div className="ps-card-eyebrow">盘口结构</div>
-                    <h3 className="ov-herodist-title">历史跟单类型分布</h3>
-                  </div>
-                  <SegmentedControl value={distMetric} onChange={setDistMetric} options={[
-                    { value: "count", label: "按笔数" },
-                    { value: "stake", label: "按金额" },
-                  ]} />
-                </div>
-                <div className="ov-herodist-body">
-                  <CategoryDonut size={112} thickness={18} centerValue={distCenter} centerLabel={distLabel} segments={distSegments} />
-                  <div className="ov-distmatrix">
-                    <div className="ov-dm-row ov-dm-head">
-                      <span className="ov-dm-game"></span>
-                      {distMarkets.map((m) => <span key={m} className="ov-dm-cell">{m}</span>)}
-                    </div>
-                    {distGames.map((g) => (
-                      <div key={g.group} className="ov-dm-row">
-                        <span className="ov-dm-game">{g.gameId ? <GameIcon game={g.gameId} size="sm" base={ASSET_BASE} /> : null} {g.group}</span>
-                        {distMarkets.map((m) => {
-                          const s = distMap[g.group + "|" + m];
-                          return (
-                            <span key={m} className="ov-dm-cell">
-                              <i className="ov-dm-sw" style={{ background: s ? s.color : "transparent" }}></i>
-                              {s ? Math.round((s.value / distTotal) * 100) : 0}%
-                            </span>
-                          );
-                        })}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            )}
+      <div className="ov-dashboard-grid ov-grid-top">
+        <Card pad="lg" className="ov-performance-card">
+          <div className="ov-performance-head">
+            <StatTile size="lg" tone={o.realizedPnl > 0 ? "up" : o.realizedPnl < 0 ? "down" : "default"} label="已结算盈亏" value={signedMoney(o.realizedPnl)} delta={<TrendValue value={o.realizedRoi} percent chip />} sub={`累计投入 ${money(o.totalStake)}`} />
+          </div>
+          <div className="ov-metricbar">
+            <div className="m"><span>已结算 ROI</span><b className={pnlClass(o.realizedPnl)}>{o.realizedRoi > 0 ? "+" : ""}{o.realizedRoi}%</b></div>
+            <div className="m"><span>结算场次</span><b>{o.settledCount}</b></div>
+            <div className="m"><span>当前持仓</span><b>{money(o.openExposure)}</b></div>
+            <div className="m"><span>钱包余额</span><b>{o.walletConfigured ? money(o.walletBalance) : "—"}</b></div>
           </div>
         </Card>
-        <Card className="ov-rightcard">
+        <Card className="ov-ops-card" eyebrow="运行概况" title="运营与健康">
           <div className="ov-twostat">
             <StatTile label="监控赛事" value={<button type="button" className="ov-link-num" onClick={() => nav("events")}>{o.watchedEvents}<i data-lucide="arrow-up-right"></i></button>} sub="esports" />
             <div className="ov-twostat-div"></div>
             <StatTile label="进行中跟单" tone="gradient" value={<button type="button" className="ov-link-num" onClick={() => nav("follows")}>{o.openFollows}<i data-lucide="arrow-up-right"></i></button>} sub={`${o.openByGame.length} 个项目`} />
           </div>
-          <div className="ov-openlist">
-            {o.openByGame.length === 0 && <div className="ov-openrow" style={{ cursor: "default", justifyContent: "center", color: "var(--text-tertiary)" }}>暂无进行中跟单</div>}
-            {o.openByGame.map((g) => (
-              <button type="button" key={g.game} className="ov-openrow" onClick={() => nav("follows")}>
-                <span className="ov-openrow-game"><GameIcon game={g.game} size="sm" base={ASSET_BASE} /> {g.name}</span>
-                <span className="ov-openrow-count">{g.count} 场</span>
-              </button>
-            ))}
-          </div>
-          <div className="ov-qualityblock">
-            <div className="ov-qualityblock-head">
-              <div className="ps-card-eyebrow">盘口结构</div>
-              <h3 className="ov-qtitle">跟单质量</h3>
-            </div>
-            <div className="ov-quality">
-              <div className="ov-qcell"><span className="qv pnl-flat">{o.cleanCount}</span><span className="ql">单向盘</span><small>无双边 / 分歧</small></div>
-              <div className="ov-qcell"><span className="qv" style={{ color: "var(--status-warn)" }}>{o.twoSidedCount + o.disagreementCount}</span><span className="ql">双边 / 分歧盘</span><small>双边 {o.twoSidedCount} · 分歧 {o.disagreementCount}</small></div>
-            </div>
-          </div>
+          <HealthPanel data={data} />
         </Card>
       </div>
-      <Card className="ov-winrate-card" eyebrow="跟单胜率" title="历史综合胜率" action={
-        <SegmentedControl value={pnlWin} onChange={setPnlWin} options={[
-          { value: "h24", label: "24小时" },
-          { value: "d7", label: "7日" },
-          { value: "d30", label: "30日" },
-          { value: "all", label: "至今" },
-        ]} />
-      }>
-        <div className="ov-winrate">
-          <div className="ov-winrate-hero">
+      <div className="ov-dashboard-grid ov-grid-analysis">
+        <Card className="ov-winrate-card" eyebrow="跟单胜率" title="历史综合胜率">
+          <div className="ov-winrate-layout">
             <div className="ov-wr-big">
               <WinRateRing size="lg" wins={o.winRate.wins} losses={o.winRate.losses} label="综合胜率" legend />
             </div>
-            <div className="ov-wr-games-col">
-              {winRates.length === 0 && <span className="ov-wr-empty">暂无已结算项目</span>}
-              {winRates.slice(0, 3).map((g) => (
-                <div className="ov-wr-grow" key={g.game}>
-                  <WinRateRing size="sm" wins={g.wins} losses={g.losses} label="" />
-                  <div className="ov-wr-gname">
-                    <span className="g-name"><GameIcon game={g.game} size="sm" base={ASSET_BASE} /> {g.name}</span>
-                    <span className="g-rec">胜 {g.wins} · 负 {g.losses}</span>
-                  </div>
+            <div className="ov-wr-games-grid">
+              {displayedWinRates.map((g) => (
+                <div className={"ov-wr-game" + (g.empty ? " is-empty" : "")} key={g.game}>
+                  <span className="ov-wr-game-name"><GameIcon game={g.game} size="sm" base={ASSET_BASE} /> {g.name}</span>
+                  {g.empty ? <span className="ov-wr-no-data">—</span> : <WinRateRing size="sm" wins={g.wins} losses={g.losses} label="" />}
+                  <span className="ov-wr-game-rec">{g.empty ? "暂无记录" : `胜 ${g.wins} · 负 ${g.losses}`}</span>
                 </div>
               ))}
             </div>
           </div>
-          <div className="ov-winrate-divider"></div>
-          <div className="ov-winrate-right">
-            <div className="ov-pnlwin">
-              <span className="ps-card-eyebrow">区间盈亏</span>
-              <div className="ov-pnlwin-val">
-                <b className={pnlClass(winPnl)}>{signedMoney(winPnl)}</b>
-                <span className="ov-pnlwin-cap">{winCaption[pnlWin]}</span>
-              </div>
-              <div className="ov-pnlwin-chart">
-                {equity.length >= 2
-                  ? <EquityArea points={equity} />
-                  : <div className="ov-pnlwin-empty">该区间暂无结算数据</div>}
+        </Card>
+        <Card className="ov-trend-card" eyebrow="区间表现" title="区间盈亏" action={
+          <SegmentedControl value={pnlWin} onChange={setPnlWin} options={[
+            { value: "h24", label: "24小时" },
+            { value: "d7", label: "7日" },
+            { value: "d30", label: "30日" },
+            { value: "all", label: "至今" },
+          ]} />
+        }>
+          <div className="ov-pnlwin-val">
+            <b className={pnlClass(winPnl)}>{signedMoney(winPnl)}</b>
+            <span className="ov-pnlwin-cap">{winCaption[pnlWin]}</span>
+          </div>
+          <div className="ov-pnlwin-chart">
+            {equity.length >= 2
+              ? <EquityArea points={equity} />
+              : <div className="ov-pnlwin-empty">该区间暂无结算数据</div>}
+          </div>
+        </Card>
+      </div>
+      <div className="ov-dashboard-grid ov-grid-structure">
+        <Card className="ov-dist-card" eyebrow="盘口结构" title="历史跟单类型分布" action={
+          <SegmentedControl value={distMetric} onChange={setDistMetric} options={[
+            { value: "count", label: "按笔数" },
+            { value: "stake", label: "按金额" },
+          ]} />
+        }>
+          {hasDist ? (
+            <div className="ov-herodist-body">
+              <CategoryDonut size={112} thickness={18} centerValue={distCenter} centerLabel={distLabel} segments={distSegments} />
+              <div className="ov-distmatrix">
+                <div className="ov-dm-row ov-dm-head">
+                  <span className="ov-dm-game"></span>
+                  {distMarkets.map((m) => <span key={m} className="ov-dm-cell">{m}</span>)}
+                </div>
+                {distGames.map((g) => (
+                  <div key={g.group} className="ov-dm-row">
+                    <span className="ov-dm-game">{g.gameId ? <GameIcon game={g.gameId} size="sm" base={ASSET_BASE} /> : null} {g.group}</span>
+                    {distMarkets.map((m) => {
+                      const s = distMap[g.group + "|" + m];
+                      return (
+                        <span key={m} className="ov-dm-cell">
+                          <i className="ov-dm-sw" style={{ background: s ? s.color : "transparent" }}></i>
+                          {s ? Math.round((s.value / distTotal) * 100) : 0}%
+                        </span>
+                      );
+                    })}
+                  </div>
+                ))}
               </div>
             </div>
+          ) : <div className="ov-compact-empty">暂无历史跟单分布</div>}
+        </Card>
+        <Card className="ov-quality-card" eyebrow="盘口结构" title="跟单质量">
+          <div className="ov-quality">
+            <div className="ov-qcell"><span className="qv pnl-flat">{o.cleanCount}</span><span className="ql">单向盘</span><small>无双边 / 分歧</small></div>
+            <div className="ov-qcell"><span className="qv" style={{ color: "var(--status-warn)" }}>{o.twoSidedCount + o.disagreementCount}</span><span className="ql">双边 / 分歧盘</span><small>双边 {o.twoSidedCount} · 分歧 {o.disagreementCount}</small></div>
           </div>
-        </div>
-      </Card>
+          <div className="ov-quality-note">质量统计覆盖当前与历史跟单，帮助识别对手盘和分歧风险。</div>
+        </Card>
+      </div>
       <Card pad="flush">
         <div className="card-toolbar">
           <div className="sec-head" style={{ marginBottom: 0 }}><h2 style={{ fontSize: "var(--fs-h4)" }}>最近跟单</h2><Badge tone="accent">最近 {RECENT_FOLLOWS} 笔</Badge></div>
@@ -1165,82 +1145,89 @@ function StrategyPipe({ kit }) {
   );
 }
 
-/* the two-column config form (shared by create + edit) */
+function StrategyRiskCard({ icon, title, enabled, onToggle, children, hint }) {
+  return (
+    <section className={"cfg-risk-card" + (enabled ? " is-enabled" : "")}>
+      <div className="crc-head">
+        <div className="cm-head"><Ico n={icon} /><span>{title}</span></div>
+        <div className="crc-toggle" onClick={(e) => e.stopPropagation()}>
+          <Switch checked={enabled} onChange={onToggle} accent aria-label={`${title}启用`} />
+          <span className="cr-label">启用</span>
+        </div>
+      </div>
+      <div className="crc-control">{children}</div>
+      <p className="crc-hint">{hint}</p>
+    </section>
+  );
+}
+
+/* balanced config form (shared by create + edit) */
 function StrategyEditor({ s, up, wallet, locked }) {
   return (
-    <div className="cfg-split" style={locked ? { opacity: 0.55, pointerEvents: "none" } : null}>
-      <div className="cfg-col">
-        <div className="cfg-mini">
+    <div className="cfg-editor" style={locked ? { opacity: 0.55, pointerEvents: "none" } : null}>
+      <div className="cfg-funds-sizing">
+        <section className="cfg-section cfg-funds-card">
           <div className="cm-head"><Ico n="wallet" /><span>可动用资金</span></div>
-          <div className="cm-body">
+          <div className="cfg-funds-body">
             <SegmentedControl value={s.usableMode} onChange={up("usableMode")} options={[{ value: "all", label: "全部余额" }, { value: "cap", label: "指定上限" }]} />
             {s.usableMode === "cap" ? <NumField value={s.usableCap} onChange={up("usableCap")} unit="USDC" width={84} /> : <span className="mc-note">钱包 {wallet > 0 ? money(wallet) : "未设置"}</span>}
           </div>
-        </div>
-        <div className="cfg-head"><h3>单笔跟单金额</h3><Badge tone="up" outline>必填</Badge></div>
-        <p className="cfg-sub">注码 = 我方可用余额 × 单笔基数%（动态随余额，不抄目标仓位大小）· 同一市场全部跟单累计 ≤ 单场预算（加仓只填到预算，不叠加）· 主盘/子盘预算解耦 · 金额向下取整</p>
-        <div className="opt-card is-active">
-          <div className="opt-body" onClick={(e) => e.stopPropagation()}>
-            <div className="ctrl-row">
+          <p className="cfg-section-note">跟单只会使用钱包余额或你指定的资金上限。</p>
+        </section>
+        <section className="cfg-section cfg-sizing-card">
+          <div className="cfg-section-head">
+            <div><div className="cm-head"><Ico n="activity" /><span>单笔与单场预算</span></div><p>按余额百分比下注，并分别限制主盘和子盘累计投入。</p></div>
+            <Badge tone="up" outline>必填</Badge>
+          </div>
+          <div className="cfg-sizing-grid" onClick={(e) => e.stopPropagation()}>
+            <div className="cfg-field">
               <NumField value={s.perSignalPct} onChange={up("perSignalPct")} unit="%" lead="单笔基数（余额）" width={60} />
+            </div>
+            <div className="cfg-field">
               <NumField value={s.perMatchPct} onChange={up("perMatchPct")} unit="%" lead="主盘单场预算（余额）" width={60} />
+            </div>
+            <div className="cfg-field">
               <NumField value={s.perMatchSubPct} onChange={up("perMatchSubPct")} unit="%" lead="子盘单场预算（余额）" width={60} />
             </div>
-            <div className="ctrl-row">
+            <div className="cfg-field">
               <NumField value={s.maxOrdersPerMatch} onChange={up("maxOrdersPerMatch")} unit="笔" lead="每场最大笔数（0=无限）" width={60} />
+            </div>
+            <div className="cfg-field">
               <NumField value={s.minStake} onChange={up("minStake")} unit="USDC" lead="单笔下限" width={72} />
             </div>
-            <p className="cfg-sub">单笔基数 = 每笔下注占我方可用余额%；主盘单场预算 = 主盘（系列胜者）同一市场全部跟单累计上限%；子盘单场预算 = map/game winner 每个单局独立上限%（可调低压制连押系列堆叠，不跨局汇总）；每场最大笔数 = 单钱包同一市场最多跟几笔（主子同限，0=无限）；单笔下限 = dust 地板，仅防 &lt;$1 废单。</p>
           </div>
-        </div>
+          <details className="cfg-details">
+            <summary>查看预算参数说明</summary>
+            <p>单笔基数按我方可用余额计算；主盘预算限制系列胜者市场的累计投入；子盘预算按每个 map/game winner 独立限制；每场最大笔数按单钱包、单市场计算；单笔下限只用于过滤 dust 小单。</p>
+          </details>
+        </section>
       </div>
 
-      <div className="cfg-col">
-        <div className="cfg-mini">
-          <div className="cm-head"><Ico n="filter" /><span>信号门槛</span></div>
-          <div className="cm-body">
-            <label className="check-row" onClick={(e) => e.stopPropagation()}>
-              <input type="checkbox" checked={s.minSignalOn} onChange={(e) => up("minSignalOn")(e.target.checked)} /><span className="cr-label">启用</span>
-            </label>
-            <NumField value={s.minSignal} onChange={up("minSignal")} unit="USDC" lead="忽略目标买入 <" width={64} disabled={!s.minSignalOn} />
-          </div>
+      <div className="cfg-risk-grid">
+        <StrategyRiskCard icon="filter" title="信号门槛" enabled={s.minSignalOn} onToggle={up("minSignalOn")} hint="低于门槛的目标买入不会触发跟单。">
+          <NumField value={s.minSignal} onChange={up("minSignal")} unit="USDC" lead="忽略目标买入 <" width={64} disabled={!s.minSignalOn} />
+        </StrategyRiskCard>
+        <StrategyRiskCard icon="crosshair" title="现价上限" enabled={s.maxEntryOn} onToggle={up("maxEntryOn")} hint="发现时现价过高则不跟，避免追高。">
+          <NumField value={s.maxEntry} onChange={up("maxEntry")} lead="现价 >" unit="不跟" width={56} disabled={!s.maxEntryOn} />
+        </StrategyRiskCard>
+        <StrategyRiskCard icon="crosshair" title="现价下限" enabled={s.minEntryOn} onToggle={up("minEntryOn")} hint="过滤低价冷门盘口，需低于现价上限。">
+          <NumField value={s.minEntry} onChange={up("minEntry")} lead="现价 <" unit="不跟" width={56} disabled={!s.minEntryOn} />
+        </StrategyRiskCard>
+        <StrategyRiskCard icon="trending-down" title="主盘止损" enabled={s.stopLossOn} onToggle={up("stopLossOn")} hint="仅作用主盘，达到跌幅阈值后平仓。">
+          <NumField value={s.stopLoss} onChange={up("stopLoss")} lead="跌" unit="% 平仓" width={56} disabled={!s.stopLossOn} />
+        </StrategyRiskCard>
+      </div>
+      <details className="cfg-details cfg-risk-details">
+        <summary>查看风控参数说明</summary>
+        <div className="cfg-details-grid">
+          <p><b>信号门槛：</b>只过滤目标钱包买入金额，不改变我方下注金额。</p>
+          <p><b>现价区间：</b>上限避免延迟追高，下限过滤低价冷门；关闭即不限制。</p>
+          <p><b>主盘止损：</b>现价较加权入场跌幅达到阈值后按现价全平，不等待结算归零。</p>
         </div>
-        <div className="cfg-mini">
-          <div className="cm-head"><Ico n="crosshair" /><span>现价上限</span></div>
-          <div className="cm-body">
-            <label className="check-row" onClick={(e) => e.stopPropagation()}>
-              <input type="checkbox" checked={s.maxEntryOn} onChange={(e) => up("maxEntryOn")(e.target.checked)} /><span className="cr-label">启用</span>
-            </label>
-            <NumField value={s.maxEntry} onChange={up("maxEntry")} lead="现价 >" unit="不跟" width={56} disabled={!s.maxEntryOn} />
-            <p className="cfg-sub">跟单有延迟:发现时现价已高于此值则不跟,避免追高(0–1)。默认 0.68（评分价区）。</p>
-          </div>
-        </div>
-        <div className="cfg-mini">
-          <div className="cm-head"><Ico n="crosshair" /><span>现价下限</span></div>
-          <div className="cm-body">
-            <label className="check-row" onClick={(e) => e.stopPropagation()}>
-              <input type="checkbox" checked={s.minEntryOn} onChange={(e) => up("minEntryOn")(e.target.checked)} /><span className="cr-label">启用</span>
-            </label>
-            <NumField value={s.minEntry} onChange={up("minEntry")} lead="现价 <" unit="不跟" width={56} disabled={!s.minEntryOn} />
-            <p className="cfg-sub">现价低于此值则不跟,过滤低价冷门(回测里 &lt;0.5 段失血最重)。需 &lt; 上限,0/关=不限。默认关。</p>
-          </div>
-        </div>
-        <div className="cfg-mini">
-          <div className="cm-head"><Ico n="trending-down" /><span>主盘止损</span></div>
-          <div className="cm-body">
-            <label className="check-row" onClick={(e) => e.stopPropagation()}>
-              <input type="checkbox" checked={s.stopLossOn} onChange={(e) => up("stopLossOn")(e.target.checked)} /><span className="cr-label">启用</span>
-            </label>
-            <NumField value={s.stopLoss} onChange={up("stopLoss")} lead="跌" unit="% 平仓" width={56} disabled={!s.stopLossOn} />
-            <p className="cfg-sub">仅主盘:现价较加权入场跌幅达到此% → 按现价全平,不等结算归零(标记「止损」)。回测仅主盘净正、子盘净负,故只作用主盘。默认关。</p>
-          </div>
-        </div>
-        <div className="cfg-mini">
-          <div className="cm-head"><Ico n="sparkles" /><span>卖出跟随（内置）</span></div>
-          <div className="cm-body">
-            <p className="cfg-sub">卖出侧:目标卖价 ≥ 0.90 才镜像跟卖,否则持有到结算（系统统一，无需配置）。</p>
-          </div>
-        </div>
+      </details>
+      <div className="cfg-sell-strip">
+        <div className="cm-head"><Ico n="sparkles" /><span>卖出跟随（内置）</span><Badge tone="up">已启用</Badge></div>
+        <p>目标卖价 ≥ 0.90 时镜像跟卖，否则持有到结算；这是系统统一规则，无需单独配置。</p>
       </div>
     </div>
   );
@@ -1258,24 +1245,27 @@ function StrategyRowEditor({ initName, initKit, wallet, saveLocked, saving, take
   const ready = !nameErr && issues.length === 0 && !saveLocked;
   return (
     <div className="strat-editor">
-      <div className="se-name">
-        <label className="se-name-label">策略名称</label>
-        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+      <div className="se-identity">
+        <div className="se-name">
+          <label className="se-name-label">策略名称</label>
           <input className="se-name-input" value={name} maxLength={24} placeholder="给这个策略起个名字，例如：稳健跟单"
             onChange={(e) => setName(e.target.value)} />
+          {nameErr ? <span className="se-name-err"><Ico n="circle-alert" />{nameErr}</span> : null}
+        </div>
+        <div className="se-refresh">
           <label onClick={(e) => e.stopPropagation()} title="跟单运行期间动态刷新 Leaderboard(发现新钱包/解隔离)"
-            style={{ display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap" }}>
+            className="se-refresh-toggle">
             <Switch checked={!!s.realtimeRefresh} onChange={(v) => up("realtimeRefresh")(v)} accent /><span>动态刷新 Leaderboard</span>
           </label>
+          <span className="se-refresh-help">跟单运行期间持续发现新钱包并更新榜单。</span>
         </div>
-        {nameErr ? <span className="se-name-err"><Ico n="circle-alert" />{nameErr}</span> : null}
       </div>
       <StrategyEditor s={s} up={up} wallet={wallet} locked={saveLocked} />
       {issues.length ? <div className="so-todo"><Ico n="circle-alert" /> 待完善必填项：{issues.join("、")}</div> : null}
       {saveLocked ? <div className="so-todo"><Ico n="lock" /> 跟单运行中，无法修改生效策略，请先停止跟单</div> : null}
       <div className="se-actions">
-        <Button variant="ghost" onClick={onCancel} disabled={saving}>取消</Button>
-        <Button variant="primary" disabled={!ready || saving} onClick={() => onSave(nameTrim, s)}>{saving ? <Spinner sm /> : "保存"}</Button>
+        <Button variant="ghost" size="sm" onClick={onCancel} disabled={saving}>取消</Button>
+        <Button variant="primary" size="sm" disabled={!ready || saving} onClick={() => onSave(nameTrim, s)}>{saving ? <Spinner sm /> : "保存"}</Button>
       </div>
     </div>
   );
