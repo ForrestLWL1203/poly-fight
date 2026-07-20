@@ -240,6 +240,66 @@ def category_refresh_cache_retention_days_by_dir(args: argparse.Namespace) -> di
     }
 
 
+def prune_collector_trade_cache_files(
+    output_dir: Path,
+    *,
+    retained_wallets: set[str],
+    active_condition_ids: set[str],
+) -> dict[str, int]:
+    """Delete whole cache files that have fallen out of the current rolling scope.
+
+    Trade rows inside a retained wallet cache are timestamp-pruned by
+    ``fetch_recent_esports_user_trades_for_wallet`` whenever that wallet is
+    refreshed.  This pass closes the other growth path: wallets discovered in an
+    earlier build (including observe-live promotions) and markets outside the
+    current classification window must not leave one file behind forever.
+
+    Empty retain/scope sets are treated as an incomplete build and skip deletion,
+    so a transient upstream outage cannot wipe reusable caches.
+    """
+    output_dir = Path(output_dir)
+    retained = {normalize_wallet(value) for value in retained_wallets if normalize_wallet(value)}
+    active_market_names = {
+        market_trades_cache_path(output_dir, str(condition_id)).name
+        for condition_id in active_condition_ids
+        if str(condition_id or "").strip()
+    }
+    stats = {
+        "raw_user_trade_cache_deleted_files": 0,
+        "raw_user_trade_cache_deleted_bytes": 0,
+        "raw_market_trade_cache_deleted_files": 0,
+        "raw_market_trade_cache_deleted_bytes": 0,
+    }
+
+    if retained:
+        user_cache_dir = output_dir / "raw_user_trades"
+        for path in user_cache_dir.glob("*.json") if user_cache_dir.exists() else ():
+            if normalize_wallet(path.stem) in retained:
+                continue
+            try:
+                size = path.stat().st_size
+                path.unlink()
+            except OSError:
+                continue
+            stats["raw_user_trade_cache_deleted_files"] += 1
+            stats["raw_user_trade_cache_deleted_bytes"] += int(size)
+
+    if active_market_names:
+        market_cache_dir = output_dir / "raw_market_trades"
+        for path in market_cache_dir.glob("*.json") if market_cache_dir.exists() else ():
+            if path.name in active_market_names:
+                continue
+            try:
+                size = path.stat().st_size
+                path.unlink()
+            except OSError:
+                continue
+            stats["raw_market_trade_cache_deleted_files"] += 1
+            stats["raw_market_trade_cache_deleted_bytes"] += int(size)
+
+    return stats
+
+
 def build_client(args: argparse.Namespace) -> PolymarketClient:
     rate_per_second = getattr(args, "max_requests_per_second", 10)
     rate_limiter = (
@@ -1032,10 +1092,18 @@ def fetch_recent_esports_user_trades_for_wallet(
     cached_trades: list[dict[str, Any]] = []
     cache_ok = False
     fetch_needed = True
+    cache_pruned = False
+    cache_stat: os.stat_result | None = None
     if use_cache and cache_path and cache_path.exists():
+        cache_stat = cache_path.stat()
         cached_trades, cache_ok = _load_raw_user_trade_cache(cache_path)
+        if cache_ok and retention_days is not None and int(retention_days) > 0:
+            cutoff = now_ts - int(retention_days) * 86400
+            retained_trades = [t for t in cached_trades if int(t.get("timestamp") or 0) >= cutoff]
+            cache_pruned = len(retained_trades) != len(cached_trades)
+            cached_trades = retained_trades
         if cache_ok and not should_refresh_file_cache(
-            cache_path.stat().st_mtime,
+            cache_stat.st_mtime,
             now_ts=now_ts,
             ttl_hours=cache_ttl_days * 24,
             force_refresh=force_refresh,
@@ -1080,6 +1148,23 @@ def fetch_recent_esports_user_trades_for_wallet(
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
+    elif cache_pruned and cache_path and cache_stat is not None:
+        # Rolling-window maintenance must not masquerade as a fresh API fetch.
+        # Preserve the original mtime after the atomic rewrite so the normal TTL
+        # still triggers the next incremental network refresh on schedule.
+        write_json(
+            cache_path,
+            {
+                "schema": USER_TRADES_CACHE_SCHEMA,
+                "wallet": wallet,
+                "trades": [_slim_user_trade(t) for t in cached_trades],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        try:
+            os.utime(cache_path, ns=(cache_stat.st_atime_ns, cache_stat.st_mtime_ns))
+        except OSError:
+            pass
 
     filtered = _filter_esports_user_trades(cached_trades, condition_ids, max_esports_markets=max_esports_markets)
     return (filtered, source) if include_source else filtered
@@ -4523,6 +4608,36 @@ def build_collector_profile_refresh_plan(
     }
 
 
+def merge_collector_profiles_published_during_build(
+    profiles_by_wallet: dict[str, dict[str, Any]],
+    latest_profiles: dict[str, dict[str, Any]],
+    *,
+    build_started_at: int,
+) -> dict[str, dict[str, Any]]:
+    """Merge concurrent observer publications without resurrecting expired profiles.
+
+    The long collect phase intentionally re-reads profiles under the publish lock.
+    Only profiles updated during this build are new concurrent work.  Re-adding
+    every older row would undo the rolling activity-window prune and let each
+    newly discovered wallet/profile/cache live forever.
+    """
+    merged = dict(profiles_by_wallet)
+    for wallet_key, latest in latest_profiles.items():
+        wallet_key = normalize_wallet(wallet_key or latest.get("wallet"))
+        if not wallet_key:
+            continue
+        current = merged.get(wallet_key)
+        latest_ts = max(to_int(latest.get("profiled_at")), to_int(latest.get("observed_at")))
+        current_ts = max(to_int((current or {}).get("profiled_at")), to_int((current or {}).get("observed_at")))
+        if current is not None:
+            if latest_ts > current_ts:
+                merged[wallet_key] = latest
+            continue
+        if latest_ts >= int(build_started_at):
+            merged[wallet_key] = latest
+    return merged
+
+
 def load_collector_existing_profiles(
     output_dir: Path, data_dir: Path | None = None, *, prefix: str = "collector"
 ) -> dict[str, dict[str, Any]]:
@@ -5705,15 +5820,11 @@ def _command_collect_wallets(
         latest_profiles = load_collector_existing_profiles(
             output_dir, resolve_data_dir(args), prefix=prefix
         )
-        for wallet_key, latest in latest_profiles.items():
-            wallet_key = normalize_wallet(wallet_key or latest.get("wallet"))
-            if not wallet_key:
-                continue
-            current = profiles_by_wallet.get(wallet_key)
-            latest_ts = max(to_int(latest.get("profiled_at")), to_int(latest.get("observed_at")))
-            current_ts = max(to_int((current or {}).get("profiled_at")), to_int((current or {}).get("observed_at")))
-            if current is None or latest_ts > current_ts:
-                profiles_by_wallet[wallet_key] = latest
+        profiles_by_wallet = merge_collector_profiles_published_during_build(
+            profiles_by_wallet,
+            latest_profiles,
+            build_started_at=now_ts,
+        )
         collector_result = build_collector_leaderboard_v2(
             profiles_by_wallet,
             now_ts=now_ts,
@@ -5723,6 +5834,11 @@ def _command_collect_wallets(
             gate_kwargs=_v2_gate_kwargs_from_args(args),
         )
         leaderboard = collector_result["leaderboard"]
+        cache_prune = prune_collector_trade_cache_files(
+            output_dir,
+            retained_wallets=set(profiles_by_wallet),
+            active_condition_ids=classification_condition_ids,
+        )
         write_json(
             output_dir / f"{prefix}_wallet_profiles.json",
             [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
@@ -5739,6 +5855,7 @@ def _command_collect_wallets(
                 "v2_per_game_counts": collector_result.get("per_game_counts", {}),
                 "v2_edge_type_counts": collector_result.get("edge_type_counts", {}),
                 "v2_rejected_counts": collector_result.get("rejected_counts", {}),
+                "cache_prune": cache_prune,
             }
         )
         dashboard_publish = publish_collector_dashboard_outputs(

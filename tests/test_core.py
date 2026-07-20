@@ -102,9 +102,11 @@ from poly_fight.cli import (
     filter_profile_candidates,
     load_active_market_cache,
     merge_cached_profile_with_candidate,
+    merge_collector_profiles_published_during_build,
     merge_profiles_with_candidates,
     migrate_category_follow_dbs,
     publish_collector_dashboard_outputs,
+    prune_collector_trade_cache_files,
     prune_profile_store,
     read_category_leaderboards,
     refresh_team_logo_cache_from_active_markets,
@@ -2881,6 +2883,114 @@ class CoreTest(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(client.calls, 1)
+
+    def test_recent_esports_user_trades_cache_prunes_window_on_cache_hit_without_delaying_refresh(self):
+        class NoFetchClient:
+            def trades_for_user(self, wallet, *, limit, offset):
+                raise AssertionError("fresh cache should not fetch")
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now_ts = 100 * 86400
+            cache_path = data_dir / "raw_user_trades" / "0xabc.json"
+            write_json(
+                cache_path,
+                {
+                    "schema": 2,
+                    "wallet": "0xabc",
+                    "trades": [
+                        {"id": "recent", "conditionId": "m1", "timestamp": now_ts - 86400},
+                        {"id": "expired", "conditionId": "m1", "timestamp": now_ts - 16 * 86400},
+                    ],
+                },
+            )
+            original_mtime_ns = (now_ts - 60) * 1_000_000_000
+            os.utime(cache_path, ns=(original_mtime_ns, original_mtime_ns))
+
+            trades = fetch_recent_esports_user_trades_for_wallet(
+                NoFetchClient(),
+                "0xABC",
+                {"m1"},
+                data_dir=data_dir,
+                now_ts=now_ts,
+                cache_ttl_days=1,
+                retention_days=15,
+            )
+            cached = read_json(cache_path, {})
+            resulting_mtime_ns = cache_path.stat().st_mtime_ns
+
+        self.assertEqual([row["id"] for row in trades], ["recent"])
+        self.assertEqual([row["id"] for row in cached["trades"]], ["recent"])
+        self.assertEqual(resulting_mtime_ns, original_mtime_ns)
+
+    def test_prune_collector_trade_cache_files_removes_out_of_scope_wallets_and_markets(self):
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            keep_user = output_dir / "raw_user_trades" / "0xkeep.json"
+            drop_user = output_dir / "raw_user_trades" / "0xdrop.json"
+            keep_market = output_dir / "raw_market_trades" / "m_keep.json"
+            drop_market = output_dir / "raw_market_trades" / "m_drop.json"
+            for path, value in [
+                (keep_user, "keep-user"),
+                (drop_user, "drop-user"),
+                (keep_market, "keep-market"),
+                (drop_market, "drop-market"),
+            ]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(value, encoding="utf-8")
+
+            stats = prune_collector_trade_cache_files(
+                output_dir,
+                retained_wallets={"0xKEEP"},
+                active_condition_ids={"m_keep"},
+            )
+
+            self.assertTrue(keep_user.exists())
+            self.assertFalse(drop_user.exists())
+            self.assertTrue(keep_market.exists())
+            self.assertFalse(drop_market.exists())
+            self.assertEqual(stats["raw_user_trade_cache_deleted_files"], 1)
+            self.assertEqual(stats["raw_market_trade_cache_deleted_files"], 1)
+            self.assertEqual(stats["raw_user_trade_cache_deleted_bytes"], len("drop-user"))
+            self.assertEqual(stats["raw_market_trade_cache_deleted_bytes"], len("drop-market"))
+
+    def test_prune_collector_trade_cache_files_skips_empty_incomplete_scope(self):
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            user_cache = output_dir / "raw_user_trades" / "0xabc.json"
+            market_cache = output_dir / "raw_market_trades" / "m1.json"
+            for path in (user_cache, market_cache):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("cached", encoding="utf-8")
+
+            stats = prune_collector_trade_cache_files(
+                output_dir,
+                retained_wallets=set(),
+                active_condition_ids=set(),
+            )
+
+            self.assertTrue(user_cache.exists())
+            self.assertTrue(market_cache.exists())
+            self.assertEqual(sum(stats.values()), 0)
+
+    def test_merge_collector_profiles_only_adds_concurrent_new_profiles(self):
+        current = {
+            "0xkeep": {"wallet": "0xkeep", "profiled_at": 200},
+        }
+        latest = {
+            "0xkeep": {"wallet": "0xkeep", "profiled_at": 250},
+            "0xexpired": {"wallet": "0xexpired", "observed_at": 50},
+            "0xconcurrent": {"wallet": "0xconcurrent", "observed_at": 150},
+        }
+
+        merged = merge_collector_profiles_published_during_build(
+            current,
+            latest,
+            build_started_at=100,
+        )
+
+        self.assertEqual(set(merged), {"0xkeep", "0xconcurrent"})
+        self.assertEqual(merged["0xkeep"]["profiled_at"], 250)
 
     def test_recent_esports_user_trades_cache_stores_raw_returns_scoped(self):
         # 缓存存原始交易(含非 scoped 的 other,供跨 scope/窗口复用);返回仍按 scope 过滤。
