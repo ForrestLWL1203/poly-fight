@@ -1157,7 +1157,8 @@ function StrategyPipe({ kit }) {
     <ol className="so-pipe srow-pipe">
       {strategyNodes(kit).map((nd) => (
         <li key={nd.k} className={"so-node" + (nd.key ? " is-key" : "")}>
-          <span className="son-k">{nd.k}</span><span className="son-v">{nd.v}</span>
+          <span className="son-k">{nd.k}</span>
+          <span className="son-v" title={nd.key ? nd.v : undefined}>{nd.v}</span>
         </li>
       ))}
     </ol>

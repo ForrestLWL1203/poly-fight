@@ -92,6 +92,14 @@ class DashboardV2StaticTests(unittest.TestCase):
         self.assertIn("window.PSMock", _read("mock.js"))
         self.assertIn('"mock"', _read("api.js"))
 
+    def test_strategy_amount_summary_truncates_with_full_hover_text(self):
+        app = _read("app.jsx")
+        css = _read("app.css")
+        self.assertIn('title={nd.key ? nd.v : undefined}', app)
+        self.assertIn('.srow-pipe .so-node.is-key .son-v', css)
+        self.assertIn('text-overflow: ellipsis', css)
+        self.assertIn('white-space: nowrap', css)
+
 
 if __name__ == "__main__":
     unittest.main()

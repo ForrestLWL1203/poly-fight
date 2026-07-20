@@ -220,6 +220,17 @@
 .srow-chev.up { transform: rotate(180deg); }
 .srow-pipe { border-top: 0 !important; padding: 0 !important; margin-top: 8px; }
 .srow-pipe .so-node { min-width: 92px; }
+/* 单笔金额摘要可能包含主盘/子盘预算与每场笔数；保持单行，避免长文案把整张策略卡撑高。
+   完整内容由节点上的原生 title 在鼠标悬浮时展示。 */
+.srow-pipe .so-node.is-key .son-v {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: help;
+}
 /* dark mode: the pale tertiary label (资金池 / 信号门槛 …) is hard to read — bump to the secondary tier */
 [data-theme="dark"] .srow-pipe .son-k { color: var(--text-secondary); }
 
