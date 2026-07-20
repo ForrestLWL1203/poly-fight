@@ -239,7 +239,7 @@
 
 .strat-list { display: flex; flex-direction: column; gap: var(--sp-4); }
 
-.strat-row { position: relative; border-radius: var(--r-lg); background: var(--surface-card); border: 1px solid var(--border-hairline); box-shadow: var(--shadow-sm); transition: box-shadow var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out); }
+.strat-row { position: relative; overflow: hidden; border-radius: var(--r-lg); background: var(--surface-card); border: 1px solid var(--border-hairline); box-shadow: var(--shadow-sm); transition: box-shadow var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out); }
 .strat-row:hover { box-shadow: var(--shadow-md); }
 /* active row: a solid 2px accent ring flush to the card edge (no transparent gap) */
 .strat-row.is-active { border-color: var(--accent); border-width: 2px; box-shadow: var(--shadow-md); }
