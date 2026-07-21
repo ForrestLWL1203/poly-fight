@@ -138,7 +138,7 @@ if ! command -v caddy >/dev/null 2>&1; then
   echo "    installed caddy"
 fi
 
-echo "[2/6] ensure repo at $REPO"
+echo "[2/7] ensure repo at $REPO"
 if [ ! -d "$REPO/.git" ]; then
   git clone "$GITHUB" "$REPO"
 else
@@ -157,8 +157,8 @@ cd "$REPO"
 echo "    at $(git rev-parse --short HEAD)"
 
 echo "[3/7] 创建项目虚拟环境并安装锁定依赖"
-if [ ! -x "$VENV/bin/python" ]; then
-  "$PY" -m venv "$VENV"
+if [ ! -x "$VENV/bin/python" ] || ! "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+  "$PY" -m venv --clear "$VENV"
 fi
 "$VENV/bin/python" -m pip install --disable-pip-version-check -q -r requirements.txt
 
