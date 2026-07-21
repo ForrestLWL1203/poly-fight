@@ -46,6 +46,8 @@ from .core import (
     choose_main_market,
     classify_edge_type,
     classify_market_type,
+    CALIBRATION_RECENT_WEIGHT,
+    CALIBRATION_RECENT_WINDOW_DAYS,
     CALIBRATION_WINDOW_DAYS,
     derive_scope_params,
     match_day_gaps,
@@ -4873,14 +4875,45 @@ def compute_scope_calibration(
     now: datetime | None = None,
 ) -> dict[str, dict[str, Any]]:
     """量各 game 密度 → 推每 scope 的 {lookback / n_eff / idle}。供 calibrate-scopes 命令与
-    collect 起步刷新共用(单一真相源)。"""
+    collect 起步刷新共用(单一真相源)。近 28d 为主、长窗为稳定基线，
+    避免上一赛事周期的高密度在当前低供给期仍长时间锁死样本门槛。"""
     now = now or datetime.now(timezone.utc)
     scopes: dict[str, dict[str, Any]] = {}
     for game_family, tag_slug in ESPORTS_GAME_TAGS.items():
-        density = measure_scope_density(client, tag_slug, window_days=window_days, min_volume=min_volume, now=now)
-        gaps = match_day_gaps(density["end_timestamps"])
-        params = derive_scope_params(markets=density["markets"], window_days=density["window_days"], gaps=gaps)
-        params["event_count"] = density["event_count"]
+        long_density = measure_scope_density(
+            client, tag_slug, window_days=window_days, min_volume=min_volume, now=now,
+        )
+        recent_days = min(max(1, int(CALIBRATION_RECENT_WINDOW_DAYS)), max(1, int(window_days)))
+        if recent_days == int(window_days):
+            recent_density = long_density
+        else:
+            recent_density = measure_scope_density(
+                client, tag_slug, window_days=recent_days, min_volume=min_volume, now=now,
+            )
+        long_lambda = float(long_density["markets"]) / max(1, int(long_density["window_days"]))
+        recent_lambda = float(recent_density["markets"]) / max(1, int(recent_density["window_days"]))
+        recent_weight = min(1.0, max(0.0, float(CALIBRATION_RECENT_WEIGHT)))
+        blended_lambda = recent_lambda * recent_weight + long_lambda * (1.0 - recent_weight)
+        # derive_scope_params 保持纯函数和现有公式；传入等价的“混合市场数”。
+        # gaps 优先用短窗，短窗无法形成间隔时才回退长窗。
+        gaps = match_day_gaps(recent_density["end_timestamps"])
+        if not gaps:
+            gaps = match_day_gaps(long_density["end_timestamps"])
+        synthetic_markets = int(round(blended_lambda * max(1, int(window_days))))
+        params = derive_scope_params(markets=synthetic_markets, window_days=window_days, gaps=gaps)
+        params.update({
+            "markets": int(long_density["markets"]),
+            "event_count": int(long_density["event_count"]),
+            "lambda_per_day": round(blended_lambda, 4),
+            "long_window_days": int(long_density["window_days"]),
+            "long_markets": int(long_density["markets"]),
+            "long_lambda_per_day": round(long_lambda, 4),
+            "recent_window_days": int(recent_density["window_days"]),
+            "recent_markets": int(recent_density["markets"]),
+            "recent_lambda_per_day": round(recent_lambda, 4),
+            "recent_density_weight": round(recent_weight, 4),
+            "density_method": "recent_long_blend",
+        })
         params["tag_slug"] = tag_slug
         scopes[game_family] = params
     return scopes
@@ -4925,6 +4958,16 @@ def load_scope_params(
 def scope_n_eff_floors(scopes: dict[str, Any]) -> dict[str, int]:
     """{game_family: n_eff_floor} —— 传给 classify_wallet/profile_candidate_wallet。"""
     return {g: int(p["n_eff_floor"]) for g, p in (scopes or {}).items() if isinstance(p, dict) and p.get("n_eff_floor")}
+
+
+def scope_n_eff_subset_floors(scopes: dict[str, Any]) -> dict[str, int]:
+    """每个 game 的评分价格子集地板。这个 accessor 是动态校准到分类器的必需链路；
+    没有显式 subset_floor 的旧校准文件不生成 override，由分类器安全回退全局门。"""
+    return {
+        g: int(p["subset_floor"])
+        for g, p in (scopes or {}).items()
+        if isinstance(p, dict) and p.get("subset_floor")
+    }
 
 
 def scope_n_eff_anchors(scopes: dict[str, Any]) -> dict[str, int]:
@@ -5451,6 +5494,7 @@ def _command_collect_wallets(
     # scope 自适应:collect 起步刷新校准(单一真相源),per-game lookback/n_eff 由此派生。
     scope_params = load_scope_params(resolve_data_dir(args), client=client, now=now_dt, refresh=True)
     n_eff_floors = scope_n_eff_floors(scope_params)
+    n_eff_subset_floors = scope_n_eff_subset_floors(scope_params)
     n_eff_anchors = scope_n_eff_anchors(scope_params)
     lookback_by_game = scope_lookback_by_game(scope_params)
     # discovery 一次按"最长 per-game 窗口"拉取;打分 scope 再按 per-game 窗口收口(见下方 filter)。
@@ -5762,6 +5806,7 @@ def _command_collect_wallets(
             now_ts=now_ts,
             scoring_basis=scoring_basis,
             n_eff_floors=n_eff_floors,
+            n_eff_subset_floors=n_eff_subset_floors,
             n_eff_anchors=n_eff_anchors,
         )
         return {
@@ -6366,6 +6411,7 @@ def rescore_demote_wallets(
     default_lookback_days = int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS)
     scope_params = load_scope_params(data_dir, client=None, now=now_dt, refresh=False)
     n_eff_floors = scope_n_eff_floors(scope_params)
+    n_eff_subset_floors = scope_n_eff_subset_floors(scope_params)
     n_eff_anchors = scope_n_eff_anchors(scope_params)
     lookback_by_game = scope_lookback_by_game(scope_params)
     lookback_days = scope_max_lookback_days(scope_params, default_lookback_days)
@@ -6411,7 +6457,11 @@ def rescore_demote_wallets(
             condition_game_family_by_id=condition_game_family_by_id,
             user_trades_loader=lambda _w: trades,
             current_positions_loader=lambda _w: [],
-            now_ts=now_ts, scoring_basis="hold", n_eff_floors=n_eff_floors, n_eff_anchors=n_eff_anchors,
+            now_ts=now_ts,
+            scoring_basis="hold",
+            n_eff_floors=n_eff_floors,
+            n_eff_subset_floors=n_eff_subset_floors,
+            n_eff_anchors=n_eff_anchors,
         )
         return {**profile, "profile_lookback_days": default_profile_lookback, "observed_at": now_ts}
 
@@ -6557,6 +6607,7 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
     profile_lookback_days = int(getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS) or V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
     scope_params = load_scope_params(data_dir, client=client, now=now_dt, refresh=False)
     n_eff_floors = scope_n_eff_floors(scope_params)
+    n_eff_subset_floors = scope_n_eff_subset_floors(scope_params)
     n_eff_anchors = scope_n_eff_anchors(scope_params)
     lookback_by_game = scope_lookback_by_game(scope_params)
     lookback_days = scope_max_lookback_days(scope_params, int(getattr(args, "lookback_days", V2_DEFAULT_LOOKBACK_DAYS) or V2_DEFAULT_LOOKBACK_DAYS))
@@ -6593,7 +6644,11 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
             condition_game_family_by_id=condition_game_family_by_id,
             user_trades_loader=lambda _w: trades,
             current_positions_loader=lambda _w: [],
-            now_ts=now_ts, scoring_basis="hold", n_eff_floors=n_eff_floors, n_eff_anchors=n_eff_anchors,
+            now_ts=now_ts,
+            scoring_basis="hold",
+            n_eff_floors=n_eff_floors,
+            n_eff_subset_floors=n_eff_subset_floors,
+            n_eff_anchors=n_eff_anchors,
         )
         return {**profile, "profile_lookback_days": profile_lookback_days,
                 "seed": collector_seed_payload(seed_wallet), "observed_at": now_ts, "seed_source": "observe_live"}

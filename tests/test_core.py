@@ -59,8 +59,10 @@ from poly_fight.cli import (
     BuildLockUnavailable,
     acquire_build_lock,
     load_scope_params,
+    compute_scope_calibration,
     _slim_user_trade,
     scope_n_eff_floors,
+    scope_n_eff_subset_floors,
     scope_lookback_by_game,
     scope_max_lookback_days,
     filter_classification_set_by_game_window,
@@ -3989,12 +3991,95 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(ok8["grade"], "A")
         self.assertNotIn("thin_followable_subset", ok8["reasons"])
 
+    def test_dynamic_subset_floor_promotes_high_win_rate_specialist(self):
+        # 生产 per-game scope 已校准 subset_floor=6，不应再被全局固定 8 覆盖。
+        # 此数据锁定 VPS 强钱包的 CS2 地图桶形状：10-0 全历史，7 个评分价格市场。
+        now = 2_000_000
+        strong = classify_wallet_bucket({
+            "category": "esports",
+            "esports_closed_count": 10,
+            "esports_win_count": 10,
+            "esports_loss_count": 0,
+            "positive_market_rate": 1.0,
+            "recency_weighted_win_rate": 1.0,
+            "recency_weighted_win_rate_full": 1.0,
+            "effective_sample_size": 6.946787,
+            "effective_sample_size_full": 9.864949,
+            "wilson_win_rate_lower_bound": 0.85922464,
+            "median_entry_price": 0.59,
+            "esports_realized_pnl": 772.62,
+            "esports_total_cost": 1376.45,
+            "esports_total_bought": 2149.08,
+            "esports_roi": 0.5613,
+            "capital_weighted_edge": 0.3595,
+            "last_esports_trade_at": now - 3600,
+            "bot_like_score": 0,
+        }, now_ts=now, min_sample=8, min_followable_sample=6, n_eff_anchor=10)
+        self.assertEqual(strong["grade"], "A")
+        self.assertTrue(strong["thin_specialist"])
+        self.assertEqual(strong["min_followable_sample"], 6.0)
+        self.assertNotIn("thin_followable_subset", strong["reasons"])
+
+    def test_dynamic_subset_floor_still_rejects_weak_thin_slice(self):
+        # 降低数量门不是放水：子集虽达 6，但胜率/全历史置信不强，仍不能上 A。
+        now = 2_000_000
+        weak = classify_wallet_bucket({
+            "category": "esports",
+            "esports_closed_count": 12,
+            "esports_win_count": 8,
+            "esports_loss_count": 4,
+            "positive_market_rate": 0.67,
+            "recency_weighted_win_rate": 0.76,
+            "recency_weighted_win_rate_full": 0.67,
+            "effective_sample_size": 6.8,
+            "effective_sample_size_full": 11.5,
+            "wilson_win_rate_lower_bound": 0.50,
+            "median_entry_price": 0.35,
+            "esports_realized_pnl": 200,
+            "esports_total_cost": 2000,
+            "esports_total_bought": 4000,
+            "esports_roi": 0.10,
+            "capital_weighted_edge": 0.08,
+            "last_esports_trade_at": now - 3600,
+            "bot_like_score": 0,
+        }, now_ts=now, min_sample=8, min_followable_sample=6, n_eff_anchor=10)
+        self.assertNotEqual(weak["grade"], "A")
+        self.assertIn("thin_followable_underqualified", weak["reasons"])
+
+    def test_per_game_scope_propagates_dynamic_subset_floor(self):
+        now = 2_000_000
+        bucket = {
+            "esports_closed_count": 10, "esports_win_count": 10, "esports_loss_count": 0,
+            "positive_market_rate": 1.0, "recency_weighted_win_rate": 1.0,
+            "recency_weighted_win_rate_full": 1.0,
+            "effective_sample_size": 6.946787, "effective_sample_size_full": 9.864949,
+            "wilson_win_rate_lower_bound": 0.85922464,
+            "median_entry_price": 0.59, "esports_realized_pnl": 772.62,
+            "esports_total_cost": 1376.45, "esports_total_bought": 2149.08,
+            "esports_roi": 0.5613, "capital_weighted_edge": 0.3595,
+            "last_esports_trade_at": now - 3600,
+        }
+        profile = classify_wallet(
+            {**bucket, "wallet": "0xstrong", "category": "esports",
+             "per_game_type": {"cs2:map_winner": bucket}},
+            now_ts=now,
+            n_eff_floors={"cs2": 8},
+            n_eff_subset_floors={"cs2": 6},
+            n_eff_anchors={"cs2": 10},
+        )
+        self.assertEqual(profile["grade"], "A")
+        self.assertEqual(profile["eligible_buckets"], ["cs2:map_winner"])
+        classified = profile["per_game_type_grades"]["cs2:map_winner"]
+        self.assertEqual(classified["min_followable_sample"], 6.0)
+        self.assertTrue(classified["thin_specialist"])
+
     def test_v21_thin_sample_gate_requires_stronger_signal_below_anchor(self):
         # v21:桶 full n_eff 落在 [放松地板6, 满严格锚点10) → 须 edge_lb≥0.08 且 θ̂≥0.80 才给 A。
         now = 100 + 86400
         base = {
             "category": "esports", "esports_closed_count": 8,
             "effective_sample_size": 8, "effective_sample_size_full": 8,  # 8 ∈ [6,10) → 薄
+            "wilson_win_rate_lower_bound": 0.80,  # 完整历史同样经得住置信下界检验
             "last_esports_trade_at": 100, "bot_like_score": 0,
         }
         # 强信号:θ̂=0.90、便宜入场 → edge_lb 大 → 过薄门 → A。
@@ -4013,9 +4098,9 @@ class CoreTest(unittest.TestCase):
             {**base, "recency_weighted_win_rate": 0.78, "median_entry_price": 0.30},
             now_ts=now, min_sample=6)
         self.assertEqual(no_anchor["grade"], "A")
-        # full n_eff ≥ 锚点(够厚,非薄样本)→ 不受薄门约束,弱胜率走基础门即可 A。
+        # full/subset n_eff 均≥锚点(够厚,非薄样本)→ 不受薄门约束,弱胜率走基础门即可 A。
         thick = classify_wallet_bucket(
-            {**base, "effective_sample_size_full": 12,
+            {**base, "effective_sample_size": 10, "effective_sample_size_full": 12,
              "recency_weighted_win_rate": 0.78, "median_entry_price": 0.30},
             now_ts=now, min_sample=6, n_eff_anchor=10)
         self.assertEqual(thick["grade"], "A")
@@ -4176,10 +4261,11 @@ class CoreTest(unittest.TestCase):
     def test_scope_param_accessors_and_loader_roundtrip(self):
         import tempfile, json as _json, os
         scopes = {
-            "valorant": {"n_eff_floor": 8, "lookback_days": 30},
-            "cs2": {"n_eff_floor": 12, "lookback_days": 14},
+            "valorant": {"n_eff_floor": 8, "subset_floor": 5, "lookback_days": 30},
+            "cs2": {"n_eff_floor": 12, "subset_floor": 7, "lookback_days": 14},
         }
         self.assertEqual(scope_n_eff_floors(scopes), {"valorant": 8, "cs2": 12})
+        self.assertEqual(scope_n_eff_subset_floors(scopes), {"valorant": 5, "cs2": 7})
         self.assertEqual(scope_lookback_by_game(scopes), {"valorant": 30, "cs2": 14})
         self.assertEqual(scope_max_lookback_days(scopes, 15), 30)
         self.assertEqual(scope_max_lookback_days({}, 15), 15)  # 空校准 → 回退默认
@@ -4191,6 +4277,30 @@ class CoreTest(unittest.TestCase):
                 _json.dump({"calibrated_at": ts, "scopes": scopes}, fh)
             loaded = load_scope_params(d, client=None, now=datetime.fromtimestamp(ts + 60, tz=timezone.utc))
             self.assertEqual(scope_n_eff_floors(loaded), {"valorant": 8, "cs2": 12})
+            self.assertEqual(scope_n_eff_subset_floors(loaded), {"valorant": 5, "cs2": 7})
+
+    def test_scope_calibration_blends_recent_supply_over_old_major_density(self):
+        now = datetime(2026, 7, 21, tzinfo=timezone.utc)
+
+        def density(_client, tag_slug, *, window_days, min_volume, now, **_kwargs):
+            # CS2 长窗仍被上个 Major 抬高到 dense，但近 28d 已降到 sparse。
+            rate = 16.0 if window_days == 90 else 5.0
+            markets = int(rate * window_days)
+            return {
+                "event_count": markets, "markets": markets, "window_days": window_days,
+                "min_volume": min_volume,
+                "end_timestamps": [int(now.timestamp()) - day * 86400 for day in range(min(window_days, 7))],
+            }
+
+        with patch("poly_fight.cli.measure_scope_density", side_effect=density):
+            scopes = compute_scope_calibration(object(), window_days=90, now=now)
+        cs2 = scopes["cs2"]
+        self.assertEqual(cs2["long_lambda_per_day"], 16.0)
+        self.assertEqual(cs2["recent_lambda_per_day"], 5.0)
+        self.assertEqual(cs2["lambda_per_day"], 8.3)  # 70% recent + 30% long
+        self.assertEqual(cs2["n_eff_floor_full"], 7)  # blended density drops to sparse
+        self.assertEqual(cs2["n_eff_floor"], 6)
+        self.assertEqual(cs2["subset_floor"], 6)
 
     def test_per_game_window_filter_keeps_each_game_to_its_own_lookback(self):
         now = datetime(2026, 6, 16, tzinfo=timezone.utc)

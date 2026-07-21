@@ -10,7 +10,7 @@ from typing import Any, Iterable
 SECONDS_PER_DAY = 86400
 # profile 复用以此为失效令牌:改任何评分口径(门槛/公式/n_eff 下限/basis)都要 +1,
 # 否则采集会复用旧口径的画像、新规则不生效。改完需全量重采一次,之后才走复用加速。
-SCORING_VERSION = 23
+SCORING_VERSION = 24
 WILSON_Z = 1.28
 TRADE_BEHAVIOR_MIN_MARKETS = 4
 # v16:两边对冲(套利)门统一 0.20——bucket 排除(core)、systemic(cli)、v2 钱包级(V2_MAX_TWO_SIDED_RATE)同口径。
@@ -44,21 +44,18 @@ ESPORTS_MIN_BUCKET_WIN_RATE = 0.58
 SPORTS_EDGE_LB_MIN = 0.03
 SPORTS_N_EFF_FLOOR = 12
 SPORTS_MIN_BUCKET_WIN_RATE = 0.60
-# v19:可跟价区(≤ceiling)子集最小厚度。全样本地板(12)管"真活跃",此项管"别拿太薄的可跟切片下判断"
-# (防 3–5 场侥幸过 edge_lb)。edge_lb 的 Wilson 仍在子集上算。
-# v22(病B,2026-06-21):6→8。scope 自适应把稀疏游戏(dota2/cs2)地板放宽到~7,导致
-# 半个榜单(41/81)靠 7–11 场可跟切片上榜,8 个是 7 场 100% 全胜——纯小样本运气,Wilson 在 n=7
-# 时(7/7→下界~0.65)惩罚不够。8 作硬地板覆盖自适应向下放宽,砍掉最薄的 ~19% 切片(实战 1/16
-# 的连胜运气钱包)。此门在 classify_wallet_bucket 内从常量取,三入口(collect/observe-live/降级)共用。
-# 注:此值【已与】scope 自适应全样本地板的基数解耦(后者用 SCOPE_NEFF_FLOOR_BASE=6),只管 min_sub
-# 子集门。因 subset n_eff ≤ full n_eff 恒成立,subset≥8 的幸存者 full 必≥8,自适应地板(≤8)不会
-# 额外多砍 → 精确等于"砍掉 subset<8 的 ~19%",不波及更厚的钱包。
+# 可跟价区(≤ceiling)子集的全局回退地板。per-game 生产路径必须优先使用 scope
+# 校准的 subset_floor：市场稀疏时允许低频强胜率专精桶，密集时仍由动态 full floor /
+# anchor 抬高样本要求。全局 8 只保留给没有 scope 上下文的 overall/per-type 兼容路径，
+# 不得再覆盖校准结果。
 ESPORTS_SUBSET_MIN_SAMPLE = 8
 SPORTS_SUBSET_MIN_SAMPLE = 6
 # ── Scope-adaptive calibration（按 game_family 实测赛事密度自适应 lookback / n_eff / idle）──
 # 见 review/scope-adaptive-calibration.md。供给侧信号(Gamma 已结算主盘,profiling 前即可算)→
 # 统一公式推每个 scope 一组门。新游戏接入即自校准、不手调。下列阈值为初值,P1 实测 4 游戏 λ 后再标定。
 CALIBRATION_WINDOW_DAYS = 90          # 测密度的校准窗(跨多个赛事周期,平滑爆发性)
+CALIBRATION_RECENT_WINDOW_DAYS = 28   # 短窗响应 Major/赛季结束后的供给变化
+CALIBRATION_RECENT_WEIGHT = 0.70      # 近 28d 为主、90d 为稳定基线，避免上月高密度长期锁死门槛
 SCOPE_MARKET_TARGET = 180             # lookback 要装够多少 main 市场(稀疏游戏据此拿到 ~30d 窗口)
 SCOPE_LOOKBACK_MIN_DAYS = 14
 SCOPE_LOOKBACK_MAX_DAYS = 90
@@ -81,6 +78,11 @@ SCOPE_NEFF_FLOOR_BASE = 6
 #   要求更强信号(edge_lb ≥ THIN_EDGE 且 θ̂ ≥ THIN_WR)才给 A/B,挡贴门弱信号、放行真专精。
 SCOPE_NEFF_THIN_EDGE_MIN = 0.08
 SCOPE_NEFF_THIN_WR_MIN = 0.80
+# 价格子集低于严格锚点时，只放行“真正强”的低频专精桶：高胜率、完整历史置信下界、
+# 保守复制优势同时过门。这替代固定 subset>=8 的一刀切，防止单纯降门槛放进侥幸连胜。
+SCOPE_SUBSET_THIN_EDGE_MIN = 0.12
+SCOPE_SUBSET_THIN_WR_MIN = 0.80
+SCOPE_SUBSET_THIN_FULL_WILSON_MIN = 0.75
 SCOPE_IDLE_MIN_HOURS = 72
 SCOPE_IDLE_MAX_HOURS = 21 * 24
 SCOPE_IDLE_GAP_MULTIPLIER = 2.0       # idle 上限 ≈ 此倍 × 赛事干涸期(p90 gap)
@@ -2006,6 +2008,7 @@ def classify_wallet_bucket(
     *,
     now_ts: int,
     min_sample: int = 8,
+    min_followable_sample: int | None = None,
     n_eff_anchor: int | None = None,
     thin_edge_min: float = SCOPE_NEFF_THIN_EDGE_MIN,
     thin_wr_min: float = SCOPE_NEFF_THIN_WR_MIN,
@@ -2095,7 +2098,9 @@ def classify_wallet_bucket(
     min_edge_lb = SPORTS_EDGE_LB_MIN if is_sports else ESPORTS_EDGE_LB_MIN
     min_win_rate = SPORTS_MIN_BUCKET_WIN_RATE if is_sports else ESPORTS_MIN_BUCKET_WIN_RATE  # v20:桶内胜率硬门
     min_eff = float(min_sample)   # n_eff 数值兜底(esports=12),作用于全样本 eff_sample_full
-    min_sub = float(SPORTS_SUBSET_MIN_SAMPLE if is_sports else ESPORTS_SUBSET_MIN_SAMPLE)  # v19:可跟价区子集最小厚度
+    default_min_sub = SPORTS_SUBSET_MIN_SAMPLE if is_sports else ESPORTS_SUBSET_MIN_SAMPLE
+    min_sub = float(default_min_sub if min_followable_sample is None else min_followable_sample)
+    min_sub = max(1.0, min_sub)
 
     if eff_sample_full < min_eff:
         reasons.append("thin_sample")
@@ -2121,6 +2126,19 @@ def classify_wallet_bucket(
         reasons.append("low_volume")
 
     edge_ok = bucket_edge_lb is not None
+    # 全价区的方向能力置信下界。生产 summary 已带 raw Wilson；旧缓存/单测缺字段时，
+    # 用全价区近期加权胜率 + full n_eff 重建，避免动态门因兼容字段缺失失效。
+    full_win_rate = (
+        to_float(summary.get("recency_weighted_win_rate_full"))
+        if summary.get("recency_weighted_win_rate_full") is not None
+        else positive_rate if summary.get("positive_market_rate") is not None
+        else win_rate
+    )
+    full_wilson_lb = (
+        to_float(summary.get("wilson_win_rate_lower_bound"))
+        if summary.get("wilson_win_rate_lower_bound") is not None
+        else wilson_lower_bound_rate(full_win_rate, eff_sample_full)
+    )
     # v21 薄样本附加门:桶 full n_eff 落在 [min_eff, n_eff_anchor)(只因缓冲缩放才够样本)→
     #   要求更强信号(edge_lb ≥ thin_edge_min 且 θ̂ ≥ thin_wr_min)。锚点未给时恒 True(旧行为)。
     thin_ok = (
@@ -2130,6 +2148,21 @@ def classify_wallet_bucket(
     )
     if n_eff_anchor is not None and eff_sample_full < n_eff_anchor and not thin_ok:
         reasons.append("thin_underqualified")
+    # 动态 subset floor 允许低频钱包进入候选，但低于严格锚点的价格切片必须是高胜率专精：
+    # 完整历史也要稳、保守 edge 也要高。这使 10-0 / 7 个评分价格市场的真强钱包能上，
+    # 但“全历史一般，恰好切出几场连胜”仍会被 full Wilson 拦住。
+    subset_is_thin = n_eff_anchor is not None and eff_sample < float(n_eff_anchor)
+    thin_specialist_ok = (
+        not subset_is_thin
+        or (
+            edge_ok
+            and bucket_edge_lb >= SCOPE_SUBSET_THIN_EDGE_MIN
+            and win_rate >= SCOPE_SUBSET_THIN_WR_MIN
+            and full_wilson_lb >= SCOPE_SUBSET_THIN_FULL_WILSON_MIN
+        )
+    )
+    if subset_is_thin and not thin_specialist_ok:
+        reasons.append("thin_followable_underqualified")
     # v17:edge 是唯一质量轴。bot>=70/系统性双边已在上方提前 return excluded;
     # 此处只判 edge_lb(内含 Wilson 置信)+ n_eff 兜底 + 新鲜度,不再卡独立胜率门。
     if (
@@ -2138,6 +2171,7 @@ def classify_wallet_bucket(
         and edge_ok and bucket_edge_lb >= min_edge_lb
         and win_rate >= min_win_rate  # v20:桶内胜率硬门(默认 0.58,见 ESPORTS_MIN_BUCKET_WIN_RATE)
         and thin_ok                   # v21:薄样本(贴放松地板)须更强信号
+        and thin_specialist_ok        # 薄价格子集须高胜率 + 全历史置信 + 高 edge
         and not stale
     ):
         grade = "A"
@@ -2147,6 +2181,7 @@ def classify_wallet_bucket(
         and edge_ok and bucket_edge_lb >= (min_edge_lb - GRADE_B_EDGE_RELAX)
         and win_rate >= min_win_rate  # v20:B 同样要过胜率门(只放宽 edge,不放宽胜率)
         and thin_ok                   # v21:薄样本同样要过附加门
+        and thin_specialist_ok
         and not stale
     ):
         grade = "B"
@@ -2161,8 +2196,11 @@ def classify_wallet_bucket(
         "bucket_win_rate": round(win_rate, 8),                       # θ̂ 近期加权点估胜率
         "bucket_eff_sample": round(eff_sample, 4),                   # n_eff 有效样本
         "bucket_wilson_lb": round(bucket_wilson_lb, 8),             # Wilson 下界(仅展示;已隐含于 edge_lb)
+        "bucket_full_wilson_lb": round(full_wilson_lb, 8),          # 全价区方向能力下界
         "bucket_copy_edge": round(copy_edge, 8) if copy_edge is not None else None,        # 点估 edge(展示)
         "bucket_edge_lb": round(bucket_edge_lb, 8) if bucket_edge_lb is not None else None,  # edge 下界(质量门:edge_lb≥min)
+        "min_followable_sample": round(min_sub, 4),
+        "thin_specialist": bool(subset_is_thin and thin_specialist_ok),
         "grade": grade,
         "profile_state": state,
         "reasons": reasons,
@@ -2191,11 +2229,14 @@ def classify_wallet(
     *,
     now_ts: int | None = None,
     n_eff_floors: dict[str, int] | None = None,
+    n_eff_subset_floors: dict[str, int] | None = None,
     n_eff_anchors: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """n_eff_floors: per-game n_eff 地板 map(game_family→floor),来自 scope 校准;
     None=全局默认。只影响 per_game_type 桶(boarding 路径);per_type 跨游戏桶仍用全局默认。
-    n_eff_anchors: per-game 满严格锚点 map,给定时对 per_game_type 桶启用薄样本附加门
+    n_eff_subset_floors: per-game 评分价格子集地板 map；生产路径来自同一份 scope 校准，
+    避免全局固定门覆盖市场密度自适应。n_eff_anchors: per-game 满严格锚点 map,
+    给定时对 per_game_type 桶启用薄样本附加门
     (full n_eff < 锚点须更强 edge/胜率);只对显式给了锚点的游戏生效,其余不加门。"""
     now_ts = now_ts or int(datetime.now(timezone.utc).timestamp())
     category = str(summary.get("category") or "").lower()
@@ -2275,6 +2316,11 @@ def classify_wallet(
                 if n_eff_anchors and game_family in n_eff_anchors
                 else None
             )
+            bucket_subset_floor = (
+                int(n_eff_subset_floors.get(key) or n_eff_subset_floors.get(game_family))
+                if n_eff_subset_floors and (n_eff_subset_floors.get(key) or n_eff_subset_floors.get(game_family))
+                else None
+            )
             bucket_input = {
                 **bucket_summary,
                 "category": summary.get("category", bucket_summary.get("category")),
@@ -2301,7 +2347,11 @@ def classify_wallet(
                 ),
             }
             bucket_classified = classify_wallet_bucket(
-                bucket_input, now_ts=now_ts, min_sample=min_sample, n_eff_anchor=bucket_anchor,
+                bucket_input,
+                now_ts=now_ts,
+                min_sample=min_sample,
+                min_followable_sample=bucket_subset_floor,
+                n_eff_anchor=bucket_anchor,
             )
             bucket_classified.update(
                 {
@@ -2459,6 +2509,7 @@ def profile_candidate_wallet(
     now_ts: int | None = None,
     scoring_basis: str = "hold",
     n_eff_floors: dict[str, int] | None = None,
+    n_eff_subset_floors: dict[str, int] | None = None,
     n_eff_anchors: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     wallet = normalize_wallet(candidate.get("wallet"))
@@ -2501,7 +2552,10 @@ def profile_candidate_wallet(
             summary["per_type"] = per_type
         result = classify_wallet(
             {**summary, "wallet": wallet, "candidate": candidate},
-            now_ts=now_ts, n_eff_floors=n_eff_floors, n_eff_anchors=n_eff_anchors,
+            now_ts=now_ts,
+            n_eff_floors=n_eff_floors,
+            n_eff_subset_floors=n_eff_subset_floors,
+            n_eff_anchors=n_eff_anchors,
         )
         # edge_type 标签恒在 profile 上(directional/technical/unknown),供 v2 导出/follow 按标签过滤。
         result["edge_type"] = classify_edge_type(result)
