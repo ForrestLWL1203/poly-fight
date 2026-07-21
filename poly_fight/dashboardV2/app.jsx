@@ -1624,7 +1624,7 @@ function AiRiskPage({ toast }) {
               : null;
           return <div className="ai-assessment-row" key={a.condition_id}><div><b>{a.team_a} <i>vs</i> {a.team_b}</b><span>{a.game?.toUpperCase()} · {a.best_of || "主盘"}</span></div><div><span>预测胜方</span><b>{winner}{prob != null ? ` ${Math.round(Number(prob))}%` : ""}</b></div><div><span>置信度</span><b>{a.confidence != null ? Math.round(Number(a.confidence)) + "%" : "—"}</b></div><p>{a.reason_zh || a.error || "判断未完成"}</p></div>;
         })}
-        {!(data.recent_assessments || []).length && <div className="empty-cell">开启风控后，监控窗口内的主盘会在这里生成独立判断</div>}
+        {!(data.recent_assessments || []).length && <div className="empty-cell">目标钱包的主盘 BUY 通过策略检查后，才会在这里生成独立判断</div>}
       </div>
     </Card>
   </div>;

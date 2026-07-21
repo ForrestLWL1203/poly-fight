@@ -7262,9 +7262,6 @@ def command_follow(
         for condition_id, market in active_markets.items()
         if str(market.get("category") or "esports").lower() in FOLLOW_SIGNAL_CATEGORIES
     }
-    # Fire-and-forget prefetch: one neutral assessment per main match, shared by
-    # every wallet.  Candidate handling still has a synchronous fail-open fallback.
-    ai_risk_service.prefetch(list(active_markets_for_follow.values()), now_ts=now_ts)
     # 队标抓取:Polymarket 对电竞对阵盘多数只给通用游戏图、无队标(已核实),所以未缓存的
     # 队每 tick 重抓也只会空手而归 → 由 command_run 节流到约 30min 一次(refresh_logos),
     # 避免每 tick 白花 ~1.3s。静默失败改为记一行日志,便于观测。

@@ -162,6 +162,7 @@ class AiRiskTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = FollowStore(Path(tmp) / "follow" / "follow.db")
             service = AiRiskService(Path(tmp), store, client_factory=FakeDeepSeek)
+            self.assertFalse(hasattr(service, "prefetch"))
             self.assertTrue(service.eligible_market(market()))
             self.assertFalse(service.eligible_market({**market(), "market_type": "game_winner"}))
             self.assertFalse(service.eligible_market({**market(), "category": "sports"}))

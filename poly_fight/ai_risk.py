@@ -18,7 +18,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -534,13 +533,11 @@ class AiRiskService:
         self.config = AiConfigStore(Path(data_dir))
         self.follow_store = follow_store
         self.client_factory = client_factory
-        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ai-risk")
-        self._inflight: set[str] = set()
         self._lock = threading.Lock()
         self._assessment_locks: dict[str, threading.Lock] = {}
 
     def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        """Compatibility hook; the signal-triggered service owns no background workers."""
 
     def enabled(self) -> bool:
         status = self.config.status()
@@ -552,33 +549,6 @@ class AiRiskService:
             and str(market.get("market_type") or "main_match").lower() == "main_match"
             and _game_key(market) in SUPPORTED_GAMES
         )
-
-    def prefetch(self, markets: list[dict[str, Any]], *, now_ts: int) -> int:
-        if not self.enabled():
-            return 0
-        scheduled = 0
-        for market in markets:
-            if not self.eligible_market(market):
-                continue
-            condition_id = str(market.get("condition_id") or market.get("conditionId") or "").lower()
-            if not condition_id or self.follow_store.load_ai_assessment(condition_id):
-                continue
-            with self._lock:
-                if condition_id in self._inflight:
-                    continue
-                self._inflight.add(condition_id)
-            self._executor.submit(self._prefetch_one, dict(market), now_ts, condition_id)
-            scheduled += 1
-            if scheduled >= 4:
-                break
-        return scheduled
-
-    def _prefetch_one(self, market: dict[str, Any], now_ts: int, condition_id: str) -> None:
-        try:
-            self.ensure_assessment(market, now_ts=now_ts)
-        finally:
-            with self._lock:
-                self._inflight.discard(condition_id)
 
     def ensure_assessment(self, market: dict[str, Any], *, now_ts: int) -> dict[str, Any]:
         condition_id = str(market.get("condition_id") or market.get("conditionId") or "").lower()
