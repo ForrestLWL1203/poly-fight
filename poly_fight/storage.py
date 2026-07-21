@@ -1005,6 +1005,54 @@ class FollowStore:
             rows = conn.execute("SELECT wallet, raw_json FROM wallet_cursors").fetchall()
         return {str(row["wallet"]): _loads(row["raw_json"], {}) for row in rows}
 
+    def load_wallet_follow_activity_readonly(self, *, category: str | None = "esports") -> dict[str, int]:
+        """Latest funded follow-leg time by target wallet, without mutating the DB.
+
+        A persisted follow leg proves that the target wallet was active in a market we
+        actually followed.  Collector activity gates use this operational timestamp in
+        addition to the closed-market history timestamp, which can lag live positions by
+        several days.  ``leg_at`` deliberately anchors the refresh to when the follow was
+        created, matching the user's observable event even for position backfills whose
+        original target fill time is unavailable.
+        """
+        conn = self.connect_readonly()
+        if conn is None:
+            return {}
+        try:
+            if "follow_legs" not in _table_names(conn):
+                return {}
+            rows = conn.execute(
+                "SELECT wallet, leg_at, raw_json FROM follow_legs "
+                "WHERE wallet IS NOT NULL AND wallet != '' AND COALESCE(leg_at, 0) > 0"
+            ).fetchall()
+            wanted_category = str(category or "").lower()
+            latest: dict[str, int] = {}
+            for row in rows:
+                payload = _loads(row["raw_json"], {})
+                if not isinstance(payload, dict):
+                    payload = {}
+                row_category = str(payload.get("category") or "esports").lower()
+                if wanted_category and row_category != wanted_category:
+                    continue
+                # Only funded legs are written by the current follower.  Keep the
+                # explicit check for defensive compatibility with older snapshots.
+                funded_stake = _to_float(
+                    payload.get("funded_stake")
+                    if payload.get("funded_stake") is not None
+                    else payload.get("stake")
+                )
+                if funded_stake <= 0:
+                    continue
+                wallet = str(row["wallet"] or "").lower()
+                activity_at = _to_int(row["leg_at"])
+                if wallet and activity_at > latest.get(wallet, 0):
+                    latest[wallet] = activity_at
+            return latest
+        except (sqlite3.Error, json.JSONDecodeError):
+            return {}
+        finally:
+            conn.close()
+
     def load_open_signals(self) -> list[dict[str, Any]]:
         self.init_db()
         with self.connect() as conn:

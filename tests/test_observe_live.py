@@ -169,6 +169,47 @@ class TestObserveLiveGates(unittest.TestCase):
             self.assertEqual(event["new_candidates"], 1)
             self.assertGreater(client.list_events_calls, 0)
 
+    def test_funded_follow_leg_refreshes_idle_profile_activity(self):
+        # 历史画像虽已 6d，但一分钟前刚实际跟到该钱包：follow leg 是更强的新鲜活动证据，
+        # observer 不应再把它当作 idle wallet 重扫，更不能在下一次发布时按 120h 踢掉。
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            start = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+            markets = {
+                "m_live": {
+                    "condition_id": "m_live", "outcome_prices": [0.5, 0.5], "volume": 100000,
+                    "game_family": "lol", "market_type": "main_match", "match_start_time": start,
+                },
+            }
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            (data_dir / "collector_v2").mkdir(parents=True, exist_ok=True)
+            write_json(data_dir / "collector_v2" / "collector_v2_wallet_profiles.json", [{
+                "wallet": "0xreturn", "grade": "A",
+                "last_esports_trade_at": now_ts - 6 * 86400,
+                "profiled_at": now_ts - 25 * 3600,
+            }])
+            FollowStore((data_dir / "follow") / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[{
+                    "signal_id": "sig-return", "status": "open", "wallet": "0xreturn",
+                    "condition_id": "m_live", "outcome_index": 0,
+                    "legs": [{
+                        "trade_id": "t-return", "category": "esports", "leg_at": now_ts - 60,
+                        "stake": 100, "funded_stake": 100,
+                    }],
+                }],
+                result_events=[],
+                performance={},
+            )
+            client = _FakeClient({"m_live": [
+                {"positions": [{"proxyWallet": "0xRETURN", "outcomeIndex": 0,
+                                "avgPrice": 0.5, "totalBought": 1000, "totalPnl": 100}]},
+                {"positions": []},
+            ]})
+            event = self._run(data_dir, markets, client)
+            self.assertEqual(event["new_candidates"], 0)
+            self.assertEqual(client.list_events_calls, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

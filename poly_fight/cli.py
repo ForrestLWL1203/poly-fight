@@ -605,6 +605,28 @@ def resolve_follow_dir(args: argparse.Namespace, root: Path | None = None) -> Pa
     return (root or DATA_DIR) / "follow"
 
 
+def resolve_shared_follow_dir(args: argparse.Namespace, data_dir: Path) -> Path:
+    """Resolve shared follow state from either the root or a category data dir."""
+    category_dir = Path(data_dir)
+    shared_root = category_dir.parent if category_dir.name.lower() in {"esports", "sports"} else category_dir
+    return resolve_follow_dir(args, shared_root)
+
+
+def load_follow_activity_for_leaderboard(
+    args: argparse.Namespace,
+    data_dir: Path,
+    *,
+    category: str = "esports",
+) -> dict[str, int]:
+    """Read target-wallet activity proven by funded follow legs.
+
+    Category collectors receive ``data/<category>`` as their data dir while follow.db is
+    shared at ``data/follow``.  An explicit --follow-dir still wins.
+    """
+    follow_dir = resolve_shared_follow_dir(args, data_dir)
+    return FollowStore(follow_dir / "follow.db").load_wallet_follow_activity_readonly(category=category)
+
+
 def category_data_dirs(root: Path) -> dict[str, Path]:
     root = Path(root)
     return {"esports": root / "esports"}
@@ -5143,10 +5165,14 @@ def profile_is_idle_over_limit(
     now_ts: int,
     max_idle_hours: int = V2_MAX_LEADERBOARD_IDLE_HOURS,
 ) -> bool:
-    """最后一笔 scoped 交易缺失或超过活跃门槛即视为不活跃。"""
+    """历史 scoped 交易和实际跟单活动都超时，才视为不活跃。"""
     if int(max_idle_hours) <= 0:
         return False
-    last_trade_at = to_int((profile or {}).get("last_esports_trade_at"))
+    last_trade_at = max(
+        to_int((profile or {}).get("last_esports_trade_at")),
+        to_int((profile or {}).get("last_follow_activity_at")),
+        to_int((profile or {}).get("last_activity_at")),
+    )
     return not last_trade_at or (int(now_ts) - last_trade_at) > int(max_idle_hours) * 3600
 
 
@@ -5159,6 +5185,7 @@ def build_collector_leaderboard_v2(
     include_technical: bool = V2_INCLUDE_TECHNICAL,
     min_grade: str = V2_LEADERBOARD_MIN_GRADE,
     gate_kwargs: dict[str, Any] | None = None,
+    follow_activity_by_wallet: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """V2 导出:逐 game×market_type 桶的专精评估 + edge_type 标签 +(可选)每游戏配额。
 
@@ -5173,12 +5200,33 @@ def build_collector_leaderboard_v2(
     max_bot_score = int(gate_kwargs.get("max_bot_score", V2_MAX_BOT_SCORE))
     max_idle_hours = int(gate_kwargs.get("max_idle_hours", V2_MAX_LEADERBOARD_IDLE_HOURS))
     min_bucket_median_cash = float(gate_kwargs.get("min_bucket_median_cash", MIN_BUCKET_MEDIAN_CASH))
+    follow_activity_by_wallet = {
+        normalize_wallet(wallet): to_int(activity_at)
+        for wallet, activity_at in (follow_activity_by_wallet or {}).items()
+        if normalize_wallet(wallet) and to_int(activity_at) > 0
+    }
     qualified: list[dict[str, Any]] = []
     rejected_counts: dict[str, int] = {}
     for wallet, profile in profiles_by_wallet.items():
         wallet = normalize_wallet(wallet or profile.get("wallet"))
         if not wallet:
             continue
+        follow_activity_at = follow_activity_by_wallet.get(wallet, 0)
+        if follow_activity_at:
+            profile = {
+                **profile,
+                "last_follow_activity_at": follow_activity_at,
+                "last_activity_at": max(
+                    to_int(profile.get("last_esports_trade_at")),
+                    follow_activity_at,
+                ),
+                # Canonical SQLite last_trade_at should expose the effective activity
+                # while last_esports_trade_at remains the historical scoring field.
+                "last_trade_at": max(
+                    to_int(profile.get("last_esports_trade_at")),
+                    follow_activity_at,
+                ),
+            }
         # wallet 级硬排除
         if to_float(profile.get("two_sided_trade_market_rate")) > max_two_sided_rate:
             rejected_counts["two_sided_over_limit"] = rejected_counts.get("two_sided_over_limit", 0) + 1
@@ -5735,13 +5783,19 @@ def _command_collect_wallets(
         for row in [*reused_profiles_by_wallet.values(), *refreshed_profiles]
         if normalize_wallet(row.get("wallet"))
     }
+    follow_activity_by_wallet = load_follow_activity_for_leaderboard(
+        args, resolve_data_dir(args), category="esports"
+    )
     # 协调:保留 observer 累积发现的钱包,避免被全量重建丢掉;按打分窗口剪枝防膨胀。
     prune_cutoff = now_ts - max(1, profile_lookback_days) * 86400
     for wallet_key, cached in existing_profiles.items():
         wallet_key = normalize_wallet(wallet_key or cached.get("wallet"))
         if not wallet_key or wallet_key in profiles_by_wallet:
             continue
-        last_trade = to_int(cached.get("last_esports_trade_at"))
+        last_trade = max(
+            to_int(cached.get("last_esports_trade_at")),
+            to_int(follow_activity_by_wallet.get(wallet_key)),
+        )
         if last_trade and last_trade >= prune_cutoff:
             profiles_by_wallet[wallet_key] = cached
     mark_stage("wallet_profiles")
@@ -5753,6 +5807,7 @@ def _command_collect_wallets(
         max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
         include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
         gate_kwargs=_v2_gate_kwargs_from_args(args),
+        follow_activity_by_wallet=follow_activity_by_wallet,
     )
     leaderboard = collector_result["leaderboard"]
     mark_stage("leaderboard")
@@ -5842,6 +5897,11 @@ def _command_collect_wallets(
             latest_profiles,
             build_started_at=now_ts,
         )
+        # The collector may run for minutes; re-read inside the publish lock so a
+        # follow created during collection refreshes activity in this very publish.
+        follow_activity_by_wallet = load_follow_activity_for_leaderboard(
+            args, resolve_data_dir(args), category="esports"
+        )
         collector_result = build_collector_leaderboard_v2(
             profiles_by_wallet,
             now_ts=now_ts,
@@ -5849,6 +5909,7 @@ def _command_collect_wallets(
             max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
             include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
             gate_kwargs=_v2_gate_kwargs_from_args(args),
+            follow_activity_by_wallet=follow_activity_by_wallet,
         )
         leaderboard = collector_result["leaderboard"]
         cache_prune = prune_collector_trade_cache_files(
@@ -5968,7 +6029,7 @@ def run_collect_v2_loop(
     retry = max(30, int(getattr(args, "loop_error_retry_seconds", 300) or 300))
     max_iter = int(getattr(args, "loop_max_iterations", 0) or 0)
     # 暂停门写到 follow 循环读的同一个 follow_dir;采集期间 follow 不开新单,DB 落库后恢复。
-    follow_dir = resolve_follow_dir(args, resolve_data_dir(args))
+    follow_dir = resolve_shared_follow_dir(args, resolve_data_dir(args))
     iterations = 0
     while True:
         now_ts = int(time.time())
@@ -6166,6 +6227,9 @@ def _delete_wallets_from_leaderboard(
                 max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
                 include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
                 gate_kwargs=_v2_gate_kwargs_from_args(args),
+                follow_activity_by_wallet=load_follow_activity_for_leaderboard(
+                    args, data_dir, category="esports"
+                ),
             )["leaderboard"]
         write_json(
             output_dir / "collector_v2_leaderboard.json",
@@ -6280,7 +6344,7 @@ def rescore_demote_wallets(
     # collector_v2 outputs); follow_dir is the SHARED follow dir (follow.db) —
     # the runner passes it explicitly since it differs from the category dir.
     data_dir = resolve_data_dir(args)
-    follow_dir = Path(follow_dir) if follow_dir else resolve_follow_dir(args, data_dir)
+    follow_dir = Path(follow_dir) if follow_dir else resolve_shared_follow_dir(args, data_dir)
     output_dir = resolve_collector_output_dir(args) / "collector_v2"
     follow_store = FollowStore(follow_dir / "follow.db")
 
@@ -6366,6 +6430,9 @@ def rescore_demote_wallets(
             max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
             include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
             gate_kwargs=_v2_gate_kwargs_from_args(args),
+            follow_activity_by_wallet=load_follow_activity_for_leaderboard(
+                args, data_dir, category="esports"
+            ),
         )["leaderboard"]
 
     # 内存重建榜(现有 profiles 叠加重评结果)判断 batch 是否仍在 A 榜。favorite 是人工置顶、
@@ -6409,7 +6476,7 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
     now_dt = datetime.now(timezone.utc)
     now_ts = int(now_dt.timestamp())
     data_dir = resolve_data_dir(args)
-    follow_dir = resolve_follow_dir(args, data_dir)
+    follow_dir = resolve_shared_follow_dir(args, data_dir)
     positions_per_market = getattr(args, "positions_per_market", 20)
     min_volume = to_float(getattr(args, "min_market_volume", LIVE_SEED_MIN_VOLUME) or 0.0)
 
@@ -6450,13 +6517,23 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
     # 3) 钱包级去重:新钱包直接 profile；已因沉寂出榜、但重新出现在活跃盘 holder 中的钱包，
     #    最多每天重评一次。这样恢复活跃且质量仍强的钱包可以自然回榜，又不会每轮重复深扫。
     existing = load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2")
+    follow_activity_by_wallet = load_follow_activity_for_leaderboard(
+        args, data_dir, category="esports"
+    )
     # M5 降级冷却:窗口内不重新发现刚被降级删除的钱包(防 demote↔readd ping-pong)。
     cooled = store.load_m5_demote_cooldown_wallets(now_ts=now_ts, cooldown_seconds=M5_DEMOTE_COOLDOWN_SECONDS)
     max_idle_hours = int(getattr(args, "max_leaderboard_idle_hours", V2_MAX_LEADERBOARD_IDLE_HOURS))
     idle_refresh_due = {
         wallet
         for wallet, profile in existing.items()
-        if profile_is_idle_over_limit(profile, now_ts=now_ts, max_idle_hours=max_idle_hours)
+        if profile_is_idle_over_limit(
+            {
+                **profile,
+                "last_follow_activity_at": follow_activity_by_wallet.get(wallet, 0),
+            },
+            now_ts=now_ts,
+            max_idle_hours=max_idle_hours,
+        )
         and now_ts - to_int(profile.get("profiled_at") or profile.get("observed_at")) >= 24 * 3600
     }
     new_seed_pool = {
@@ -6542,6 +6619,9 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
                 max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
                 include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
                 gate_kwargs=_v2_gate_kwargs_from_args(args),
+                follow_activity_by_wallet=load_follow_activity_for_leaderboard(
+                    args, data_dir, category="esports"
+                ),
             )
             leaderboard = collector_result["leaderboard"]
             write_json(

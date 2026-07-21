@@ -3090,7 +3090,10 @@ class CoreTest(unittest.TestCase):
                     "condition_id": "m1",
                     "outcome_index": 0,
                     "status": "open",
-                    "legs": [{"trade_id": "t1", "stake": 1}],
+                    "legs": [{
+                        "trade_id": "t1", "stake": 1, "funded_stake": 1,
+                        "leg_at": 115, "category": "esports",
+                    }],
                     "behavior_events": [{"kind": "add", "timestamp": 100}],
                 }
             ]
@@ -3106,6 +3109,8 @@ class CoreTest(unittest.TestCase):
 
             self.assertEqual(store.load_wallet_trade_state(), wallet_state)
             self.assertEqual(store.load_open_signals(), open_signals)
+            self.assertEqual(store.load_wallet_follow_activity_readonly(), {"0xabc": 115})
+            self.assertEqual(store.load_wallet_follow_activity_readonly(category="sports"), {})
             self.assertEqual(store.load_performance(), performance)
             self.assertEqual(store.load_market_cache(cache_kind="closed", now_ts=200, ttl_seconds=900)[0]["m1"]["condition_id"], "m1")
             self.assertEqual(store.load_market_cache(cache_kind="active", now_ts=200, ttl_seconds=900)[0], {})
@@ -14605,6 +14610,20 @@ class CoreTest(unittest.TestCase):
         self.assertEqual({row["wallet"] for row in out_loose["leaderboard"]}, {"0xstale"})
         out_off = build_collector_leaderboard_v2({"0xstale": stale}, now_ts=now, gate_kwargs={"max_idle_hours": 0})
         self.assertEqual({row["wallet"] for row in out_off["leaderboard"]}, {"0xstale"})
+        # 实际生成过一笔 funded follow leg = 钱包刚在我们可跟市场里活跃过。即使历史画像
+        # 仍停在 6 天前，也必须以该操作时间刷新 120h 活跃门，且保留原历史字段供评分审计。
+        follow_at = now - 60
+        out_follow_active = build_collector_leaderboard_v2(
+            {"0xstale": stale},
+            now_ts=now,
+            follow_activity_by_wallet={"0xstale": follow_at},
+        )
+        self.assertEqual({row["wallet"] for row in out_follow_active["leaderboard"]}, {"0xstale"})
+        kept = out_follow_active["leaderboard"][0]
+        self.assertEqual(kept["last_esports_trade_at"], now - 6 * 24 * 3600)
+        self.assertEqual(kept["last_follow_activity_at"], follow_at)
+        self.assertEqual(kept["last_activity_at"], follow_at)
+        self.assertEqual(kept["last_trade_at"], follow_at)
 
     def test_v2_specialist_qualifies_via_strong_bucket(self):
         # 专精评估:钱包整体平庸(lol 主赛很差),但在 cs2 地图胜负上很强 →
