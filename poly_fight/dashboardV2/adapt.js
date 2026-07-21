@@ -364,6 +364,7 @@
     const info = matchInfo(row);
     const pnl = num(row.display_pnl);
     const open = row.status === "open";
+    const aiBlockedOpen = row.status === "ai_blocked";
     const settlement = open ? "未结算" : (pnl > 0 ? "盈利" : pnl < 0 ? "亏损" : "未结算");
     const mtLabel = row.market_type_label || row.market_type || "";
     const marketType = marketTypeTag(mtLabel, row.question || row.market_question);
@@ -374,7 +375,7 @@
       marketType,
       // 我们买入哪一边(可能两边:对手盘 / 自对冲)。
       sides: (row.sides || []).map((s) => ({ outcome: String(s.outcome || ""), index: num(s.outcome_index), legs: num(s.leg_count) })),
-      status: open ? "open" : "settled",
+      status: aiBlockedOpen ? "ai_blocked" : open ? "open" : "settled",
       // 已平仓的细分:manual_exit=目标清仓/对账兜底,我们提前镜像平仓;
       // auto_settlement=等到市场结算;auto_and_manual=多信号混合。用于区分"提前卖出 vs 自动结算"。
       settlementType: open ? "" : String(row.settlement_type || ""),
@@ -389,6 +390,11 @@
       pnlKind: row.display_pnl_kind === "unrealized" ? "unrealized" : "realized",
       quality: followQuality(row),
       sourceOffLeaderboard: !!row.source_off_leaderboard,
+      aiAction: String(row.ai_action || ""),
+      aiRisk: row.ai_risk || null,
+      aiIntentCount: num(row.ai_intent_count),
+      aiBlockedStake: num(row.ai_blocked_intended_stake),
+      aiNetEffect: num(row.ai_net_effect),
       start: fmtClock(row.match_start_time, nowMs),
       end: fmtClock(row.end_date, nowMs),
     };

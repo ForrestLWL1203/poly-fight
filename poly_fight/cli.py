@@ -22,6 +22,7 @@ from urllib.parse import quote, unquote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from .api import PolymarketClient, RateLimiter
+from .ai_risk import AiRiskService
 from .core import (
     ALLOWED_GAME_FAMILIES,
     FOLLOWABLE_PRICE_CEILING,
@@ -7116,6 +7117,7 @@ def command_follow(
     backfill_positions: bool = False,
     backfilled_wallets: set[str] | None = None,
     refresh_logos: bool = True,
+    ai_risk_service: AiRiskService | None = None,
 ) -> dict[str, Any]:
     client = client or build_client(args)
     data_dir = resolve_dashboard_root(args)
@@ -7137,6 +7139,8 @@ def command_follow(
         results_path=results_path,
         perf_path=perf_path,
     )
+    owns_ai_risk_service = ai_risk_service is None
+    ai_risk_service = ai_risk_service or AiRiskService(data_dir, store)
     leaderboard_rows, leaderboard_mtimes = read_category_leaderboards(data_dir)
     leaderboard_wallets = {
         f"{str(row.get('category') or 'esports').lower()}:{normalize_wallet(row.get('wallet'))}"
@@ -7258,6 +7262,9 @@ def command_follow(
         for condition_id, market in active_markets.items()
         if str(market.get("category") or "esports").lower() in FOLLOW_SIGNAL_CATEGORIES
     }
+    # Fire-and-forget prefetch: one neutral assessment per main match, shared by
+    # every wallet.  Candidate handling still has a synchronous fail-open fallback.
+    ai_risk_service.prefetch(list(active_markets_for_follow.values()), now_ts=now_ts)
     # 队标抓取:Polymarket 对电竞对阵盘多数只给通用游戏图、无队标(已核实),所以未缓存的
     # 队每 tick 重抓也只会空手而归 → 由 command_run 节流到约 30min 一次(refresh_logos),
     # 避免每 tick 白花 ~1.3s。静默失败改为记一行日志,便于观测。
@@ -7454,6 +7461,7 @@ def command_follow(
                     held_pending_price=held_pending_price,
                     stop_loss_blocked=stop_loss_blocked,
                     bucket_metrics=bucket_metrics_by_wallet.get(scope_key),
+                    ai_risk_handler=ai_risk_service,
                 )
                 backfill_legs_opened += len({signal.get("signal_id") for signal in open_signals} - before_ids)
                 # 汇总各候选未开仓的拦截原因(eligibility / low_entry / small_wallet / match_budget …),
@@ -7659,6 +7667,7 @@ def command_follow(
                 held_pending_price=held_pending_price,
                 stop_loss_blocked=stop_loss_blocked,
                 bucket_metrics=bucket_metrics_by_wallet.get(scope_key),
+                ai_risk_handler=ai_risk_service,
             )
             after_ids = {signal.get("signal_id") for signal in open_signals}
             new_signal_count += len(after_ids - before_ids)
@@ -7797,6 +7806,7 @@ def command_follow(
                 held_pending_price=held_pending_price,
                 stop_loss_blocked=stop_loss_blocked,
                 bucket_metrics=bucket_metrics_by_wallet.get(scope_key_h),
+                ai_risk_handler=ai_risk_service,
             )
             followed_h = len({s.get("signal_id") for s in open_signals} - before_ids_h)
             price_held_followed_count += followed_h
@@ -7842,6 +7852,7 @@ def command_follow(
                 follow_strategy=follow_strategy,
                 held_pending_price=held_pending_price,
                 stop_loss_blocked=stop_loss_blocked,
+                ai_risk_handler=ai_risk_service,
             )
             exited_signal_count += _exit_pft_stats.get("exited_signal_count", 0)
         if emit and exit_reconcile_stats.get("synth_sells"):
@@ -7859,13 +7870,18 @@ def command_follow(
             s for s in open_signals
             if (s.get("status") or "open") == "open" and str(s.get("market_type") or "main_match") == "main_match"
         ]
-        if sl_open and now_ts - to_int(state.get("last_stop_loss_check_at")) >= sl_interval:
+        sl_shadows = ai_risk_service.follow_store.load_ai_shadows(open_only=True)
+        if (sl_open or sl_shadows) and now_ts - to_int(state.get("last_stop_loss_check_at")) >= sl_interval:
             state["last_stop_loss_check_at"] = now_ts
             # 现价**必须**用实时盘口价(与跟单详情/held 同源:Gamma /markets 不带 closed 过滤),
             # 不能用 clob_price——它对 in-play 盘常返回 None → 退化读 15min 陈旧缓存(卡在 entry 附近)
             # → 止损永远不触发,直到盘结算价跳到 ~0 才"触发",算成 -100%、等于没止损(实测 2026-06-23
             # Nigma/NaVi 三笔都在 exit_price=0.0005 才平)。
-            sl_conds = sorted({str(s.get("condition_id") or "").lower() for s in sl_open})
+            sl_conds = sorted({
+                str(s.get("condition_id") or "").lower()
+                for s in [*sl_open, *sl_shadows]
+                if s.get("condition_id")
+            })
             try:
                 sl_live = resolution_market_records_from_markets(
                     client.gamma("/markets", condition_ids=sl_conds, limit=max(1, len(sl_conds))) or []
@@ -7890,6 +7906,14 @@ def command_follow(
                     # 记入黑名单:该 (钱包|盘|outcome) 不再复跟,避免反复挨割。
                     key = f"{normalize_wallet(signal.get('wallet'))}|{str(signal.get('condition_id') or '').lower()}|{to_int(signal.get('outcome_index'), -1)}"
                     stop_loss_blocked[key] = {"stopped_at": now_ts, "exit_price": round(cur, 8)}
+            ai_risk_service.apply_shadow_stop_loss(
+                {
+                    str(condition_id).lower(): list(record.get("outcome_prices") or [])
+                    for condition_id, record in sl_live.items()
+                },
+                drop_pct=stop_loss_pct,
+                now_ts=now_ts,
+            )
             if stop_loss_exit_count and emit:
                 print(json.dumps({"status": "stop_loss_exit", "count": stop_loss_exit_count, "drop_pct": stop_loss_pct}, ensure_ascii=False), flush=True)
 
@@ -7908,15 +7932,21 @@ def command_follow(
     resolution_poll_interval = int(getattr(args, "resolution_poll_seconds", 300) or 0)
     resolutions: dict[str, int] = {}
     price_settled_cids: set[str] = set()
-    if open_signals and (
+    open_ai_shadows = ai_risk_service.follow_store.load_ai_shadows(open_only=True)
+    resolution_candidates = [*open_signals, *open_ai_shadows]
+    if resolution_candidates and (
         resolution_poll_interval <= 0
-        or now_ts - max((to_int(s.get("resolution_checked_at")) for s in open_signals), default=0) >= resolution_poll_interval
+        or now_ts - max(
+            max((to_int(s.get("resolution_checked_at")) for s in open_signals), default=0),
+            to_int(state.get("last_ai_resolution_check_at")),
+        ) >= resolution_poll_interval
     ):
         for signal in open_signals:
             signal["resolution_checked_at"] = now_ts
+        state["last_ai_resolution_check_at"] = now_ts
         resolutions, price_settled_cids = fetch_resolutions_for_open_signals(
             client,
-            open_signals,
+            resolution_candidates,
             state=state,
             store=store,
             now_ts=now_ts,
@@ -7924,6 +7954,7 @@ def command_follow(
             ttl_seconds=args.resolution_cache_ttl_seconds,
         )
     open_signals, settled = settle_open_signals(open_signals, resolutions, now_ts=now_ts)
+    ai_risk_service.settle_shadows(resolutions, now_ts=now_ts, void_index=VOID_RESOLUTION_INDEX)
     # 价格隐含结算(盘口未 closed,靠实时价≈1.0 判定)的信号打审计标记,区别于 Polymarket
     # 正式结算结果;后续 dashboard / 复盘可据此分辨"提前按盘口价结"的单。
     if price_settled_cids:
@@ -8077,6 +8108,7 @@ def command_follow(
         "last_dataapi_sweep_at": to_int(state.get("last_dataapi_sweep_at")),
         "last_held_refresh_at": to_int(state.get("last_held_refresh_at")),
         "last_stop_loss_check_at": to_int(state.get("last_stop_loss_check_at")),
+        "last_ai_resolution_check_at": to_int(state.get("last_ai_resolution_check_at")),
     }
     write_json(state_path, state)
 
@@ -8089,6 +8121,8 @@ def command_follow(
         # 单行紧凑 JSON:每拍一行而非 ~92 行 pretty-print,日志增速减半、grep 更快。
         # 完整结构化记录已经 save_run_tick 入库(follow.db),这里只为可读观测。
         print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    if owns_ai_risk_service:
+        ai_risk_service.close()
     return summary
 
 
@@ -8173,6 +8207,7 @@ def command_run(args: argparse.Namespace) -> int:
     rescore_threshold = int(getattr(args, "rescore_settled_threshold", 10) or 0)
     rescore_thread: threading.Thread | None = None
     m5_store = FollowStore(follow_dir / "follow.db")   # M5 计数从 DB 派生(持久化、含 exited)
+    ai_risk_service = AiRiskService(collection_root, m5_store)
     last_follow_breaker_result_count = -1
 
     def sleep_or_stop(seconds: int) -> None:
@@ -8236,6 +8271,7 @@ def command_run(args: argparse.Namespace) -> int:
                     backfill_positions=True,
                     backfilled_wallets=backfilled_wallets,
                     refresh_logos=_do_logos,
+                    ai_risk_service=ai_risk_service,
                 )
                 if _do_logos:
                     last_logo_refresh_at = iteration_started_mono
@@ -8330,6 +8366,7 @@ def command_run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print(json.dumps({"status": "stopped", "reason": "keyboard_interrupt", "ticks": tick_count}, ensure_ascii=False))
     finally:
+        ai_risk_service.close()
         if collector is not None:
             collector.stop()
         if stop_event.is_set():

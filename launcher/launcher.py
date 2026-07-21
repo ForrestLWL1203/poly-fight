@@ -113,6 +113,7 @@ REPO=@@REPO@@
 DATADIR=@@DATADIR@@
 GITHUB=@@GITHUB@@
 PY=@@PYTHON@@
+VENV="$REPO/.venv"
 PORT=@@PORT@@
 DOMAIN=@@DOMAIN@@
 CADDYFILE=@@CADDYFILE@@
@@ -123,9 +124,9 @@ if ! command -v git >/dev/null 2>&1; then
   apt-get update -qq && apt-get install -y -qq git
   echo "    installed git"
 fi
-if ! command -v python3 >/dev/null 2>&1; then
-  apt-get update -qq && apt-get install -y -qq python3
-  echo "    installed python3"
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv --help >/dev/null 2>&1; then
+  apt-get update -qq && apt-get install -y -qq python3 python3-venv
+  echo "    installed python3 + venv"
 fi
 if ! command -v caddy >/dev/null 2>&1; then
   apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl gnupg
@@ -155,7 +156,13 @@ fi
 cd "$REPO"
 echo "    at $(git rev-parse --short HEAD)"
 
-echo "[3/6] write secrets (chmod 600)"
+echo "[3/7] 创建项目虚拟环境并安装锁定依赖"
+if [ ! -x "$VENV/bin/python" ]; then
+  "$PY" -m venv "$VENV"
+fi
+"$VENV/bin/python" -m pip install --disable-pip-version-check -q -r requirements.txt
+
+echo "[4/7] write secrets (chmod 600)"
 mkdir -p secret
 # secret vars (RPC_HTTPS/RPC_WSS/DASH_PW/DASH_SECRET) are injected at the top of
 # this script by the launcher — only ever travels over SSH stdin, never argv.
@@ -164,7 +171,7 @@ chmod 600 secret/rpc
 printf 'POLY_FIGHT_DASH_PASSWORD=%s\nPOLY_FIGHT_DASH_COOKIE_SECRET=%s\n' "${DASH_PW:-}" "${DASH_SECRET:-}" > secret/dashboard.env
 chmod 600 secret/dashboard.env
 
-echo "[4/6] systemd unit (dashboard 托管模式 — runner 由面板「启动跟单」spawn)"
+echo "[5/7] systemd unit (dashboard 托管模式 — runner 由面板「启动跟单」spawn)"
 mkdir -p "$DATADIR"
 # 旧版把 runner 当独立常驻服务;现模型是 dashboard spawn runner，停用旧 runner 服务避免冲突。
 if systemctl list-unit-files 2>/dev/null | grep -q '^poly-fight-runner.service'; then
@@ -180,7 +187,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$REPO
 EnvironmentFile=$REPO/secret/dashboard.env
-ExecStart=$PY -m poly_fight.cli --data-dir $DATADIR serve --host 127.0.0.1 --port $PORT
+ExecStart=$VENV/bin/python -m poly_fight.cli --data-dir $DATADIR serve --host 127.0.0.1 --port $PORT
 Restart=always
 RestartSec=4
 # 只管 dashboard 进程本身 — 重启/停 dashboard 不连带杀掉它 spawn 的 runner+observe，
@@ -192,7 +199,7 @@ UNIT
 systemctl daemon-reload
 systemctl enable poly-fight-dashboard
 
-echo "[5/6] caddy reverse_proxy for $DOMAIN"
+echo "[6/7] caddy reverse_proxy for $DOMAIN"
 # 防火墙:ufw 默认 deny incoming,只放 22 会挡死 80/443 → Let's Encrypt ACME 验证连不进来,
 # 证书签不下来,HTTPS 不可用。所以在装反代前先放行 80/443(先确保 22,绝不把自己锁在外面)。
 # 只在 ufw 已启用时动它;未启用就不碰(裸机 ufw 默认 inactive,端口本就开放)。
@@ -213,7 +220,7 @@ else
   echo "    caddy block already present (or no Caddyfile) — skipped"
 fi
 
-echo "[6/6] 环境就绪"
+echo "[7/7] 环境就绪"
 echo "PREPARED — 代码/密钥/服务/反代已就绪，点「启动」拉起 dashboard"
 """
 

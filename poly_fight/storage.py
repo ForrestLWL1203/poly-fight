@@ -27,7 +27,7 @@ class _AutoCloseConnection(sqlite3.Connection):
 
 
 LEADERBOARD_SCHEMA_VERSION = 2
-FOLLOW_SCHEMA_VERSION = 2
+FOLLOW_SCHEMA_VERSION = 3
 
 # run_ticks 是 runner 心跳日志(每行含完整 stats blob),dashboard 只读最近若干条。
 # 保留最近 RUN_TICKS_RETENTION 条,写入时裁掉更旧的,防止该表无界增长。
@@ -830,6 +830,38 @@ class FollowStore:
                     updated_at INTEGER NOT NULL,
                     raw_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ai_match_assessments (
+                    condition_id TEXT PRIMARY KEY,
+                    input_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ai_follow_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    condition_id TEXT NOT NULL,
+                    wallet TEXT,
+                    outcome_index INTEGER,
+                    action TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ai_shadow_positions (
+                    shadow_id TEXT PRIMARY KEY,
+                    intent_id TEXT NOT NULL,
+                    condition_id TEXT NOT NULL,
+                    wallet TEXT,
+                    outcome_index INTEGER,
+                    status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    realized_pnl REAL NOT NULL DEFAULT 0,
+                    ai_net_effect REAL,
+                    raw_json TEXT NOT NULL
+                );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_follow_strategy_library_name
                     ON follow_strategy_library(name COLLATE NOCASE);
                 CREATE INDEX IF NOT EXISTS idx_follow_signals_status ON follow_signals(status);
@@ -843,9 +875,21 @@ class FollowStore:
                 CREATE INDEX IF NOT EXISTS idx_wallet_quarantine_ts ON wallet_quarantine(quarantined_at);
                 CREATE INDEX IF NOT EXISTS idx_wallet_favorites_category_ts ON wallet_favorites(category, favorited_at);
                 CREATE INDEX IF NOT EXISTS idx_account_balance_ledger_created_at ON account_balance_ledger(created_at);
+                CREATE INDEX IF NOT EXISTS idx_ai_assessments_updated_at ON ai_match_assessments(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_ai_intents_condition_at ON ai_follow_intents(condition_id, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_ai_intents_action_at ON ai_follow_intents(action, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_ai_shadow_status_condition ON ai_shadow_positions(status, condition_id);
                 """
             )
             self._migrate_market_cache_schema(conn)
+            _ensure_columns(
+                conn,
+                "ai_shadow_positions",
+                {
+                    "realized_pnl": "REAL NOT NULL DEFAULT 0",
+                    "ai_net_effect": "REAL",
+                },
+            )
             _ensure_columns(
                 conn,
                 "market_cache",
@@ -2235,6 +2279,255 @@ class FollowStore:
         finally:
             conn.close()
         return {"db_ready": True, "signals": signals}
+
+    # ---- DeepSeek pre-match risk audit ---------------------------------
+
+    def load_ai_assessment(self, condition_id: str) -> dict[str, Any] | None:
+        conn = self.connect_readonly()
+        if conn is None:
+            return None
+        try:
+            if "ai_match_assessments" not in _table_names(conn):
+                return None
+            row = conn.execute(
+                "SELECT raw_json FROM ai_match_assessments WHERE condition_id = ?",
+                (str(condition_id or "").lower(),),
+            ).fetchone()
+            return _loads(row["raw_json"], {}) if row else None
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+
+    def save_ai_assessment(self, assessment: dict[str, Any]) -> None:
+        condition_id = str(assessment.get("condition_id") or "").lower()
+        if not condition_id:
+            raise ValueError("AI assessment requires condition_id")
+        self.init_db()
+        now = _to_int(assessment.get("updated_at") or assessment.get("created_at") or time.time())
+        created = _to_int(assessment.get("created_at") or now)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_match_assessments
+                (condition_id, input_hash, status, created_at, updated_at, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(condition_id) DO UPDATE SET
+                    input_hash=excluded.input_hash,
+                    status=excluded.status,
+                    updated_at=excluded.updated_at,
+                    raw_json=excluded.raw_json
+                """,
+                (
+                    condition_id,
+                    str(assessment.get("input_hash") or ""),
+                    str(assessment.get("status") or "unavailable"),
+                    created,
+                    now,
+                    _dumps({**assessment, "condition_id": condition_id, "created_at": created, "updated_at": now}),
+                ),
+            )
+
+    def save_ai_intent(self, intent: dict[str, Any]) -> None:
+        intent_id = str(intent.get("intent_id") or "")
+        condition_id = str(intent.get("condition_id") or "").lower()
+        if not intent_id or not condition_id:
+            raise ValueError("AI intent requires intent_id and condition_id")
+        self.init_db()
+        now = _to_int(intent.get("updated_at") or intent.get("created_at") or time.time())
+        created = _to_int(intent.get("created_at") or now)
+        normalized = {**intent, "condition_id": condition_id, "created_at": created, "updated_at": now}
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_follow_intents
+                (intent_id, condition_id, wallet, outcome_index, action, status, created_at, updated_at, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(intent_id) DO UPDATE SET
+                    action=excluded.action,
+                    status=excluded.status,
+                    updated_at=excluded.updated_at,
+                    raw_json=excluded.raw_json
+                """,
+                (
+                    intent_id,
+                    condition_id,
+                    str(intent.get("wallet") or "").lower(),
+                    _to_int(intent.get("outcome_index"), -1),
+                    str(intent.get("action") or "unavailable"),
+                    str(intent.get("status") or "open"),
+                    created,
+                    now,
+                    _dumps(normalized),
+                ),
+            )
+
+    def update_ai_intent_status(self, intent_id: str, status: str, *, updated_at: int) -> None:
+        self.init_db()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT raw_json FROM ai_follow_intents WHERE intent_id = ?", (str(intent_id),)
+            ).fetchone()
+            if not row:
+                return
+            payload = _loads(row["raw_json"], {})
+            payload["status"] = str(status)
+            payload["updated_at"] = int(updated_at)
+            conn.execute(
+                "UPDATE ai_follow_intents SET status=?, updated_at=?, raw_json=? WHERE intent_id=?",
+                (str(status), int(updated_at), _dumps(payload), str(intent_id)),
+            )
+
+    def save_ai_shadow(self, shadow: dict[str, Any]) -> None:
+        shadow_id = str(shadow.get("shadow_id") or "")
+        condition_id = str(shadow.get("condition_id") or "").lower()
+        if not shadow_id or not condition_id:
+            raise ValueError("AI shadow requires shadow_id and condition_id")
+        self.init_db()
+        now = _to_int(shadow.get("updated_at") or shadow.get("created_at") or time.time())
+        created = _to_int(shadow.get("created_at") or now)
+        normalized = {**shadow, "condition_id": condition_id, "created_at": created, "updated_at": now}
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_shadow_positions
+                (shadow_id, intent_id, condition_id, wallet, outcome_index, status, created_at, updated_at,
+                 realized_pnl, ai_net_effect, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(shadow_id) DO UPDATE SET
+                    status=excluded.status,
+                    updated_at=excluded.updated_at,
+                    realized_pnl=excluded.realized_pnl,
+                    ai_net_effect=excluded.ai_net_effect,
+                    raw_json=excluded.raw_json
+                """,
+                (
+                    shadow_id,
+                    str(shadow.get("intent_id") or ""),
+                    condition_id,
+                    str(shadow.get("wallet") or "").lower(),
+                    _to_int(shadow.get("outcome_index"), -1),
+                    str(shadow.get("status") or "open"),
+                    created,
+                    now,
+                    _to_float(shadow.get("realized_pnl")),
+                    (_to_float(shadow.get("ai_net_effect")) if shadow.get("ai_net_effect") is not None else None),
+                    _dumps(normalized),
+                ),
+            )
+
+    def load_ai_shadows(self, *, open_only: bool = False) -> list[dict[str, Any]]:
+        conn = self.connect_readonly()
+        if conn is None:
+            return []
+        try:
+            if "ai_shadow_positions" not in _table_names(conn):
+                return []
+            sql = "SELECT raw_json FROM ai_shadow_positions"
+            params: tuple[Any, ...] = ()
+            if open_only:
+                sql += " WHERE status = ?"
+                params = ("open",)
+            sql += " ORDER BY updated_at DESC"
+            rows = conn.execute(sql, params).fetchall()
+            return [_loads(row["raw_json"], {}) for row in rows]
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+
+    def load_ai_audit(self, *, condition_id: str = "", limit: int = 500) -> dict[str, Any]:
+        conn = self.connect_readonly()
+        if conn is None:
+            return {"db_ready": False, "assessments": [], "intents": [], "shadows": []}
+        try:
+            tables = _table_names(conn)
+            if not {"ai_match_assessments", "ai_follow_intents", "ai_shadow_positions"}.issubset(tables):
+                return {"db_ready": False, "assessments": [], "intents": [], "shadows": []}
+            cid = str(condition_id or "").lower()
+            where = " WHERE condition_id = ?" if cid else ""
+            params: tuple[Any, ...] = (cid,) if cid else ()
+            assessment_rows = conn.execute(
+                "SELECT raw_json FROM ai_match_assessments" + where + " ORDER BY updated_at DESC LIMIT ?",
+                (*params, max(1, int(limit))),
+            ).fetchall()
+            intent_rows = conn.execute(
+                "SELECT raw_json FROM ai_follow_intents" + where + " ORDER BY updated_at DESC LIMIT ?",
+                (*params, max(1, int(limit))),
+            ).fetchall()
+            shadow_rows = conn.execute(
+                "SELECT raw_json FROM ai_shadow_positions" + where + " ORDER BY updated_at DESC LIMIT ?",
+                (*params, max(1, int(limit))),
+            ).fetchall()
+        except sqlite3.Error:
+            return {"db_ready": False, "assessments": [], "intents": [], "shadows": []}
+        finally:
+            conn.close()
+        return {
+            "db_ready": True,
+            "assessments": [_loads(row["raw_json"], {}) for row in assessment_rows],
+            "intents": [_loads(row["raw_json"], {}) for row in intent_rows],
+            "shadows": [_loads(row["raw_json"], {}) for row in shadow_rows],
+        }
+
+    def load_ai_summary(self) -> dict[str, Any]:
+        """Aggregate the complete AI audit history without loading every JSON row."""
+        empty = {
+            "assessment_count": 0,
+            "intent_count": 0,
+            "blocked_count": 0,
+            "agree_count": 0,
+            "insufficient_count": 0,
+            "unavailable_count": 0,
+            "resolved_blocked_count": 0,
+            "avoided_loss_usdc": 0.0,
+            "missed_profit_usdc": 0.0,
+            "net_effect_usdc": 0.0,
+        }
+        conn = self.connect_readonly()
+        if conn is None:
+            return empty
+        try:
+            tables = _table_names(conn)
+            if not {"ai_match_assessments", "ai_follow_intents", "ai_shadow_positions"}.issubset(tables):
+                return empty
+            assessment = conn.execute("SELECT COUNT(*) AS n FROM ai_match_assessments").fetchone()
+            intents = conn.execute(
+                """
+                SELECT COUNT(*) AS n,
+                       SUM(CASE WHEN action='blocked' THEN 1 ELSE 0 END) AS blocked,
+                       SUM(CASE WHEN action='agree' THEN 1 ELSE 0 END) AS agree,
+                       SUM(CASE WHEN action='insufficient' THEN 1 ELSE 0 END) AS insufficient,
+                       SUM(CASE WHEN action='unavailable' THEN 1 ELSE 0 END) AS unavailable
+                FROM ai_follow_intents
+                """
+            ).fetchone()
+            shadows = conn.execute(
+                """
+                SELECT COUNT(*) AS n,
+                       SUM(CASE WHEN ai_net_effect > 0 THEN ai_net_effect ELSE 0 END) AS avoided,
+                       SUM(CASE WHEN ai_net_effect < 0 THEN -ai_net_effect ELSE 0 END) AS missed,
+                       SUM(COALESCE(ai_net_effect, 0)) AS net
+                FROM ai_shadow_positions
+                WHERE status IN ('settled','exited')
+                """
+            ).fetchone()
+        except sqlite3.Error:
+            return empty
+        finally:
+            conn.close()
+        return {
+            "assessment_count": _to_int(assessment["n"]),
+            "intent_count": _to_int(intents["n"]),
+            "blocked_count": _to_int(intents["blocked"]),
+            "agree_count": _to_int(intents["agree"]),
+            "insufficient_count": _to_int(intents["insufficient"]),
+            "unavailable_count": _to_int(intents["unavailable"]),
+            "resolved_blocked_count": _to_int(shadows["n"]),
+            "avoided_loss_usdc": round(_to_float(shadows["avoided"]), 8),
+            "missed_profit_usdc": round(_to_float(shadows["missed"]), 8),
+            "net_effect_usdc": round(_to_float(shadows["net"]), 8),
+        }
 
     def load_dashboard_wallet_follow_detail(self, wallet: str, *, statuses: set[str] | None = None) -> dict[str, Any]:
         empty = {"db_ready": False, "signals": []}

@@ -24,7 +24,8 @@ The UI opens at `http://127.0.0.1:8799`.
      uses the **VPS password** to install your pubkey into the box's
      `authorized_keys` (SSH pairing) — every later run is passwordless,
   then over SSH:
-  1. installs missing deps (`git` / `python3` / `caddy`) — idempotent, skipped if present,
+  1. installs missing deps (`git` / `python3` / `python3-venv` / `caddy`), creates
+     the repo `.venv`, and installs the version-locked `requirements.txt` — idempotent,
   2. clones or `git pull`s the repo (aborts if the VPS worktree is dirty — policy),
   3. writes `secret/rpc` + `secret/dashboard.env` on the VPS (chmod 600),
   4. installs/enables a `poly-fight-dashboard` **systemd** unit (auto-restart, boot-start),

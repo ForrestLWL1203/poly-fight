@@ -664,6 +664,7 @@ def process_follow_trades(
     held_pending_price: dict[str, dict[str, Any]] | None = None,   # 价格 held 暂存器(现价<下限的买单,等上穿;跨 tick 持久)
     stop_loss_blocked: dict[str, Any] | None = None,               # 止损黑名单:已止损平过的 (钱包|盘|outcome) 不再复跟
     bucket_metrics: dict[str, dict[str, Any]] | None = None,       # eligible bucket -> θ̂/edge_lb
+    ai_risk_handler: Any | None = None,                            # DeepSeek 主盘闸门;异常一律 fail-open
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     wallet = normalize_wallet(wallet)
     active_strategy = normalize_follow_strategy(follow_strategy) if isinstance(follow_strategy, dict) else None
@@ -695,6 +696,10 @@ def process_follow_trades(
         "small_buy_cached_count": 0,
         "small_buy_triggered_count": 0,
         "backfill_dup_skipped_count": 0,
+        "ai_agree_count": 0,
+        "ai_blocked_count": 0,
+        "ai_insufficient_count": 0,
+        "ai_unavailable_count": 0,
     }
     effective_trades = list(trades)
     for trade in sorted(effective_trades, key=lambda row: _trade_tuple(row)):
@@ -719,6 +724,19 @@ def process_follow_trades(
             continue
 
         if side == "SELL":
+            if ai_risk_handler is not None:
+                try:
+                    ai_risk_handler.observe_sell(
+                        wallet=wallet,
+                        trade=trade,
+                        condition_id=condition_id,
+                        outcome_index=outcome_index,
+                        price=current_price,
+                        now_ts=now_ts,
+                    )
+                except Exception:
+                    # AI 影子审计绝不能阻断正常镜像卖出。
+                    stats["ai_shadow_error_count"] = stats.get("ai_shadow_error_count", 0) + 1
             # 钱包卖出该 (cond,outcome):若有未凑够门槛的小单缓存,说明它没建够仓就跑了 → 清缓存,不补跟。
             if pending_small_buys is not None:
                 pending_small_buys.pop(f"{wallet}|{condition_id}|{outcome_index}", None)
@@ -1006,6 +1024,28 @@ def process_follow_trades(
                 funding_status = "signal_cap"
                 stake_mode = "signal_cap"
                 stats["signal_cap_limited_count"] += 1
+        ai_decision: dict[str, Any] | None = None
+        if would_follow and funded_stake > 0 and ai_risk_handler is not None:
+            try:
+                ai_decision = ai_risk_handler.decide(
+                    market={**market, "condition_id": condition_id},
+                    wallet=wallet,
+                    outcome_index=outcome_index,
+                    intended_stake=funded_stake,
+                    entry_price=current_price,
+                    trade_id=trade_id(trade),
+                    wallet_trade_size=trade_size(trade),
+                    now_ts=now_ts,
+                )
+            except Exception:
+                # 明确 fail-open:provider/审计异常都不改变原策略执行。
+                ai_decision = None
+                stats["ai_unavailable_count"] += 1
+            if ai_decision:
+                action = str(ai_decision.get("action") or "unavailable")
+                stats[f"ai_{action}_count"] = stats.get(f"ai_{action}_count", 0) + 1
+                if ai_decision.get("blocked"):
+                    continue
         if not would_follow or funded_stake <= 0:
             continue
         # 跟成了 → 该 (wallet,cond,outcome) 不再 held(价已上穿进区间或钱包又来一笔真单)。
@@ -1058,6 +1098,10 @@ def process_follow_trades(
             )
             for key in ("theta", "live_edge", "bucket_edge_lb", "per_match_cap_usdc"):
                 leg[key] = strategy_decision.get(key)
+        if ai_decision is not None:
+            leg["ai_intent_id"] = ai_decision.get("intent_id")
+            leg["ai_action"] = ai_decision.get("action")
+            leg["ai_assessment"] = ai_decision.get("assessment")
         if funding_status == "signal_cap":
             leg["signal_cap_limited"] = True
         if add_ratio_to_first is not None:
@@ -1092,6 +1136,9 @@ def process_follow_trades(
             if detected_after_start:
                 existing["detected_after_start"] = True
             existing["wallet_behavior"] = wallet_behavior_summary(existing)
+            if ai_decision is not None:
+                existing["ai_risk"] = ai_decision.get("assessment")
+                existing["ai_last_action"] = ai_decision.get("action")
         else:
             outcomes = market.get("outcomes") or []
             signal = {
@@ -1131,6 +1178,9 @@ def process_follow_trades(
                     "exit_count": 0,
                 },
             }
+            if ai_decision is not None:
+                signal["ai_risk"] = ai_decision.get("assessment")
+                signal["ai_last_action"] = ai_decision.get("action")
             if strategy_decision is not None:
                 signal["strategy_schema_version"] = leg.get("strategy_schema_version")
                 signal["strategy_mode"] = leg.get("strategy_mode")

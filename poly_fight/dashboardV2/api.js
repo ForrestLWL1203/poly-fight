@@ -92,6 +92,8 @@
     return get("/api/wallet-follows?" + q.toString());
   };
   const marketPrices = (cid) => get("/api/markets/" + encodeURIComponent(cid) + "/prices");
+  const aiRisk = () => get("/api/ai-risk");
+  const aiWrapKey = () => get("/api/ai-risk/wrap-key");
   const walletTrades = (wallet, opts) => {
     const o = opts || {};
     const q = new URLSearchParams({ page: o.page || 1, size: o.size || 10 });
@@ -116,6 +118,10 @@
   const resetData = () => post("/api/reset-data", {});
   const walletRefresh = (category, body) =>
     post("/api/wallet-refresh?category=" + encodeURIComponent(category), body || {});
+  const saveAiCredential = (envelope) => post("/api/ai-risk/credential", { envelope });
+  const testAiCredential = () => post("/api/ai-risk/credential/test", {});
+  const deleteAiCredential = () => post("/api/ai-risk/credential/delete", {});
+  const saveAiSettings = (enabled) => post("/api/ai-risk/settings", { enabled: !!enabled });
 
   /* ---- live stream (SSE) with polling fallback ---- */
   function openStream(onFrame, onStatus) {
@@ -140,10 +146,11 @@
     setAuthExpiredHandler: (fn) => { onAuthExpired = typeof fn === "function" ? fn : null; },
     get, post, login, logout,
     health, overview, wallets, events, runner, followStrategy, walletRefreshStatus,
-    follows, followDetail, walletFollows, marketPrices, walletTrades,
+    follows, followDetail, walletFollows, marketPrices, walletTrades, aiRisk, aiWrapKey,
     setFavorite, setQuarantine, setAccountBalance, saveStrategy,
     strategies, createStrategy, updateStrategy, activateStrategy, deleteStrategy,
     runnerStart, runnerStop, resetData, walletRefresh,
+    saveAiCredential, testAiCredential, deleteAiCredential, saveAiSettings,
     openStream,
   };
 
@@ -165,6 +172,8 @@
     api.followDetail = wrap(m.followDetail);
     api.walletFollows = wrap(m.walletFollows);
     api.marketPrices = wrap(m.marketPrices);
+    api.aiRisk = m.aiRisk ? wrap(m.aiRisk) : () => Promise.resolve({ settings: { enabled: false, model: "deepseek-v4-pro", win_probability_threshold: 65, confidence_threshold: 75 }, credential: { configured: false, status: "not_configured" }, balance: null, summary: {} });
+    api.aiWrapKey = () => Promise.resolve({ ready: true, envelopeVersion: 1, keyId: "mock", spki: "" });
     const okEcho = (x) => Promise.resolve(x || { ok: true });
     api.setFavorite = (w, c, f) => okEcho({ wallet: w, category: c, favorite: f });
     api.setQuarantine = (w, c, q) => okEcho({ wallet: w, category: c, quarantined: q });
@@ -178,10 +187,31 @@
     api.deleteStrategy = tryMock((slug) => m.deleteStrategy(slug));
     api.runnerStart = m.runnerStart ? wrap(m.runnerStart) : () => okEcho({ status: "running" });
     api.runnerStop = m.runnerStop ? wrap(m.runnerStop) : () => okEcho({ status: "stopped" });
+    api.saveAiCredential = () => okEcho({ configured: true, status: "valid" });
+    api.testAiCredential = () => okEcho({ configured: true, status: "valid" });
+    api.deleteAiCredential = () => okEcho({ deleted: true, enabled: false });
+    api.saveAiSettings = (enabled) => okEcho({ enabled: !!enabled });
     api.resetData = () => okEcho({ status: "reset" });
     api.walletRefresh = m.walletRefresh ? wrap(m.walletRefresh) : () => okEcho({ status: "running" });
     api.openStream = () => ({ close() {}, get closed() { return true; } });
   }
 
   window.PSApi = api;
+  window.PSEncryptCredential = async function encryptCredential(secret, wrapKey) {
+    if (wrapKey && wrapKey.keyId === "mock") return { envelopeVersion: 1, keyId: "mock", wrappedKey: "mock", nonce: "mock", ciphertext: btoa(secret) };
+    if (!window.crypto || !window.crypto.subtle || !wrapKey || !wrapKey.spki) throw new Error("secure_context_required");
+    const b64ToBytes = (value) => Uint8Array.from(atob(value), (c) => c.charCodeAt(0));
+    const bytesToB64 = (value) => {
+      const bytes = new Uint8Array(value); let binary = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      return btoa(binary);
+    };
+    const publicKey = await window.crypto.subtle.importKey("spki", b64ToBytes(wrapKey.spki), { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"]);
+    const dek = await window.crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
+    const rawDek = await window.crypto.subtle.exportKey("raw", dek);
+    const nonce = window.crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, dek, new TextEncoder().encode(secret));
+    const wrappedKey = await window.crypto.subtle.encrypt({ name: "RSA-OAEP" }, publicKey, rawDek);
+    return { envelopeVersion: wrapKey.envelopeVersion, keyId: wrapKey.keyId, wrappedKey: bytesToB64(wrappedKey), nonce: bytesToB64(nonce), ciphertext: bytesToB64(ciphertext) };
+  };
 })();

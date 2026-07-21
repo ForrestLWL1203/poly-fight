@@ -123,6 +123,7 @@ function TeamLine({ ev, size = 26, held }) {
 // 提前卖出沿用 warn 色徽标(同 源已脱榜),让列表一眼看出是我们主动平的还是等到结算。
 // settledByPrice:盘口还没正式关闭、我们按实时价≈1.0 提前结算的场,附一个小 "盘口价" 标记。
 function FollowStatusBadge({ f }) {
+  if (f.status === "ai_blocked") return <Badge tone="down" dot title="该下单意图通过原策略全部检查后，被赛前 AI 强冲突判断拦截">AI拦截</Badge>;
   if (f.status === "open") return <Badge tone="up" dot>进行中</Badge>;
   let main;
   if (f.settlementType === "stop_loss")
@@ -140,6 +141,17 @@ function FollowStatusBadge({ f }) {
       <Badge tone="neutral" outline title="比赛已结束、但 Polymarket 盘口尚未正式关闭时,按实时盘口价≈1.0 提前结算(胜负/盈亏与官方结算一致)">盘口价</Badge>
     </React.Fragment>
   );
+}
+function AiDecisionBadge({ action, assessment }) {
+  if (!action && !assessment) return null;
+  const a = assessment || {};
+  const verdict = String(a.verdict || "");
+  const winner = verdict === "team_a" ? a.team_a : verdict === "team_b" ? a.team_b : "";
+  const probability = verdict === "team_a" ? a.team_a_win_probability : verdict === "team_b" ? a.team_b_win_probability : null;
+  const label = action === "blocked" ? "AI拦截" : action === "agree" ? "AI一致" : action === "insufficient" ? "AI不确定" : "AI不可用";
+  const tone = action === "blocked" ? "down" : action === "agree" ? "up" : action === "insufficient" ? "warn" : "neutral";
+  const suffix = winner ? ` · ${winner}${probability != null ? " " + Math.round(Number(probability)) + "%" : ""}` : " · 原策略放行";
+  return <Badge tone={tone} outline title={a.reason_zh || ""}>{label}{suffix}</Badge>;
 }
 function MatchCell({ ev, tag, held }) {
   const dual = held && held.length >= 2;
@@ -258,6 +270,7 @@ function OverviewPage({ data, onNav, onOpenFollow }) {
   const winMs = { h24: DAY, d7: 7 * DAY, d30: 30 * DAY, all: null };
   const equity = Adapt.equitySeries(raw, winMs[pnlWin]);
   const winPnl = equity.length ? equity[equity.length - 1] : 0;
+  const ai = raw.ai_risk || {};
   const nav = onNav || (() => {});
 
   const distSegments = ft.segments.map((s) => ({ ...s, value: distMetric === "stake" ? s.stake : s.value }));
@@ -336,6 +349,20 @@ function OverviewPage({ data, onNav, onOpenFollow }) {
           </div>
         </Card>
       </div>
+      <Card className={"ov-ai-card" + (ai.enabled ? " is-live" : "")}>
+        <div className="ov-ai-identity">
+          <span className="ov-ai-icon"><Ico n="shield-check" /></span>
+          <div><span className="ps-card-eyebrow">主盘赛前佐证</span><h3>AI 风控雷达</h3><small>{ai.enabled ? "运行中 · 新主盘 BUY 正在独立研判" : "已关闭 · 原跟单策略不受影响"}</small></div>
+          <Badge tone={ai.enabled ? "up" : "neutral"} dot>{ai.enabled ? "已开启" : "已关闭"}</Badge>
+        </div>
+        <div className="ov-ai-metrics">
+          <div><span>强冲突拦截</span><b>{ai.blocked_count || 0}</b></div>
+          <div><span>一致放行</span><b>{ai.agree_count || 0}</b></div>
+          <div><span>已结算拦截</span><b>{ai.resolved_blocked_count || 0}</b></div>
+          <div className="ov-ai-impact"><span>实质净影响</span><b className={pnlClass(ai.net_effect_usdc || 0)}>{signedMoney(ai.net_effect_usdc || 0)}</b><small>{(ai.net_effect_usdc || 0) >= 0 ? "避免亏损多于少赚" : "少赚多于避免亏损"}</small></div>
+        </div>
+        <Button variant="ghost" size="sm" onClick={() => nav("ai")}>查看判断明细</Button>
+      </Card>
       <div className="ov-dashboard-grid ov-grid-structure">
         <Card className="ov-dist-card" eyebrow="盘口结构" title="历史跟单类型分布" action={
           <SegmentedControl value={distMetric} onChange={setDistMetric} options={[
@@ -704,7 +731,7 @@ function FollowsPage({ data, goStrategy, onOpenFollow }) {
             <div className="filter-group">
               <label htmlFor="st-f">状态</label>
               <select id="st-f" className="ps-select" value={status} onChange={(e) => setStatus(e.target.value)}>
-                <option value="all">全部</option><option value="open">进行中</option><option value="settled">已结算</option>
+                <option value="all">全部</option><option value="open">进行中</option><option value="settled">已结算</option><option value="ai_blocked">AI拦截</option>
               </select>
             </div>
             <Button size="sm" variant="ghost" iconLeft={<i data-lucide="sliders-horizontal"></i>} onClick={goStrategy}>调整策略</Button>
@@ -719,6 +746,7 @@ function FollowsPage({ data, goStrategy, onOpenFollow }) {
                   <td><MatchCell ev={f} tag={f.marketType} held={(f.sides || []).map((s) => s.outcome)} /></td>
                   <td><div className="cell-stack">
                     <div className="evt-status"><FollowStatusBadge f={f} />{f.sourceOffLeaderboard && <Badge tone="warn" title="源钱包已不在最新榜单 — 此跟单继续跟至结算，但不再新开仓">源已脱榜</Badge>}</div>
+                    <AiDecisionBadge action={f.aiAction} assessment={f.aiRisk} />
                     {f.exitPrice != null && <span className="muted" title="提前卖出/部分卖出的加权卖出价">卖出价：{priceStr(f.exitPrice)}</span>}
                   </div></td>
                   <td className="strong">{f.wallets}</td>
@@ -867,6 +895,43 @@ function WalletLegBlock({ w, prices, ev }) {
   );
 }
 
+function AiRiskDetailCard({ risk }) {
+  if (!risk) return null;
+  const a = risk.assessment || {};
+  const verdict = String(a.verdict || "insufficient");
+  const winner = verdict === "team_a" ? a.team_a : verdict === "team_b" ? a.team_b : "";
+  const pa = a.team_a_win_probability == null ? null : Number(a.team_a_win_probability);
+  const pb = a.team_b_win_probability == null ? null : Number(a.team_b_win_probability);
+  const counts = risk.action_counts || {};
+  const action = counts.blocked ? "blocked" : counts.agree ? "agree" : counts.insufficient ? "insufficient" : "unavailable";
+  const actionText = action === "blocked" ? `拦截 ${counts.blocked} 个意图` : action === "agree" ? "与跟单方向一致" : action === "insufficient" ? "信息不足 · 原策略放行" : "AI不可用 · 原策略放行";
+  return (
+    <section className={"ai-judgment action-" + action}>
+      <div className="ai-judgment-head">
+        <div className="ai-orb"><Ico n="sparkles" /></div>
+        <div><span className="ai-eyebrow">AI 赛前判断</span><h3>{winner ? `更看好 ${winner}` : "本场暂无可靠结论"}</h3></div>
+        <AiDecisionBadge action={action} assessment={a} />
+      </div>
+      <div className="ai-prob-grid">
+        <div><span>{a.team_a || "队伍 A"}</span><b>{pa == null ? "—" : Math.round(pa) + "%"}</b><i><em style={{ width: (pa || 0) + "%" }} /></i></div>
+        <div><span>{a.team_b || "队伍 B"}</span><b>{pb == null ? "—" : Math.round(pb) + "%"}</b><i><em style={{ width: (pb || 0) + "%" }} /></i></div>
+        <div className="ai-confidence"><span>判断置信度</span><b>{a.confidence != null ? Math.round(Number(a.confidence)) + "%" : "—"}</b><small>{a.knowledge_recency === "recent" ? "资料可用" : a.status === "ok" ? "谨慎参考" : "未完成判断"}</small></div>
+      </div>
+      <div className="ai-reason"><b>{actionText}</b><span>{a.reason_zh || a.error || "DeepSeek 未返回可用结论"}</span></div>
+      {risk.blocked_wallets && risk.blocked_wallets.length > 0 && <div className="ai-blocked-list">
+        <div className="ai-blocked-title"><span>被拦截的下单意图</span><small>计划投入 {money(risk.blocked_intended_stake)} · 实际投入 $0.00</small></div>
+        {risk.blocked_wallets.map((w, i) => <div className="ai-blocked-row" key={(w.wallet || "") + i}>
+          <WalletAddress address={w.wallet} copyable />
+          <SideChip outcome={w.outcome} index={w.outcome_index} ev={{ teamA: a.team_a, teamB: a.team_b }} />
+          <span>计划 {money(w.intended_stake)} · {priceStr(w.entry_price)}</span>
+          <b className={w.ai_net_effect != null ? pnlClass(w.ai_net_effect) : ""}>{w.ai_net_effect != null ? `AI影响 ${signedMoney(w.ai_net_effect)}` : "待结算"}</b>
+        </div>)}
+      </div>}
+      <div className="ai-audit-foot"><span>{a.model || "DeepSeek"} · {a.prompt_version || "—"}</span><span>{risk.counterfactual_label}</span></div>
+    </section>
+  );
+}
+
 function FollowDetailModal({ cid, onClose, toast }) {
   const [detail, setDetail] = React.useState(null);
   const [err, setErr] = React.useState(false);
@@ -947,6 +1012,7 @@ function FollowDetailModal({ cid, onClose, toast }) {
             <IconButton size="sm" label="刷新盘口价" disabled={refreshing} className={"mh-refresh" + (refreshing ? " spinning" : "")} onClick={refreshPrices}><Ico n="refresh-cw" /></IconButton>
           </div>
         </div>
+        <AiRiskDetailCard risk={detail.ai_risk} />
         {(detail.wallets || []).map((w) => <WalletLegBlock w={w} prices={px} ev={ev} key={w.wallet} />)}
       </div>
     );
@@ -1101,6 +1167,8 @@ function Ico({ n, className }) {
     case "sparkles": return <svg {...p}><path d="m12 3 1.9 5.8a2 2 0 0 0 1.3 1.3L21 12l-5.8 1.9a2 2 0 0 0-1.3 1.3L12 21l-1.9-5.8a2 2 0 0 0-1.3-1.3L3 12l5.8-1.9a2 2 0 0 0 1.3-1.3z" /></svg>;
     case "circle-alert": return <svg {...p}><circle cx="12" cy="12" r="10" /><line x1="12" x2="12" y1="8" y2="12" /><line x1="12" x2="12.01" y1="16" y2="16" /></svg>;
     case "lock": return <svg {...p}><rect width="18" height="11" x="3" y="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></svg>;
+    case "lock-keyhole": return <svg {...p}><rect width="18" height="11" x="3" y="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /><circle cx="12" cy="16" r="1" /></svg>;
+    case "shield-check": return <svg {...p}><path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3z" /><path d="m9 12 2 2 4-4" /></svg>;
     case "crosshair": return <svg {...p}><circle cx="12" cy="12" r="10" /><line x1="22" x2="18" y1="12" y2="12" /><line x1="6" x2="2" y1="12" y2="12" /><line x1="12" x2="12" y1="6" y2="2" /><line x1="12" x2="12" y1="22" y2="18" /></svg>;
     case "wallet": return <svg {...p}><path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1" /><path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4" /></svg>;
     case "filter": return <svg {...p}><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" /></svg>;
@@ -1457,12 +1525,118 @@ function ProgressMask({ kind, done, error, label, hint, onClose }) {
 /* ============================================================
    Shell + data orchestration
    ============================================================ */
+function AiRiskPage({ toast }) {
+  const [data, setData] = React.useState(null);
+  const [wrap, setWrap] = React.useState(null);
+  const [secret, setSecret] = React.useState("");
+  const [show, setShow] = React.useState(false);
+  const [busy, setBusy] = React.useState("");
+  const load = React.useCallback(async () => {
+    const [status, key] = await Promise.all([Api.aiRisk(), Api.aiWrapKey()]);
+    setData(status); setWrap(key);
+  }, []);
+  React.useEffect(() => { load().catch(() => toast("AI 风控状态加载失败", "error")); }, [load, toast]);
+  if (!data) return <CenterLoad />;
+  const cfg = data.settings || {};
+  const credential = data.credential || {};
+  const balance = data.balance;
+  const summary = data.summary || {};
+  const connectionTone = credential.status === "valid" ? "up" : credential.status === "error" ? "down" : "neutral";
+  const connectionText = credential.status === "valid" ? "连接正常" : credential.status === "error" ? "连接异常" : "未配置";
+
+  const save = async () => {
+    if (!secret.trim() || !wrap) return;
+    setBusy("save");
+    try {
+      const envelope = await window.PSEncryptCredential(secret.trim(), wrap);
+      await Api.saveAiCredential(envelope); setSecret(""); setShow(false); await load();
+      toast("DeepSeek Key 已在浏览器加密并验证", "success");
+    } catch (e) {
+      toast(e && e.message === "secure_context_required" ? "请通过 HTTPS 或 localhost 配置凭证" : "保存失败，请检查 API Key", "error");
+    } finally { setBusy(""); }
+  };
+  const test = async () => {
+    setBusy("test");
+    try { await Api.testAiCredential(); await load(); toast("DeepSeek 连接与余额正常", "success"); }
+    catch (e) { await load().catch(() => {}); toast("DeepSeek 连接测试失败", "error"); }
+    finally { setBusy(""); }
+  };
+  const toggle = async (enabled) => {
+    setBusy("toggle");
+    try { await Api.saveAiSettings(enabled); await load(); toast(enabled ? "AI 主盘风控已开启" : "AI 主盘风控已关闭", "success"); }
+    catch (e) { toast(e && e.error === "deepseek_not_configured" ? "请先保存并验证 DeepSeek Key" : "AI 风控状态更新失败", "error"); }
+    finally { setBusy(""); }
+  };
+  const remove = async () => {
+    if (!window.confirm("删除 DeepSeek 凭证？历史 AI 判断与拦截记录会保留。")) return;
+    setBusy("delete");
+    try { await Api.deleteAiCredential(); await load(); toast("DeepSeek 凭证已删除", "success"); }
+    catch (e) { toast("删除失败", "error"); }
+    finally { setBusy(""); }
+  };
+
+  return <div className="page-inner ai-page">
+    <section className="ai-command-card">
+      <div className="ai-command-copy">
+        <span className="ai-kicker"><Ico n="shield-check" /> PRE-MATCH INTELLIGENCE</span>
+        <h2>让历史实力成为主盘的第二道门</h2>
+        <p>DeepSeek 先独立判断两队胜面，再由本地规则与钱包方向比对。它看不到钱包、赔率、投入金额，也不会介入地图盘和局盘。</p>
+        <div className="ai-rule-pills"><span>主盘限定</span><span>对手胜率 ≥ 65%</span><span>置信度 ≥ 75%</span><span>异常时原策略放行</span></div>
+      </div>
+      <div className="ai-master-switch">
+        <span className={"ai-live-dot" + (cfg.enabled ? " on" : "")}></span>
+        <div><b>{cfg.enabled ? "风控运行中" : "风控已关闭"}</b><small>{cfg.enabled ? "新主盘 BUY 将经过 AI 判定" : "现有跟单逻辑保持不变"}</small></div>
+        <Switch checked={!!cfg.enabled} disabled={!!busy} onChange={toggle} accent />
+      </div>
+    </section>
+
+    <div className="ai-page-grid">
+      <Card className="ai-connection-card">
+        <div className="ai-section-head"><div><span>安全与连接</span><h3>DeepSeek API</h3></div><Badge tone={connectionTone} dot>{connectionText}</Badge></div>
+        <div className="ai-provider-line"><span className="ai-provider-mark">DS</span><div><b>{cfg.model || "deepseek-v4-pro"}</b><small>BYOK · Key 仅以信封密文保存</small></div></div>
+        <div className="ai-secret-row">
+          <Input type={show ? "text" : "password"} value={secret} onChange={(e) => setSecret(e.target.value)} placeholder={credential.configured ? "输入新 Key 可安全替换" : "sk-••••••••••••"} autoComplete="off" />
+          <Button variant="ghost" size="sm" onClick={() => setShow((v) => !v)}>{show ? "隐藏" : "显示"}</Button>
+          <Button variant="primary" size="sm" disabled={!secret.trim() || !!busy || !wrap?.ready} onClick={save}>{busy === "save" ? "验证中…" : "加密保存"}</Button>
+        </div>
+        <p className="ai-security-note"><Ico n="lock-keyhole" /> 浏览器使用 AES-GCM 加密，随机密钥再由本 VPS 的 RSA 公钥包装；数据库和请求日志不接触明文 Key。</p>
+        {balance && <div className="ai-balance-strip"><span><small>账户余额</small><b>{Number(balance.total_balance || 0).toFixed(2)} {balance.currency || ""}</b></span><span><small>最近检查</small><b>{balance.checked_at ? new Date(balance.checked_at * 1000).toLocaleString() : "—"}</b></span></div>}
+        <div className="ai-connection-actions"><Button variant="ghost" size="sm" disabled={!credential.configured || !!busy} onClick={test}>{busy === "test" ? "测试中…" : "测试连接 / 刷新余额"}</Button>{credential.configured && <Button variant="danger" size="sm" disabled={!!busy} onClick={remove}>删除凭证</Button>}</div>
+      </Card>
+
+      <Card className="ai-impact-card">
+        <div className="ai-section-head"><div><span>反事实审计</span><h3>AI 带来的净影响</h3></div><span className="ai-audit-count">{summary.resolved_blocked_count || 0} 个已结算拦截</span></div>
+        <div className="ai-net-value"><span>累计净影响</span><b className={pnlClass(summary.net_effect_usdc || 0)}>{signedMoney(summary.net_effect_usdc || 0)}</b></div>
+        <div className="ai-impact-split"><div><span>避免亏损</span><b className="pnl-up">+{money(summary.avoided_loss_usdc || 0)}</b></div><div><span>错失盈利</span><b className="pnl-down">-{money(summary.missed_profit_usdc || 0)}</b></div></div>
+        <p>按每个被拦截意图模拟原策略的卖出、止损和结算；不把释放资金的后续用途强行归因给 AI。</p>
+      </Card>
+    </div>
+
+    <Card className="ai-recent-card" pad="flush">
+      <div className="ai-recent-head"><div><span>最近研判</span><h3>独立赛前结论</h3></div><div className="ai-mini-stats"><span>一致 <b>{summary.agree_count || 0}</b></span><span>拦截 <b>{summary.blocked_count || 0}</b></span><span>不确定 <b>{summary.insufficient_count || 0}</b></span></div></div>
+      <div className="ai-assessment-list">
+        {(data.recent_assessments || []).slice(0, 8).map((a) => {
+          const winner = a.verdict === "team_a" ? a.team_a : a.verdict === "team_b" ? a.team_b : "信息不足";
+          const prob = a.verdict === "team_a"
+            ? a.team_a_win_probability
+            : a.verdict === "team_b"
+              ? a.team_b_win_probability
+              : null;
+          return <div className="ai-assessment-row" key={a.condition_id}><div><b>{a.team_a} <i>vs</i> {a.team_b}</b><span>{a.game?.toUpperCase()} · {a.best_of || "主盘"}</span></div><div><span>预测胜方</span><b>{winner}{prob != null ? ` ${Math.round(Number(prob))}%` : ""}</b></div><div><span>置信度</span><b>{a.confidence != null ? Math.round(Number(a.confidence)) + "%" : "—"}</b></div><p>{a.reason_zh || a.error || "判断未完成"}</p></div>;
+        })}
+        {!(data.recent_assessments || []).length && <div className="empty-cell">开启风控后，监控窗口内的主盘会在这里生成独立判断</div>}
+      </div>
+    </Card>
+  </div>;
+}
+
 const PAGES = {
   overview: { title: "概览", icon: "layout-dashboard" },
   strategy: { title: "跟单策略", icon: "crosshair" },
   leaderboard: { title: "Leaderboard", icon: "trophy" },
   events: { title: "关注赛事", icon: "swords" },
   follows: { title: "跟单列表", icon: "list-checks" },
+  ai: { title: "AI 风控", icon: "sparkles" },
 };
 
 function useToasts() {
@@ -1639,6 +1813,7 @@ function Dashboard({ onLogout, toast }) {
   else if (page === "leaderboard") Body = <LeaderboardPage data={data} merge={merge} toast={toast} onOpenWallet={openWallet} onSample={runSample} />;
   else if (page === "events") Body = <EventsPage data={data} />;
   else if (page === "follows") Body = <FollowsPage data={data} goStrategy={() => setPage("strategy")} onOpenFollow={openFollow} />;
+  else if (page === "ai") Body = <AiRiskPage toast={toast} />;
 
   return (
     <div className="app-shell" data-theme={light ? "light" : "dark"}>
@@ -1649,6 +1824,7 @@ function Dashboard({ onLogout, toast }) {
           { id: "leaderboard", label: "Leaderboard", icon: ico("trophy"), count: counts.leaderboard },
           { id: "events", label: "关注赛事", icon: ico("swords"), count: counts.events },
           { id: "follows", label: "跟单列表", icon: ico("list-checks"), count: counts.follows },
+          { id: "ai", label: "AI 风控", icon: ico("sparkles") },
         ]}
         footer={<div className="theme-toggle"><span>{ico(light ? "sun" : "moon")} {light ? "浅色" : "深色"}</span><Switch checked={!light} onChange={() => setLight((v) => !v)} accent /></div>}
       />

@@ -348,6 +348,10 @@ POST /api/follow-strategies      (+ /api/follow-strategies/<id>/{activate,delete
 POST /api/runner/start
 POST /api/runner/stop
 POST /api/reset-data
+POST /api/ai-risk/credential
+POST /api/ai-risk/credential/test
+POST /api/ai-risk/credential/delete
+POST /api/ai-risk/settings
 ```
 
 `wallet-refresh` and runner controls write process/control state only, not
@@ -362,10 +366,15 @@ explicit personal-use destructive operation for clearing generated
 category/follow/log state; it must stay behind authenticated dashboard access
 and must not be called implicitly. The only live external Data API request from
 dashboard is `/api/wallets/{addr}/trades`; validate wallet addresses first.
+AI credential mutations store only the browser-created AES-GCM/RSA-OAEP
+envelope under `data/.secrets/`; the plaintext key must never enter SQLite,
+logs, SSE, follow state, or control files. `reset-data` deliberately preserves
+this separate credential store; deleting it requires the explicit credential
+delete endpoint.
 
 `GET /api/stream` is same-origin, cookie-authenticated SSE. It sends an
 immediate frame, heartbeats, caps clients, and releases the count in `finally`.
-Do not switch to WebSocket unless the zero-dependency design changes.
+Do not switch to WebSocket without a concrete need and corresponding tests.
 
 Dashboard runner input is a percentage (`--stake-ratio-percent`), not dollars.
 Minimum stake remains server config `--runner-stake-usdc` (default 1).
@@ -414,12 +423,16 @@ poly_fight/core.py       classification, scoring, pure logic
 poly_fight/api.py        read-only HTTP client
 poly_fight/cli.py        collect/follow/run/serve
 poly_fight/follow.py     paper follow logic
+poly_fight/ai_risk.py    DeepSeek assessment, encrypted BYOK config, local gate
 poly_fight/dashboard.py  read-only dashboard/API
 poly_fight/storage.py    SQLite follow-state persistence
 tests/test_core.py       unittest coverage
 ```
 
-The project intentionally uses only the Python standard library.
+Dependencies are allowed when they materially improve security or correctness.
+Keep runtime dependencies minimal, version-locked in `requirements.txt`, covered
+by tests, and installed into the project virtual environment.  Never add a
+dependency merely for convenience when a small existing implementation is safer.
 
 ## Generated Data
 

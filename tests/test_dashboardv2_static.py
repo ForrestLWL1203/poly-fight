@@ -52,14 +52,14 @@ class DashboardV2StaticTests(unittest.TestCase):
         for banned in ("vue-3", "daisyui", "tailwind-browser", "v-cloak"):
             self.assertNotIn(banned, html, f"index.html should not reference {banned}")
 
-    def test_app_exposes_five_pages(self):
+    def test_app_exposes_dashboard_pages(self):
         app = _read("app.jsx")
         for comp in (
             "function OverviewPage", "function StrategyPage", "function LeaderboardPage",
-            "function EventsPage", "function FollowsPage",
+            "function EventsPage", "function FollowsPage", "function AiRiskPage",
         ):
             self.assertIn(comp, app, f"app.jsx missing {comp}")
-        for label in ("概览", "跟单策略", "Leaderboard", "关注赛事", "跟单列表"):
+        for label in ("概览", "跟单策略", "Leaderboard", "关注赛事", "跟单列表", "AI 风控"):
             self.assertIn(label, app, f"app.jsx missing sidebar label {label}")
 
     def test_app_has_auth_and_detail_modals(self):
@@ -85,7 +85,8 @@ class DashboardV2StaticTests(unittest.TestCase):
         for ep in ("/api/login", "/api/overview", "/api/wallets", "/api/events",
                    "/api/follows", "/api/follow-strategy", "/api/runner/start",
                    "/api/runner/stop", "/api/wallet-favorites", "/api/wallet-quarantine",
-                   "/api/stream"):
+                   "/api/ai-risk", "/api/ai-risk/wrap-key", "/api/ai-risk/credential",
+                   "/api/ai-risk/settings", "/api/stream"):
             self.assertIn(ep, api, f"api.js missing endpoint {ep}")
 
     def test_mock_mode_available(self):

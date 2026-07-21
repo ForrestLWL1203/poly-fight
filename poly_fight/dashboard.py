@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .control import _pid_alive, read_follow_control, reconcile_wallet_refresh_status, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
+from .ai_risk import AiConfigStore, DeepSeekClient, ai_audit_summary
 from .core import (
     GAME_FAMILY_LABELS,
     LEAGUE_LABELS,
@@ -249,6 +250,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/reset-data":
                 self._reset_data()
                 return
+            if parsed.path == "/api/ai-risk/credential":
+                self._ai_credential_save()
+                return
+            if parsed.path == "/api/ai-risk/credential/test":
+                self._ai_credential_test()
+                return
+            if parsed.path == "/api/ai-risk/credential/delete":
+                self._ai_credential_delete()
+                return
+            if parsed.path == "/api/ai-risk/settings":
+                self._ai_settings()
+                return
         self._error("not_found", status=HTTPStatus.NOT_FOUND)
 
     def _handle_api_get(self, parsed: urllib.parse.ParseResult) -> None:
@@ -268,6 +281,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/overview":
             self._ok(build_overview(self.dashboard_config.data_dir, follow_dir=follow_dir))
+            return
+        if parsed.path == "/api/ai-risk":
+            config_store = AiConfigStore(self.dashboard_config.data_dir)
+            follow_store = FollowStore(_follow_db_path(self.dashboard_config))
+            audit = follow_store.load_ai_audit(limit=20)
+            self._ok({
+                **config_store.status(),
+                "summary": ai_audit_summary(follow_store),
+                "recent_assessments": audit.get("assessments") or [],
+                "recent_intents": audit.get("intents") or [],
+            })
+            return
+        if parsed.path == "/api/ai-risk/wrap-key":
+            self._ok(AiConfigStore(self.dashboard_config.data_dir).public_wrap_key())
             return
         if parsed.path == "/api/follow-strategy":
             store = FollowStore(_follow_db_path(self.dashboard_config))
@@ -623,6 +650,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": exc.reason, "data": exc.status}, status=HTTPStatus.CONFLICT)
             return
         self._json({"ok": True, "data": result, "generated_at": int(time.time())}, status=HTTPStatus.OK)
+
+    def _ai_credential_save(self) -> None:
+        form = self._read_request_form()
+        envelope = form.get("envelope") if isinstance(form.get("envelope"), dict) else form
+        store = AiConfigStore(self.dashboard_config.data_dir)
+        try:
+            secret = store.decrypt_envelope(envelope)
+            balance = DeepSeekClient(secret).balance()
+            store.save_credential(envelope)
+            safe_balance = store.save_balance(balance)
+        except Exception as exc:
+            self._error("deepseek_credential_invalid", status=HTTPStatus.BAD_GATEWAY, detail=str(exc)[:200])
+            return
+        self._ok({"configured": True, "status": "valid", "balance": safe_balance})
+
+    def _ai_credential_test(self) -> None:
+        store = AiConfigStore(self.dashboard_config.data_dir)
+        try:
+            secret = store.secret()
+            if not secret:
+                self._error("deepseek_not_configured", status=HTTPStatus.BAD_REQUEST)
+                return
+            balance = DeepSeekClient(secret).balance()
+            store.mark_credential_valid()
+            safe_balance = store.save_balance(balance)
+        except Exception as exc:
+            store.mark_credential_error(str(exc))
+            store.save_balance(None, error=str(exc))
+            self._error("deepseek_connection_failed", status=HTTPStatus.BAD_GATEWAY, detail=str(exc)[:200])
+            return
+        self._ok({"configured": True, "status": "valid", "balance": safe_balance})
+
+    def _ai_credential_delete(self) -> None:
+        store = AiConfigStore(self.dashboard_config.data_dir)
+        store.save_settings(enabled=False)
+        self._ok({"deleted": store.delete_credential(), "enabled": False})
+
+    def _ai_settings(self) -> None:
+        form = self._read_request_form()
+        enabled = _request_bool(form.get("enabled"), default=False)
+        store = AiConfigStore(self.dashboard_config.data_dir)
+        if enabled and not store.credential_envelope():
+            self._error("deepseek_not_configured", status=HTTPStatus.CONFLICT)
+            return
+        self._ok(store.save_settings(enabled=enabled))
 
     def _wallet_trades(self, raw_addr: str, query: dict[str, list[str]]) -> None:
         wallet = urllib.parse.unquote(raw_addr).lower()
@@ -1040,6 +1112,14 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
         for category in CATEGORIES
     }
     overview.update(_overview_full_app_aggregates(open_signals, results))
+    # A normal overview read must not create or mutate the credential store.
+    ai_config = AiConfigStore.read_existing_status(Path(data_dir))
+    overview["ai_risk"] = {
+        **ai_audit_summary(store),
+        "enabled": bool((ai_config.get("settings") or {}).get("enabled")),
+        "credential_configured": bool((ai_config.get("credential") or {}).get("configured")),
+        "credential_status": str((ai_config.get("credential") or {}).get("status") or "not_configured"),
+    }
     return overview
 
 
@@ -1898,21 +1978,112 @@ def wallet_leaderboard_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _merge_ai_audit_groups(
+    groups: dict[str, dict[str, Any]],
+    audit: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    assessments = {
+        str(row.get("condition_id") or "").lower(): row
+        for row in audit.get("assessments") or []
+        if row.get("condition_id")
+    }
+    intents_by_condition: dict[str, list[dict[str, Any]]] = {}
+    shadows_by_intent = {
+        str(row.get("intent_id") or ""): row
+        for row in audit.get("shadows") or []
+        if row.get("intent_id")
+    }
+    for intent in audit.get("intents") or []:
+        cid = str(intent.get("condition_id") or "").lower()
+        if cid:
+            intents_by_condition.setdefault(cid, []).append(intent)
+
+    # A condition with only blocked intentions has no follow_signal, but it is a
+    # first-class research record and must remain visible after settlement.
+    for cid, intents in intents_by_condition.items():
+        if cid in groups or not any(row.get("action") == "blocked" for row in intents):
+            continue
+        sample = intents[0]
+        pseudo = []
+        for intent in intents:
+            if intent.get("action") != "blocked":
+                continue
+            shadow = shadows_by_intent.get(str(intent.get("intent_id") or "")) or {}
+            pseudo.append({
+                "signal_id": "blocked:" + str(intent.get("intent_id") or ""),
+                "condition_id": cid,
+                "wallet": intent.get("wallet"),
+                "outcome_index": intent.get("outcome_index"),
+                "outcome": intent.get("outcome"),
+                "event_title": intent.get("event_title"),
+                "market_question": intent.get("market_question"),
+                "market_type": intent.get("market_type") or "main_match",
+                "category": intent.get("category") or "esports",
+                "game_family": intent.get("game_family"),
+                "match_start_time": intent.get("match_start_time"),
+                "end_date": intent.get("end_date"),
+                "status": "open" if shadow.get("status") == "open" else "settled",
+                "created_at": intent.get("created_at"),
+                "updated_at": shadow.get("updated_at") or intent.get("updated_at"),
+                "legs": [],
+            })
+        built = _follow_groups_from_signals(pseudo).get(cid)
+        if built:
+            # Keep AI-blocked as a first-class list status after settlement; the
+            # shadow lifecycle is carried separately for the audit/result view.
+            built["status"] = "ai_blocked"
+            built["ai_shadow_status"] = "open" if any(
+                (shadows_by_intent.get(str(row.get("intent_id") or "")) or {}).get("status") == "open"
+                for row in intents if row.get("action") == "blocked"
+            ) else "settled"
+            built["title"] = built.get("title") or sample.get("event_title")
+            groups[cid] = built
+
+    priority = {"blocked": 4, "agree": 3, "insufficient": 2, "unavailable": 1}
+    for cid, group in groups.items():
+        intents = sorted(
+            intents_by_condition.get(cid) or [],
+            key=lambda row: (priority.get(str(row.get("action") or ""), 0), int(row.get("updated_at") or 0)),
+            reverse=True,
+        )
+        if not intents:
+            continue
+        action_counts: dict[str, int] = {}
+        for intent in intents:
+            action = str(intent.get("action") or "unavailable")
+            action_counts[action] = action_counts.get(action, 0) + 1
+        shadow_rows = [
+            shadows_by_intent[str(intent.get("intent_id"))]
+            for intent in intents
+            if str(intent.get("intent_id") or "") in shadows_by_intent
+        ]
+        group["ai_risk"] = assessments.get(cid)
+        group["ai_action"] = str(intents[0].get("action") or "unavailable")
+        group["ai_action_counts"] = action_counts
+        group["ai_intent_count"] = len(intents)
+        group["ai_blocked_intended_stake"] = round(sum(
+            to_float(row.get("intended_stake")) for row in intents if row.get("action") == "blocked"
+        ), 8)
+        group["ai_net_effect"] = round(sum(to_float(row.get("ai_net_effect")) for row in shadow_rows), 8)
+    return groups
+
+
 def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str = "", category: str = "", follow_dir: Path | None = None, client: Any = None) -> dict[str, Any]:
     store = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir))
     result = store.load_dashboard_follow_rows(page=1, size=10_000)
     logo_cache = _load_team_logo_cache(data_dir)
-    allowed_statuses = {"open", "settled", "insufficient_balance"}
+    allowed_statuses = {"open", "settled", "insufficient_balance", "ai_blocked"}
     status_filter = status if status in allowed_statuses else ""
     category_filter = normalize_category(category)
     groups = _follow_groups_from_signals(
         [signal for signal in result.get("signals", []) if _signal_has_actual_follow(signal)]
     )
+    groups = _merge_ai_audit_groups(groups, store.load_ai_audit(limit=10_000))
     # 进行中(未结算)的跟单排最前;组内再按开单时间(最近一次建腿动作)最近的在前。
     rows = sorted(
         groups.values(),
         key=lambda row: (
-            1 if str(row.get("status") or "") in {"open", "insufficient_balance"} else 0,
+            1 if str(row.get("status") or "") in {"open", "insufficient_balance", "ai_blocked"} else 0,
             int(row.get("last_follow_action_at") or 0),
             int(row.get("last_activity_at") or 0),
             str(row.get("condition_id") or ""),
@@ -1921,6 +2092,8 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
     )
     if status_filter == "open":
         rows = [row for row in rows if str(row.get("status") or "") in {"open", "insufficient_balance"}]
+    elif status_filter == "ai_blocked":
+        rows = [row for row in rows if str(row.get("ai_action") or "") == "blocked"]
     elif status_filter:
         rows = [row for row in rows if str(row.get("status") or "") == status_filter]
     if category_filter:
@@ -2058,7 +2231,13 @@ def _signal_follow_outcome_key(signal: dict[str, Any]) -> str:
 
 def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path | None = None, client: Any = None) -> dict[str, Any]:
     condition_id = condition_id.lower()
-    result = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir)).load_dashboard_follow_detail(condition_id)
+    store = FollowStore(_follow_db_file(data_dir, follow_dir=follow_dir))
+    result = store.load_dashboard_follow_detail(condition_id)
+    ai_audit = store.load_ai_audit(condition_id=condition_id, limit=1000)
+    ai_assessment = (ai_audit.get("assessments") or [None])[0]
+    ai_intents = ai_audit.get("intents") or []
+    ai_shadows = ai_audit.get("shadows") or []
+    ai_shadow_by_intent = {str(row.get("intent_id") or ""): row for row in ai_shadows}
     signals = result.get("signals", [])
     _annotate_signal_quality(signals)
     market = _active_market_by_condition(data_dir, condition_id, follow_dir=follow_dir)
@@ -2134,6 +2313,7 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
         bucket["_follow_weighted_entry"] += entry_summary["_weighted_entry"] or 0.0
         if entry_summary["follow_total_stake"] > 0:
             bucket["_follow_outcome_keys"].add(_signal_follow_outcome_key(signal))
+    ai_sample = ai_intents[0] if ai_intents else {}
     for bucket in by_wallet.values():
         total_stake = to_float(bucket.pop("_follow_total_stake", 0.0))
         priced_stake = to_float(bucket.pop("_follow_priced_stake", 0.0))
@@ -2158,14 +2338,14 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
         # 与"提前卖出"标签一起显示(比只显示卖出价更直观)。
         bucket["follow_exit_stake"] = round(exit_stake, 8) if exit_stake > 0 and not mixed_outcomes else None
         bucket["follow_realized_pnl"] = round(realized_pnl, 8) if realized_count else None
-    title = title or str(market.get("title") or "")
-    question = question or str(market.get("question") or "")
-    match_start_time = match_start_time or market.get("match_start_time") or market.get("market_start_time")
-    end_date = end_date or market.get("end_date")
+    title = title or str(market.get("title") or ai_sample.get("event_title") or "")
+    question = question or str(market.get("question") or ai_sample.get("market_question") or "")
+    match_start_time = match_start_time or market.get("match_start_time") or market.get("market_start_time") or ai_sample.get("match_start_time")
+    end_date = end_date or market.get("end_date") or ai_sample.get("end_date")
     event_slug = event_slug or _event_slug(market)
-    market_type = market_type or str(market.get("market_type") or "")
+    market_type = market_type or str(market.get("market_type") or ai_sample.get("market_type") or "")
     market_type_label = market_type_label or str(market.get("market_type_label") or "")
-    category = category or normalize_category(str(market.get("category") or "")) or "esports"
+    category = category or normalize_category(str(market.get("category") or ai_sample.get("category") or "")) or "esports"
     match_parts = _match_parts_for_row(
         {
             "title": title,
@@ -2174,6 +2354,40 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
             "market_type_label": market_type_label,
         }
     )
+    action_counts: dict[str, int] = {}
+    for intent in ai_intents:
+        action = str(intent.get("action") or "unavailable")
+        action_counts[action] = action_counts.get(action, 0) + 1
+    blocked_wallets = []
+    for intent in ai_intents:
+        if intent.get("action") != "blocked":
+            continue
+        shadow = ai_shadow_by_intent.get(str(intent.get("intent_id") or "")) or {}
+        blocked_wallets.append({
+            "wallet": intent.get("wallet"),
+            "short_addr": short_addr(str(intent.get("wallet") or "")),
+            "outcome": intent.get("outcome"),
+            "outcome_index": intent.get("outcome_index"),
+            "intended_stake": intent.get("intended_stake"),
+            "entry_price": intent.get("entry_price"),
+            "created_at": intent.get("created_at"),
+            "shadow_status": shadow.get("status"),
+            "baseline_pnl": shadow.get("realized_pnl") if shadow.get("status") in {"settled", "exited"} else None,
+            "ai_net_effect": shadow.get("ai_net_effect") if shadow.get("status") in {"settled", "exited"} else None,
+            "outcome_won": shadow.get("outcome_won"),
+        })
+    ai_detail = None
+    if ai_assessment or ai_intents:
+        ai_detail = {
+            "assessment": ai_assessment,
+            "action_counts": action_counts,
+            "intent_count": len(ai_intents),
+            "blocked_intent_count": action_counts.get("blocked", 0),
+            "blocked_intended_stake": round(sum(to_float(row.get("intended_stake")) for row in ai_intents if row.get("action") == "blocked"), 8),
+            "blocked_wallets": blocked_wallets,
+            "net_effect": round(sum(to_float(row.get("ai_net_effect")) for row in ai_shadows), 8),
+            "counterfactual_label": "被拦截意图级反事实；不包含释放资金后续用途",
+        }
     return {
         "condition_id": condition_id,
         "category": category,
@@ -2187,11 +2401,16 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
         "market_type_label": market_type_label,
         "match_parts": match_parts,
         "team_logos": _team_logos_for_parts(match_parts, logo_cache),
-        "outcomes": market.get("outcomes"),
+        "outcomes": market.get("outcomes") or ai_sample.get("outcomes") or (
+            [ai_assessment.get("team_a"), ai_assessment.get("team_b")]
+            if isinstance(ai_assessment, dict) and ai_assessment.get("team_a") and ai_assessment.get("team_b")
+            else None
+        ),
         "outcome_prices": market.get("outcome_prices") or market.get("outcomePrices"),
         "price_live": price_live,
         "wallets": list(by_wallet.values()),
         "signal_count": len(signals),
+        "ai_risk": ai_detail,
         "db_ready": bool(result.get("db_ready")),
     }
 

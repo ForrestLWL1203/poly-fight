@@ -48,6 +48,12 @@
     open_exposure: 3180.0, account_total_equity_usdc: 8642.18,
     account_balance: { configured: true, balance_usdc: 5462.18, source: "manual", updated_at: ago(3600) },
     clean_signal_count: 14, two_sided_signal_count: 2, disagreement_signal_count: 2,
+    ai_risk: {
+      enabled: true, credential_configured: true, credential_status: "valid",
+      blocked_count: 9, agree_count: 24, insufficient_count: 4, unavailable_count: 1,
+      resolved_blocked_count: 7, avoided_loss_usdc: 1084, missed_profit_usdc: 214,
+      net_effect_usdc: 870,
+    },
     win_rates_by_game: [
       { game: "dota2", game_label: "Dota 2", wins: 18, losses: 7, settled_count: 25, win_rate: 0.72 },
       { game: "cs2", game_label: "CS2", wins: 11, losses: 2, settled_count: 13, win_rate: 0.85 },
@@ -153,14 +159,15 @@
     current_price: m.outcome_prices[0], sides: [],
   }, over);
   const follows = {
-    page: 1, size: 25, total: 5, status: "", category: "esports", db_ready: true,
+    page: 1, size: 25, total: 7, status: "", category: "esports", db_ready: true,
     follows: [
-      mkFollow(M.cs2_main, { wallet_count: 5, leg_count: 11, stake: 880, display_pnl: 142.6, display_pnl_kind: "unrealized", status: "open", quality_label: "one_way", sides: [{ outcome: "PARIVISION", outcome_index: 0, leg_count: 11 }] }),
+      mkFollow(M.cs2_main, { wallet_count: 5, leg_count: 11, stake: 880, display_pnl: 142.6, display_pnl_kind: "unrealized", status: "open", quality_label: "one_way", sides: [{ outcome: "PARIVISION", outcome_index: 0, leg_count: 11 }], ai_action: "agree", ai_risk: { status: "ok", verdict: "team_a", team_a: "PARIVISION", team_b: "Monte", team_a_win_probability: 69, team_b_win_probability: 31, confidence: 82, reason_zh: "近期状态与系列赛稳定性更强" } }),
       mkFollow(M.dota_main, { wallet_count: 4, leg_count: 8, stake: 640, display_pnl: -38.2, display_pnl_kind: "unrealized", status: "open", quality_two_sided: true, quality_label: "two_sided", market_type: "map_winner", market_type_label: "地图", sides: [{ outcome: "Team Spirit", outcome_index: 0, leg_count: 5 }, { outcome: "Falcons", outcome_index: 1, leg_count: 3 }] }),
       mkFollow(M.lol_main, { wallet_count: 6, leg_count: 14, stake: 1200, our_realized_pnl: 502.7, display_pnl: 502.7, display_pnl_kind: "realized", status: "settled", settled_by_price: true, sides: [{ outcome: "Gen.G", outcome_index: 1, leg_count: 14 }] }),
       mkFollow({ ...M.cs2_main, condition_id: "0xmockarchcs2faze0009", title: "Counter-Strike: FaZe vs G2 (BO3) - 八强", match_parts: { game: "Counter-Strike", teamA: "FaZe", teamB: "G2", meta: "(BO3) 八强" } }, { wallet_count: 3, leg_count: 6, stake: 480, our_realized_pnl: -86.2, display_pnl: -86.2, display_pnl_kind: "realized", status: "settled", quality_disagreement: true, quality_label: "disagreement", sides: [{ outcome: "FaZe", outcome_index: 0, leg_count: 4 }, { outcome: "G2", outcome_index: 1, leg_count: 2 }] }),
       mkFollow({ ...M.cs2_main, condition_id: "0xmockchaosexit0042", title: "Counter-Strike: CHAOS vs Alpha Dominion Nation (BO3) - United21 Group C", match_parts: { game: "Counter-Strike", teamA: "CHAOS", teamB: "Alpha Dominion Nation", meta: "(BO3) United21 Group C" } }, { wallet_count: 1, leg_count: 4, stake: 200, our_realized_pnl: 0, display_pnl: 0, display_pnl_kind: "realized", status: "settled", settlement_type: "manual_exit", follow_exit_price: 0.62, quality_label: "one_way", sides: [{ outcome: "CHAOS", outcome_index: 0, leg_count: 4 }] }),
       mkFollow({ ...M.dota_main, condition_id: "0xmockstoploss0077", title: "Dota 2: Tundra vs BetBoom (BO3) - 主盘止损样例", match_parts: { game: "Dota 2", teamA: "Tundra", teamB: "BetBoom", meta: "(BO3) 主盘" } }, { wallet_count: 1, leg_count: 3, stake: 150, our_realized_pnl: -82.5, display_pnl: -82.5, display_pnl_kind: "realized", status: "settled", settlement_type: "stop_loss", follow_exit_price: 0.27, quality_label: "one_way", sides: [{ outcome: "Tundra", outcome_index: 0, leg_count: 3 }] }),
+      mkFollow({ ...M.lol_main, condition_id: "0xmockaiblockedt1drx", title: "League of Legends: T1 vs Kiwoom DRX (BO1) - KeSPA Cup", match_parts: { game: "League of Legends", teamA: "T1", teamB: "Kiwoom DRX", meta: "(BO1) KeSPA Cup" } }, { wallet_count: 3, leg_count: 0, stake: 0, display_pnl: 0, status: "ai_blocked", sides: [{ outcome: "Kiwoom DRX", outcome_index: 1, leg_count: 0 }], ai_action: "blocked", ai_intent_count: 3, ai_blocked_intended_stake: 682, ai_net_effect: 682, ai_risk: { status: "ok", verdict: "team_a", team_a: "T1", team_b: "Kiwoom DRX", team_a_win_probability: 82, team_b_win_probability: 18, confidence: 91, reason_zh: "T1长期实力、交手与大赛经验明显占优" } }),
     ],
   };
 
@@ -172,6 +179,21 @@
     trade_id: "0xleg" + Math.floor(now % 1e6),
   }, over);
   function followDetail(cid) {
+    if (cid === "0xmockaiblockedt1drx") return {
+      condition_id: cid, category: "esports", title: "League of Legends: T1 vs Kiwoom DRX (BO1) - KeSPA Cup", question: "T1 vs Kiwoom DRX",
+      match_start_time: iso(-4), end_date: iso(2), market_type: "main_match", market_type_label: "主盘",
+      match_parts: { game: "League of Legends", teamA: "T1", teamB: "Kiwoom DRX", meta: "(BO1) KeSPA Cup" }, team_logos: {},
+      outcomes: ["T1", "Kiwoom DRX"], outcome_prices: [1, .001], signal_count: 0, db_ready: true, wallets: [],
+      ai_risk: {
+        assessment: { status: "ok", verdict: "team_a", team_a: "T1", team_b: "Kiwoom DRX", team_a_win_probability: 82, team_b_win_probability: 18, confidence: 91, knowledge_recency: "recent", reason_zh: "T1长期实力、交手与大赛经验明显占优", model: "deepseek-v4-pro", prompt_version: "esports-main-v1" },
+        action_counts: { blocked: 3 }, intent_count: 3, blocked_intent_count: 3, blocked_intended_stake: 682, net_effect: 682,
+        blocked_wallets: [
+          { wallet: "0xcb7286ed5e91a6db709876543210abcdef126532", outcome: "Kiwoom DRX", outcome_index: 1, intended_stake: 126, entry_price: .585, shadow_status: "settled", baseline_pnl: -126, ai_net_effect: 126 },
+          { wallet: "0xe405b789a4f01234567890abcdef12345678c67e", outcome: "Kiwoom DRX", outcome_index: 1, intended_stake: 243, entry_price: .605, shadow_status: "settled", baseline_pnl: -243, ai_net_effect: 243 },
+          { wallet: "0xe548c67890abcdef1234567890abcdef1234a9fe", outcome: "Kiwoom DRX", outcome_index: 1, intended_stake: 313, entry_price: .605, shadow_status: "settled", baseline_pnl: -313, ai_net_effect: 313 },
+        ], counterfactual_label: "被拦截意图级反事实；不包含释放资金后续用途",
+      },
+    };
     const m = M.cs2_main;
     return {
       condition_id: cid, category: "esports", title: m.title, question: m.title,
@@ -180,6 +202,11 @@
       market_type: m.market_type, market_type_label: m.market_type_label,
       match_parts: m.match_parts, team_logos: m.team_logos,
       outcomes: m.outcomes, outcome_prices: m.outcome_prices, signal_count: 2, db_ready: true,
+      ai_risk: {
+        assessment: { status: "ok", verdict: "team_a", team_a: "PARIVISION", team_b: "Monte", team_a_win_probability: 69, team_b_win_probability: 31, confidence: 82, knowledge_recency: "recent", reason_zh: "近期状态与系列赛稳定性更强", model: "deepseek-v4-pro", prompt_version: "esports-main-v1" },
+        action_counts: { agree: 2 }, intent_count: 2, blocked_intent_count: 0, blocked_intended_stake: 0, blocked_wallets: [], net_effect: 0,
+        counterfactual_label: "被拦截意图级反事实；不包含释放资金后续用途",
+      },
       wallets: [
         {
           wallet: "0x8f3c2a1b9d4e5f60718293a4b5c6d7e8f9012345", short_addr: "0x8f3...345",
@@ -315,6 +342,20 @@
     detection_source: "onchain", onchain_configured: true, onchain_healthy: true, follow_wallet_count: 41,
   };
 
+  function aiRisk() {
+    return {
+      settings: { enabled: true, model: "deepseek-v4-pro", win_probability_threshold: 65, confidence_threshold: 75, updated_at: ago(300) },
+      credential: { configured: true, status: "valid", updated_at: ago(600), last_validated_at: ago(120) },
+      balance: { checked_at: ago(120), currency: "CNY", total_balance: 96.42, is_available: true },
+      summary: { assessment_count: 18, intent_count: 31, blocked_count: 5, agree_count: 20, insufficient_count: 4, unavailable_count: 2, resolved_blocked_count: 3, avoided_loss_usdc: 682, missed_profit_usdc: 126, net_effect_usdc: 556 },
+      recent_assessments: [
+        { condition_id: "0xmockaiblockedt1drx", game: "lol", team_a: "T1", team_b: "Kiwoom DRX", best_of: "BO1", verdict: "team_a", team_a_win_probability: 82, team_b_win_probability: 18, confidence: 91, reason_zh: "T1长期实力、交手与大赛经验明显占优" },
+        { condition_id: M.cs2_main.condition_id, game: "cs2", team_a: "PARIVISION", team_b: "Monte", best_of: "BO3", verdict: "team_a", team_a_win_probability: 69, team_b_win_probability: 31, confidence: 82, reason_zh: "近期状态与系列赛稳定性更强" },
+        { condition_id: M.dota_main.condition_id, game: "dota2", team_a: "Team Spirit", team_b: "Falcons", best_of: "BO3", verdict: "insufficient", team_a_win_probability: 52, team_b_win_probability: 48, confidence: 58, reason_zh: "近期阵容信息不足" },
+      ],
+    };
+  }
+
   window.PSMock = {
     overview: () => overview,
     wallets: () => wallets,
@@ -332,6 +373,7 @@
     runnerStart,
     runnerStop,
     walletRefresh,
+    aiRisk,
     health: () => health,
     walletRefreshStatus: walletRefreshStatusFn,
     marketPrices: (cid) => ({ condition_id: cid, outcomes: M.cs2_main.outcomes, outcome_prices: [0.57, 0.43], updated_at: ago(1) }),

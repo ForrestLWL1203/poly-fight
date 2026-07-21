@@ -6,14 +6,16 @@ wallets from historical trades, scores them into a leaderboard, then simulates
 following their entries as paper legs — **no live orders, private keys,
 balances, or approvals are ever used.**
 
-The project runs on the **Python standard library only** (no third-party
-runtime dependencies). The dashboard UI ships vendored JS assets.
+The project keeps dependencies deliberately small. `cryptography` is the only
+third-party runtime dependency and is used for the encrypted DeepSeek BYOK
+credential envelope; the dashboard UI ships vendored JS assets.
 
 ---
 
 ## Requirements
 
 - Python 3.10+
+- `python3 -m pip install -r requirements.txt` (prefer a project `.venv`)
 - Network access to Polymarket's public Gamma + Data APIs
 - (Optional) Node.js, only to run the JS dashboard unit test
 
@@ -201,6 +203,9 @@ data/follow/
   follow.db                 # source of truth (see below)
   follow_state.json         # thin metadata/compatibility file
   follow_control.json       # runner/refresh/pause control
+data/.secrets/
+  ai_config.db              # DeepSeek settings + ciphertext envelope only
+  credential_wrap_private.pem  # local RSA key, chmod 0600
 ```
 
 The dashboard's "product" data lives only in SQLite now: the leaderboard and
@@ -213,7 +218,18 @@ JSON files above are collector intermediates or thin compatibility stubs.
 
 `follow.db` is the long-running source of truth: wallet cursors, open/closed
 paper signals, legs, behavior events, results, quarantine, CLV/contested fields,
-performance, manual balance cap, run ticks, and the configurable follow strategy.
+performance, manual balance cap, run ticks, the configurable follow strategy,
+and AI assessment/intent/shadow-position audit records.
+
+### DeepSeek main-match risk gate
+
+The optional AI risk radar evaluates only LOL/CS2/Dota2 full-match winner BUYs.
+It receives a compact neutral prompt containing only the game, the two team
+names, BO format, and analysis date. Wallet identity, intended side, price and
+stake never leave the process. Strong opponent predictions (>=65% win
+probability and >=75 confidence) block the paper leg; insufficient/stale data
+or provider failures fail open. The feature is off by default and can be
+configured, tested, enabled, or disabled from the dashboard's **AI 风控** page.
 
 Runtime-downloaded team logos are cached locally under `logs/`-adjacent dirs and
 are git-ignored — they persist locally but are never committed.
