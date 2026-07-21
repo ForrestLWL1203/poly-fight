@@ -26,7 +26,7 @@ DEFAULT_PER_MATCH_PERCENT = 1.0
 # 【子盘】(map/game winner 等非 main_match)每场总预算,与主盘解耦、单独可调;口径同上(每 condition
 # 总额,不汇总到系列)。默认 = 主盘值;调低它压制"一个队连押整个系列每局"的子盘堆叠。
 DEFAULT_PER_MATCH_PERCENT_SUB = 1.0
-# 单钱包每场(单个市场/单局)最大跟单笔数,主/子盘同一上限。0 = 无限制(默认,不改现状)。
+# 每场(单个 conditionId)所有钱包合计的最大跟单笔数，主/子盘同一上限。0 = 无限制。
 DEFAULT_MAX_FOLLOW_ORDERS_PER_MATCH = 0
 DEFAULT_MIN_STAKE_USDC = 1.0              # dust 地板(Polymarket CLOB 最小单),只防 <$1 废单
 DEFAULT_MIN_TARGET_ORDER_CASH_USDC = 10.0
@@ -228,8 +228,7 @@ def evaluate_follow_candidate(
     target_wallet_order_cash_usdc: float,
     available_balance_usdc: float,
     condition_funded_stake_usdc: float = 0.0,        # 该场(整场所有钱包合计)已投 → 每场总预算门
-    condition_funded_order_count: int = 0,           # 保留入参,不使用
-    wallet_condition_funded_order_count: int = 0,    # 该钱包该场(单市场)已资助笔数 → 每场最大笔数门
+    condition_funded_order_count: int = 0,           # 该场(所有钱包合计)已资助笔数
     entry_price: float = 0.0,                        # 跟单时实时价 p
     bankroll_usdc: float = 0.0,                      # 旧入参:回退用;注码实际按 available_balance_usdc(现金)算
     wallet_condition_funded_stake_usdc: float = 0.0, # 保留入参(每钱包每场口径已弃用,改用整场总额),不使用
@@ -284,10 +283,10 @@ def evaluate_follow_candidate(
 
     min_stake = to_float(sizing.get("min_stake_usdc"))
 
-    # ── 门 5:每场最大跟单笔数(单个市场/单局;主子盘同一上限;0=无限)──
+    # ── 门 5:每场全局最大跟单笔数(单个 conditionId,所有钱包/两个方向合计;0=无限)──
     max_orders = to_int(sizing.get("max_follow_orders_per_match"))
-    if max_orders > 0 and to_int(wallet_condition_funded_order_count) >= max_orders:
-        return _block("wallet_condition_order_cap_reached", strategy=normalized)
+    if max_orders > 0 and to_int(condition_funded_order_count) >= max_orders:
+        return _block("condition_order_cap_reached", strategy=normalized)
 
     # ── 门 6:每场总预算。限额单位 = 单个 conditionId(一个市场,含双边两个 outcome)。该 condition
     #         所有钱包、两个方向合计 ≤ 余额×cap%(先到先得,只填到此不叠加)。主盘/子盘各自独立 cap。──

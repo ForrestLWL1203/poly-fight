@@ -174,6 +174,8 @@ market_batch_count = 2
 max_pages_per_market = 3
 closed_position_market_chunk_size = 50
 check_current_positions = false by default
+max_profile_wallets = 3000 (manual and 12h runner refresh share this budget)
+max exported leaderboard wallets = 200 (presentation safety cap only)
 ```
 
 Sports defaults:
@@ -221,7 +223,7 @@ sub-min BUY fills accumulate per (wallet,cond,outcome) until >= min order, then 
 SELL mirrors exit proportionally (cumulative wallet_sold_frac; >= $1 min, hold/accumulate else, dust full-clear)
 post-start snapshot records CLV once
 same conditionId with both outcomes open marks contested
-settled markets move open signals to results; a fast observed-performance breaker deletes non-favorite wallets after >=2 actual followed results when win-rate <=50% and stake-weighted realized ROI <=-25%; independently, M5 re-scores followed wallets every N settle events (--rescore-settled-threshold, default 15) and DELETES any that fall out of grade-A: leaderboard row + scoring profile + raw trade cache dropped (no quarantine middle state). Favorites are spared; follow.db research records are kept and open positions settle out. Re-discovery by the observer is the only way back onto the board, and prior results before the last demotion do not retrigger the breaker.
+  settled markets move open signals to results; a fast observed-performance breaker deletes non-favorite wallets after >=2 actual followed results when win-rate <=50% and stake-weighted realized ROI <=-25%; independently, M5 re-scores followed wallets every N settle events (--rescore-settled-threshold, default 15) and DELETES any that fail uncapped grade-A quality/activity/hard gates: leaderboard row + scoring profile + raw trade cache dropped (no quarantine middle state). Ranking quotas and the 200-wallet display safety cap never count as demotion. Favorites are spared; follow.db research records are kept and open positions settle out. Re-discovery by the observer is the only way back onto the board, and prior results before the last demotion do not retrigger the breaker.
 ```
 
 Do not rely on `/trades` time-range params. Use local cursor `{timestamp, id}`
@@ -238,6 +240,8 @@ clamped to `[min_stake floor, per-match remaining]`.
 - The per-match percentage is the cumulative ceiling for one conditionId across
   all followed wallets and outcomes. Main and submarket caps are configurable
   independently.
+- The per-match order-count limit is also cumulative per conditionId across all
+  followed wallets and outcomes; it is not reset for each wallet.
 - Example: with $5,000 available and a 2% per-signal setting, the next leg starts
   at $100, unless the remaining match budget or cash balance is lower.
 - The live edge check (`θ̂×0.95 > price`) remains an entry gate, but it does not

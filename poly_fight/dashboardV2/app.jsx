@@ -470,7 +470,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
   const [pg, setPg] = React.useState(1);
   const [busy, setBusy] = React.useState({});
   const [fullRecollect, setFullRecollect] = React.useState(false);
-  const [maxSeed, setMaxSeed] = React.useState("2000");
+  const [maxSeed, setMaxSeed] = React.useState("3000");
   const maxSeedNum = parseInt(maxSeed, 10);
   const maxSeedValid = Number.isFinite(maxSeedNum) && maxSeedNum >= 1 && maxSeedNum <= 20000;
   const [confirmRecollect, setConfirmRecollect] = React.useState(false);
@@ -1198,7 +1198,7 @@ function StrategyEditor({ s, up, wallet, locked }) {
           </div>
           <details className="cfg-details">
             <summary>查看预算参数说明</summary>
-            <p>单笔基数按我方可用余额计算；主盘预算限制系列胜者市场的累计投入；子盘预算按每个 map/game winner 独立限制；每场最大笔数按单钱包、单市场计算；单笔下限只用于过滤 dust 小单。</p>
+            <p>单笔基数按我方可用余额计算；主盘预算限制系列胜者市场的累计投入；子盘预算按每个 map/game winner 独立限制；每场最大笔数按该市场全部钱包合计；单笔下限只用于过滤 dust 小单。</p>
           </details>
         </section>
       </div>

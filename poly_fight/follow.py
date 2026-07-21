@@ -689,7 +689,6 @@ def process_follow_trades(
         "strategy_invalid_count": 0,
         "stake_below_minimum_count": 0,
         "condition_order_cap_blocked_count": 0,
-        "wallet_condition_order_cap_blocked_count": 0,
         "condition_stake_cap_blocked_count": 0,
         "funded_stake_usdc": 0.0,
         "unfunded_intent_count": 0,
@@ -861,7 +860,6 @@ def process_follow_trades(
                 available_balance_usdc=bankroll_usdc - _open_signals_exposure(open_signals),
                 condition_funded_stake_usdc=to_float(condition_counts["condition_funded_stake_usdc"]),
                 condition_funded_order_count=to_int(condition_counts["condition_funded_order_count"]),
-                wallet_condition_funded_order_count=to_int(condition_counts["wallet_condition_funded_order_count"]),
                 wallet_condition_funded_stake_usdc=to_float(condition_counts.get("wallet_condition_funded_stake_usdc")),
                 entry_price=to_float(current_price),
                 bankroll_usdc=to_float(bankroll_usdc) if bankroll_usdc != float("inf") else 0.0,
@@ -928,8 +926,6 @@ def process_follow_trades(
                     stats["unfunded_intent_count"] += 1
                 elif reason == "condition_order_cap_reached":
                     stats["condition_order_cap_blocked_count"] += 1
-                elif reason == "wallet_condition_order_cap_reached":
-                    stats["wallet_condition_order_cap_blocked_count"] += 1
                 elif reason == "condition_stake_cap_reached":
                     stats["condition_stake_cap_blocked_count"] += 1
                 elif reason == "invalid_strategy":

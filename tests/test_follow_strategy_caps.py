@@ -123,28 +123,40 @@ class TestMaxOrdersPerMatch(unittest.TestCase):
     def test_blocks_at_cap(self):
         s = _strategy(max_follow_orders_per_match=2)
         r = evaluate_follow_candidate(strategy=s, market_type="game_winner",
-                                      wallet_condition_funded_order_count=2, **COMMON)
+                                      condition_funded_order_count=2, **COMMON)
         self.assertFalse(r["would_follow"])
-        self.assertEqual(r["block_reason"], "wallet_condition_order_cap_reached")
+        self.assertEqual(r["block_reason"], "condition_order_cap_reached")
 
     def test_allows_below_cap(self):
         s = _strategy(max_follow_orders_per_match=2)
         r = evaluate_follow_candidate(strategy=s, market_type="game_winner",
-                                      wallet_condition_funded_order_count=1, **COMMON)
+                                      condition_funded_order_count=1, **COMMON)
         self.assertTrue(r["would_follow"])
 
     def test_zero_means_unlimited(self):
         s = _strategy(max_follow_orders_per_match=0)
         r = evaluate_follow_candidate(strategy=s, market_type="game_winner",
-                                      wallet_condition_funded_order_count=99, **COMMON)
+                                      condition_funded_order_count=99, **COMMON)
         self.assertTrue(r["would_follow"])
 
     def test_cap_applies_to_main_too(self):
         s = _strategy(max_follow_orders_per_match=1)
         r = evaluate_follow_candidate(strategy=s, market_type="main_match",
-                                      wallet_condition_funded_order_count=1, **COMMON)
+                                      condition_funded_order_count=1, **COMMON)
         self.assertFalse(r["would_follow"])
-        self.assertEqual(r["block_reason"], "wallet_condition_order_cap_reached")
+        self.assertEqual(r["block_reason"], "condition_order_cap_reached")
+
+    def test_cap_is_shared_across_wallets(self):
+        # 第二个钱包的首笔也必须受该 condition 已有总笔数限制。
+        s = _strategy(max_follow_orders_per_match=5)
+        r = evaluate_follow_candidate(
+            strategy=s,
+            market_type="main_match",
+            condition_funded_order_count=5,
+            **COMMON,
+        )
+        self.assertFalse(r["would_follow"])
+        self.assertEqual(r["block_reason"], "condition_order_cap_reached")
 
 
 if __name__ == "__main__":

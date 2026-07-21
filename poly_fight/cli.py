@@ -127,8 +127,6 @@ SPORTS_FLAT_FOLLOW_MIN_WILSON = 0.50
 SPORTS_FLAT_FOLLOW_MIN_MEDIAN_MARKET_ROI = 0.10
 SPORTS_FLAT_FOLLOW_MAX_MEDIAN_ENTRY = 0.68
 CATEGORY_REFRESH_OUTPUT_FILES = {
-    "leaderboard.db",
-    "leaderboard_v2.db",  # legacy filename; cleanup/migration only
     "smart_wallet_leaderboard.json",
     "wallet_profiles.json",
     "candidate_wallets.json",
@@ -364,6 +362,7 @@ V2_MAX_BOT_SCORE = 70              # bot 评分硬排除阈
 V2_MAX_LEADERBOARD_IDLE_HOURS = 120  # 5d:剔除已停止下注的钱包;恢复活跃后下一轮可重新评分入榜
 V2_PER_GAME_QUOTA = 0              # 0 = 不设每游戏上限(榜单=全部够格);>0 时才强制每游戏封顶
 V2_MAX_LEADERBOARD_WALLETS = 200   # 仅作安全上限(质量门已把关,大小不重要)
+V2_DEFAULT_MAX_PROFILE_WALLETS = 3000  # 全量与定时刷新共用的深评预算
 # M5 自动降级删除后的冷却期:此窗口内 observer(observe-live)不重新发现加回被降级的
 # 钱包,堵「贴门钱包 2 输降级 → 下次赢 observer 立刻拉回」的 demote↔readd 抖动(2026-06-21 用户要求)。
 M5_DEMOTE_COOLDOWN_SECONDS = 24 * 3600
@@ -455,7 +454,6 @@ SPORTS_DEFAULT_TARGET_MARKETS = 20
 SPORTS_DEFAULT_SUBMARKET_TARGET_MARKETS = 60
 SPORTS_DEFAULT_MAX_MARKETS_PER_RUN = 100
 SPORTS_DEFAULT_SUBMARKET_MAX_MARKETS_PER_RUN = 60
-ESPORTS_DEFAULT_MAX_PROFILES_PER_RUN = 300
 ESPORTS_DEFAULT_MAX_ESPORTS_CLOSED_POSITIONS_PER_WALLET = 100
 ESPORTS_DEFAULT_USER_HISTORY_TRADES_MAX_PAGES = 3
 
@@ -2544,7 +2542,7 @@ def build_leaderboard_from_profiles(
     min_avg_market_cash: float = 1_500,
     require_tail_entry_field: bool = False,
     require_current_scoring_version: bool = False,
-    max_leaderboard_wallets: int = 30,
+    max_leaderboard_wallets: int = V2_MAX_LEADERBOARD_WALLETS,
     max_tail_entry_rate: float = 0.34,
     max_two_sided_market_count: int = 0,
     max_two_sided_market_rate: float = 0.0,
@@ -4816,7 +4814,7 @@ def resolve_collector_profile_wallet_limit(
     if explicit is None:
         explicit = getattr(args, "max_profiles_per_run", None)
     if explicit is None:
-        explicit = 2000  # v16:扩漏斗,深采上限 700→2000
+        explicit = V2_DEFAULT_MAX_PROFILE_WALLETS
     return int(explicit or 0)
 
 
@@ -5993,6 +5991,11 @@ def _command_collect_wallets(
         )
     summary["dashboard_publish"] = dashboard_publish
     write_json(output_dir / f"{prefix}_build_summary.json", summary)
+    # 只有完整 collect-v2 成功发布才更新池刷新时钟。observe-live / M5
+    # 均不能重置这个 12h 计时；runner 重启后也从 follow.db 继续计时。
+    FollowStore(
+        resolve_shared_follow_dir(args, resolve_data_dir(args)) / "follow.db"
+    ).record_pool_refresh_at(category="esports", ts=int(time.time()))
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 
@@ -6473,11 +6476,13 @@ def rescore_demote_wallets(
         if wallet:
             reprofiled[wallet] = result
 
-    def _rebuild_board(profiles: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    def _rebuild_quality_eligible_wallets(profiles: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        # M5 只判断质量资格，不参与榜单展示截断。全局上限或每游戏 quota
+        # 只能决定“展示前多少名”，不能把依然 grade-A 的钱包当成降级删除。
         return build_collector_leaderboard_v2(
             profiles, now_ts=now_ts,
-            per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
-            max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
+            per_game_quota=0,
+            max_leaderboard_wallets=0,
             include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
             gate_kwargs=_v2_gate_kwargs_from_args(args),
             follow_activity_by_wallet=load_follow_activity_for_leaderboard(
@@ -6485,12 +6490,12 @@ def rescore_demote_wallets(
             ),
         )["leaderboard"]
 
-    # 内存重建榜(现有 profiles 叠加重评结果)判断 batch 是否仍在 A 榜。favorite 是人工置顶、
-    # 越过 grade-A 强制跟单的覆盖项 → 不自动淘汰。
+    # 内存重评现有 profiles；只有真正跌出 grade-A/活跃度/硬排除门才降级。
+    # favorite 是人工置顶覆盖项，不自动淘汰。
     existing = load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2")
     new_board = {
         normalize_wallet(r.get("wallet"))
-        for r in _rebuild_board({**existing, **reprofiled})
+        for r in _rebuild_quality_eligible_wallets({**existing, **reprofiled})
         if normalize_wallet(r.get("wallet"))
     }
     favorites = {
@@ -7349,7 +7354,6 @@ def command_follow(
     strategy_invalid_count = 0
     stake_below_minimum_count = 0
     condition_order_cap_blocked_count = 0
-    wallet_condition_order_cap_blocked_count = 0
     condition_stake_cap_blocked_count = 0
     wallet_fetch_error_count = 0
     wallet_fetch_seconds: list[float] = []
@@ -7673,7 +7677,6 @@ def command_follow(
             strategy_invalid_count += stats.get("strategy_invalid_count", 0)
             stake_below_minimum_count += stats.get("stake_below_minimum_count", 0)
             condition_order_cap_blocked_count += stats.get("condition_order_cap_blocked_count", 0)
-            wallet_condition_order_cap_blocked_count += stats.get("wallet_condition_order_cap_blocked_count", 0)
             condition_stake_cap_blocked_count += stats.get("condition_stake_cap_blocked_count", 0)
             exited_signal_count += stats.get("exited_signal_count", 0)
             hedge_event_count += stats.get("hedge_event_count", 0)
@@ -8018,7 +8021,6 @@ def command_follow(
         "strategy_invalid_count": strategy_invalid_count,
         "stake_below_minimum_count": stake_below_minimum_count,
         "condition_order_cap_blocked_count": condition_order_cap_blocked_count,
-        "wallet_condition_order_cap_blocked_count": wallet_condition_order_cap_blocked_count,
         "condition_stake_cap_blocked_count": condition_stake_cap_blocked_count,
         "max_signal_stake_usdc": max_signal_stake_usdc,
         "max_signal_stake_balance_percent": max_signal_stake_balance_percent,
@@ -8093,7 +8095,6 @@ def command_follow(
 def command_run(args: argparse.Namespace) -> int:
     client = build_client(args)
     now_init = int(datetime.now(timezone.utc).timestamp())
-    last_build_at = now_init if args.skip_initial_build else 0
     tick_count = 0
     first_error_at: float | None = None
     # 增量补单:已补过持仓的钱包集合,跨 tick 持有。startup 全量补,之后 live-seed 中途
@@ -8106,6 +8107,15 @@ def command_run(args: argparse.Namespace) -> int:
     stop_reason = {"value": ""}
     collection_root = resolve_dashboard_root(args)
     follow_dir = resolve_follow_dir(args, collection_root)
+    refresh_store = FollowStore(follow_dir / "follow.db")
+    persisted_refresh_at = refresh_store.load_pool_refresh_at_readonly(category="esports")
+    # --skip-initial-build 不再把进程启动时间当成“刚刷新”。已有成功刷新时间就
+    # 继续计时；仅首次运行且无记录时从现在起算，避免意外立即深采。
+    last_build_at = (
+        min(persisted_refresh_at, now_init)
+        if args.skip_initial_build and persisted_refresh_at > 0
+        else (now_init if args.skip_initial_build else 0)
+    )
 
     def category_args(category: str) -> argparse.Namespace:
         return argparse.Namespace(
@@ -8473,7 +8483,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--total-cash-threshold", type=float, default=5_000)
         subparser.add_argument("--single-market-cash-threshold", type=float, default=1_000)
         subparser.add_argument("--max-candidate-wallets", type=int, default=1000)
-        subparser.add_argument("--max-profiles-per-run", type=int, default=ESPORTS_DEFAULT_MAX_PROFILES_PER_RUN)
+        subparser.add_argument("--max-profiles-per-run", type=int, default=V2_DEFAULT_MAX_PROFILE_WALLETS)
         subparser.add_argument("--max-esports-closed-positions-per-wallet", type=int, default=100)
         subparser.add_argument("--closed-position-market-chunk-size", type=int, default=50)
         subparser.add_argument("--user-history-trades-limit", type=int, default=500)
@@ -8484,7 +8494,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--min-profile-avg-market-cash", type=float, default=1_500)
         subparser.add_argument("--leaderboard-min-participated-markets", type=int, default=None)
         subparser.add_argument("--leaderboard-min-avg-market-cash", type=float, default=1_500)
-        subparser.add_argument("--max-leaderboard-wallets", type=int, default=60)
+        subparser.add_argument("--max-leaderboard-wallets", type=int, default=V2_MAX_LEADERBOARD_WALLETS)
         subparser.add_argument("--profile-refresh-ttl-days", type=int, default=7)
         subparser.add_argument("--profile-store-max-age-days", type=int, default=180)
         subparser.set_defaults(func=command_collect)

@@ -3179,6 +3179,17 @@ class CoreTest(unittest.TestCase):
             store.record_m5_demote_cooldown(["0xA"], ts=200)
             self.assertEqual(store.load_m5_demote_history(), {"0xa": 200})
 
+    def test_pool_refresh_clock_persists_across_store_instances(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "follow.db"
+            store = FollowStore(db_path)
+            self.assertEqual(store.load_pool_refresh_at_readonly(category="esports"), 0)
+            store.record_pool_refresh_at(category="esports", ts=12345)
+            self.assertEqual(
+                FollowStore(db_path).load_pool_refresh_at_readonly(category="esports"),
+                12345,
+            )
+
     def test_follow_store_market_cache_migrates_to_cache_kind_primary_key(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "follow.db"
@@ -5321,7 +5332,7 @@ class CoreTest(unittest.TestCase):
         self.assertTrue(leaderboard[0]["flat_followable"])
         self.assertEqual(leaderboard[0]["sports_follow_mode"], "flat")
 
-    def test_leaderboard_defaults_to_top_30_a_wallets(self):
+    def test_legacy_leaderboard_helper_has_no_obsolete_top_30_cap(self):
         now = 100 + 10 * 86400
         profiles_by_wallet = {}
         for index in range(35):
@@ -5336,9 +5347,9 @@ class CoreTest(unittest.TestCase):
 
         leaderboard = build_leaderboard_from_profiles(profiles_by_wallet, now_ts=now)
 
-        self.assertEqual(len(leaderboard), 30)
+        self.assertEqual(len(leaderboard), 35)
         self.assertEqual(leaderboard[0]["esports_roi"], 0.64)
-        self.assertEqual(leaderboard[-1]["esports_roi"], 0.35)
+        self.assertEqual(leaderboard[-1]["esports_roi"], 0.30)
 
     def test_stale_ab_profile_is_not_kept_on_leaderboard(self):
         profiles_by_wallet = {
@@ -11056,6 +11067,7 @@ class CoreTest(unittest.TestCase):
     def test_prepare_category_refresh_dir_preserves_and_prunes_caches(self):
         with TemporaryDirectory() as tmp:
             category_dir = Path(tmp) / "sports"
+            leaderboard_db = category_dir / "leaderboard.db"
             output_file = category_dir / "smart_wallet_leaderboard.json"
             profile_file = category_dir / "wallet_profiles.json"
             classification_file = category_dir / "esports_classification_set.json"
@@ -11065,6 +11077,7 @@ class CoreTest(unittest.TestCase):
             for path in [
                 output_file,
                 profile_file,
+                leaderboard_db,
                 classification_file,
                 fresh_cache,
                 old_cache,
@@ -11083,6 +11096,7 @@ class CoreTest(unittest.TestCase):
 
             self.assertFalse(output_file.exists())
             self.assertFalse(profile_file.exists())
+            self.assertTrue(leaderboard_db.exists())
             self.assertTrue(classification_file.exists())
             self.assertTrue(fresh_cache.exists())
             self.assertFalse(old_cache.exists())
@@ -15032,6 +15046,12 @@ class CoreTest(unittest.TestCase):
                 captured.update(k)
                 return ([], "cache")
 
+            board_build_kwargs = []
+
+            def fake_board(profiles, **kwargs):
+                board_build_kwargs.append(kwargs)
+                return {"leaderboard": [{"wallet": w} for w in profiles]}
+
             class FakeClient:
                 def list_events_paginated(self, **_k):
                     return []
@@ -15043,11 +15063,13 @@ class CoreTest(unittest.TestCase):
                  patch("poly_fight.cli.backfill_market_resolutions", return_value={}), \
                  patch("poly_fight.cli.filter_classification_set_by_game_window", return_value=[fake_market]), \
                  patch("poly_fight.cli.fetch_recent_esports_user_trades_for_wallet", side_effect=fake_fetch), \
-                 patch("poly_fight.cli.build_collector_leaderboard_v2", side_effect=lambda profiles, **_k: {"leaderboard": [{"wallet": w} for w in profiles]}):
+                 patch("poly_fight.cli.build_collector_leaderboard_v2", side_effect=fake_board):
                 rescore_demote_wallets(FakeClient(), args, wallets={"0xdrop"}, follow_dir=follow_dir, now_ts=now)
             self.assertTrue(captured, "profile_one 应调用 fetch(condition_ids 非空)")
             self.assertTrue(captured.get("use_cache"), "rescore 必须读累积缓存(与 observe 同口径)")
             self.assertFalse(captured.get("force_refresh"), "rescore 不应 force_refresh(截断现拉会低估 n_eff)")
+            self.assertEqual(board_build_kwargs[0]["per_game_quota"], 0)
+            self.assertEqual(board_build_kwargs[0]["max_leaderboard_wallets"], 0)
 
     def test_purge_legacy_demote_quarantine_deletes_not_releases(self):
         from unittest.mock import patch
@@ -15565,6 +15587,8 @@ class CoreTest(unittest.TestCase):
         self.assertTrue(args.skip_initial_build)
         self.assertEqual(args.max_run_ticks, 1)
         self.assertEqual(args.pool_refresh_hours, 12)
+        self.assertEqual(args.max_profiles_per_run, 3000)
+        self.assertEqual(args.max_leaderboard_wallets, 200)
         self.assertEqual(args.rescore_settled_threshold, 15)
         self.assertEqual(args.observe_window_hours, 24)
         self.assertEqual(args.user_trades_limit, 50)
@@ -15699,6 +15723,41 @@ class CoreTest(unittest.TestCase):
                 self.assertEqual(command_run(args), 0)
 
         self.assertEqual(build.call_count, 0)
+
+    def test_run_restart_keeps_persisted_pool_refresh_clock(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            follow_dir = data_dir / "follow"
+            FollowStore(follow_dir / "follow.db").record_pool_refresh_at(
+                category="esports", ts=1000,
+            )
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    "--data-dir", str(data_dir), "run", "--stake-usdc", "1",
+                    "--skip-initial-build", "--max-run-ticks", "1",
+                    "--pool-refresh-hours", "24",
+                ]
+            )
+            real_datetime = datetime
+
+            class FakeDateTime:
+                @classmethod
+                def now(cls, tz=None):
+                    return real_datetime.fromtimestamp(90000, tz=tz)
+
+            with patch("poly_fight.cli.datetime", FakeDateTime), patch(
+                "poly_fight.cli.build_client", return_value=object()
+            ), patch("poly_fight.cli._command_collect_wallets") as build, patch(
+                "poly_fight.cli.command_follow",
+                return_value={"desired_next_interval_seconds": 900},
+            ), patch("poly_fight.cli.load_rpc_endpoints", return_value=(None, None)):
+                from poly_fight.cli import command_run
+
+                with redirect_stdout(StringIO()):
+                    self.assertEqual(command_run(args), 0)
+
+            self.assertEqual(build.call_count, 1)
 
     def test_run_loop_survives_one_follow_exception(self):
         parser = build_parser()

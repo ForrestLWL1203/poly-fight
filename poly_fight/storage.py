@@ -1059,6 +1059,38 @@ class FollowStore:
             rows = conn.execute("SELECT raw_json FROM follow_signals WHERE status = 'open' ORDER BY created_at, signal_id").fetchall()
         return [_loads(row["raw_json"], {}) for row in rows]
 
+    def load_pool_refresh_at_readonly(self, *, category: str = "esports") -> int:
+        """Load the last successful full collector publish without mutating the DB."""
+        conn = self.connect_readonly()
+        if conn is None:
+            return 0
+        try:
+            if "meta" not in _table_names(conn):
+                return 0
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (f"pool_refresh:{str(category or 'esports').lower()}:updated_at",),
+            ).fetchone()
+            return _to_int(row["value"]) if row else 0
+        except sqlite3.Error:
+            return 0
+        finally:
+            conn.close()
+
+    def record_pool_refresh_at(self, *, category: str = "esports", ts: int | None = None) -> int:
+        """Persist a successful full collector publish for the runner's 12h clock."""
+        refreshed_at = int(ts or time.time())
+        self.init_db()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                (
+                    f"pool_refresh:{str(category or 'esports').lower()}:updated_at",
+                    str(refreshed_at),
+                ),
+            )
+        return refreshed_at
+
     def load_pending_small_buys(self) -> dict[str, dict[str, Any]]:
         """小单累加器:键 "wallet|condition_id|outcome_index" -> {cash,size,wsum,first_ts,last_ts}。
         目标钱包在可跟桶上的 BUY 未达最小下单额时缓存累加,凑够即跟、清零;卖出/结算亦清。
