@@ -118,13 +118,13 @@ PORT=@@PORT@@
 DOMAIN=@@DOMAIN@@
 CADDYFILE=@@CADDYFILE@@
 
-echo "[1/6] 确保依赖 (git / python3 / caddy) — 裸机首跑会装,已装则跳过"
+echo "[1/7] 确保依赖 (git / python3 / venv / caddy) — 裸机首跑会装,已装则跳过"
 export DEBIAN_FRONTEND=noninteractive
 if ! command -v git >/dev/null 2>&1; then
   apt-get update -qq && apt-get install -y -qq git
   echo "    installed git"
 fi
-if ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv --help >/dev/null 2>&1; then
+if ! command -v python3 >/dev/null 2>&1 || ! dpkg-query -W -f='${Status}' python3-venv 2>/dev/null | grep -q 'install ok installed'; then
   apt-get update -qq && apt-get install -y -qq python3 python3-venv
   echo "    installed python3 + venv"
 fi
