@@ -79,6 +79,16 @@ class DashboardV2StaticTests(unittest.TestCase):
         self.assertIn(".ai-control-card", css)
         self.assertIn(".ai-record-table", css)
 
+    def test_ai_risk_layout_does_not_override_game_chip_or_leak_live_accent(self):
+        app = _read("app.jsx")
+        css = _read("app.css")
+        self.assertIn('className="ai-record-copy"', app)
+        self.assertIn(".ai-record-match > .ps-gamechip { display: inline-flex", css)
+        self.assertNotIn(".ai-record-match b, .ai-record-match span", css)
+        live_rule = css.split(".ai-control-card.is-live", 1)[1].split("}", 1)[0]
+        self.assertNotIn("inset", live_rule)
+        self.assertIn(".ai-control-card.is-live { border-color: var(--border-hairline)", css)
+
     def test_app_consumes_design_system_bundle(self):
         app = _read("app.jsx")
         self.assertIn("window.PolySniperDesignSystem_8d05e5", app)

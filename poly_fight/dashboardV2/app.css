@@ -479,8 +479,8 @@
 .collect-square .cs-action .ps-spinner { border-color: rgba(255,255,255,0.45); border-top-color: #fff; }
 /* ── AI pre-match risk · compact operational view ───────────── */
 .ai-page { display: flex; flex-direction: column; gap: var(--sp-5); }
-.ai-control-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--sp-6); padding: 18px 22px !important; }
-.ai-control-card.is-live { border-color: color-mix(in srgb, var(--pnl-up) 26%, var(--border-hairline)); box-shadow: var(--shadow-md), inset 3px 0 0 color-mix(in srgb, var(--pnl-up) 74%, transparent); }
+.ai-control-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--sp-6); width: 100%; box-sizing: border-box; overflow: hidden; padding: 18px 22px !important; }
+.ai-control-card.is-live { border-color: var(--border-hairline); box-shadow: var(--shadow-md), var(--inner-highlight); }
 .ai-control-copy { display: flex; align-items: center; gap: var(--sp-4); min-width: 0; }
 .ai-control-icon { display: grid; place-items: center; width: 42px; height: 42px; flex: none; border-radius: 14px; color: var(--accent); background: var(--accent-soft); }
 .ai-control-icon svg { width: 20px; height: 20px; }
@@ -517,11 +517,13 @@
 .ai-record-table th:nth-child(4) { width: 12%; }
 .ai-record-table th:nth-child(5) { width: 28%; }
 .ai-record-match { display: flex; align-items: center; gap: 10px; min-width: 260px; }
-.ai-record-match > div { min-width: 0; }
-.ai-record-match b, .ai-record-match span { display: block; }
-.ai-record-match b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
-.ai-record-match i { margin: 0 6px; color: var(--text-quaternary); font-weight: 500; font-style: normal; }
-.ai-record-match span { margin-top: 3px; color: var(--text-tertiary); font-size: 10px; }
+.ai-record-match > .ps-gamechip { display: inline-flex; align-items: center; flex: none; margin: 0; }
+.ai-record-match > .ps-gamechip img { display: block; flex: none; }
+.ai-record-copy { min-width: 0; }
+.ai-record-copy > b, .ai-record-copy > span { display: block; }
+.ai-record-copy > b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.ai-record-copy i { margin: 0 6px; color: var(--text-quaternary); font-weight: 500; font-style: normal; }
+.ai-record-copy > span { margin-top: 3px; color: var(--text-tertiary); font-size: 10px; }
 .ai-record-verdict { white-space: nowrap; font-size: 13px; }
 .ai-record-reason { display: block; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); font-size: 11px; }
 

@@ -481,24 +481,34 @@ Operational notes:
 - Do not edit live code directly on the VPS unless explicitly asked. Prefer
   local commit/push, then pull/deploy on the VPS.
 
-VPS deploy/restart (launcher-driven):
+VPS deploy/restart (direct SSH for routine releases):
 
-Deployment is driven by the local launcher (`launcher/launcher.py`), not by
-hand-editing live processes. The dashboard runs as a `poly-fight-dashboard`
-systemd unit bound to `127.0.0.1`, fronted by Caddy for HTTPS; the **paper runner
-and observe processes are spawned by the dashboard panel**, not as a separate
-systemd unit or manual argv.
+For an already-provisioned VPS with working SSH access, routine deployments must
+connect directly to the VPS: update the live checkout to `origin/main`, install
+locked dependencies when needed, and restart the `poly-fight-dashboard` systemd
+unit. Do not launch `launcher/launcher.py` for a normal code release. The launcher
+is reserved for first-time/bootstrap work such as SSH key pairing, installing the
+base packages, creating the systemd unit, or configuring Caddy/firewall.
+
+The dashboard runs as a `poly-fight-dashboard` systemd unit bound to `127.0.0.1`,
+fronted by Caddy for HTTPS; the **paper runner and observe processes are spawned
+by the dashboard panel**, not as a separate systemd unit or manual argv. A routine
+dashboard restart must preserve those existing child processes and their data.
 
 ```text
 1. Read local private ops notes outside git for the host + login method.
 2. Commit and push local changes to GitHub first.
-3. Launcher → 远程 VPS → 环境准备: pairs SSH key (first run), installs
-   git/python3/caddy, opens ufw 80/443, git-resets the live repo to origin/main
-   (aborts if the worktree is dirty), writes secrets, installs/enables the
-   poly-fight-dashboard systemd unit + Caddy block.
-4. Launcher → 启动: systemctl restart poly-fight-dashboard.
-5. Start the runner / realtime refresh from the dashboard panel, not by argv.
-6. Verify: VPS repo HEAD matches local, `systemctl is-active
+3. Connect over SSH and abort if the VPS worktree is dirty; otherwise fetch,
+   check out `main`, and reset the live checkout to `origin/main`.
+4. Install `requirements.txt` into the existing project virtual environment if
+   dependencies may have changed, then run `systemctl restart
+   poly-fight-dashboard` directly. Do not restart or manually spawn the runner or
+   realtime observer during a routine dashboard deployment.
+5. Use the launcher only when the VPS has not yet been provisioned or its
+   SSH/systemd/Caddy/firewall setup needs bootstrap repair.
+6. Start a stopped runner / realtime refresh from the dashboard panel, not by
+   manual argv.
+7. Verify: VPS repo HEAD matches local, `systemctl is-active
    poly-fight-dashboard caddy`, the HTTPS domain returns 200, and the latest
    `run_ticks` row in `follow.db` looks current.
 ```

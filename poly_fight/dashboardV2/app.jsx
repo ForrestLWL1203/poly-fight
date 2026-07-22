@@ -1609,7 +1609,7 @@ function AiRiskPage({ toast }) {
           const actionLabel = action === "blocked" ? "已拦截" : action === "agree" ? "正常跟单" : "原策略放行";
           const actionTone = action === "blocked" ? "down" : action === "agree" ? "up" : "neutral";
           return <tr key={a.condition_id}>
-            <td><div className="ai-record-match"><GameIcon game={Adapt.normalizeGame(a.game)} base={ASSET_BASE} chip /><div><b>{a.team_a} <i>vs</i> {a.team_b}</b><span>{String(a.game || "").toUpperCase()} · {a.best_of || "主盘"}</span></div></div></td>
+            <td><div className="ai-record-match"><GameIcon game={Adapt.normalizeGame(a.game)} base={ASSET_BASE} chip /><div className="ai-record-copy"><b>{a.team_a} <i>vs</i> {a.team_b}</b><span>{String(a.game || "").toUpperCase()} · {a.best_of || "主盘"}</span></div></div></td>
             <td><b className="ai-record-verdict">{winner}{prob != null ? ` ${Math.round(Number(prob))}%` : ""}</b></td>
             <td className="num strong">{a.confidence != null ? Math.round(Number(a.confidence)) + "%" : "—"}</td>
             <td><Badge tone={actionTone}>{actionLabel}</Badge></td>
