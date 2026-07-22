@@ -62,6 +62,19 @@ class FakeOpenDota:
 
 
 class OpenDotaEvidenceTests(unittest.TestCase):
+    def test_resolver_handles_provider_prefix_and_generic_suffix_aliases(self):
+        cutoff_ts = int(datetime(2026, 7, 22, tzinfo=timezone.utc).timestamp())
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            client = FakeOpenDota(cutoff_ts)
+            client.teams = lambda: [
+                {"team_id": 7, "name": "NEMIGA", "tag": "Nemiga", "last_match_time": cutoff_ts - 10},
+                {"team_id": 8, "name": "Team Spirit Academy", "tag": "Spirit Academy", "last_match_time": cutoff_ts - 20},
+            ]
+            service = OpenDotaEvidenceService(store, client)
+            self.assertEqual(service.resolve_team("Nemiga Gaming", now_ts=cutoff_ts)["id"], 7)
+            self.assertEqual(service.resolve_team("Spirit Academy", now_ts=cutoff_ts)["id"], 8)
+
     def test_history_is_cutoff_safe_series_compacted_and_cached(self):
         cutoff_ts = int(datetime(2026, 7, 22, tzinfo=timezone.utc).timestamp())
         with tempfile.TemporaryDirectory() as tmp:

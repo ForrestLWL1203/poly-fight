@@ -41,13 +41,28 @@ def normalize_team_name(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
 
 
+def _team_name_variants(value: Any) -> set[str]:
+    normalized = normalize_team_name(value)
+    variants = {normalized} if normalized else set()
+    if normalized.startswith("team") and len(normalized) > 4:
+        variants.add(normalized[4:])
+    for suffix in ("gaming", "esports"):
+        for candidate in list(variants):
+            if candidate.endswith(suffix) and len(candidate) > len(suffix):
+                variants.add(candidate[:-len(suffix)])
+    return variants
+
+
 def _candidate_score(query: str, candidate: dict[str, Any]) -> float:
-    needle = normalize_team_name(query)
+    needles = _team_name_variants(query)
     names = [candidate.get("name"), candidate.get("tag")]
-    normalized = [normalize_team_name(value) for value in names if value]
-    if needle in normalized:
+    normalized = {variant for value in names if value for variant in _team_name_variants(value)}
+    if needles & normalized:
         return 1.0
-    return max((difflib.SequenceMatcher(None, needle, value).ratio() for value in normalized), default=0.0)
+    return max(
+        (difflib.SequenceMatcher(None, needle, value).ratio() for needle in needles for value in normalized),
+        default=0.0,
+    )
 
 
 class OpenDotaClient:
