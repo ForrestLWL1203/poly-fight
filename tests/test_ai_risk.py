@@ -190,6 +190,10 @@ class AiRiskTests(unittest.TestCase):
         self.assertNotIn("top_p", captured)
         self.assertNotIn("top_k", captured)
         self.assertIn("json", captured["messages"][0]["content"].lower())
+        canonical = validate_assessment_output(parsed, valid_evidence_ids=set())
+        self.assertEqual(canonical["verdict"], "insufficient")
+        self.assertEqual(canonical["team_a_win_probability"], 50)
+        self.assertEqual(canonical["team_b_win_probability"], 50)
 
     def test_live_assessment_cutoff_never_advances_to_future_match_start(self):
         RecordingEvidence.cutoffs = []
@@ -241,7 +245,7 @@ class AiRiskTests(unittest.TestCase):
         self.assertIn("KeSPA Cup", encoded)
         self.assertIn("Match Winner", SYSTEM_PROMPT)
         self.assertIn("A/B从50开始", SYSTEM_PROMPT)
-        self.assertIn("只输出json", SYSTEM_PROMPT)
+        self.assertIn("只输出JSON", SYSTEM_PROMPT)
         self.assertNotIn("wallet", encoded.lower())
         self.assertNotIn("outcome_index", encoded)
         self.assertNotIn("condition_id", encoded)

@@ -49,7 +49,7 @@ PROPRIETARY_LIQUIDITY_PROBE_HOURS = (24, 12, 6, 3, 2, 1, 0.5)
 PROPRIETARY_SCHEDULE_VERSION = 3
 
 
-SYSTEM_PROMPT = """仅用输入E中的赛前证据判断电竞整场Match Winner；禁止模型记忆、搜索、赔率、钱包、金额、目标赛果及Map/单局预测。A/B从50开始，综合近况、对手强度、H2H、阵容与BO。冲突或不足则s=i,w=null。只输出json：{"s":"d或i","w":"a或b或null","a":0,"b":0,"c":0,"e":["证据id"],"f":[],"r":"40字内"}。a+b=100；d时胜方分更高且e只引用输入id；i时w必须为JSON null。"""
+SYSTEM_PROMPT = """仅用输入E中的赛前证据判断电竞整场Match Winner；禁止模型记忆、搜索、赔率、钱包、金额、目标赛果及Map/单局预测。A/B从50开始，综合近况、对手强度、H2H、阵容与BO。只输出JSON，字段固定为s,w,a,b,c,e,f,r；s=d/i，w=a/b/null，a/b为双方分，c为置信度，e为证据id，f为风险，r用中文且不超过40字。d时a+b=100、胜方分更高且e只引用输入id；冲突或不足时s=i,w=null,a=50,b=50,c=0,e=[]。"""
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
@@ -562,6 +562,11 @@ def validate_assessment_output(value: Any, *, valid_evidence_ids: set[str] | Non
         confidence = float(value["confidence"])
     except (TypeError, ValueError) as exc:
         raise ValueError("assessment_bad_scores") from exc
+    # Some JSON models use 0/0 as a sentinel for an explicitly insufficient
+    # verdict. Probabilities are irrelevant in that branch; canonicalize it to
+    # the neutral 50/50 stored representation before enforcing the sum rule.
+    if status == "insufficient" and pa == 0 and pb == 0:
+        pa = pb = 50.0
     if not all(math.isfinite(n) and 0 <= n <= 100 for n in (pa, pb, confidence)) or abs(pa + pb - 100) > 1e-9:
         raise ValueError("assessment_bad_scores")
     if status == "decisive" and winner is None or status == "insufficient" and winner is not None:
