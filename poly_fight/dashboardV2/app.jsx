@@ -123,7 +123,8 @@ function TeamLine({ ev, size = 26, held }) {
 // 提前卖出沿用 warn 色徽标(同 源已脱榜),让列表一眼看出是我们主动平的还是等到结算。
 // settledByPrice:盘口还没正式关闭、我们按实时价≈1.0 提前结算的场,附一个小 "盘口价" 标记。
 function FollowStatusBadge({ f }) {
-  if (f.status === "ai_blocked") return <Badge tone="down" dot title="该下单意图通过原策略全部检查后，被赛前 AI 强冲突判断拦截">AI拦截</Badge>;
+  // AI 拦截由下面的 AiDecisionBadge 合并展示，避免同一状态重复两次。
+  if (f.status === "ai_blocked") return null;
   if (f.status === "open") return <Badge tone="up" dot>进行中</Badge>;
   let main;
   if (f.settlementType === "stop_loss")
@@ -142,16 +143,21 @@ function FollowStatusBadge({ f }) {
     </React.Fragment>
   );
 }
-function AiDecisionBadge({ action, assessment }) {
-  if (!action && !assessment) return null;
+function AiDecisionBadge({ action, assessment, blocked = false }) {
+  const resolvedAction = action || (blocked ? "blocked" : "");
+  if (!resolvedAction && !assessment) return null;
   const a = assessment || {};
   const verdict = String(a.verdict || "");
   const winner = verdict === "team_a" ? a.team_a : verdict === "team_b" ? a.team_b : "";
   const probability = verdict === "team_a" ? a.team_a_win_probability : verdict === "team_b" ? a.team_b_win_probability : null;
-  const label = action === "blocked" ? "AI拦截" : action === "agree" ? "AI一致" : action === "insufficient" ? "AI不确定" : "AI不可用";
-  const tone = action === "blocked" ? "down" : action === "agree" ? "up" : action === "insufficient" ? "warn" : "neutral";
-  const suffix = winner ? ` · ${winner}${probability != null ? " " + Math.round(Number(probability)) + "%" : ""}` : " · 原策略放行";
-  return <Badge tone={tone} outline title={a.reason_zh || ""}>{label}{suffix}</Badge>;
+  const hasConclusion = winner && resolvedAction !== "insufficient" && resolvedAction !== "unavailable";
+  const label = resolvedAction === "blocked"
+    ? `AI拦截${hasConclusion ? ` · ${winner}${probability != null ? " " + Math.round(Number(probability)) + "%" : ""}` : ""}`
+    : hasConclusion
+      ? `AI判定 · ${winner}${probability != null ? " " + Math.round(Number(probability)) + "%" : ""}`
+      : "证据不足";
+  const tone = resolvedAction === "blocked" ? "down" : resolvedAction === "agree" ? "up" : "neutral";
+  return <Badge className="ai-decision-badge" tone={tone} title={a.reason_zh || a.error || ""}>{label}</Badge>;
 }
 function MatchCell({ ev, tag, held }) {
   const dual = held && held.length >= 2;
@@ -746,7 +752,7 @@ function FollowsPage({ data, goStrategy, onOpenFollow }) {
                   <td><MatchCell ev={f} tag={f.marketType} held={(f.sides || []).map((s) => s.outcome)} /></td>
                   <td><div className="cell-stack">
                     <div className="evt-status"><FollowStatusBadge f={f} />{f.sourceOffLeaderboard && <Badge tone="warn" title="源钱包已不在最新榜单 — 此跟单继续跟至结算，但不再新开仓">源已脱榜</Badge>}</div>
-                    <AiDecisionBadge action={f.aiAction} assessment={f.aiRisk} />
+                    <AiDecisionBadge action={f.aiAction} assessment={f.aiRisk} blocked={f.status === "ai_blocked"} />
                     {f.exitPrice != null && <span className="muted" title="提前卖出/部分卖出的加权卖出价">卖出价：{priceStr(f.exitPrice)}</span>}
                   </div></td>
                   <td className="strong">{f.wallets}</td>
@@ -895,43 +901,6 @@ function WalletLegBlock({ w, prices, ev }) {
   );
 }
 
-function AiRiskDetailCard({ risk }) {
-  if (!risk) return null;
-  const a = risk.assessment || {};
-  const verdict = String(a.verdict || "insufficient");
-  const winner = verdict === "team_a" ? a.team_a : verdict === "team_b" ? a.team_b : "";
-  const pa = a.team_a_win_probability == null ? null : Number(a.team_a_win_probability);
-  const pb = a.team_b_win_probability == null ? null : Number(a.team_b_win_probability);
-  const counts = risk.action_counts || {};
-  const action = counts.blocked ? "blocked" : counts.agree ? "agree" : counts.insufficient ? "insufficient" : "unavailable";
-  const actionText = action === "blocked" ? `拦截 ${counts.blocked} 个意图` : action === "agree" ? "与跟单方向一致" : action === "insufficient" ? "信息不足 · 原策略放行" : "AI不可用 · 原策略放行";
-  return (
-    <section className={"ai-judgment action-" + action}>
-      <div className="ai-judgment-head">
-        <div className="ai-orb"><Ico n="sparkles" /></div>
-        <div><span className="ai-eyebrow">AI 赛前判断</span><h3>{winner ? `更看好 ${winner}` : "本场暂无可靠结论"}</h3></div>
-        <AiDecisionBadge action={action} assessment={a} />
-      </div>
-      <div className="ai-prob-grid">
-        <div><span>{a.team_a || "队伍 A"}</span><b>{pa == null ? "—" : Math.round(pa) + "%"}</b><i><em style={{ width: (pa || 0) + "%" }} /></i></div>
-        <div><span>{a.team_b || "队伍 B"}</span><b>{pb == null ? "—" : Math.round(pb) + "%"}</b><i><em style={{ width: (pb || 0) + "%" }} /></i></div>
-        <div className="ai-confidence"><span>判断置信度</span><b>{a.confidence != null ? Math.round(Number(a.confidence)) + "%" : "—"}</b><small>{a.knowledge_recency === "recent" ? "资料可用" : a.status === "ok" ? "谨慎参考" : "未完成判断"}</small></div>
-      </div>
-      <div className="ai-reason"><b>{actionText}</b><span>{a.reason_zh || a.error || "DeepSeek 未返回可用结论"}</span></div>
-      {risk.blocked_wallets && risk.blocked_wallets.length > 0 && <div className="ai-blocked-list">
-        <div className="ai-blocked-title"><span>被拦截的下单意图</span><small>计划投入 {money(risk.blocked_intended_stake)} · 实际投入 $0.00</small></div>
-        {risk.blocked_wallets.map((w, i) => <div className="ai-blocked-row" key={(w.wallet || "") + i}>
-          <WalletAddress address={w.wallet} copyable />
-          <SideChip outcome={w.outcome} index={w.outcome_index} ev={{ teamA: a.team_a, teamB: a.team_b }} />
-          <span>计划 {money(w.intended_stake)} · {priceStr(w.entry_price)}</span>
-          <b className={w.ai_net_effect != null ? pnlClass(w.ai_net_effect) : ""}>{w.ai_net_effect != null ? `AI影响 ${signedMoney(w.ai_net_effect)}` : "待结算"}</b>
-        </div>)}
-      </div>}
-      <div className="ai-audit-foot"><span>{a.model || "DeepSeek"} · {a.prompt_version || "—"}</span><span>{risk.counterfactual_label}</span></div>
-    </section>
-  );
-}
-
 function FollowDetailModal({ cid, onClose, toast }) {
   const [detail, setDetail] = React.useState(null);
   const [err, setErr] = React.useState(false);
@@ -1012,8 +981,8 @@ function FollowDetailModal({ cid, onClose, toast }) {
             <IconButton size="sm" label="刷新盘口价" disabled={refreshing} className={"mh-refresh" + (refreshing ? " spinning" : "")} onClick={refreshPrices}><Ico n="refresh-cw" /></IconButton>
           </div>
         </div>
-        <AiRiskDetailCard risk={detail.ai_risk} />
         {(detail.wallets || []).map((w) => <WalletLegBlock w={w} prices={px} ev={ev} key={w.wallet} />)}
+        {!(detail.wallets || []).length && <div className="modal-compact-empty">未产生实际跟单仓位</div>}
       </div>
     );
   }
@@ -1575,56 +1544,81 @@ function AiRiskPage({ toast }) {
     finally { setBusy(""); }
   };
 
+  const intentActions = new Map();
+  (data.recent_intents || []).forEach((intent) => {
+    const cid = String(intent.condition_id || "").toLowerCase();
+    if (!cid) return;
+    const actions = intentActions.get(cid) || { blocked: 0, agree: 0, insufficient: 0, unavailable: 0 };
+    const action = String(intent.action || "unavailable");
+    actions[action] = (actions[action] || 0) + 1;
+    intentActions.set(cid, actions);
+  });
+  const recent = (data.recent_assessments || []).slice(0, 10);
+
   return <div className="page-inner ai-page">
-    <section className="ai-command-card">
-      <div className="ai-command-copy">
-        <span className="ai-kicker"><Ico n="shield-check" /> PRE-MATCH INTELLIGENCE</span>
-        <h2>让历史实力成为主盘的第二道门</h2>
-        <p>DeepSeek 先独立判断两队胜面，再由本地规则与钱包方向比对。它看不到钱包、赔率、投入金额，也不会介入地图盘和局盘。</p>
-        <div className="ai-rule-pills"><span>主盘限定</span><span>对手胜率 ≥ 65%</span><span>置信度 ≥ 75%</span><span>异常时原策略放行</span></div>
+    <Card className={"ai-control-card" + (cfg.enabled ? " is-live" : "")}>
+      <div className="ai-control-copy">
+        <span className="ai-control-icon"><Ico n="radar" /></span>
+        <div><h2>AI 风控雷达</h2><p>目标钱包的主盘买入通过策略检查后，DeepSeek 独立评估对阵；强冲突时拦截，证据不足或服务异常时按原策略放行。</p></div>
       </div>
-      <div className="ai-master-switch">
-        <span className={"ai-live-dot" + (cfg.enabled ? " on" : "")}></span>
-        <div><b>{cfg.enabled ? "风控运行中" : "风控已关闭"}</b><small>{cfg.enabled ? "新主盘 BUY 将经过 AI 判定" : "现有跟单逻辑保持不变"}</small></div>
+      <div className="ai-control-state">
+        <Badge tone={cfg.enabled ? "up" : "neutral"} dot>{cfg.enabled ? "运行中" : "已关闭"}</Badge>
         <Switch checked={!!cfg.enabled} disabled={!!busy} onChange={toggle} accent />
       </div>
-    </section>
+    </Card>
 
     <div className="ai-page-grid">
       <Card className="ai-connection-card">
-        <div className="ai-section-head"><div><span>安全与连接</span><h3>DeepSeek API</h3></div><Badge tone={connectionTone} dot>{connectionText}</Badge></div>
-        <div className="ai-provider-line"><span className="ai-provider-mark">DS</span><div><b>{cfg.model || "deepseek-v4-pro"}</b><small>BYOK · Key 仅以信封密文保存</small></div></div>
+        <div className="ai-section-head"><div><h3>DeepSeek 凭证</h3><p>{cfg.model || "deepseek-v4-pro"} · 浏览器加密后保存</p></div><Badge tone={connectionTone} dot>{connectionText}</Badge></div>
         <div className="ai-secret-row">
           <Input type={show ? "text" : "password"} value={secret} onChange={(e) => setSecret(e.target.value)} placeholder={credential.configured ? "输入新 Key 可安全替换" : "sk-••••••••••••"} autoComplete="off" />
           <Button variant="ghost" size="sm" onClick={() => setShow((v) => !v)}>{show ? "隐藏" : "显示"}</Button>
           <Button variant="primary" size="sm" disabled={!secret.trim() || !!busy || !wrap?.ready} onClick={save}>{busy === "save" ? "验证中…" : "加密保存"}</Button>
         </div>
-        <p className="ai-security-note"><Ico n="lock-keyhole" /> 浏览器使用 AES-GCM 加密，随机密钥再由本 VPS 的 RSA 公钥包装；数据库和请求日志不接触明文 Key。</p>
+        <p className="ai-security-note"><Ico n="lock-keyhole" /> 明文 Key 不进入数据库和请求日志。</p>
         {balance && <div className="ai-balance-strip"><span><small>账户余额</small><b>{Number(balance.total_balance || 0).toFixed(2)} {balance.currency || ""}</b></span><span><small>最近检查</small><b>{balance.checked_at ? new Date(balance.checked_at * 1000).toLocaleString() : "—"}</b></span></div>}
         <div className="ai-connection-actions"><Button variant="ghost" size="sm" disabled={!credential.configured || !!busy} onClick={test}>{busy === "test" ? "测试中…" : "测试连接 / 刷新余额"}</Button>{credential.configured && <Button variant="danger" size="sm" disabled={!!busy} onClick={remove}>删除凭证</Button>}</div>
       </Card>
 
       <Card className="ai-impact-card">
-        <div className="ai-section-head"><div><span>反事实审计</span><h3>AI 带来的净影响</h3></div><span className="ai-audit-count">{summary.resolved_blocked_count || 0} 个已结算拦截</span></div>
-        <div className="ai-net-value"><span>累计净影响</span><b className={pnlClass(summary.net_effect_usdc || 0)}>{signedMoney(summary.net_effect_usdc || 0)}</b></div>
-        <div className="ai-impact-split"><div><span>避免亏损</span><b className="pnl-up">+{money(summary.avoided_loss_usdc || 0)}</b></div><div><span>错失盈利</span><b className="pnl-down">-{money(summary.missed_profit_usdc || 0)}</b></div></div>
-        <p>按每个被拦截意图模拟原策略的卖出、止损和结算；不把释放资金的后续用途强行归因给 AI。</p>
+        <div className="ai-section-head"><div><h3>风控效果</h3><p>{summary.resolved_blocked_count || 0} 个拦截已结算</p></div><b className={"ai-impact-total " + pnlClass(summary.net_effect_usdc || 0)}>{signedMoney(summary.net_effect_usdc || 0)}</b></div>
+        <div className="ai-impact-grid">
+          <div><span>一致放行</span><b>{summary.agree_count || 0}</b></div>
+          <div><span>AI 拦截</span><b>{summary.blocked_count || 0}</b></div>
+          <div><span>避免亏损</span><b className="pnl-up">+{money(summary.avoided_loss_usdc || 0)}</b></div>
+          <div><span>错失盈利</span><b className="pnl-down">-{money(summary.missed_profit_usdc || 0)}</b></div>
+        </div>
       </Card>
     </div>
 
     <Card className="ai-recent-card" pad="flush">
-      <div className="ai-recent-head"><div><span>最近研判</span><h3>独立赛前结论</h3></div><div className="ai-mini-stats"><span>一致 <b>{summary.agree_count || 0}</b></span><span>拦截 <b>{summary.blocked_count || 0}</b></span><span>不确定 <b>{summary.insufficient_count || 0}</b></span></div></div>
-      <div className="ai-assessment-list">
-        {(data.recent_assessments || []).slice(0, 8).map((a) => {
-          const winner = a.verdict === "team_a" ? a.team_a : a.verdict === "team_b" ? a.team_b : "信息不足";
+      <div className="ai-recent-head"><div><h3>AI 研判记录</h3><p>仅记录实际触发跟单意图的主盘赛事</p></div></div>
+      <div className="tbl-wrap">
+        <table className="ps-table ai-record-table">
+          <thead><tr><th>对阵</th><th>AI 结论</th><th>置信度</th><th>处理</th><th>判断依据</th></tr></thead>
+          <tbody>
+        {recent.map((a) => {
+          const winner = a.verdict === "team_a" ? a.team_a : a.verdict === "team_b" ? a.team_b : "证据不足";
           const prob = a.verdict === "team_a"
             ? a.team_a_win_probability
             : a.verdict === "team_b"
               ? a.team_b_win_probability
               : null;
-          return <div className="ai-assessment-row" key={a.condition_id}><div><b>{a.team_a} <i>vs</i> {a.team_b}</b><span>{a.game?.toUpperCase()} · {a.best_of || "主盘"}</span></div><div><span>预测胜方</span><b>{winner}{prob != null ? ` ${Math.round(Number(prob))}%` : ""}</b></div><div><span>置信度</span><b>{a.confidence != null ? Math.round(Number(a.confidence)) + "%" : "—"}</b></div><p>{a.reason_zh || a.error || "判断未完成"}</p></div>;
+          const actions = intentActions.get(String(a.condition_id || "").toLowerCase()) || {};
+          const action = actions.blocked ? "blocked" : actions.agree ? "agree" : actions.insufficient ? "insufficient" : "unavailable";
+          const actionLabel = action === "blocked" ? "已拦截" : action === "agree" ? "正常跟单" : "原策略放行";
+          const actionTone = action === "blocked" ? "down" : action === "agree" ? "up" : "neutral";
+          return <tr key={a.condition_id}>
+            <td><div className="ai-record-match"><GameIcon game={Adapt.normalizeGame(a.game)} base={ASSET_BASE} chip /><div><b>{a.team_a} <i>vs</i> {a.team_b}</b><span>{String(a.game || "").toUpperCase()} · {a.best_of || "主盘"}</span></div></div></td>
+            <td><b className="ai-record-verdict">{winner}{prob != null ? ` ${Math.round(Number(prob))}%` : ""}</b></td>
+            <td className="num strong">{a.confidence != null ? Math.round(Number(a.confidence)) + "%" : "—"}</td>
+            <td><Badge tone={actionTone}>{actionLabel}</Badge></td>
+            <td><span className="ai-record-reason" title={a.reason_zh || a.error || "判断未完成"}>{a.reason_zh || a.error || "判断未完成"}</span></td>
+          </tr>;
         })}
-        {!(data.recent_assessments || []).length && <div className="empty-cell">目标钱包的主盘 BUY 通过策略检查后，才会在这里生成独立判断</div>}
+        {!recent.length && <tr><td colSpan="5" className="empty-cell">目标钱包的主盘 BUY 通过策略检查后，才会生成 AI 研判记录</td></tr>}
+          </tbody>
+        </table>
       </div>
     </Card>
   </div>;

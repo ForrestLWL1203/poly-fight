@@ -66,6 +66,18 @@ class DashboardV2StaticTests(unittest.TestCase):
         app = _read("app.jsx")
         for token in ("function LoginPanel", "function FollowDetailModal", "function WalletFollowsModal", "ReactDOM.createRoot"):
             self.assertIn(token, app, f"app.jsx missing {token}")
+        self.assertNotIn("function AiRiskDetailCard", app)
+        self.assertNotIn('<AiRiskDetailCard risk={detail.ai_risk}', app)
+
+    def test_ai_risk_ui_uses_compact_operational_language(self):
+        app = _read("app.jsx")
+        css = _read("app.css")
+        for token in ("AI 风控雷达", "AI 研判记录", "证据不足", "ai-record-table", "ai-decision-badge"):
+            self.assertIn(token, app)
+        for noisy in ("PRE-MATCH INTELLIGENCE", "让历史实力成为主盘的第二道门", "独立赛前结论", "AI不确定"):
+            self.assertNotIn(noisy, app)
+        self.assertIn(".ai-control-card", css)
+        self.assertIn(".ai-record-table", css)
 
     def test_app_consumes_design_system_bundle(self):
         app = _read("app.jsx")

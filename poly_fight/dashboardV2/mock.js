@@ -163,7 +163,7 @@
     follows: [
       mkFollow(M.cs2_main, { wallet_count: 5, leg_count: 11, stake: 880, display_pnl: 142.6, display_pnl_kind: "unrealized", status: "open", quality_label: "one_way", sides: [{ outcome: "PARIVISION", outcome_index: 0, leg_count: 11 }], ai_action: "agree", ai_risk: { status: "ok", verdict: "team_a", team_a: "PARIVISION", team_b: "Monte", team_a_win_probability: 69, team_b_win_probability: 31, confidence: 82, reason_zh: "近期状态与系列赛稳定性更强" } }),
       mkFollow(M.dota_main, { wallet_count: 4, leg_count: 8, stake: 640, display_pnl: -38.2, display_pnl_kind: "unrealized", status: "open", quality_two_sided: true, quality_label: "two_sided", market_type: "map_winner", market_type_label: "地图", sides: [{ outcome: "Team Spirit", outcome_index: 0, leg_count: 5 }, { outcome: "Falcons", outcome_index: 1, leg_count: 3 }] }),
-      mkFollow(M.lol_main, { wallet_count: 6, leg_count: 14, stake: 1200, our_realized_pnl: 502.7, display_pnl: 502.7, display_pnl_kind: "realized", status: "settled", settled_by_price: true, sides: [{ outcome: "Gen.G", outcome_index: 1, leg_count: 14 }] }),
+      mkFollow(M.lol_main, { wallet_count: 6, leg_count: 14, stake: 1200, our_realized_pnl: 502.7, display_pnl: 502.7, display_pnl_kind: "realized", status: "settled", settled_by_price: true, sides: [{ outcome: "Gen.G", outcome_index: 1, leg_count: 14 }], ai_action: "insufficient", ai_risk: { status: "insufficient", verdict: "insufficient", team_a: "T1", team_b: "Gen.G", team_a_win_probability: 50, team_b_win_probability: 50, confidence: 30, reason_zh: "赛前阵容与近期状态证据不足" } }),
       mkFollow({ ...M.cs2_main, condition_id: "0xmockarchcs2faze0009", title: "Counter-Strike: FaZe vs G2 (BO3) - 八强", match_parts: { game: "Counter-Strike", teamA: "FaZe", teamB: "G2", meta: "(BO3) 八强" } }, { wallet_count: 3, leg_count: 6, stake: 480, our_realized_pnl: -86.2, display_pnl: -86.2, display_pnl_kind: "realized", status: "settled", quality_disagreement: true, quality_label: "disagreement", sides: [{ outcome: "FaZe", outcome_index: 0, leg_count: 4 }, { outcome: "G2", outcome_index: 1, leg_count: 2 }] }),
       mkFollow({ ...M.cs2_main, condition_id: "0xmockchaosexit0042", title: "Counter-Strike: CHAOS vs Alpha Dominion Nation (BO3) - United21 Group C", match_parts: { game: "Counter-Strike", teamA: "CHAOS", teamB: "Alpha Dominion Nation", meta: "(BO3) United21 Group C" } }, { wallet_count: 1, leg_count: 4, stake: 200, our_realized_pnl: 0, display_pnl: 0, display_pnl_kind: "realized", status: "settled", settlement_type: "manual_exit", follow_exit_price: 0.62, quality_label: "one_way", sides: [{ outcome: "CHAOS", outcome_index: 0, leg_count: 4 }] }),
       mkFollow({ ...M.dota_main, condition_id: "0xmockstoploss0077", title: "Dota 2: Tundra vs BetBoom (BO3) - 主盘止损样例", match_parts: { game: "Dota 2", teamA: "Tundra", teamB: "BetBoom", meta: "(BO3) 主盘" } }, { wallet_count: 1, leg_count: 3, stake: 150, our_realized_pnl: -82.5, display_pnl: -82.5, display_pnl_kind: "realized", status: "settled", settlement_type: "stop_loss", follow_exit_price: 0.27, quality_label: "one_way", sides: [{ outcome: "Tundra", outcome_index: 0, leg_count: 3 }] }),
@@ -352,6 +352,11 @@
         { condition_id: "0xmockaiblockedt1drx", game: "lol", team_a: "T1", team_b: "Kiwoom DRX", best_of: "BO1", verdict: "team_a", team_a_win_probability: 82, team_b_win_probability: 18, confidence: 91, reason_zh: "T1长期实力、交手与大赛经验明显占优" },
         { condition_id: M.cs2_main.condition_id, game: "cs2", team_a: "PARIVISION", team_b: "Monte", best_of: "BO3", verdict: "team_a", team_a_win_probability: 69, team_b_win_probability: 31, confidence: 82, reason_zh: "近期状态与系列赛稳定性更强" },
         { condition_id: M.dota_main.condition_id, game: "dota2", team_a: "Team Spirit", team_b: "Falcons", best_of: "BO3", verdict: "insufficient", team_a_win_probability: 52, team_b_win_probability: 48, confidence: 58, reason_zh: "近期阵容信息不足" },
+      ],
+      recent_intents: [
+        { condition_id: "0xmockaiblockedt1drx", action: "blocked" },
+        { condition_id: M.cs2_main.condition_id, action: "agree" },
+        { condition_id: M.dota_main.condition_id, action: "insufficient" },
       ],
     };
   }
