@@ -12,12 +12,12 @@ from unittest.mock import patch
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from google.genai import types
+import httpx
 
 from poly_fight.ai_risk import (
     AiConfigStore,
     AiRiskService,
-    GeminiClient,
+    DeepSeekClient,
     SYSTEM_PROMPT,
     assessment_direction,
     build_match_prompt,
@@ -70,7 +70,7 @@ def market(condition_id="c1"):
     }
 
 
-class FakeGemini:
+class FakeDeepSeek:
     calls = []
 
     def __init__(self, secret):
@@ -168,30 +168,28 @@ class FakePandaScore:
 
 
 class AiRiskTests(unittest.TestCase):
-    def test_gemini_uses_minimal_thinking_and_bounded_output(self):
+    def test_deepseek_uses_compact_json_without_thinking_or_sampling(self):
         captured = {}
 
-        class Models:
-            @staticmethod
-            def generate_content(**kwargs):
-                captured.update(kwargs)
-                return type("Response", (), {
-                    "parsed": {"status": "insufficient"},
-                    "text": "",
-                })()
+        def handle(request):
+            captured.update(json.loads(request.content.decode()))
+            return httpx.Response(200, json={
+                "model": "deepseek-v4-pro",
+                "choices": [{"message": {"content": '{"s":"i","w":null,"a":50,"b":50,"c":0,"e":[],"f":[],"r":"证据不足"}'}}],
+                "usage": {"prompt_tokens": 80, "completion_tokens": 20, "total_tokens": 100},
+            })
 
-        client = GeminiClient.__new__(GeminiClient)
-        client.client = type("Client", (), {"models": Models()})()
-        parsed, _, _ = client.assess(
-            {"task": "test", "valid_evidence_ids": []}, model="gemini-3.6-flash",
-        )
-        config = captured["config"]
-        self.assertEqual(parsed["status"], "insufficient")
-        self.assertEqual(config.thinking_config.thinking_level, types.ThinkingLevel.MINIMAL)
-        self.assertEqual(config.max_output_tokens, 2048)
-        self.assertIsNone(config.temperature)
-        self.assertIsNone(config.top_p)
-        self.assertIsNone(config.top_k)
+        client = DeepSeekClient("sk-test", transport=httpx.MockTransport(handle))
+        parsed, response, _ = client.assess({"M": {}, "E": {}}, model="deepseek-v4-pro")
+        self.assertEqual(parsed["s"], "i")
+        self.assertEqual(response["model"], "deepseek-v4-pro")
+        self.assertEqual(captured["thinking"], {"type": "disabled"})
+        self.assertEqual(captured["response_format"], {"type": "json_object"})
+        self.assertEqual(captured["max_tokens"], 256)
+        self.assertNotIn("temperature", captured)
+        self.assertNotIn("top_p", captured)
+        self.assertNotIn("top_k", captured)
+        self.assertIn("json", captured["messages"][0]["content"].lower())
 
     def test_live_assessment_cutoff_never_advances_to_future_match_start(self):
         RecordingEvidence.cutoffs = []
@@ -199,9 +197,9 @@ class AiRiskTests(unittest.TestCase):
             data_dir = Path(tmp)
             store = FollowStore(data_dir / "follow" / "follow.db")
             service = AiRiskService(
-                data_dir, store, client_factory=FakeGemini, evidence_factory=RecordingEvidence,
+                data_dir, store, client_factory=FakeDeepSeek, evidence_factory=RecordingEvidence,
             )
-            service.config.save_credential(encrypted_envelope(service.config, "gemini-test"))
+            service.config.save_credential(encrypted_envelope(service.config, "deepseek-test"))
             service.config.save_settings(enabled=True)
             now_ts = 1_783_000_000
             service.ensure_assessment(market("future-cutoff"), now_ts=now_ts)
@@ -240,32 +238,30 @@ class AiRiskTests(unittest.TestCase):
         encoded = str(prompt)
         self.assertIn("T1", encoded)
         self.assertIn("Kiwoom DRX", encoded)
-        self.assertIn("Evidence Pack", encoded)
         self.assertIn("KeSPA Cup", encoded)
         self.assertIn("Match Winner", SYSTEM_PROMPT)
-        self.assertIn("50:50", SYSTEM_PROMPT)
-        self.assertIn("insufficient", SYSTEM_PROMPT)
+        self.assertIn("A/B从50开始", SYSTEM_PROMPT)
+        self.assertIn("只输出json", SYSTEM_PROMPT)
         self.assertNotIn("wallet", encoded.lower())
         self.assertNotIn("outcome_index", encoded)
         self.assertNotIn("condition_id", encoded)
         self.assertNotIn("0.62", encoded)
-        self.assertIn("evidence_pack", prompt)
+        self.assertIn("E", prompt)
+        self.assertNotIn("valid_evidence_ids", encoded)
         self.assertEqual(metadata["team_a"], "T1")
 
     def test_dota2_is_supported_by_ai_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = FollowStore(Path(tmp) / "follow.db")
-            service = AiRiskService(Path(tmp), store, client_factory=FakeGemini)
+            service = AiRiskService(Path(tmp), store, client_factory=FakeDeepSeek)
             dota_market = {**market(), "game_family": "dota2"}
             self.assertTrue(service.eligible_market(dota_market))
             service.close()
 
     def test_minimal_output_validation_and_threshold(self):
         parsed = validate_assessment_output({
-            "status": "decisive", "winner": "team_b", "team_a_score": 31,
-            "team_b_score": 69, "confidence": 80,
-            "supporting_evidence_ids": ["ev1"], "risk_flags": ["roster_change"],
-            "reason_zh": "B队历史表现更稳",
+            "s": "d", "w": "b", "a": 31, "b": 69, "c": 80,
+            "e": ["ev1"], "f": ["roster_change"], "r": "B队历史表现更稳",
         }, valid_evidence_ids={"ev1"})
         self.assertEqual(parsed["verdict"], "team_b")
         self.assertEqual(assessment_direction({"status": "ok", "evidence_score": 80, **parsed}, {
@@ -289,22 +285,22 @@ class AiRiskTests(unittest.TestCase):
             self.assertTrue(config.db_path.is_relative_to(Path(tmp) / ".secrets"))
             self.assertNotIn("sk-private-test", config.db_path.read_bytes().decode("latin1"))
 
-    def test_model_migrates_to_fixed_gemini_without_deleting_deepseek_ciphertext(self):
+    def test_model_migrates_to_fixed_deepseek_without_deleting_gemini_ciphertext(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             config = AiConfigStore(data_dir)
             with sqlite3.connect(config.db_path) as conn:
-                conn.execute("UPDATE ai_risk_settings SET enabled=1,model='gemini-3.5-flash' WHERE id=1")
+                conn.execute("UPDATE ai_risk_settings SET enabled=1,model='gemini-3.6-flash' WHERE id=1")
                 conn.execute(
                     "INSERT INTO provider_credential "
                     "(provider,envelope_version,key_id,wrapped_key,nonce,ciphertext,status,created_at,updated_at) "
-                    "VALUES ('deepseek',1,'old','old','old','old','valid',1,1)"
+                    "VALUES ('gemini',1,'old','old','old','old','valid',1,1)"
                 )
             migrated = AiConfigStore(data_dir)
-            self.assertEqual(migrated.settings()["model"], "gemini-3.6-flash")
+            self.assertEqual(migrated.settings()["model"], "deepseek-v4-pro")
             self.assertTrue(migrated.settings()["enabled"])
             self.assertIsNone(migrated.credential_envelope())
-            self.assertIsNotNone(migrated.credential_envelope("deepseek"))
+            self.assertIsNotNone(migrated.credential_envelope("gemini"))
 
     def test_explicit_data_reset_preserves_encrypted_credential(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -320,13 +316,13 @@ class AiRiskTests(unittest.TestCase):
             self.assertEqual(AiConfigStore(data_dir).secret(), "sk-survives-reset")
 
     def test_strong_conflict_blocks_and_shadow_settles(self):
-        FakeGemini.calls = []
+        FakeDeepSeek.calls = []
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             store = FollowStore(data_dir / "follow" / "follow.db")
             store.init_db()
             service = AiRiskService(
-                data_dir, store, client_factory=FakeGemini, evidence_factory=FakeEvidence,
+                data_dir, store, client_factory=FakeDeepSeek, evidence_factory=FakeEvidence,
             )
             service.config.save_credential(encrypted_envelope(service.config, "sk-test"))
             service.config.save_credential(
@@ -346,7 +342,7 @@ class AiRiskTests(unittest.TestCase):
             )
             self.assertTrue(decision["blocked"])
             self.assertEqual(decision["action"], "blocked")
-            self.assertEqual(len(FakeGemini.calls), 1)
+            self.assertEqual(len(FakeDeepSeek.calls), 1)
             # Same condition reuses the neutral assessment.
             agree = service.decide(
                 market=market(), wallet="0x" + "2" * 40, outcome_index=0,
@@ -354,7 +350,7 @@ class AiRiskTests(unittest.TestCase):
                 wallet_trade_size=80, now_ts=1_783_000_001,
             )
             self.assertEqual(agree["action"], "agree")
-            self.assertEqual(len(FakeGemini.calls), 1)
+            self.assertEqual(len(FakeDeepSeek.calls), 1)
             service.settle_shadows({"c1": 0}, now_ts=1_783_000_100)
             shadows = store.load_ai_shadows()
             wallet_shadow = next(row for row in shadows if row["shadow_kind"] == "wallet_original")
@@ -371,18 +367,18 @@ class AiRiskTests(unittest.TestCase):
             finalized = store.load_ai_assessment("c1")
             self.assertNotIn("provider_request", finalized)
             self.assertNotIn("parsed_output", finalized)
-            self.assertTrue(finalized["evidence_snapshot"]["valid_evidence_ids"])
+            self.assertEqual(finalized["evidence_snapshot"]["a"][0]["id"], "ev_test")
             service.close()
 
     def test_medium_evidence_is_assessed_but_cannot_block_wallet(self):
-        FakeGemini.calls = []
+        FakeDeepSeek.calls = []
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             store = FollowStore(data_dir / "follow" / "follow.db")
             service = AiRiskService(
-                data_dir, store, client_factory=FakeGemini, evidence_factory=MediumEvidence,
+                data_dir, store, client_factory=FakeDeepSeek, evidence_factory=MediumEvidence,
             )
-            service.config.save_credential(encrypted_envelope(service.config, "gemini-test"))
+            service.config.save_credential(encrypted_envelope(service.config, "deepseek-test"))
             service.config.save_settings(enabled=True)
             decision = service.decide(
                 market=market("medium"), wallet="0x" + "4" * 40, outcome_index=1,
@@ -391,13 +387,13 @@ class AiRiskTests(unittest.TestCase):
             )
             self.assertEqual(decision["action"], "insufficient")
             self.assertFalse(decision["blocked"])
-            self.assertEqual(len(FakeGemini.calls), 1)
+            self.assertEqual(len(FakeDeepSeek.calls), 1)
             service.close()
 
     def test_ai_scope_is_esports_main_match_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = FollowStore(Path(tmp) / "follow" / "follow.db")
-            service = AiRiskService(Path(tmp), store, client_factory=FakeGemini)
+            service = AiRiskService(Path(tmp), store, client_factory=FakeDeepSeek)
             self.assertFalse(hasattr(service, "prefetch"))
             self.assertTrue(service.eligible_market(market()))
             self.assertFalse(service.eligible_market({**market(), "market_type": "game_winner"}))
@@ -485,7 +481,7 @@ class AiRiskTests(unittest.TestCase):
                 self.assertEqual(status, 401)
                 token = make_session_token("admin", "secret")
                 cookie = "poly_fight_session=" + token
-                with patch("poly_fight.dashboard.GeminiClient", ModelClient):
+                with patch("poly_fight.dashboard.DeepSeekClient", ModelClient):
                     status, payload = call("POST", "/api/ai-risk/credential", {"envelope": envelope}, cookie)
                 self.assertEqual(status, 200)
                 self.assertTrue(payload["data"]["configured"])

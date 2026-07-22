@@ -253,7 +253,15 @@ def group_scoreboard_games(rows: list[dict[str, Any]], *, team: str, cutoff_ts: 
         for game in games:
             is_a = normalize_team_name(game.get("Team1")) == needle
             opponent = str(game.get("Team2") if is_a else game.get("Team1") or opponent)
-            winner = normalize_team_name(game.get("Winner"))
+            # Cargo ScoreboardGames encodes Winner as side 1/2, not always as
+            # a team name.  Treating "1" as a literal name inverted every
+            # Leaguepedia result into a loss for the requested team.
+            winner_raw = str(game.get("Winner") or "").strip()
+            if winner_raw.casefold() in {"1", "team1"}:
+                winner_raw = str(game.get("Team1") or "")
+            elif winner_raw.casefold() in {"2", "team2"}:
+                winner_raw = str(game.get("Team2") or "")
+            winner = normalize_team_name(winner_raw)
             if winner == needle:
                 team_wins += 1
             elif winner:

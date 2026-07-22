@@ -180,7 +180,7 @@
     api.followDetail = wrap(m.followDetail);
     api.walletFollows = wrap(m.walletFollows);
     api.marketPrices = wrap(m.marketPrices);
-    api.aiRisk = m.aiRisk ? wrap(m.aiRisk) : () => Promise.resolve({ settings: { enabled: false, model: "gemini-3.6-flash", win_probability_threshold: 65, confidence_threshold: 75 }, credential: { configured: false, status: "not_configured" }, summary: {}, source_health: [], proprietary_records: [], proprietary_page: { limit: 10, offset: 0, total: 0 } });
+    api.aiRisk = m.aiRisk ? wrap(m.aiRisk) : () => Promise.resolve({ settings: { enabled: false, model: "deepseek-v4-pro", win_probability_threshold: 65, confidence_threshold: 75 }, credential: { configured: false, status: "not_configured" }, summary: {}, source_health: [], proprietary_records: [], proprietary_page: { limit: 10, offset: 0, total: 0 } });
     api.aiWrapKey = () => Promise.resolve({ ready: true, envelopeVersion: 1, keyId: "mock", spki: "" });
     const okEcho = (x) => Promise.resolve(x || { ok: true });
     api.setFavorite = (w, c, f) => okEcho({ wallet: w, category: c, favorite: f });

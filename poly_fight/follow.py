@@ -664,7 +664,7 @@ def process_follow_trades(
     held_pending_price: dict[str, dict[str, Any]] | None = None,   # 价格 held 暂存器(现价<下限的买单,等上穿;跨 tick 持久)
     stop_loss_blocked: dict[str, Any] | None = None,               # 止损黑名单:已止损平过的 (钱包|盘|outcome) 不再复跟
     bucket_metrics: dict[str, dict[str, Any]] | None = None,       # eligible bucket -> θ̂/edge_lb
-    ai_risk_handler: Any | None = None,                            # Gemini 多源主盘闸门;异常一律 fail-open
+    ai_risk_handler: Any | None = None,                            # DeepSeek 多源主盘闸门;异常一律 fail-open
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     wallet = normalize_wallet(wallet)
     active_strategy = normalize_follow_strategy(follow_strategy) if isinstance(follow_strategy, dict) else None

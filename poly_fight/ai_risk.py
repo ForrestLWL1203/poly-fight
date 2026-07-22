@@ -1,4 +1,4 @@
-"""Gemini-backed, multi-source RAG risk gate for esports main-match paper follows.
+"""DeepSeek-backed, multi-source RAG risk gate for esports main-match paper follows.
 
 The model receives compact pre-cutoff team evidence merged from game-specific
 public APIs. Wallet identity, intended side, price and stake never enter the
@@ -19,8 +19,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from google import genai
-from google.genai import types
+import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -33,10 +32,10 @@ from .pandascore import PANDASCORE_PROVIDER
 from .storage import FollowStore
 
 
-PROVIDER = "gemini"
-LEGACY_PROVIDER = "deepseek"
-DEFAULT_MODEL = "gemini-3.6-flash"
-PROMPT_VERSION = "esports-main-rag-v2"
+PROVIDER = "deepseek"
+LEGACY_PROVIDER = "gemini"
+DEFAULT_MODEL = "deepseek-v4-pro"
+PROMPT_VERSION = "esports-main-rag-v3"
 WIN_PROBABILITY_THRESHOLD = 65.0
 CONFIDENCE_THRESHOLD = 75.0
 WALLET_MIN_EVIDENCE_SCORE = 70
@@ -50,32 +49,10 @@ PROPRIETARY_LIQUIDITY_PROBE_HOURS = (24, 12, 6, 3, 2, 1, 0.5)
 PROPRIETARY_SCHEDULE_VERSION = 3
 
 
-SYSTEM_PROMPT = """你是全球电竞（CS2、LoL、Dota2）全场赛前胜负精算师。
-只评估整场比赛最终大比分胜方（Match Winner），绝不预测或提及 Map、单局、击杀等子盘口。
+SYSTEM_PROMPT = """仅用输入E中的赛前证据判断电竞整场Match Winner；禁止模型记忆、搜索、赔率、钱包、金额、目标赛果及Map/单局预测。A/B从50开始，综合近况、对手强度、H2H、阵容与BO。冲突或不足则s=i,w=null。只输出json：{"s":"d或i","w":"a或b或null","a":0,"b":0,"c":0,"e":["证据id"],"f":[],"r":"40字内"}。a+b=100；d时胜方分更高且e只引用输入id；i时w必须为JSON null。"""
 
-只能使用用户提供并标明证据ID的赛前证据，不得用模型记忆补全比赛、阵容或赛果。双方从50:50开始，综合：
-长期与近期战绩、对手含金量、历史交锋、阵容稳定性、赛事等级和BO赛制。
-不得参考投注市场、赔率、钱包、下注方向或金额；不得使用目标比赛开赛后的赛果；不得编造资料。
-
-两队分值必须在0-100且合计100。除非资料完全镜像，否则不得给50:50。
-证据不足、互相冲突或无法识别队伍时必须返回 insufficient，不要勉强猜测。
-supporting_evidence_ids只能引用输入中真实存在的证据ID。reason_zh只写一句简短结论。"""
-
-GEMINI_RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "status": {"type": "string", "enum": ["decisive", "insufficient"]},
-        "winner": {"type": ["string", "null"], "enum": ["team_a", "team_b", None]},
-        "team_a_score": {"type": "integer", "minimum": 0, "maximum": 100},
-        "team_b_score": {"type": "integer", "minimum": 0, "maximum": 100},
-        "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
-        "supporting_evidence_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-        "risk_flags": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-        "reason_zh": {"type": "string", "maxLength": 120},
-    },
-    "required": ["status", "winner", "team_a_score", "team_b_score", "confidence", "supporting_evidence_ids", "risk_flags", "reason_zh"],
-    "additionalProperties": False,
-}
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 
 
 def _json_dumps(value: Any) -> str:
@@ -163,9 +140,8 @@ class AiConfigStore:
                 "VALUES (1,0,?,?,?,?)",
                 (DEFAULT_MODEL, WIN_PROBABILITY_THRESHOLD, CONFIDENCE_THRESHOLD, _now()),
             )
-            # Migrate the active model to Gemini without touching the legacy
-            # DeepSeek ciphertext.  Provider credentials are keyed separately,
-            # so the historical key remains available for audit/delete only.
+            # Provider credentials are keyed separately. Switching the active
+            # model never rewrites or deletes the historical Gemini envelope.
             conn.execute(
                 "UPDATE ai_risk_settings SET model=?,updated_at=? WHERE model<>?",
                 (DEFAULT_MODEL, _now(), DEFAULT_MODEL),
@@ -458,49 +434,89 @@ class AiConfigStore:
         return value
 
 
-class GeminiClient:
-    """Gemini structured-output client with every optional external tool disabled."""
+class DeepSeekClient:
+    """Small DeepSeek JSON client; no SDK, tools, search or hidden retries."""
 
-    def __init__(self, api_key: str, *, timeout_seconds: int = REQUEST_TIMEOUT_SECONDS):
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        timeout_seconds: int = REQUEST_TIMEOUT_SECONDS,
+        transport: httpx.BaseTransport | None = None,
+    ):
         self.api_key = str(api_key or "").strip()
         self.timeout_seconds = int(timeout_seconds)
-        self.client = genai.Client(api_key=self.api_key, http_options=types.HttpOptions(timeout=self.timeout_seconds * 1000))
+        self.transport = transport
+
+    def _request(self, method: str, url: str, *, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not self.api_key:
+            raise ValueError("deepseek_not_configured")
+        try:
+            with httpx.Client(
+                timeout=self.timeout_seconds,
+                transport=self.transport,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+            ) as client:
+                response = client.request(method, url, json=body)
+            if response.status_code >= 400:
+                raise RuntimeError(f"deepseek_http_{response.status_code}")
+            value = response.json()
+        except RuntimeError:
+            raise
+        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(f"deepseek_unavailable:{type(exc).__name__}") from exc
+        if not isinstance(value, dict):
+            raise RuntimeError("deepseek_invalid_response")
+        return value
 
     def test(self, *, model: str = DEFAULT_MODEL) -> dict[str, Any]:
-        parsed, response, latency = self.assess({"task": "连接测试；返回insufficient", "valid_evidence_ids": []}, model=model)
-        return {"ok": bool(parsed), "model": str(getattr(response, "model_version", None) or model), "latency_ms": latency}
-
-    def assess(self, prompt_payload: dict[str, Any], *, model: str) -> tuple[dict[str, Any], Any, int]:
         started = time.monotonic()
+        response = self._request("GET", DEEPSEEK_BALANCE_URL)
+        if response.get("is_available") is False:
+            raise RuntimeError("deepseek_balance_unavailable")
+        balance = response.get("balance_infos") if isinstance(response.get("balance_infos"), list) else []
+        return {
+            "ok": True,
+            "model": model,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "balance": {"is_available": response.get("is_available"), "balance_infos": balance[:8]},
+        }
+
+    def assess(self, prompt_payload: dict[str, Any], *, model: str) -> tuple[dict[str, Any], dict[str, Any], int]:
+        started = time.monotonic()
+        response = self._request("POST", DEEPSEEK_API_URL, body={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": _json_dumps(prompt_payload)},
+            ],
+            "thinking": {"type": "disabled"},
+            "response_format": {"type": "json_object"},
+            "max_tokens": 256,
+            "stream": False,
+        })
         try:
-            response = self.client.models.generate_content(
-                model=model,
-                contents=_json_dumps(prompt_payload),
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    response_mime_type="application/json",
-                    response_json_schema=GEMINI_RESPONSE_SCHEMA,
-                    # This is a bounded classification task over an already
-                    # normalized evidence pack.  Minimal thinking avoids
-                    # spending scarce free-tier TPM on hidden reasoning while
-                    # the local schema and evidence-id checks retain safety.
-                    thinking_config=types.ThinkingConfig(
-                        thinking_level=types.ThinkingLevel.MINIMAL,
-                    ),
-                    max_output_tokens=2048,
-                ),
-            )
-            parsed = response.parsed if isinstance(getattr(response, "parsed", None), dict) else json.loads(str(response.text or ""))
-        except json.JSONDecodeError as exc:
-            raise ValueError("invalid_gemini_json") from exc
-        except Exception as exc:
-            # Provider SDK errors can include request metadata; store only a
-            # stable class name, never the raw response or credential-bearing request.
-            raise RuntimeError(f"gemini_unavailable:{type(exc).__name__}") from exc
+            content = response["choices"][0]["message"]["content"]
+            parsed = json.loads(str(content or ""))
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid_deepseek_json") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("invalid_deepseek_json")
         return parsed, response, int((time.monotonic() - started) * 1000)
 
 
-def _gemini_usage(response: Any) -> dict[str, int]:
+def _provider_usage(response: Any) -> dict[str, int]:
+    if isinstance(response, dict):
+        usage = response.get("usage") or {}
+        return {
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+        }
+    # Keep test doubles and historical response adapters harmless.
     usage = getattr(response, "usage_metadata", None)
     return {
         "prompt_tokens": int(getattr(usage, "prompt_token_count", 0) or 0),
@@ -509,9 +525,28 @@ def _gemini_usage(response: Any) -> dict[str, int]:
     }
 
 
+def _response_model(response: Any, fallback: str) -> str:
+    if isinstance(response, dict):
+        return str(response.get("model") or fallback)
+    return str(getattr(response, "model_version", None) or fallback)
+
+
 def validate_assessment_output(value: Any, *, valid_evidence_ids: set[str] | None = None) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("assessment_not_object")
+    if "s" in value:
+        value = {
+            "status": {"d": "decisive", "i": "insufficient"}.get(str(value.get("s") or "").lower()),
+            "winner": {"a": "team_a", "b": "team_b", "null": None}.get(
+                "null" if value.get("w") is None else str(value.get("w") or "").lower()
+            ),
+            "team_a_score": value.get("a"),
+            "team_b_score": value.get("b"),
+            "confidence": value.get("c"),
+            "supporting_evidence_ids": value.get("e"),
+            "risk_flags": value.get("f"),
+            "reason_zh": value.get("r"),
+        }
     required = {"status", "winner", "team_a_score", "team_b_score", "confidence", "supporting_evidence_ids", "risk_flags", "reason_zh"}
     if not required.issubset(value):
         raise ValueError("assessment_missing_fields")
@@ -564,6 +599,50 @@ def _parse_timestamp(value: Any) -> int:
         return 0
 
 
+def _compact_model_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Remove audit-only and duplicate fields before paying model input tokens."""
+    summaries = []
+    team_keys = (
+        "name", "acronym", "tag", "window_days", "record", "last5", "last10",
+        "by_bo", "days_since_last", "current_roster",
+    )
+    for source in evidence.get("source_summaries") or []:
+        row: dict[str, Any] = {"p": str(source.get("provider") or "")}
+        for short, side in (("a", "team_a"), ("b", "team_b")):
+            team = source.get(side) or {}
+            compact = {key: team.get(key) for key in team_keys if team.get(key) not in (None, "", [], {})}
+            if compact:
+                row[short] = compact
+        if len(row) > 1:
+            summaries.append(row)
+
+    normalized = evidence.get("normalized") or {}
+    detail_keys = ("id", "d", "opp", "r", "s", "event", "tier", "also_seen_in")
+    h2h_keys = ("id", "d", "winner", "s", "event", "tier")
+    compact_rows = {
+        "a": [
+            {key: item.get(key) for key in detail_keys if item.get(key) not in (None, "", [], {})}
+            for item in (normalized.get("team_a") or [])
+        ],
+        "b": [
+            {key: item.get(key) for key in detail_keys if item.get(key) not in (None, "", [], {})}
+            for item in (normalized.get("team_b") or [])
+        ],
+        "h": [
+            {key: item.get(key) for key in h2h_keys if item.get(key) not in (None, "", [], {})}
+            for item in (normalized.get("h2h") or [])
+        ],
+    }
+    coverage = evidence.get("coverage") or {}
+    return {
+        "t": evidence.get("as_of"),
+        "src": summaries,
+        **compact_rows,
+        "g": [str(value) for value in (coverage.get("gaps") or [])][:8],
+        "x": list(coverage.get("conflicts") or [])[:5],
+    }
+
+
 def build_match_prompt(
     market: dict[str, Any], *, now_ts: int, evidence: dict[str, Any] | None = None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -590,21 +669,18 @@ def build_match_prompt(
     # stake. Tournament/stage and the time cutoff help disambiguate similarly
     # named teams and prevent accidental use of a later result.
     prompt = {
-        "task": "只根据Evidence Pack独立评估两队赢下整场比赛的赢面与置信度",
-        "match": {
-            "game": game.upper(),
-            "team_a": outcomes[0],
-            "team_b": outcomes[1],
-            "tournament_stage": " · ".join(
+        "M": {
+            "g": game.upper(),
+            "a": outcomes[0],
+            "b": outcomes[1],
+            "event": " · ".join(
                 value for value in (metadata["tournament"], metadata["stage"]) if value
             )[:360] or "unknown",
-            "best_of": metadata["best_of"],
-            "match_start": str(metadata["start_time"] or "unknown"),
-            "analysis_date_utc": metadata["analysis_date_utc"],
+            "bo": metadata["best_of"],
+            "start": str(metadata["start_time"] or "unknown"),
+            "cut": metadata["analysis_date_utc"],
         },
-        "evidence_pack": {
-            key: value for key, value in (evidence or {}).items() if key != "cache_keys"
-        },
+        "E": _compact_model_evidence(evidence or {}),
     }
     return metadata, prompt
 
@@ -635,7 +711,7 @@ class AiRiskService:
         data_dir: Path,
         follow_store: FollowStore,
         *,
-        client_factory=GeminiClient,
+        client_factory=DeepSeekClient,
         evidence_factory=None,
         orderbook_client: PolymarketOrderbookClient | None = None,
     ):
@@ -698,18 +774,17 @@ class AiRiskService:
             if evidence_score < 65:
                 return {**base, "status": "ok", "verdict": "insufficient", "direction": "insufficient", "evidence_score": evidence_score, "evidence_summary": evidence.get("coverage") or {}}
             metadata, prompt = build_match_prompt(market, now_ts=cutoff_ts, evidence=evidence)
-            prompt["mode"] = "historical_replay"
-            prompt["leakage_guard"] = "只能使用所给证据；目标比赛结果已从数据中截断"
+            prompt["H"] = 1
             secret = self.config.secret()
             if not secret:
-                raise ValueError("gemini_not_configured")
+                raise ValueError("deepseek_not_configured")
             parsed, response, latency_ms = self.client_factory(secret).assess(prompt, model=settings["model"])
             validated = validate_assessment_output(parsed, valid_evidence_ids=set(evidence.get("valid_evidence_ids") or []))
             return {
                 **base, **metadata, **validated, "status": "ok", "latency_ms": latency_ms,
                 "evidence_score": evidence_score,
                 "direction": assessment_direction({"status": "ok", "evidence_score": evidence_score, **validated}, settings),
-                "usage": _gemini_usage(response),
+                "usage": _provider_usage(response),
                 "evidence_summary": {
                     "coverage": evidence.get("coverage"), "score_components": evidence.get("score_components"),
                 },
@@ -780,7 +855,7 @@ class AiRiskService:
                     "coverage": evidence.get("coverage"),
                     "score_components": evidence.get("score_components"),
                 },
-                "evidence_snapshot": prompt.get("evidence_pack") or {},
+                "evidence_snapshot": prompt.get("E") or {},
             })
             if evidence_score < 65:
                 assessment = {
@@ -794,7 +869,7 @@ class AiRiskService:
                 return assessment
             secret = self.config.secret()
             if not secret:
-                raise ValueError("gemini_not_configured")
+                raise ValueError("deepseek_not_configured")
             parsed, response, latency_ms = self.client_factory(secret).assess(prompt, model=settings["model"])
             validated = validate_assessment_output(
                 parsed, valid_evidence_ids=set(evidence.get("valid_evidence_ids") or [])
@@ -805,10 +880,10 @@ class AiRiskService:
                 **validated,
                 "status": "ok",
                 "latency_ms": latency_ms,
-                "usage": _gemini_usage(response),
+                "usage": _provider_usage(response),
                 "provider_request": prompt,
                 "parsed_output": parsed,
-                "response_model": str(getattr(response, "model_version", None) or settings["model"]),
+                "response_model": _response_model(response, settings["model"]),
             }
         except Exception as exc:  # fail open, but preserve a sanitized audit record
             assessment = {

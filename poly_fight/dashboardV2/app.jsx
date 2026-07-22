@@ -1528,15 +1528,15 @@ function AiRiskPage({ toast }) {
       const key = await ensureWrap();
       const envelope = await window.PSEncryptCredential(secret.trim(), key);
       await Api.saveAiCredential(envelope); setSecret(""); setShow(false); await load();
-      toast("Gemini Key 已在浏览器加密并验证", "success");
+      toast("DeepSeek Key 已在浏览器加密并验证", "success");
     } catch (e) {
       toast(e && e.message === "secure_context_required" ? "请通过 HTTPS 或 localhost 配置凭证" : "保存失败，请检查 API Key", "error");
     } finally { setBusy(""); }
   };
   const test = async () => {
     setBusy("test");
-    try { await Api.testAiCredential(); await load(); toast("Gemini 连接正常", "success"); }
-    catch (e) { await load().catch(() => {}); toast("Gemini 连接测试失败", "error"); }
+    try { await Api.testAiCredential(); await load(); toast("DeepSeek 连接正常", "success"); }
+    catch (e) { await load().catch(() => {}); toast("DeepSeek 连接测试失败", "error"); }
     finally { setBusy(""); }
   };
   const saveData = async () => {
@@ -1560,13 +1560,13 @@ function AiRiskPage({ toast }) {
   const toggle = async (enabled) => {
     setBusy("toggle");
     try { await Api.saveAiSettings(enabled); await load(); toast(enabled ? "AI 主盘风控已开启" : "AI 主盘风控已关闭", "success"); }
-    catch (e) { toast(e && e.error === "gemini_not_configured" ? "请先保存并验证 Gemini Key" : "AI 风控状态更新失败", "error"); }
+    catch (e) { toast(e && e.error === "deepseek_not_configured" ? "请先保存并验证 DeepSeek Key" : "AI 风控状态更新失败", "error"); }
     finally { setBusy(""); }
   };
   const remove = async () => {
-    if (!window.confirm("删除 Gemini 凭证？历史 AI 判断与拦截记录会保留。")) return;
+    if (!window.confirm("删除 DeepSeek 凭证？历史 AI 判断与拦截记录会保留。")) return;
     setBusy("delete");
-    try { await Api.deleteAiCredential(); await load(); toast("Gemini 凭证已删除", "success"); }
+    try { await Api.deleteAiCredential(); await load(); toast("DeepSeek 凭证已删除", "success"); }
     catch (e) { toast("删除失败", "error"); }
     finally { setBusy(""); }
   };
@@ -1628,7 +1628,7 @@ function AiRiskPage({ toast }) {
     <Card className={"ai-control-card" + (radarRunning ? " is-live" : "")}>
       <div className="ai-control-copy">
         <span className="ai-control-icon"><Ico n="radar" /></span>
-        <div><h2>AI 风控雷达</h2><p>多源赛前证据交由 Gemini 独立判断主盘胜方：强冲突拦截钱包信号，高质量机会进入独立自营影子账本。</p></div>
+        <div><h2>AI 风控雷达</h2><p>多源赛前证据交由 DeepSeek 独立判断主盘胜方：强冲突拦截钱包信号，高质量机会进入独立自营影子账本。</p></div>
       </div>
       <div className="ai-control-state">
         <Badge tone={radarRunning ? "up" : "neutral"} dot>{radarRunning ? "运行中" : cfg.enabled ? "待配置" : "已关闭"}</Badge>
@@ -1659,9 +1659,9 @@ function AiRiskPage({ toast }) {
     <div className="ai-page-grid">
       <Card className="ai-connection-card">
         <div className="ai-section-head"><div><h3>模型与数据连接</h3><p>两组 Key 均在浏览器加密后保存</p></div></div>
-        <div className="ai-provider-head"><div><b>Gemini</b><span>{cfg.model || "gemini-3.6-flash"}</span></div><Badge tone={connectionTone} dot>{connectionText}</Badge></div>
+        <div className="ai-provider-head"><div><b>DeepSeek</b><span>{cfg.model || "deepseek-v4-pro"}</span></div><Badge tone={connectionTone} dot>{connectionText}</Badge></div>
         <div className="ai-secret-row">
-          <Input type={show ? "text" : "password"} value={secret} onFocus={() => ensureWrap().catch(() => {})} onChange={(e) => setSecret(e.target.value)} placeholder={credential.configured ? "输入新 Key 可安全替换" : "Gemini API Key"} autoComplete="off" />
+          <Input type={show ? "text" : "password"} value={secret} onFocus={() => ensureWrap().catch(() => {})} onChange={(e) => setSecret(e.target.value)} placeholder={credential.configured ? "输入新 Key 可安全替换" : "DeepSeek API Key"} autoComplete="off" />
           <Button variant="ghost" size="sm" onClick={() => setShow((v) => !v)}>{show ? "隐藏" : "显示"}</Button>
           <Button variant="primary" size="sm" disabled={!secret.trim() || !!busy} onClick={save}>{busy === "save" ? "验证中…" : "加密保存"}</Button>
         </div>

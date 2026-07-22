@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .control import _pid_alive, read_follow_control, reconcile_wallet_refresh_status, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
-from .ai_risk import AiConfigStore, GeminiClient, ai_audit_summary
+from .ai_risk import AiConfigStore, DeepSeekClient, ai_audit_summary
 from .pandascore import PANDASCORE_PROVIDER, PandaScoreClient
 from .core import (
     GAME_FAMILY_LABELS,
@@ -693,10 +693,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         store = AiConfigStore(self.dashboard_config.data_dir)
         try:
             secret = store.decrypt_envelope(envelope)
-            test_result = GeminiClient(secret).test(model=store.settings()["model"])
+            test_result = DeepSeekClient(secret).test(model=store.settings()["model"])
             store.save_credential(envelope)
+            store.save_balance(test_result.get("balance"))
         except Exception as exc:
-            self._error("gemini_credential_invalid", status=HTTPStatus.BAD_GATEWAY, detail=str(exc)[:200])
+            self._error("deepseek_credential_invalid", status=HTTPStatus.BAD_GATEWAY, detail=str(exc)[:200])
             return
         self._ok({"configured": True, "status": "valid", "test": test_result})
 
@@ -705,13 +706,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             secret = store.secret()
             if not secret:
-                self._error("gemini_not_configured", status=HTTPStatus.BAD_REQUEST)
+                self._error("deepseek_not_configured", status=HTTPStatus.BAD_REQUEST)
                 return
-            test_result = GeminiClient(secret).test(model=store.settings()["model"])
+            test_result = DeepSeekClient(secret).test(model=store.settings()["model"])
             store.mark_credential_valid()
+            store.save_balance(test_result.get("balance"))
         except Exception as exc:
             store.mark_credential_error(str(exc))
-            self._error("gemini_connection_failed", status=HTTPStatus.BAD_GATEWAY, detail=str(exc)[:200])
+            self._error("deepseek_connection_failed", status=HTTPStatus.BAD_GATEWAY, detail=str(exc)[:200])
             return
         self._ok({"configured": True, "status": "valid", "test": test_result})
 
@@ -759,7 +761,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         store = AiConfigStore(self.dashboard_config.data_dir)
         if enabled:
             if not store.credential_envelope():
-                self._error("gemini_not_configured", status=HTTPStatus.CONFLICT)
+                self._error("deepseek_not_configured", status=HTTPStatus.CONFLICT)
                 return
         self._ok(store.save_settings(enabled=enabled))
 

@@ -146,6 +146,20 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(len(series), 1)
         self.assertEqual(series[0]["score"], [2, 0])
 
+    def test_leaguepedia_numeric_winner_is_resolved_to_team_side(self):
+        rows = [
+            {"MatchId": "m1", "GameId": "g1", "N_GameInMatch": "1", "DateTime_UTC": "2026-07-20 10:00:00", "Team1": "Alpha", "Team2": "Beta", "Winner": "1", "Tournament": "Cup"},
+            {"MatchId": "m1", "GameId": "g2", "N_GameInMatch": "2", "DateTime_UTC": "2026-07-20 11:00:00", "Team1": "Alpha", "Team2": "Beta", "Winner": "2", "Tournament": "Cup"},
+            {"MatchId": "m1", "GameId": "g3", "N_GameInMatch": "3", "DateTime_UTC": "2026-07-20 12:00:00", "Team1": "Alpha", "Team2": "Beta", "Winner": "1", "Tournament": "Cup"},
+        ]
+        series = group_scoreboard_games(rows, team="Alpha", cutoff_ts=1_784_688_000)
+        self.assertEqual(len(series), 1)
+        self.assertEqual(series[0]["result"], "W")
+        self.assertEqual(series[0]["score"], [2, 1])
+        reverse = group_scoreboard_games(rows, team="Beta", cutoff_ts=1_784_688_000)
+        self.assertEqual(reverse[0]["result"], "L")
+        self.assertEqual(reverse[0]["score"], [1, 2])
+
     def test_liquipedia_api_html_normalizes_series(self):
         html = """
         <div class='match-table-wrapper'><table><tr class='table2__row--body'>

@@ -8494,7 +8494,7 @@ def command_reconcile_balance(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_ai_backtest(args: argparse.Namespace) -> int:
-    """Replay settled main matches through multi-source evidence + Gemini without changing follow state."""
+    """Replay settled main matches through multi-source evidence + DeepSeek without changing follow state."""
     data_dir = resolve_dashboard_root(args)
     follow_dir = resolve_follow_dir(args, data_dir)
     store = FollowStore(follow_dir / "follow.db")
@@ -8834,7 +8834,7 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.set_defaults(func=command_reconcile_balance)
 
     ai_backtest = subparsers.add_parser(
-        "ai-backtest", help="replay settled main matches through multi-source evidence and Gemini"
+        "ai-backtest", help="replay settled main matches through multi-source evidence and DeepSeek"
     )
     ai_backtest.add_argument("--follow-dir")
     ai_backtest.add_argument("--limit", type=int, default=50, help="maximum distinct settled conditions")

@@ -379,7 +379,7 @@ delete endpoint.
 AI risk provider rules:
 
 ```text
-data/model = parallel multi-source EvidenceRouter -> Gemini / gemini-3.6-flash
+data/model = parallel multi-source EvidenceRouter -> DeepSeek / deepseek-v4-pro
   Dota2 = PandaScore + OpenDota
   LoL = PandaScore + Leaguepedia Cargo
   CS2 = PandaScore + Liquipedia MediaWiki action API
@@ -404,7 +404,8 @@ self-run shadow = independent 5000 USDC ledger; evidence >=80, winner >=65%,
                   one main-match position per condition, hold to settlement
 ```
 
-Gemini receives no search/tools and returns strict JSON. Local code validates
+DeepSeek receives no search/tools and returns compact strict JSON with thinking
+disabled. Local code validates
 scores, confidence, evidence references and winner/score consistency; only local
 code decides whether to block a wallet signal or enter the self-run shadow.
 
@@ -459,7 +460,7 @@ poly_fight/core.py       classification, scoring, pure logic
 poly_fight/api.py        read-only HTTP client
 poly_fight/cli.py        collect/follow/run/serve
 poly_fight/follow.py     paper follow logic
-poly_fight/ai_risk.py    Gemini assessment, encrypted BYOK config, local gates
+poly_fight/ai_risk.py    DeepSeek assessment, encrypted BYOK config, local gates
 poly_fight/evidence.py   parallel evidence router, merge, scoring and snapshots
 poly_fight/opendota.py   cutoff-safe Dota2 history and limited match metrics
 poly_fight/leaguepedia.py Cargo whole-series LoL evidence with circuit breaker

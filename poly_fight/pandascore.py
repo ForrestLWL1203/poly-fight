@@ -1,4 +1,4 @@
-"""Compact PandaScore evidence for the multi-source Gemini risk gate.
+"""Compact PandaScore evidence for the multi-source AI risk gate.
 
 Raw provider payloads never reach the model or persistent cache.  Team history is
 normalized, bounded by both time and count, and upserted per team.  Match-specific

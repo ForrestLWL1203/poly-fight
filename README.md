@@ -7,9 +7,9 @@ following their entries as paper legs — **no live orders, private keys,
 balances, or approvals are ever used.**
 
 Runtime dependencies are version-locked and deliberately small. `cryptography`
-protects browser-encrypted BYOK envelopes, `google-genai` supplies the strict
-Gemini client, and the remaining HTTP/HTML libraries support bounded public API
-adapters; the dashboard UI ships vendored JS assets.
+protects browser-encrypted BYOK envelopes, while `httpx` and the remaining
+HTTP/HTML libraries support DeepSeek and bounded public API adapters; the
+dashboard UI ships vendored JS assets.
 
 ---
 
@@ -173,7 +173,7 @@ The dashboard serves **every** response from SQLite (`follow.db` plus the
 per-category `leaderboard.db`) — it never parses raw JSON outputs. Access is
 **read-only** (`mode=ro`, `PRAGMA query_only=1`); it never places trades. The
 live external requests are the wallet-trades proxy and explicit authenticated
-Gemini/PandaScore credential tests. Authenticated users can trigger a
+DeepSeek/PandaScore credential tests. Authenticated users can trigger a
 background smart-wallet refresh, start/stop the runner, set
 a manual paper balance cap, manage favorites, and reset generated data — nothing
 that writes follow-signal state directly.
@@ -223,20 +223,20 @@ paper signals, legs, behavior events, results, quarantine, CLV/contested fields,
 performance, manual balance cap, run ticks, the configurable follow strategy,
 and AI assessment/intent/shadow-position audit records.
 
-### Multi-source Gemini main-match risk and self-run shadow
+### Multi-source DeepSeek main-match risk and self-run shadow
 
 The optional AI risk radar evaluates only LOL/CS2/Dota2 full-match winners.
 PandaScore runs in parallel with OpenDota for Dota2, Leaguepedia Cargo for LoL,
 or Liquipedia's compliant MediaWiki Action API for CS2. The router normalizes
 whole-match series, removes duplicates and conflicting results, scores evidence
-quality locally, and sends Gemini an immutable evidence pack of at most about
+quality locally, and sends DeepSeek an immutable evidence pack of at most about
 12K tokens. It includes 30/60/120-day summaries, up to 12 recent series, H2H,
 format, roster/coverage gaps and real evidence IDs; sparse histories may extend
 to 180 days. Raw provider responses are not retained long term.
 
-Gemini runs with external tools disabled and can cite only supplied evidence
+DeepSeek runs with thinking and external tools disabled and can cite only supplied evidence
 IDs. Wallet identity, intended side, price and stake never enter the prompt.
-A wallet leg is blocked only when local evidence is >=70 and Gemini gives the
+A wallet leg is blocked only when local evidence is >=70 and DeepSeek gives the
 opponent >=65% with >=75 confidence; missing data and failures fail open. Each
 blocked intent maintains both the original-wallet shadow and a same-stake
 AI-side hold-to-settlement shadow.
