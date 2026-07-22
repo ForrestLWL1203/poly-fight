@@ -480,14 +480,14 @@ class GeminiClient:
                     system_instruction=SYSTEM_PROMPT,
                     response_mime_type="application/json",
                     response_json_schema=GEMINI_RESPONSE_SCHEMA,
-                    # Gemini 3.x accounts for internal reasoning inside the
-                    # generation ceiling.  Medium thinking keeps the matchup
-                    # comparison substantive; 4K prevents a valid short JSON
-                    # answer from being cut off after its thought phase.
+                    # This is a bounded classification task over an already
+                    # normalized evidence pack.  Minimal thinking avoids
+                    # spending scarce free-tier TPM on hidden reasoning while
+                    # the local schema and evidence-id checks retain safety.
                     thinking_config=types.ThinkingConfig(
-                        thinking_level=types.ThinkingLevel.MEDIUM,
+                        thinking_level=types.ThinkingLevel.MINIMAL,
                     ),
-                    max_output_tokens=4096,
+                    max_output_tokens=2048,
                 ),
             )
             parsed = response.parsed if isinstance(getattr(response, "parsed", None), dict) else json.loads(str(response.text or ""))

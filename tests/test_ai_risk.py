@@ -12,10 +12,12 @@ from unittest.mock import patch
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from google.genai import types
 
 from poly_fight.ai_risk import (
     AiConfigStore,
     AiRiskService,
+    GeminiClient,
     SYSTEM_PROMPT,
     assessment_direction,
     build_match_prompt,
@@ -166,6 +168,31 @@ class FakePandaScore:
 
 
 class AiRiskTests(unittest.TestCase):
+    def test_gemini_uses_minimal_thinking_and_bounded_output(self):
+        captured = {}
+
+        class Models:
+            @staticmethod
+            def generate_content(**kwargs):
+                captured.update(kwargs)
+                return type("Response", (), {
+                    "parsed": {"status": "insufficient"},
+                    "text": "",
+                })()
+
+        client = GeminiClient.__new__(GeminiClient)
+        client.client = type("Client", (), {"models": Models()})()
+        parsed, _, _ = client.assess(
+            {"task": "test", "valid_evidence_ids": []}, model="gemini-3.6-flash",
+        )
+        config = captured["config"]
+        self.assertEqual(parsed["status"], "insufficient")
+        self.assertEqual(config.thinking_config.thinking_level, types.ThinkingLevel.MINIMAL)
+        self.assertEqual(config.max_output_tokens, 2048)
+        self.assertIsNone(config.temperature)
+        self.assertIsNone(config.top_p)
+        self.assertIsNone(config.top_k)
+
     def test_live_assessment_cutoff_never_advances_to_future_match_start(self):
         RecordingEvidence.cutoffs = []
         with tempfile.TemporaryDirectory() as tmp:
