@@ -1484,11 +1484,14 @@ function ProgressMask({ kind, done, error, label, hint, onClose }) {
 /* ============================================================
    Shell + data orchestration
    ============================================================ */
+const aiRiskPageCache = new Map();
+
 function AiRiskPage({ toast }) {
   const [tab, setTab] = React.useState("wallet");
   const [shadowPage, setShadowPage] = React.useState(1);
   const shadowPageSize = 10;
-  const [data, setData] = React.useState(null);
+  const cacheKey = `${shadowPageSize}:${shadowPage}`;
+  const [data, setData] = React.useState(() => aiRiskPageCache.get(cacheKey) || null);
   const [wrap, setWrap] = React.useState(null);
   const [secret, setSecret] = React.useState("");
   const [dataSecret, setDataSecret] = React.useState("");
@@ -1496,9 +1499,16 @@ function AiRiskPage({ toast }) {
   const [dataShow, setDataShow] = React.useState(false);
   const [busy, setBusy] = React.useState("");
   const load = React.useCallback(async () => {
-    const [status, key] = await Promise.all([Api.aiRisk({ proprietary_limit: shadowPageSize, proprietary_offset: (shadowPage - 1) * shadowPageSize }), Api.aiWrapKey()]);
-    setData(status); setWrap(key);
-  }, [shadowPage]);
+    const status = await Api.aiRisk({ proprietary_limit: shadowPageSize, proprietary_offset: (shadowPage - 1) * shadowPageSize });
+    aiRiskPageCache.set(cacheKey, status);
+    setData(status);
+  }, [cacheKey, shadowPage]);
+  const ensureWrap = React.useCallback(async () => {
+    if (wrap?.ready) return wrap;
+    const key = await Api.aiWrapKey();
+    setWrap(key);
+    return key;
+  }, [wrap]);
   React.useEffect(() => { load().catch(() => toast("AI 风控状态加载失败", "error")); }, [load, toast]);
   if (!data) return <CenterLoad />;
   const cfg = data.settings || {};
@@ -1512,10 +1522,11 @@ function AiRiskPage({ toast }) {
   const radarRunning = !!cfg.enabled && !!credential.configured;
 
   const save = async () => {
-    if (!secret.trim() || !wrap) return;
+    if (!secret.trim()) return;
     setBusy("save");
     try {
-      const envelope = await window.PSEncryptCredential(secret.trim(), wrap);
+      const key = await ensureWrap();
+      const envelope = await window.PSEncryptCredential(secret.trim(), key);
       await Api.saveAiCredential(envelope); setSecret(""); setShow(false); await load();
       toast("Gemini Key 已在浏览器加密并验证", "success");
     } catch (e) {
@@ -1529,10 +1540,11 @@ function AiRiskPage({ toast }) {
     finally { setBusy(""); }
   };
   const saveData = async () => {
-    if (!dataSecret.trim() || !wrap) return;
+    if (!dataSecret.trim()) return;
     setBusy("save-data");
     try {
-      const envelope = await window.PSEncryptCredential(dataSecret.trim(), wrap);
+      const key = await ensureWrap();
+      const envelope = await window.PSEncryptCredential(dataSecret.trim(), key);
       await Api.saveAiDataCredential(envelope); setDataSecret(""); setDataShow(false); await load();
       toast("PandaScore Key 已加密保存并验证", "success");
     } catch (e) {
@@ -1649,18 +1661,18 @@ function AiRiskPage({ toast }) {
         <div className="ai-section-head"><div><h3>模型与数据连接</h3><p>两组 Key 均在浏览器加密后保存</p></div></div>
         <div className="ai-provider-head"><div><b>Gemini</b><span>{cfg.model || "gemini-3.6-flash"}</span></div><Badge tone={connectionTone} dot>{connectionText}</Badge></div>
         <div className="ai-secret-row">
-          <Input type={show ? "text" : "password"} value={secret} onChange={(e) => setSecret(e.target.value)} placeholder={credential.configured ? "输入新 Key 可安全替换" : "Gemini API Key"} autoComplete="off" />
+          <Input type={show ? "text" : "password"} value={secret} onFocus={() => ensureWrap().catch(() => {})} onChange={(e) => setSecret(e.target.value)} placeholder={credential.configured ? "输入新 Key 可安全替换" : "Gemini API Key"} autoComplete="off" />
           <Button variant="ghost" size="sm" onClick={() => setShow((v) => !v)}>{show ? "隐藏" : "显示"}</Button>
-          <Button variant="primary" size="sm" disabled={!secret.trim() || !!busy || !wrap?.ready} onClick={save}>{busy === "save" ? "验证中…" : "加密保存"}</Button>
+          <Button variant="primary" size="sm" disabled={!secret.trim() || !!busy} onClick={save}>{busy === "save" ? "验证中…" : "加密保存"}</Button>
         </div>
         <p className="ai-security-note"><Ico n="lock-keyhole" /> 明文 Key 不进入数据库和请求日志。</p>
         <div className="ai-connection-actions"><Button variant="ghost" size="sm" disabled={!credential.configured || !!busy} onClick={test}>{busy === "test" ? "测试中…" : "测试模型连接"}</Button>{credential.configured && <Button variant="danger" size="sm" disabled={!!busy} onClick={remove}>删除凭证</Button>}</div>
         <div className="ai-provider-divider"></div>
         <div className="ai-provider-head"><div><b>PandaScore</b><span>120 天主窗口 · 样本不足回补至 180 天</span></div><Badge tone={dataConnectionTone} dot>{dataConnectionText}</Badge></div>
         <div className="ai-secret-row">
-          <Input type={dataShow ? "text" : "password"} value={dataSecret} onChange={(e) => setDataSecret(e.target.value)} placeholder={dataCredential.configured ? "输入新 Key 可安全替换" : "PandaScore API Key"} autoComplete="off" />
+          <Input type={dataShow ? "text" : "password"} value={dataSecret} onFocus={() => ensureWrap().catch(() => {})} onChange={(e) => setDataSecret(e.target.value)} placeholder={dataCredential.configured ? "输入新 Key 可安全替换" : "PandaScore API Key"} autoComplete="off" />
           <Button variant="ghost" size="sm" onClick={() => setDataShow((v) => !v)}>{dataShow ? "隐藏" : "显示"}</Button>
-          <Button variant="primary" size="sm" disabled={!dataSecret.trim() || !!busy || !wrap?.ready} onClick={saveData}>{busy === "save-data" ? "验证中…" : "加密保存"}</Button>
+          <Button variant="primary" size="sm" disabled={!dataSecret.trim() || !!busy} onClick={saveData}>{busy === "save-data" ? "验证中…" : "加密保存"}</Button>
         </div>
         <div className="ai-connection-actions"><Button variant="ghost" size="sm" disabled={!dataCredential.configured || !!busy} onClick={testData}>{busy === "test-data" ? "测试中…" : "测试数据连接"}</Button>{dataCredential.configured && <Button variant="danger" size="sm" disabled={!!busy} onClick={removeData}>删除凭证</Button>}</div>
       </Card>

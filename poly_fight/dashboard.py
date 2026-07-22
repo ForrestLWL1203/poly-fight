@@ -52,6 +52,13 @@ _RANK_CACHE_LOCK = threading.Lock()
 _MATCH_TITLE_RE = re.compile(r"^([^:]+):\s+(.+?)\s+vs\s+(.+?)(\s+\([^)]+\))?\s+-\s+(.+)$", re.IGNORECASE)
 _SPORTS_TITLE_RE = re.compile(r"^(.+?)\s+vs\.?\s+(.+?)(?:\s+-\s+(.+))?$", re.IGNORECASE)
 _ESPORTS_GAME_ORDER = {"dota2": 0, "cs2": 1, "lol": 2, "valorant": 3}
+_AI_ASSESSMENT_LIST_FIELDS = (
+    "condition_id", "status", "verdict", "team_a", "team_b",
+    "team_a_win_probability", "team_b_win_probability", "confidence",
+    "game", "best_of", "evidence_score", "reason_zh", "error",
+    "model", "prompt_version", "updated_at",
+)
+_AI_INTENT_LIST_FIELDS = ("condition_id", "action", "status", "updated_at")
 
 
 @dataclass(frozen=True)
@@ -102,6 +109,10 @@ def _request_bool(value: Any, *, default: bool = False) -> bool:
     if text in {"0", "false", "no", "n", "off", ""}:
         return False
     return default
+
+
+def _compact_rows(rows: list[dict[str, Any]], fields: tuple[str, ...]) -> list[dict[str, Any]]:
+    return [{key: row.get(key) for key in fields if row.get(key) is not None} for row in rows]
 
 
 def _b64(data: bytes) -> str:
@@ -306,8 +317,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._ok({
                 **AiConfigStore.read_existing_status(self.dashboard_config.data_dir),
                 "summary": summary,
-                "recent_assessments": audit.get("assessments") or [],
-                "recent_intents": audit.get("intents") or [],
+                "recent_assessments": _compact_rows((audit.get("assessments") or [])[:10], _AI_ASSESSMENT_LIST_FIELDS),
+                "recent_intents": _compact_rows(audit.get("intents") or [], _AI_INTENT_LIST_FIELDS),
                 "source_health": follow_store.load_ai_provider_health(),
                 "proprietary_records": follow_store.load_ai_proprietary_positions(
                     limit=proprietary_limit, offset=proprietary_offset,
@@ -319,7 +330,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             })
             return
         if parsed.path == "/api/ai-risk/wrap-key":
-            self._ok(AiConfigStore(self.dashboard_config.data_dir).public_wrap_key())
+            self._ok(AiConfigStore.read_existing_public_wrap_key(self.dashboard_config.data_dir))
             return
         if parsed.path == "/api/follow-strategy":
             store = FollowStore(_follow_db_path(self.dashboard_config))

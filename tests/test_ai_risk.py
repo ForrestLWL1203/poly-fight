@@ -413,6 +413,15 @@ class AiRiskTests(unittest.TestCase):
             self.assertFalse(config.private_key_path.exists())
             self.assertFalse(config.public_key_path.exists())
 
+    def test_existing_public_wrap_key_read_skips_store_initialization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            config = AiConfigStore(data_dir)
+            expected = config.public_wrap_key()
+            with patch.object(AiConfigStore, "init_db", side_effect=AssertionError("must not initialize")):
+                actual = AiConfigStore.read_existing_public_wrap_key(data_dir)
+            self.assertEqual(actual, expected)
+
     def test_ai_dashboard_routes_require_auth_and_accept_encrypted_envelope(self):
         class ModelClient:
             def __init__(self, secret):

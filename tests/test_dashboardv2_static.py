@@ -79,6 +79,9 @@ class DashboardV2StaticTests(unittest.TestCase):
         self.assertIn("Gemini 凭证", app)
         self.assertIn(".ai-control-card", css)
         self.assertIn(".ai-record-table", css)
+        self.assertIn("const aiRiskPageCache = new Map()", app)
+        initial_load = app.split("const load = React.useCallback", 1)[1].split("const ensureWrap", 1)[0]
+        self.assertNotIn("Api.aiWrapKey", initial_load)
 
     def test_follow_ai_badge_only_shows_decision_action(self):
         app = _read("app.jsx")

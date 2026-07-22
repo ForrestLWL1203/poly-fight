@@ -211,7 +211,11 @@ class AiConfigStore:
             os.replace(tmp, self.public_key_path)
 
     def public_wrap_key(self) -> dict[str, Any]:
-        public = serialization.load_pem_public_key(self.public_key_path.read_bytes())
+        return self._public_wrap_key_from_path(self.public_key_path)
+
+    @staticmethod
+    def _public_wrap_key_from_path(path: Path) -> dict[str, Any]:
+        public = serialization.load_pem_public_key(Path(path).read_bytes())
         der = public.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
         return {
             "ready": True,
@@ -220,6 +224,14 @@ class AiConfigStore:
             "keyId": hashlib.sha256(der).hexdigest()[:24],
             "spki": base64.b64encode(der).decode("ascii"),
         }
+
+    @classmethod
+    def read_existing_public_wrap_key(cls, data_dir: Path) -> dict[str, Any]:
+        """Read an existing public key without initializing SQLite or loading the private key."""
+        public_path = Path(data_dir) / ".secrets" / "credential_wrap_public.pem"
+        if public_path.exists():
+            return cls._public_wrap_key_from_path(public_path)
+        return cls(data_dir).public_wrap_key()
 
     def decrypt_envelope(self, envelope: dict[str, Any]) -> str:
         expected = self.public_wrap_key()
