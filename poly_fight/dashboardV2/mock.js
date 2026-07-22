@@ -52,7 +52,7 @@
       enabled: true, credential_configured: true, credential_status: "valid",
       blocked_count: 9, agree_count: 24, insufficient_count: 4, unavailable_count: 1,
       resolved_blocked_count: 7, avoided_loss_usdc: 1084, missed_profit_usdc: 214,
-      net_effect_usdc: 870,
+      net_effect_usdc: 870, proprietary_pnl_usdc: 284.61, proprietary_open_count: 2,
     },
     win_rates_by_game: [
       { game: "dota2", game_label: "Dota 2", wins: 18, losses: 7, settled_count: 25, win_rate: 0.72 },
@@ -185,7 +185,7 @@
       match_parts: { game: "League of Legends", teamA: "T1", teamB: "Kiwoom DRX", meta: "(BO1) KeSPA Cup" }, team_logos: {},
       outcomes: ["T1", "Kiwoom DRX"], outcome_prices: [1, .001], signal_count: 0, db_ready: true, wallets: [],
       ai_risk: {
-        assessment: { status: "ok", verdict: "team_a", team_a: "T1", team_b: "Kiwoom DRX", team_a_win_probability: 82, team_b_win_probability: 18, confidence: 91, knowledge_recency: "recent", reason_zh: "优势：T1历史实力与交手；风险：BO1波动", model: "deepseek-v4-pro", prompt_version: "esports-main-pandascore-v1" },
+        assessment: { status: "ok", verdict: "team_a", team_a: "T1", team_b: "Kiwoom DRX", team_a_win_probability: 82, team_b_win_probability: 18, confidence: 91, knowledge_recency: "recent", reason_zh: "优势：T1历史实力与交手；风险：BO1波动", model: "gemini-3.6-flash", prompt_version: "esports-main-rag-v2" },
         action_counts: { blocked: 3 }, intent_count: 3, blocked_intent_count: 3, blocked_intended_stake: 682, net_effect: 682,
         blocked_wallets: [
           { wallet: "0xcb7286ed5e91a6db709876543210abcdef126532", outcome: "Kiwoom DRX", outcome_index: 1, intended_stake: 126, entry_price: .585, shadow_status: "settled", baseline_pnl: -126, ai_net_effect: 126 },
@@ -203,7 +203,7 @@
       match_parts: m.match_parts, team_logos: m.team_logos,
       outcomes: m.outcomes, outcome_prices: m.outcome_prices, signal_count: 2, db_ready: true,
       ai_risk: {
-        assessment: { status: "ok", verdict: "team_a", team_a: "PARIVISION", team_b: "Monte", team_a_win_probability: 69, team_b_win_probability: 31, confidence: 82, knowledge_recency: "recent", reason_zh: "优势：近期状态更稳；风险：阵容信息有限", model: "deepseek-v4-pro", prompt_version: "esports-main-pandascore-v1" },
+        assessment: { status: "ok", verdict: "team_a", team_a: "PARIVISION", team_b: "Monte", team_a_win_probability: 69, team_b_win_probability: 31, confidence: 82, knowledge_recency: "recent", reason_zh: "优势：近期状态更稳；风险：阵容信息有限", model: "gemini-3.6-flash", prompt_version: "esports-main-rag-v2" },
         action_counts: { agree: 2 }, intent_count: 2, blocked_intent_count: 0, blocked_intended_stake: 0, blocked_wallets: [], net_effect: 0,
         counterfactual_label: "被拦截意图级反事实；不包含释放资金后续用途",
       },
@@ -344,11 +344,21 @@
 
   function aiRisk() {
     return {
-      settings: { enabled: true, model: "deepseek-v4-pro", win_probability_threshold: 65, confidence_threshold: 75, updated_at: ago(300) },
+      settings: { enabled: true, model: "gemini-3.6-flash", win_probability_threshold: 65, confidence_threshold: 75, updated_at: ago(300) },
       credential: { configured: true, status: "valid", updated_at: ago(600), last_validated_at: ago(120) },
       data_credential: { configured: true, status: "valid", updated_at: ago(600), last_validated_at: ago(120) },
-      balance: { checked_at: ago(120), currency: "CNY", total_balance: 96.42, is_available: true },
-      summary: { assessment_count: 18, intent_count: 31, blocked_count: 5, agree_count: 20, insufficient_count: 4, unavailable_count: 2, resolved_blocked_count: 3, avoided_loss_usdc: 682, missed_profit_usdc: 126, net_effect_usdc: 556, ai_inverse_resolved_count: 3, ai_inverse_win_count: 2, ai_inverse_pnl_usdc: 412.35, ai_vs_wallet_usdc: 1094.35 },
+      summary: { assessment_count: 18, intent_count: 31, blocked_count: 5, agree_count: 20, insufficient_count: 4, unavailable_count: 2, resolved_blocked_count: 3, avoided_loss_usdc: 682, missed_profit_usdc: 126, net_effect_usdc: 556, ai_inverse_resolved_count: 3, ai_inverse_win_count: 2, ai_inverse_pnl_usdc: 412.35, ai_vs_wallet_usdc: 1094.35, proprietary_screened_count: 12, proprietary_open_count: 2, proprietary_settled_count: 7, proprietary_win_count: 5, proprietary_pnl_usdc: 284.61, proprietary_roi: .081, proprietary_bankroll_usdc: 5284.61, proprietary_brier_score: .164 },
+      source_health: [
+        { provider: "pandascore", status: "ok", coverage: 18, last_success_at: ago(80) },
+        { provider: "opendota", status: "ok", coverage: 14, last_success_at: ago(220) },
+        { provider: "leaguepedia", status: "limited", coverage: 9, error: "leaguepedia_ratelimited", last_success_at: ago(1800) },
+        { provider: "liquipedia", status: "ok", coverage: 12, last_success_at: ago(110) },
+      ],
+      proprietary_records: [
+        { condition_id: "self-1", game_family: "cs2", outcomes: ["Astralis", "HEROIC"], outcome_index: 0, status: "open", decision: "entered", evidence_score: 91, ai_probability: 72, confidence: 84, stake_usdc: 52, entry_price: .61 },
+        { condition_id: "self-2", game_family: "lol", outcomes: ["Top Esports", "Team WE"], outcome_index: 0, status: "settled", decision: "settled", evidence_score: 87, ai_probability: 68, confidence: 79, stake_usdc: 50, entry_price: .58, realized_pnl: 36.21, prediction_correct: true },
+        { condition_id: "self-3", game_family: "dota2", outcomes: ["Falcons", "Team Spirit"], outcome_index: -1, status: "watching", decision: "volume_insufficient", evidence_score: 0, required_volume_usdc: 1000, volume_usdc: 640 },
+      ],
       recent_assessments: [
         { condition_id: "0xmockaiblockedt1drx", game: "lol", team_a: "T1", team_b: "Kiwoom DRX", best_of: "BO1", verdict: "team_a", team_a_win_probability: 82, team_b_win_probability: 18, confidence: 91, reason_zh: "T1长期实力、交手与大赛经验明显占优" },
         { condition_id: M.cs2_main.condition_id, game: "cs2", team_a: "PARIVISION", team_b: "Monte", best_of: "BO3", verdict: "team_a", team_a_win_probability: 69, team_b_win_probability: 31, confidence: 82, reason_zh: "近期状态与系列赛稳定性更强" },

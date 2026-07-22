@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .control import _pid_alive, read_follow_control, reconcile_wallet_refresh_status, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
-from .ai_risk import AiConfigStore, DeepSeekClient, ai_audit_summary
+from .ai_risk import AiConfigStore, GeminiClient, ai_audit_summary
 from .pandascore import PANDASCORE_PROVIDER, PandaScoreClient
 from .core import (
     GAME_FAMILY_LABELS,
@@ -293,14 +293,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._ok(build_overview(self.dashboard_config.data_dir, follow_dir=follow_dir))
             return
         if parsed.path == "/api/ai-risk":
-            config_store = AiConfigStore(self.dashboard_config.data_dir)
             follow_store = FollowStore(_follow_db_path(self.dashboard_config))
             audit = follow_store.load_ai_audit(limit=20)
+            query = urllib.parse.parse_qs(parsed.query)
+            proprietary_limit = _int_param(
+                (query.get("proprietary_limit") or [10])[0], default=10, minimum=5, maximum=100,
+            )
+            proprietary_offset = _int_param(
+                (query.get("proprietary_offset") or [0])[0], default=0, minimum=0, maximum=1_000_000,
+            )
+            summary = ai_audit_summary(follow_store)
             self._ok({
-                **config_store.status(),
-                "summary": ai_audit_summary(follow_store),
+                **AiConfigStore.read_existing_status(self.dashboard_config.data_dir),
+                "summary": summary,
                 "recent_assessments": audit.get("assessments") or [],
                 "recent_intents": audit.get("intents") or [],
+                "source_health": follow_store.load_ai_provider_health(),
+                "proprietary_records": follow_store.load_ai_proprietary_positions(
+                    limit=proprietary_limit, offset=proprietary_offset,
+                ),
+                "proprietary_page": {
+                    "limit": proprietary_limit, "offset": proprietary_offset,
+                    "total": int(summary.get("proprietary_screened_count") or 0),
+                },
             })
             return
         if parsed.path == "/api/ai-risk/wrap-key":
@@ -667,30 +682,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
         store = AiConfigStore(self.dashboard_config.data_dir)
         try:
             secret = store.decrypt_envelope(envelope)
-            balance = DeepSeekClient(secret).balance()
+            test_result = GeminiClient(secret).test(model=store.settings()["model"])
             store.save_credential(envelope)
-            safe_balance = store.save_balance(balance)
         except Exception as exc:
-            self._error("deepseek_credential_invalid", status=HTTPStatus.BAD_GATEWAY, detail=str(exc)[:200])
+            self._error("gemini_credential_invalid", status=HTTPStatus.BAD_GATEWAY, detail=str(exc)[:200])
             return
-        self._ok({"configured": True, "status": "valid", "balance": safe_balance})
+        self._ok({"configured": True, "status": "valid", "test": test_result})
 
     def _ai_credential_test(self) -> None:
         store = AiConfigStore(self.dashboard_config.data_dir)
         try:
             secret = store.secret()
             if not secret:
-                self._error("deepseek_not_configured", status=HTTPStatus.BAD_REQUEST)
+                self._error("gemini_not_configured", status=HTTPStatus.BAD_REQUEST)
                 return
-            balance = DeepSeekClient(secret).balance()
+            test_result = GeminiClient(secret).test(model=store.settings()["model"])
             store.mark_credential_valid()
-            safe_balance = store.save_balance(balance)
         except Exception as exc:
             store.mark_credential_error(str(exc))
-            store.save_balance(None, error=str(exc))
-            self._error("deepseek_connection_failed", status=HTTPStatus.BAD_GATEWAY, detail=str(exc)[:200])
+            self._error("gemini_connection_failed", status=HTTPStatus.BAD_GATEWAY, detail=str(exc)[:200])
             return
-        self._ok({"configured": True, "status": "valid", "balance": safe_balance})
+        self._ok({"configured": True, "status": "valid", "test": test_result})
 
     def _ai_credential_delete(self) -> None:
         store = AiConfigStore(self.dashboard_config.data_dir)
@@ -728,8 +740,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _ai_data_credential_delete(self) -> None:
         store = AiConfigStore(self.dashboard_config.data_dir)
-        store.save_settings(enabled=False)
-        self._ok({"deleted": store.delete_credential(PANDASCORE_PROVIDER), "enabled": False})
+        self._ok({"deleted": store.delete_credential(PANDASCORE_PROVIDER), "enabled": store.settings()["enabled"]})
 
     def _ai_settings(self) -> None:
         form = self._read_request_form()
@@ -737,10 +748,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         store = AiConfigStore(self.dashboard_config.data_dir)
         if enabled:
             if not store.credential_envelope():
-                self._error("deepseek_not_configured", status=HTTPStatus.CONFLICT)
-                return
-            if not store.credential_envelope(PANDASCORE_PROVIDER):
-                self._error("pandascore_not_configured", status=HTTPStatus.CONFLICT)
+                self._error("gemini_not_configured", status=HTTPStatus.CONFLICT)
                 return
         self._ok(store.save_settings(enabled=enabled))
 
@@ -1167,7 +1175,7 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
     ai_data_ready = bool((ai_config.get("data_credential") or {}).get("configured"))
     overview["ai_risk"] = {
         **ai_audit_summary(store),
-        "enabled": bool(ai_requested and ai_model_ready and ai_data_ready),
+        "enabled": bool(ai_requested and ai_model_ready),
         "requested_enabled": ai_requested,
         "credential_configured": ai_model_ready,
         "credential_status": str((ai_config.get("credential") or {}).get("status") or "not_configured"),

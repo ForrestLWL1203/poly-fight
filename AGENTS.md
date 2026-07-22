@@ -379,27 +379,34 @@ delete endpoint.
 AI risk provider rules:
 
 ```text
-data/model = PandaScore compact team evidence -> DeepSeek / deepseek-v4-pro
+data/model = parallel multi-source EvidenceRouter -> Gemini / gemini-3.6-flash
+  Dota2 = PandaScore + OpenDota
+  LoL = PandaScore + Leaguepedia Cargo
+  CS2 = PandaScore + Liquipedia MediaWiki action API
 trigger = an otherwise eligible LOL/CS2/Dota2 main_match BUY intent only
-history = 120d primary; extend to 180d only when fewer than 8 matches;
-          at most 20 matches/team
-prompt compaction = recent 10 match details; matches 11-20 aggregate only;
-                    raw provider JSON, URLs, streams and IDs excluded
-cache = team history by PandaScore team id + one neutral assessment per
-        condition_id/prompt version
+history = 30/60/120d summaries; extend to 180d when sparse; at most 30
+          full-match series/team with 12 detailed series in the prompt
+prompt compaction = <=~12K tokens; evidence IDs, coverage gaps and conflicts
+                    included; raw provider JSON, URLs and streams excluded
+cache = provider + game + team normalized evidence with 6h freshness;
+        one immutable evidence snapshot/assessment per condition
 provider input excludes wallet, intended side, price, stake and condition_id
 prompt = full-match winner only, 50:50 baseline, historical strength + form +
          opponent quality + H2H + roster/system + event tier + BO format
-uncertain/stale knowledge = UNKNOWN with low confidence; never force a pick
-local block rule = opponent >=65% and confidence >=75%
-provider/schema/timeout/quota failure = fail open + audited unavailable
-settlement = delete referenced team-history cache and retain compact assessment
+evidence score = local 0-100 score; model cannot change it
+local block rule = evidence >=70, opponent >=65%, confidence >=75%
+provider/schema/timeout/quota failure = wallet fail open + audited unavailable
+settlement = retain immutable evidence snapshot; prune unused team cache by TTL
 blocked audit = original-wallet shadow + same-stake AI-side hold-to-settlement shadow
+self-run shadow = independent 5000 USDC ledger; evidence >=80, winner >=65%,
+                  confidence >=75%, positive EV and read-only CLOB depth gates;
+                  unformed books probe only at T-3h/T-2h/T-1h, then cold-skip;
+                  one main-match position per condition, hold to settlement
 ```
 
-The provider response is strict JSON. Local code validates scores, confidence,
-knowledge state and winner/score consistency; only local code decides whether
-to block.
+Gemini receives no search/tools and returns strict JSON. Local code validates
+scores, confidence, evidence references and winner/score consistency; only local
+code decides whether to block a wallet signal or enter the self-run shadow.
 
 `GET /api/stream` is same-origin, cookie-authenticated SSE. It sends an
 immediate frame, heartbeats, caps clients, and releases the count in `finally`.
@@ -452,8 +459,13 @@ poly_fight/core.py       classification, scoring, pure logic
 poly_fight/api.py        read-only HTTP client
 poly_fight/cli.py        collect/follow/run/serve
 poly_fight/follow.py     paper follow logic
-poly_fight/ai_risk.py    DeepSeek assessment, encrypted BYOK config, local gate
-poly_fight/pandascore.py bounded team-history fetch, compaction, cache adapter
+poly_fight/ai_risk.py    Gemini assessment, encrypted BYOK config, local gates
+poly_fight/evidence.py   parallel evidence router, merge, scoring and snapshots
+poly_fight/opendota.py   cutoff-safe Dota2 history and limited match metrics
+poly_fight/leaguepedia.py Cargo whole-series LoL evidence with circuit breaker
+poly_fight/liquipedia.py compliant MediaWiki API CS2 evidence with rate limits
+poly_fight/pandascore.py bounded multi-game team-history cache adapter
+poly_fight/orderbook.py  read-only CLOB depth/VWAP filters for self-run shadow
 poly_fight/dashboard.py  read-only dashboard/API
 poly_fight/storage.py    SQLite follow-state persistence
 tests/test_core.py       unittest coverage
@@ -522,8 +534,11 @@ base packages, creating the systemd unit, or configuring Caddy/firewall.
 
 The dashboard runs as a `poly-fight-dashboard` systemd unit bound to `127.0.0.1`,
 fronted by Caddy for HTTPS; the **paper runner and observe processes are spawned
-by the dashboard panel**, not as a separate systemd unit or manual argv. A routine
-dashboard restart must preserve those existing child processes and their data.
+by the dashboard panel**, not as a separate systemd unit or manual argv. A
+dashboard-only release preserves child processes. A release that changes runner,
+observer, AI, evidence or storage code must stop and restart them through the
+authenticated dashboard control path so they load the new code; never spawn them
+with a manual argv.
 
 ```text
 1. Read local private ops notes outside git for the host + login method.
@@ -531,9 +546,10 @@ dashboard restart must preserve those existing child processes and their data.
 3. Connect over SSH and abort if the VPS worktree is dirty; otherwise fetch,
    check out `main`, and reset the live checkout to `origin/main`.
 4. Install `requirements.txt` into the existing project virtual environment if
-   dependencies may have changed, then run `systemctl restart
-   poly-fight-dashboard` directly. Do not restart or manually spawn the runner or
-   realtime observer during a routine dashboard deployment.
+   dependencies may have changed. If runtime code changed, stop runner/observer
+   through dashboard controls before switching code. Restart the
+   `poly-fight-dashboard` unit directly, then start runner/observer again through
+   dashboard controls. Never spawn either with a manual argv.
 5. Use the launcher only when the VPS has not yet been provisioned or its
    SSH/systemd/Caddy/firewall setup needs bootstrap repair.
 6. Start a stopped runner / realtime refresh from the dashboard panel, not by

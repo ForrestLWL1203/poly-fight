@@ -6,9 +6,10 @@ wallets from historical trades, scores them into a leaderboard, then simulates
 following their entries as paper legs — **no live orders, private keys,
 balances, or approvals are ever used.**
 
-The project keeps dependencies deliberately small. `cryptography` is the only
-third-party runtime dependency and protects the encrypted DeepSeek BYOK
-credential envelope; the dashboard UI ships vendored JS assets.
+Runtime dependencies are version-locked and deliberately small. `cryptography`
+protects browser-encrypted BYOK envelopes, `google-genai` supplies the strict
+Gemini client, and the remaining HTTP/HTML libraries support bounded public API
+adapters; the dashboard UI ships vendored JS assets.
 
 ---
 
@@ -172,7 +173,7 @@ The dashboard serves **every** response from SQLite (`follow.db` plus the
 per-category `leaderboard.db`) — it never parses raw JSON outputs. Access is
 **read-only** (`mode=ro`, `PRAGMA query_only=1`); it never places trades. The
 live external requests are the wallet-trades proxy and explicit authenticated
-DeepSeek/PandaScore credential tests. Authenticated users can trigger a
+Gemini/PandaScore credential tests. Authenticated users can trigger a
 background smart-wallet refresh, start/stop the runner, set
 a manual paper balance cap, manage favorites, and reset generated data — nothing
 that writes follow-signal state directly.
@@ -222,26 +223,34 @@ paper signals, legs, behavior events, results, quarantine, CLV/contested fields,
 performance, manual balance cap, run ticks, the configurable follow strategy,
 and AI assessment/intent/shadow-position audit records.
 
-### PandaScore-grounded DeepSeek main-match risk gate
+### Multi-source Gemini main-match risk and self-run shadow
 
-The optional AI risk radar evaluates only LOL/CS2/Dota2 full-match winner BUYs.
-Only after a BUY passes the deterministic strategy gates does the runner query
-PandaScore. Team history uses a 120-day primary window; if a team has fewer than
-8 matches it extends to 180 days, capped at 20 matches per team. Before calling
-DeepSeek, raw responses are compacted: the most recent 10 matches retain bounded
-date/opponent/result/BO/event details, while matches 11-20 contribute only to
-aggregate record, recent-5/10 and BO splits. URLs, streams and unrelated provider
-fields never enter the prompt.
+The optional AI risk radar evaluates only LOL/CS2/Dota2 full-match winners.
+PandaScore runs in parallel with OpenDota for Dota2, Leaguepedia Cargo for LoL,
+or Liquipedia's compliant MediaWiki Action API for CS2. The router normalizes
+whole-match series, removes duplicates and conflicting results, scores evidence
+quality locally, and sends Gemini an immutable evidence pack of at most about
+12K tokens. It includes 30/60/120-day summaries, up to 12 recent series, H2H,
+format, roster/coverage gaps and real evidence IDs; sparse histories may extend
+to 180 days. Raw provider responses are not retained long term.
 
-The versioned prompt scores the full-match winner from a 50:50 baseline using
-only this pre-match evidence. Wallet identity, intended side, price and stake
-never leave the process. Strong opponent predictions (>=65% win
-probability and >=75 confidence) block the paper leg; insufficient/stale data
-or provider failures fail open. The feature is off by default and can be
-configured, tested, enabled, or disabled from the dashboard's **AI 风控** page.
-Each blocked intent maintains both the original-wallet shadow and a same-stake
-AI-side hold-to-settlement shadow. Referenced team caches are removed after the
-match settles; idle/expired rows are pruned automatically.
+Gemini runs with external tools disabled and can cite only supplied evidence
+IDs. Wallet identity, intended side, price and stake never enter the prompt.
+A wallet leg is blocked only when local evidence is >=70 and Gemini gives the
+opponent >=65% with >=75 confidence; missing data and failures fail open. Each
+blocked intent maintains both the original-wallet shadow and a same-stake
+AI-side hold-to-settlement shadow.
+
+The same radar scans followed upcoming full-match markets for an independent
+5,000 USDC self-run shadow. It requires evidence >=80, winner probability >=65%,
+confidence >=75%, positive expected value, bounded spread and three-times depth
+from Polymarket's unauthenticated read-only orderbook API. It never places an
+order, opens at size-aware VWAP, allows one position per condition and holds to
+settlement without stop loss. Unformed markets are checked only at three, two,
+and one hour before start; a final failure is recorded as a cold-market skip.
+Wallet-risk and self-run results are stored and
+displayed separately. Unreferenced team caches expire automatically; every
+historical decision retains its compact evidence snapshot for audit/backtest.
 
 Historical settled main matches can be replayed without changing follow state:
 

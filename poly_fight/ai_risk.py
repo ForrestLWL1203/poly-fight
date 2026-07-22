@@ -1,8 +1,8 @@
-"""DeepSeek-backed, evidence-grounded risk gate for esports main-match paper follows.
+"""Gemini-backed, multi-source RAG risk gate for esports main-match paper follows.
 
-The model receives compact pre-cutoff PandaScore team evidence. Wallet identity,
-intended side, price and stake never enter the prompt; the local gate compares the
-independent prediction with the candidate side after ordinary strategy checks pass.
+The model receives compact pre-cutoff team evidence merged from game-specific
+public APIs. Wallet identity, intended side, price and stake never enter the
+prompt; local gates alone decide wallet blocking and self-run shadow entry.
 """
 
 from __future__ import annotations
@@ -16,47 +16,64 @@ import re
 import sqlite3
 import threading
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 
+from google import genai
+from google.genai import types
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .core import to_float
-from .pandascore import PANDASCORE_PROVIDER, PandaScoreClient, PandaScoreEvidenceService
+from .evidence import EvidenceRouter, game_key
+from .orderbook import PolymarketOrderbookClient, evaluate_books, market_token_ids
+from .pandascore import PANDASCORE_PROVIDER
 from .storage import FollowStore
 
 
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
-DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
-PROVIDER = "deepseek"
-DEFAULT_MODEL = "deepseek-v4-pro"
-PROMPT_VERSION = "esports-main-pandascore-v1"
+PROVIDER = "gemini"
+LEGACY_PROVIDER = "deepseek"
+DEFAULT_MODEL = "gemini-3.6-flash"
+PROMPT_VERSION = "esports-main-rag-v2"
 WIN_PROBABILITY_THRESHOLD = 65.0
 CONFIDENCE_THRESHOLD = 75.0
+WALLET_MIN_EVIDENCE_SCORE = 70
+PROPRIETARY_MIN_EVIDENCE_SCORE = 80
 REQUEST_TIMEOUT_SECONDS = 15
 ERROR_RETRY_SECONDS = 300
 SUPPORTED_GAMES = frozenset({"lol", "cs2", "dota2"})
-HARD_UNCERTAINTY_FLAGS = frozenset({"roster_unknown", "stale_knowledge"})
+PROPRIETARY_INITIAL_BANKROLL = 5000.0
+PROPRIETARY_MIN_VOLUME = 1000.0
+PROPRIETARY_LIQUIDITY_PROBE_HOURS = (3, 2, 1)
 
 
 SYSTEM_PROMPT = """你是全球电竞（CS2、LoL、Dota2）全场赛前胜负精算师。
 只评估整场比赛最终大比分胜方（Match Winner），绝不预测或提及 Map、单局、击杀等子盘口。
 
-只能使用用户提供的PandaScore赛前证据，不得用模型记忆补全比赛、阵容或赛果。双方从50:50开始，综合：
+只能使用用户提供并标明证据ID的赛前证据，不得用模型记忆补全比赛、阵容或赛果。双方从50:50开始，综合：
 长期与近期战绩、对手含金量、历史交锋、阵容稳定性、赛事等级和BO赛制。
 不得参考投注市场、赔率、钱包、下注方向或金额；不得使用目标比赛开赛后的赛果；不得编造资料。
 
 两队分值必须在0-100且合计100。除非资料完全镜像，否则不得给50:50。
-无法识别队伍、资料不足或知识可能过时时，winner必须为UNKNOWN，knowledge标为stale或insufficient，
-并降低confidence；不要勉强猜测。
+证据不足、互相冲突或无法识别队伍时必须返回 insufficient，不要勉强猜测。
+supporting_evidence_ids只能引用输入中真实存在的证据ID。reason_zh只写一句简短结论。"""
 
-只返回一个JSON对象，不要Markdown或额外文字：
-{"winner":"A|B|UNKNOWN","a":0,"b":0,"confidence":0,
- "knowledge":"ok|stale|insufficient","reason":"优势：核心依据；风险：主要不确定性（40字内）"}"""
+GEMINI_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["decisive", "insufficient"]},
+        "winner": {"type": ["string", "null"], "enum": ["team_a", "team_b", None]},
+        "team_a_score": {"type": "integer", "minimum": 0, "maximum": 100},
+        "team_b_score": {"type": "integer", "minimum": 0, "maximum": 100},
+        "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+        "supporting_evidence_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+        "risk_flags": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+        "reason_zh": {"type": "string", "maxLength": 120},
+    },
+    "required": ["status", "winner", "team_a_score", "team_b_score", "confidence", "supporting_evidence_ids", "risk_flags", "reason_zh"],
+    "additionalProperties": False,
+}
 
 
 def _json_dumps(value: Any) -> str:
@@ -144,12 +161,12 @@ class AiConfigStore:
                 "VALUES (1,0,?,?,?,?)",
                 (DEFAULT_MODEL, WIN_PROBABILITY_THRESHOLD, CONFIDENCE_THRESHOLD, _now()),
             )
-            # A short-lived local Gemini branch may have initialized this row.
-            # Restore the established DeepSeek model without touching the
-            # encrypted DeepSeek credential or the user's enabled state.
+            # Migrate the active model to Gemini without touching the legacy
+            # DeepSeek ciphertext.  Provider credentials are keyed separately,
+            # so the historical key remains available for audit/delete only.
             conn.execute(
-                "UPDATE ai_risk_settings SET model=?,updated_at=? WHERE lower(model) LIKE 'gemini%'",
-                (DEFAULT_MODEL, _now()),
+                "UPDATE ai_risk_settings SET model=?,updated_at=? WHERE model<>?",
+                (DEFAULT_MODEL, _now(), DEFAULT_MODEL),
             )
         try:
             os.chmod(self.db_path, 0o600)
@@ -415,100 +432,92 @@ class AiConfigStore:
         return value
 
 
-class DeepSeekClient:
+class GeminiClient:
+    """Gemini structured-output client with every optional external tool disabled."""
+
     def __init__(self, api_key: str, *, timeout_seconds: int = REQUEST_TIMEOUT_SECONDS):
-        self.api_key = api_key
-        self.timeout_seconds = timeout_seconds
+        self.api_key = str(api_key or "").strip()
+        self.timeout_seconds = int(timeout_seconds)
+        self.client = genai.Client(api_key=self.api_key, http_options=types.HttpOptions(timeout=self.timeout_seconds * 1000))
 
-    def _request(self, url: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
-        data = json.dumps(body).encode("utf-8") if body is not None else None
-        request = urllib.request.Request(
-            url,
-            data=data,
-            method="POST" if body is not None else "GET",
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            # Never include provider bodies: they can contain request echoes or operational detail.
-            raise RuntimeError(f"deepseek_http_{exc.code}") from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
-            raise RuntimeError("deepseek_unavailable") from exc
+    def test(self, *, model: str = DEFAULT_MODEL) -> dict[str, Any]:
+        parsed, response, latency = self.assess({"task": "连接测试；返回insufficient", "valid_evidence_ids": []}, model=model)
+        return {"ok": bool(parsed), "model": str(getattr(response, "model_version", None) or model), "latency_ms": latency}
 
-    def balance(self) -> dict[str, Any]:
-        response = self._request(DEEPSEEK_BALANCE_URL)
-        if not isinstance(response.get("is_available"), bool) or not isinstance(response.get("balance_infos"), list):
-            raise ValueError("invalid_deepseek_balance")
-        return response
-
-    def assess(self, prompt_payload: dict[str, Any], *, model: str) -> tuple[dict[str, Any], dict[str, Any], int]:
+    def assess(self, prompt_payload: dict[str, Any], *, model: str) -> tuple[dict[str, Any], Any, int]:
         started = time.monotonic()
-        response = self._request(
-            DEEPSEEK_API_URL,
-            {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": _json_dumps(prompt_payload)},
-                ],
-                "thinking": {"type": "disabled"},
-                "response_format": {"type": "json_object"},
-                "temperature": 0.1,
-                "max_tokens": 180,
-            },
-        )
         try:
-            parsed = json.loads(response["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise ValueError("invalid_deepseek_json") from exc
+            response = self.client.models.generate_content(
+                model=model,
+                contents=_json_dumps(prompt_payload),
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    response_json_schema=GEMINI_RESPONSE_SCHEMA,
+                    max_output_tokens=512,
+                ),
+            )
+            parsed = response.parsed if isinstance(getattr(response, "parsed", None), dict) else json.loads(str(response.text or ""))
+        except json.JSONDecodeError as exc:
+            raise ValueError("invalid_gemini_json") from exc
+        except Exception as exc:
+            # Provider SDK errors can include request metadata; store only a
+            # stable class name, never the raw response or credential-bearing request.
+            raise RuntimeError(f"gemini_unavailable:{type(exc).__name__}") from exc
         return parsed, response, int((time.monotonic() - started) * 1000)
 
 
-def validate_assessment_output(value: Any) -> dict[str, Any]:
+def _gemini_usage(response: Any) -> dict[str, int]:
+    usage = getattr(response, "usage_metadata", None)
+    return {
+        "prompt_tokens": int(getattr(usage, "prompt_token_count", 0) or 0),
+        "completion_tokens": int(getattr(usage, "candidates_token_count", 0) or 0),
+        "total_tokens": int(getattr(usage, "total_token_count", 0) or 0),
+    }
+
+
+def validate_assessment_output(value: Any, *, valid_evidence_ids: set[str] | None = None) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("assessment_not_object")
-    required = {"winner", "a", "b", "confidence", "knowledge", "reason"}
+    required = {"status", "winner", "team_a_score", "team_b_score", "confidence", "supporting_evidence_ids", "risk_flags", "reason_zh"}
     if not required.issubset(value):
         raise ValueError("assessment_missing_fields")
-    winner = str(value["winner"]).strip().upper()
-    knowledge = str(value["knowledge"]).strip().lower()
-    if winner not in {"A", "B", "UNKNOWN"}:
+    status = str(value["status"]).strip().lower()
+    winner = value.get("winner")
+    if winner is not None:
+        winner = str(winner).strip().lower()
+    if status not in {"decisive", "insufficient"} or winner not in {"team_a", "team_b", None}:
         raise ValueError("assessment_bad_verdict")
-    if knowledge not in {"ok", "stale", "insufficient"}:
-        raise ValueError("assessment_bad_quality")
     try:
-        pa = float(value["a"])
-        pb = float(value["b"])
+        pa = float(value["team_a_score"])
+        pb = float(value["team_b_score"])
         confidence = float(value["confidence"])
     except (TypeError, ValueError) as exc:
         raise ValueError("assessment_bad_scores") from exc
-    if not all(math.isfinite(n) and 0 <= n <= 100 for n in (pa, pb, confidence)) or not 98 <= pa + pb <= 102:
+    if not all(math.isfinite(n) and 0 <= n <= 100 for n in (pa, pb, confidence)) or abs(pa + pb - 100) > 1e-9:
         raise ValueError("assessment_bad_scores")
-    if winner == "A" and pa < pb or winner == "B" and pb < pa:
+    if status == "decisive" and winner is None or status == "insufficient" and winner is not None:
+        raise ValueError("assessment_status_winner_mismatch")
+    if winner == "team_a" and pa <= pb or winner == "team_b" and pb <= pa:
         raise ValueError("assessment_verdict_probability_mismatch")
-    verdict = "team_a" if winner == "A" else "team_b" if winner == "B" else "insufficient"
-    quality = "medium" if knowledge == "ok" else "low"
-    recency = "recent" if knowledge == "ok" else "stale" if knowledge == "stale" else "unknown"
-    flags = ["stale_knowledge"] if knowledge == "stale" else ["insufficient_history"] if knowledge == "insufficient" else []
+    ids = [str(item) for item in value.get("supporting_evidence_ids") or []]
+    if valid_evidence_ids is not None and any(item not in valid_evidence_ids for item in ids):
+        raise ValueError("assessment_unknown_evidence_id")
+    if status == "decisive" and not ids:
+        raise ValueError("assessment_evidence_missing")
     return {
-        "verdict": verdict,
+        "verdict": winner or "insufficient",
         "team_a_win_probability": round(pa, 2),
         "team_b_win_probability": round(pb, 2),
         "confidence": round(confidence, 2),
-        "data_quality": quality,
-        "knowledge_recency": recency,
-        "reason_zh": str(value["reason"] or "")[:120],
-        "key_factors": [],
-        "risk_flags": flags,
+        "reason_zh": str(value["reason_zh"] or "")[:120],
+        "supporting_evidence_ids": ids[:8],
+        "risk_flags": [str(flag)[:60] for flag in value.get("risk_flags") or []][:8],
     }
 
 
 def _game_key(market: dict[str, Any]) -> str:
-    raw = str(market.get("game_family") or market.get("league") or "").strip().lower()
-    aliases = {"league of legends": "lol", "dota 2": "dota2", "counter-strike": "cs2", "counter strike": "cs2"}
-    return aliases.get(raw, raw)
+    return game_key(market)
 
 
 def _parse_timestamp(value: Any) -> int:
@@ -548,7 +557,7 @@ def build_match_prompt(
     # stake. Tournament/stage and the time cutoff help disambiguate similarly
     # named teams and prevent accidental use of a later result.
     prompt = {
-        "task": "根据历史数据独立评估两队赢下整场比赛的赢面与置信度",
+        "task": "只根据Evidence Pack独立评估两队赢下整场比赛的赢面与置信度",
         "match": {
             "game": game.upper(),
             "team_a": outcomes[0],
@@ -560,7 +569,7 @@ def build_match_prompt(
             "match_start": str(metadata["start_time"] or "unknown"),
             "analysis_date_utc": metadata["analysis_date_utc"],
         },
-        "pandascore_evidence": {
+        "evidence_pack": {
             key: value for key, value in (evidence or {}).items() if key != "cache_keys"
         },
     }
@@ -575,13 +584,11 @@ def assessment_direction(assessment: dict[str, Any], settings: dict[str, Any]) -
         return "insufficient"
     probability = to_float(assessment.get(f"{verdict}_win_probability"))
     confidence = to_float(assessment.get("confidence"))
-    flags = {str(flag).lower() for flag in assessment.get("risk_flags") or []}
     if (
+        to_float(assessment.get("evidence_score")) < 65
+        or
         probability < to_float(settings.get("win_probability_threshold"), WIN_PROBABILITY_THRESHOLD)
         or confidence < to_float(settings.get("confidence_threshold"), CONFIDENCE_THRESHOLD)
-        or assessment.get("data_quality") not in {"high", "medium"}
-        or assessment.get("knowledge_recency") not in {"current", "recent"}
-        or flags & HARD_UNCERTAINTY_FLAGS
     ):
         return "insufficient"
     return verdict
@@ -595,34 +602,44 @@ class AiRiskService:
         data_dir: Path,
         follow_store: FollowStore,
         *,
-        client_factory=DeepSeekClient,
+        client_factory=GeminiClient,
         evidence_factory=None,
+        orderbook_client: PolymarketOrderbookClient | None = None,
     ):
         self.config = AiConfigStore(Path(data_dir))
         self.follow_store = follow_store
         self.client_factory = client_factory
         self.evidence_factory = evidence_factory
+        self._evidence_router: EvidenceRouter | None = None
+        self.orderbook_client = orderbook_client or PolymarketOrderbookClient()
         self._lock = threading.Lock()
         self._assessment_locks: dict[str, threading.Lock] = {}
 
     def close(self) -> None:
-        """Compatibility hook; the signal-triggered service owns no background workers."""
+        if self._evidence_router is not None:
+            self._evidence_router.close()
+            self._evidence_router = None
+        close = getattr(self.orderbook_client, "close", None)
+        if close:
+            close()
 
     def enabled(self) -> bool:
         status = self.config.status()
         return bool(
             status["settings"]["enabled"]
             and status["credential"]["configured"]
-            and status["data_credential"]["configured"]
         )
 
-    def _evidence_service(self) -> PandaScoreEvidenceService:
+    def _build_evidence(self, market: dict[str, Any], *, cutoff_ts: int, now_ts: int) -> dict[str, Any]:
         if self.evidence_factory is not None:
-            return self.evidence_factory(self.follow_store)
-        secret = self.config.secret(PANDASCORE_PROVIDER)
-        if not secret:
-            raise ValueError("pandascore_not_configured")
-        return PandaScoreEvidenceService(self.follow_store, PandaScoreClient(secret))
+            return self.evidence_factory(self.follow_store).build_evidence(
+                market, cutoff_ts=cutoff_ts, now_ts=now_ts
+            )
+        if self._evidence_router is None:
+            self._evidence_router = EvidenceRouter(
+                self.follow_store, pandascore_key=self.config.secret(PANDASCORE_PROVIDER)
+            )
+        return self._evidence_router.build_evidence(market, cutoff_ts=cutoff_ts, now_ts=now_ts)
 
     def eligible_market(self, market: dict[str, Any]) -> bool:
         return (
@@ -632,7 +649,7 @@ class AiRiskService:
         )
 
     def assess_backtest(self, market: dict[str, Any], *, cutoff_ts: int, now_ts: int) -> dict[str, Any]:
-        """Replay one settled match from pre-match PandaScore evidence without mutating live assessments.
+        """Replay one settled match from cutoff-safe provider evidence without mutating live assessments.
 
         The result is indicative rather than a guarantee: target results are excluded by timestamp and the
         prompt forbids model-memory completion, but callers should still label historical LLM evaluation as
@@ -641,43 +658,57 @@ class AiRiskService:
         settings = self.config.settings()
         base = {"prompt_version": PROMPT_VERSION, "model": settings["model"], "cutoff_ts": int(cutoff_ts)}
         try:
-            evidence = self._evidence_service().build_evidence(market, cutoff_ts=cutoff_ts, now_ts=now_ts)
+            evidence = self._build_evidence(market, cutoff_ts=cutoff_ts, now_ts=now_ts)
+            evidence_score = int(evidence.get("evidence_score") or 0)
+            if evidence_score < 65:
+                return {**base, "status": "ok", "verdict": "insufficient", "direction": "insufficient", "evidence_score": evidence_score, "evidence_summary": evidence.get("coverage") or {}}
             metadata, prompt = build_match_prompt(market, now_ts=cutoff_ts, evidence=evidence)
             prompt["mode"] = "historical_replay"
             prompt["leakage_guard"] = "只能使用所给证据；目标比赛结果已从数据中截断"
             secret = self.config.secret()
             if not secret:
-                raise ValueError("deepseek_not_configured")
+                raise ValueError("gemini_not_configured")
             parsed, response, latency_ms = self.client_factory(secret).assess(prompt, model=settings["model"])
-            validated = validate_assessment_output(parsed)
-            usage = response.get("usage") or {}
+            validated = validate_assessment_output(parsed, valid_evidence_ids=set(evidence.get("valid_evidence_ids") or []))
             return {
                 **base, **metadata, **validated, "status": "ok", "latency_ms": latency_ms,
-                "direction": assessment_direction({"status": "ok", **validated}, settings),
-                "usage": {key: int(usage.get(key) or 0) for key in (
-                    "prompt_tokens", "completion_tokens", "total_tokens"
-                )},
+                "evidence_score": evidence_score,
+                "direction": assessment_direction({"status": "ok", "evidence_score": evidence_score, **validated}, settings),
+                "usage": _gemini_usage(response),
                 "evidence_summary": {
-                    "team_a": (evidence.get("team_a") or {}).get("record"),
-                    "team_b": (evidence.get("team_b") or {}).get("record"),
-                    "h2h_count": len(evidence.get("h2h") or []),
-                    "window": evidence.get("window"),
+                    "coverage": evidence.get("coverage"), "score_components": evidence.get("score_components"),
                 },
             }
         except Exception as exc:
             return {**base, "status": "unavailable", "error": str(exc)[:300], "direction": "unavailable"}
 
-    def ensure_assessment(self, market: dict[str, Any], *, now_ts: int) -> dict[str, Any]:
+    def ensure_assessment(
+        self,
+        market: dict[str, Any],
+        *,
+        now_ts: int,
+        prefetched_evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         condition_id = str(market.get("condition_id") or market.get("conditionId") or "").lower()
         if not condition_id:
             return {"condition_id": "", "status": "unavailable", "error": "condition_id_missing"}
         with self._lock:
             condition_lock = self._assessment_locks.setdefault(condition_id, threading.Lock())
         with condition_lock:
-            return self._ensure_assessment_locked(market, now_ts=now_ts, condition_id=condition_id)
+            return self._ensure_assessment_locked(
+                market,
+                now_ts=now_ts,
+                condition_id=condition_id,
+                prefetched_evidence=prefetched_evidence,
+            )
 
     def _ensure_assessment_locked(
-        self, market: dict[str, Any], *, now_ts: int, condition_id: str
+        self,
+        market: dict[str, Any],
+        *,
+        now_ts: int,
+        condition_id: str,
+        prefetched_evidence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         cached = self.follow_store.load_ai_assessment(condition_id)
         if cached and cached.get("prompt_version") == PROMPT_VERSION:
@@ -692,10 +723,15 @@ class AiRiskService:
                 market.get("match_start_time") or market.get("market_start_time")
                 or market.get("eventStartTime")
             )
-            cutoff_ts = _parse_timestamp(start_value) or int(now_ts)
-            evidence = self._evidence_service().build_evidence(
+            # A scheduled start can be hours in the future. Never let a live
+            # evidence query see records newer than the signal that triggered
+            # this assessment, even if an upstream API exposes them early.
+            start_ts = _parse_timestamp(start_value)
+            cutoff_ts = min(start_ts, int(now_ts)) if start_ts else int(now_ts)
+            evidence = prefetched_evidence or self._build_evidence(
                 {**market, "condition_id": condition_id}, cutoff_ts=cutoff_ts, now_ts=now_ts
             )
+            evidence_score = int(evidence.get("evidence_score") or 0)
             metadata, prompt = build_match_prompt(
                 {**market, "condition_id": condition_id}, now_ts=now_ts, evidence=evidence
             )
@@ -703,35 +739,41 @@ class AiRiskService:
             base.update({
                 **metadata,
                 "input_hash": input_hash,
-                "pandascore_cache_keys": list(evidence.get("cache_keys") or []),
+                "evidence_cache_keys": list(evidence.get("cache_keys") or []),
+                "evidence_score": evidence_score,
                 "evidence_summary": {
-                    "source": evidence.get("source"), "as_of": evidence.get("as_of"),
-                    "window": evidence.get("window"),
-                    "team_a": (evidence.get("team_a") or {}).get("record"),
-                    "team_b": (evidence.get("team_b") or {}).get("record"),
-                    "h2h_count": len(evidence.get("h2h") or []),
+                    "coverage": evidence.get("coverage"),
+                    "score_components": evidence.get("score_components"),
                 },
+                "evidence_snapshot": prompt.get("evidence_pack") or {},
             })
+            if evidence_score < 65:
+                assessment = {
+                    **base, "status": "ok", "verdict": "insufficient",
+                    "team_a_win_probability": 50.0, "team_b_win_probability": 50.0,
+                    "confidence": 0.0, "supporting_evidence_ids": [],
+                    "risk_flags": ["evidence_below_65"], "reason_zh": "赛前证据不足",
+                    "latency_ms": 0, "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                }
+                self.follow_store.save_ai_assessment(assessment)
+                return assessment
             secret = self.config.secret()
             if not secret:
-                raise ValueError("deepseek_not_configured")
+                raise ValueError("gemini_not_configured")
             parsed, response, latency_ms = self.client_factory(secret).assess(prompt, model=settings["model"])
-            validated = validate_assessment_output(parsed)
+            validated = validate_assessment_output(
+                parsed, valid_evidence_ids=set(evidence.get("valid_evidence_ids") or [])
+            )
             self.config.mark_credential_valid()
-            usage = response.get("usage") or {}
             assessment = {
                 **base,
                 **validated,
                 "status": "ok",
                 "latency_ms": latency_ms,
-                "usage": {
-                    "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-                    "completion_tokens": int(usage.get("completion_tokens") or 0),
-                    "total_tokens": int(usage.get("total_tokens") or 0),
-                },
+                "usage": _gemini_usage(response),
                 "provider_request": prompt,
                 "parsed_output": parsed,
-                "response_model": str(response.get("model") or settings["model"]),
+                "response_model": str(getattr(response, "model_version", None) or settings["model"]),
             }
         except Exception as exc:  # fail open, but preserve a sanitized audit record
             assessment = {
@@ -762,7 +804,13 @@ class AiRiskService:
         assessment = self.ensure_assessment(market, now_ts=now_ts)
         direction = assessment_direction(assessment, settings)
         intended_side = "team_a" if int(outcome_index) == 0 else "team_b" if int(outcome_index) == 1 else "unknown"
-        action = "unavailable" if direction == "unavailable" else "insufficient" if direction == "insufficient" else "agree" if direction == intended_side else "blocked"
+        action = (
+            "unavailable" if direction == "unavailable"
+            else "insufficient" if direction == "insufficient"
+            else "agree" if direction == intended_side
+            else "blocked" if to_float(assessment.get("evidence_score")) >= WALLET_MIN_EVIDENCE_SCORE
+            else "insufficient"
+        )
         condition_id = str(market.get("condition_id") or market.get("conditionId") or "").lower()
         intent_id = "ai:" + hashlib.sha256(
             f"{str(wallet).lower()}|{condition_id}|{outcome_index}|{trade_id}".encode("utf-8")
@@ -861,11 +909,268 @@ class AiRiskService:
                 key: assessment.get(key)
                 for key in (
                     "status", "verdict", "team_a", "team_b", "team_a_win_probability",
-                    "team_b_win_probability", "confidence", "data_quality", "knowledge_recency",
-                    "reason_zh", "key_factors", "risk_flags", "model", "prompt_version", "updated_at",
+                    "team_b_win_probability", "confidence", "evidence_score", "evidence_summary",
+                    "reason_zh", "supporting_evidence_ids", "risk_flags", "model", "prompt_version", "updated_at",
                 )
             },
         }
+
+    def _proprietary_plan(self) -> dict[str, float]:
+        rows = self.follow_store.load_ai_proprietary_positions(limit=10_000)
+        realized = sum(to_float(row.get("realized_pnl")) for row in rows if row.get("status") == "settled")
+        open_exposure = sum(to_float(row.get("stake_usdc")) for row in rows if row.get("status") == "open")
+        equity = PROPRIETARY_INITIAL_BANKROLL + realized
+        available = max(0.0, equity - open_exposure)
+        strategy = self.follow_store.load_follow_strategy_readonly()
+        sizing = strategy.get("sizing") or {}
+        percent = max(0.0, to_float(sizing.get("per_signal_percent"), 1.0))
+        match_percent = max(percent, to_float(sizing.get("per_match_percent"), percent))
+        minimum = max(1.0, to_float(sizing.get("min_stake_usdc"), 1.0))
+        raw_stake = math.floor(available * percent / 100.0)
+        match_cap = math.floor(available * match_percent / 100.0)
+        stake = min(float(raw_stake), float(match_cap), available)
+        return {"equity": equity, "available": available, "stake": stake if stake >= minimum else 0.0, "minimum": minimum}
+
+    def scan_proprietary(self, markets: dict[str, dict[str, Any]], *, now_ts: int) -> dict[str, int]:
+        """Screen all followed-scope pre-match main markets into an isolated $5k paper book."""
+        stats = {"screened": 0, "entered": 0, "watching": 0, "skipped": 0, "errors": 0}
+        if not self.enabled():
+            return stats
+        existing = {str(row.get("condition_id") or "").lower(): row for row in self.follow_store.load_ai_proprietary_positions(limit=10_000)}
+        plan = self._proprietary_plan()
+        assessments_started = 0
+        for condition_id, market in sorted(markets.items()):
+            cid = str(condition_id or market.get("condition_id") or "").lower()
+            if not cid or not self.eligible_market(market):
+                continue
+            start_ts = _parse_timestamp(market.get("match_start_time") or market.get("market_start_time") or market.get("eventStartTime"))
+            if start_ts and start_ts <= now_ts:
+                continue
+            prior = existing.get(cid)
+            if prior and prior.get("status") in {"open", "settled", "skipped"}:
+                continue
+            if prior and int(prior.get("next_retry_at") or 0) > now_ts:
+                continue
+            stake = to_float(plan.get("stake"))
+            base = {
+                "condition_id": cid, "status": "watching", "decision": "pending", "outcome_index": -1,
+                "evidence_score": 0, "stake_usdc": 0.0, "realized_pnl": 0.0,
+                "game_family": _game_key(market), "market_type": "main_match",
+                "event_title": market.get("title") or market.get("event_title"),
+                "market_question": market.get("question"), "outcomes": list(market.get("outcomes") or []),
+                "match_start_time": market.get("match_start_time") or market.get("market_start_time"),
+                "end_date": market.get("end_date"), "created_at": int((prior or {}).get("created_at") or now_ts),
+                "updated_at": now_ts,
+                "probe_count": int((prior or {}).get("probe_count") or 0),
+                "liquidity_qualified": bool((prior or {}).get("liquidity_qualified")),
+            }
+            if not start_ts:
+                self.follow_store.save_ai_proprietary_position({**base, "status": "skipped", "decision": "start_time_missing"})
+                stats["skipped"] += 1
+                continue
+            if start_ts - now_ts > PROPRIETARY_LIQUIDITY_PROBE_HOURS[0] * 3600:
+                self.follow_store.save_ai_proprietary_position({
+                    **base, "decision": "awaiting_liquidity_window",
+                    "next_retry_at": start_ts - PROPRIETARY_LIQUIDITY_PROBE_HOURS[0] * 3600,
+                })
+                stats["watching"] += 1
+                continue
+
+            def next_probe_at() -> int | None:
+                slots = [
+                    start_ts - hours * 3600
+                    for hours in PROPRIETARY_LIQUIDITY_PROBE_HOURS[1:]
+                    if start_ts - hours * 3600 > now_ts
+                ]
+                return min(slots) if slots else None
+
+            def record_retry_or_skip(decision: str, **details: Any) -> None:
+                retry_at = next_probe_at()
+                if retry_at is None:
+                    self.follow_store.save_ai_proprietary_position({
+                        **base, "status": "skipped", "decision": str(decision), **details,
+                    })
+                    stats["skipped"] += 1
+                    return
+                self.follow_store.save_ai_proprietary_position({
+                    **base, "decision": str(decision), **details, "next_retry_at": retry_at,
+                })
+                stats["watching"] += 1
+
+            def record_liquidity_failure(reason: str, **details: Any) -> None:
+                retry_at = next_probe_at()
+                if retry_at is None:
+                    self.follow_store.save_ai_proprietary_position({
+                        **base, "status": "skipped", "decision": "cold_market",
+                        "cold_reason": str(reason), **details,
+                    })
+                    stats["skipped"] += 1
+                    return
+                self.follow_store.save_ai_proprietary_position({
+                    **base, "decision": str(reason), **details, "next_retry_at": retry_at,
+                })
+                stats["watching"] += 1
+
+            if stake <= 0:
+                self.follow_store.save_ai_proprietary_position({**base, "decision": "bankroll_insufficient", "next_retry_at": now_ts + 300})
+                stats["watching"] += 1
+                continue
+            base["probe_count"] += 1
+            base["last_probe_at"] = now_ts
+            volume = to_float(market.get("volume") or market.get("volumeNum") or market.get("volume24hr"))
+            required_volume = max(PROPRIETARY_MIN_VOLUME, stake * 10.0)
+            if volume + 1e-9 < required_volume:
+                record_liquidity_failure(
+                    "volume_insufficient", volume_usdc=volume, required_volume_usdc=required_volume,
+                )
+                continue
+            tokens = market_token_ids(market)
+            if len(tokens) != 2:
+                record_liquidity_failure("orderbook_token_missing")
+                continue
+            try:
+                books = self.orderbook_client.books(tokens)
+                if len(books) != 2 or any(not (book.get("bids") and book.get("asks")) for book in books):
+                    record_liquidity_failure("orderbook_missing_side")
+                    continue
+                # The eventual AI side is not known yet.  At least one side
+                # must already satisfy the exact spread/depth/VWAP gate before
+                # we spend provider or model quota; the selected side is
+                # checked again below by indexing this immutable snapshot.
+                book_checks = [
+                    evaluate_books(books, predicted_index=index, planned_stake=stake)
+                    for index in (0, 1)
+                ]
+                if not any(check.get("eligible") for check in book_checks):
+                    reasons = sorted({str(check.get("reason") or "orderbook_rejected") for check in book_checks})
+                    record_liquidity_failure(
+                        reasons[0] if len(reasons) == 1 else "orderbook_rejected",
+                        book_candidates=book_checks,
+                    )
+                    continue
+                base["liquidity_qualified"] = True
+                base["liquidity_passed_at"] = int((prior or {}).get("liquidity_passed_at") or now_ts)
+                cached_assessment = self.follow_store.load_ai_assessment(cid)
+                if not cached_assessment and assessments_started >= 2:
+                    record_retry_or_skip("assessment_queued")
+                    continue
+                prefetched_evidence = None
+                if not cached_assessment:
+                    assessments_started += 1
+                    cutoff_ts = min(start_ts, now_ts) if start_ts else now_ts
+                    prefetched_evidence = self._build_evidence(
+                        {**market, "condition_id": cid}, cutoff_ts=cutoff_ts, now_ts=now_ts
+                    )
+                    prefetched_score = int(prefetched_evidence.get("evidence_score") or 0)
+                    if prefetched_score < PROPRIETARY_MIN_EVIDENCE_SCORE:
+                        coverage = prefetched_evidence.get("coverage") or {}
+                        failed_sources = coverage.get("failed_sources") or {}
+                        if failed_sources:
+                            record_retry_or_skip(
+                                "evidence_source_unavailable",
+                                evidence_score=prefetched_score,
+                                evidence_summary=coverage,
+                            )
+                            stats["errors"] += 1
+                        else:
+                            self.follow_store.save_ai_proprietary_position({
+                                **base, "status": "skipped", "decision": "evidence_insufficient",
+                                "evidence_score": prefetched_score, "evidence_summary": coverage,
+                            })
+                            stats["skipped"] += 1
+                        continue
+                assessment = self.ensure_assessment(
+                    {**market, "condition_id": cid},
+                    now_ts=now_ts,
+                    prefetched_evidence=prefetched_evidence,
+                )
+                stats["screened"] += 1
+                evidence_score = int(assessment.get("evidence_score") or 0)
+                verdict = str(assessment.get("verdict") or "insufficient")
+                probability = to_float(assessment.get(f"{verdict}_win_probability")) if verdict in {"team_a", "team_b"} else 0.0
+                confidence = to_float(assessment.get("confidence"))
+                terminal = {
+                    **base, "status": "skipped", "decision": "evidence_insufficient",
+                    "evidence_score": evidence_score, "assessment": {
+                        key: assessment.get(key) for key in ("verdict", "team_a_win_probability", "team_b_win_probability", "confidence", "reason_zh", "model", "prompt_version")
+                    },
+                }
+                if assessment.get("status") != "ok":
+                    record_retry_or_skip("assessment_unavailable")
+                    stats["errors"] += 1
+                    continue
+                if evidence_score < PROPRIETARY_MIN_EVIDENCE_SCORE or verdict not in {"team_a", "team_b"} or probability < WIN_PROBABILITY_THRESHOLD or confidence < CONFIDENCE_THRESHOLD:
+                    self.follow_store.save_ai_proprietary_position(terminal)
+                    stats["skipped"] += 1
+                    continue
+                predicted_index = 0 if verdict == "team_a" else 1
+                book_check = book_checks[predicted_index]
+                if not book_check.get("eligible"):
+                    record_liquidity_failure(
+                        str(book_check.get("reason") or "orderbook_rejected"),
+                        book=book_check,
+                    )
+                    continue
+                entry = to_float(book_check.get("vwap"))
+                prefilters = (self.follow_store.load_follow_strategy_readonly().get("prefilters") or {})
+                max_entry = to_float(prefilters.get("max_follow_entry_price"))
+                min_entry = to_float(prefilters.get("min_follow_entry_price"))
+                if (max_entry > 0 and entry > max_entry) or (min_entry > 0 and entry < min_entry):
+                    self.follow_store.save_ai_proprietary_position({**terminal, "decision": "strategy_price_gate", "book": book_check})
+                    stats["skipped"] += 1
+                    continue
+                if probability / 100.0 * 0.95 <= entry:
+                    self.follow_store.save_ai_proprietary_position({**terminal, "decision": "no_positive_edge", "book": book_check})
+                    stats["skipped"] += 1
+                    continue
+                outcomes = list(market.get("outcomes") or [])
+                self.follow_store.save_ai_proprietary_position({
+                    **base, "status": "open", "decision": "entered", "outcome_index": predicted_index,
+                    "outcome": outcomes[predicted_index] if predicted_index < len(outcomes) else None,
+                    "evidence_score": evidence_score, "stake_usdc": round(stake, 8), "entry_price": round(entry, 8),
+                    "ai_probability": round(probability, 2), "confidence": round(confidence, 2),
+                    "book": book_check, "volume_usdc": volume, "required_volume_usdc": required_volume,
+                    "hold_policy": "to_settlement_no_stop_loss",
+                })
+                plan = self._proprietary_plan()
+                stats["entered"] += 1
+            except Exception as exc:
+                record_retry_or_skip("transient_error", error=str(exc)[:180])
+                stats["errors"] += 1
+        return stats
+
+    def settle_proprietary(self, resolutions: dict[str, int], *, now_ts: int, void_index: int = -2) -> int:
+        changed = 0
+        for row in self.follow_store.load_ai_proprietary_positions(open_only=True):
+            winner = resolutions.get(str(row.get("condition_id") or "").lower())
+            if winner is None:
+                continue
+            stake = to_float(row.get("stake_usdc"))
+            entry = to_float(row.get("entry_price"))
+            selected = int(row.get("outcome_index") or 0)
+            if int(winner) == int(void_index):
+                row.update({
+                    "status": "void", "decision": "void", "winner_index": int(winner),
+                    "realized_pnl": 0.0, "resolved_at": now_ts, "updated_at": now_ts,
+                    "prediction_correct": None, "brier_score": None,
+                    "market_implied_probability": round(entry, 8),
+                })
+                self.follow_store.save_ai_proprietary_position(row)
+                changed += 1
+                continue
+            pnl = stake * (1.0 - entry) / entry if int(winner) == selected and entry > 0 else -stake
+            probability = to_float(row.get("ai_probability")) / 100.0
+            actual = 1.0 if int(winner) == selected else 0.0
+            row.update({
+                "status": "settled", "decision": "settled", "winner_index": int(winner),
+                "realized_pnl": round(pnl, 8), "resolved_at": now_ts, "updated_at": now_ts,
+                "prediction_correct": bool(int(winner) == selected),
+                "brier_score": round((probability - actual) ** 2, 8),
+                "market_implied_probability": round(entry, 8),
+            })
+            self.follow_store.save_ai_proprietary_position(row)
+            changed += 1
+        return changed
 
     def observe_sell(self, *, wallet: str, trade: dict[str, Any], condition_id: str, outcome_index: int, price: float, now_ts: int) -> int:
         matches = [
@@ -986,8 +1291,10 @@ class AiRiskService:
         assessment = self.follow_store.load_ai_assessment(condition_id)
         if not assessment:
             return 0
-        cache_keys = [str(value) for value in assessment.get("pandascore_cache_keys") or []]
-        removed = self.follow_store.delete_ai_data_cache(cache_keys)
+        # Team histories are shared by every pending match involving that team;
+        # never delete them merely because one condition settled.  The bounded
+        # 6h TTL + idle/absolute pruning owns cache reclamation.
+        removed = 0
         for key in ("provider_request", "parsed_output"):
             assessment.pop(key, None)
         assessment["finalized_at"] = int(now_ts)

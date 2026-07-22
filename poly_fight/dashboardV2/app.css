@@ -186,7 +186,7 @@
 .ov-ai-icon svg { width: 19px; height: 19px; }
 .ov-ai-identity h3 { margin: 3px 0 0; font-size: 17px; }
 .ov-ai-identity small { display: block; margin-top: 3px; color: var(--text-tertiary); font-size: 10px; }
-.ov-ai-metrics { display: grid; grid-template-columns: repeat(3, minmax(76px, .6fr)) minmax(150px, 1.2fr); gap: 10px; }
+.ov-ai-metrics { display: grid; grid-template-columns: repeat(3, minmax(72px, .55fr)) repeat(2, minmax(140px, 1.05fr)); gap: 10px; }
 .ov-ai-metrics > div { padding: 9px 12px; border-left: 1px solid var(--border-hairline); }
 .ov-ai-metrics span, .ov-ai-metrics b, .ov-ai-metrics small { display: block; }
 .ov-ai-metrics span { color: var(--text-tertiary); font-size: 10px; }
@@ -487,6 +487,21 @@
 .ai-control-copy h2 { margin: 0; font-size: 19px; letter-spacing: -.02em; }
 .ai-control-copy p { max-width: 850px; margin: 5px 0 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.55; }
 .ai-control-state { display: flex; align-items: center; gap: var(--sp-4); }
+.ai-tabs-row { display: flex; align-items: center; min-height: 42px; padding: 0 2px; border-bottom: 1px solid var(--border-hairline); }
+.ai-tabs-row .ps-tabs { width: 100%; }
+
+.ai-source-card { padding: 16px 20px !important; }
+.ai-source-title { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-4); margin-bottom: 12px; }
+.ai-source-title h3 { margin: 0; font-size: 15px; }
+.ai-source-title p { margin: 4px 0 0; color: var(--text-tertiary); font-size: 10px; }
+.ai-source-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.ai-source-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 6px 10px; min-width: 0; padding: 10px 11px; border-radius: var(--r-md); background: var(--surface-inset); }
+.ai-source-name { min-width: 0; }
+.ai-source-name b, .ai-source-name span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-source-name b { font-size: 12px; }
+.ai-source-name span { margin-top: 2px; color: var(--text-tertiary); font-size: 9px; }
+.ai-source-row > .ps-badge { flex: none; }
+.ai-source-meta { grid-column: 1 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-quaternary); font-size: 9px; }
 
 .ai-page-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(360px, .85fr); gap: var(--sp-5); align-items: stretch; }
 .ai-connection-card, .ai-impact-card { min-width: 0; }
@@ -516,6 +531,13 @@
 .ai-impact-grid span { color: var(--text-tertiary); font-size: 10px; }
 .ai-impact-grid b { margin-top: 4px; font-size: 15px; font-variant-numeric: tabular-nums; }
 
+.ai-shadow-summary { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: var(--sp-4); }
+.ai-shadow-summary .ps-card { min-width: 0; padding: 16px 18px; }
+.ai-shadow-summary span, .ai-shadow-summary b, .ai-shadow-summary small { display: block; }
+.ai-shadow-summary span { color: var(--text-tertiary); font-size: 10px; }
+.ai-shadow-summary b { margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 21px; font-variant-numeric: tabular-nums; }
+.ai-shadow-summary small { margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-quaternary); font-size: 9px; }
+
 .ai-recent-head { display: flex; align-items: center; justify-content: space-between; padding: 17px 22px 13px; border-bottom: 1px solid var(--border-hairline); }
 .ai-record-table th:first-child, .ai-record-table td:first-child { padding-left: 22px; }
 .ai-record-table th:last-child, .ai-record-table td:last-child { padding-right: 22px; }
@@ -533,12 +555,23 @@
 .ai-record-copy > span { margin-top: 3px; color: var(--text-tertiary); font-size: 10px; }
 .ai-record-verdict { white-space: nowrap; font-size: 13px; }
 .ai-record-reason { display: block; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); font-size: 11px; }
+.ai-shadow-table th:nth-child(2) { width: 17%; }
+.ai-shadow-table th:nth-child(3) { width: 9%; }
+.ai-shadow-table th:nth-child(4) { width: 19%; }
+.ai-shadow-table th:nth-child(5) { width: 15%; }
+.ai-shadow-table td:nth-child(5) b, .ai-shadow-table td:nth-child(5) small { display: block; white-space: nowrap; }
+.ai-shadow-table td:nth-child(5) small { margin-top: 2px; color: var(--text-tertiary); font-size: 9px; }
+.ai-evidence-score { font-size: 15px; font-weight: var(--fw-bold); font-variant-numeric: tabular-nums; }
+.ai-shadow-table td:nth-child(3) > small { margin-left: 3px; color: var(--text-quaternary); font-size: 9px; }
+.ai-screen-reason { display: block; max-width: 190px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-quaternary); font-size: 9px; }
+.ai-shadow-pager { padding: 0 22px 18px; }
 
 .ai-decision-badge { align-self: flex-start; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .modal-compact-empty { margin-top: var(--sp-4); padding: var(--sp-4); border-radius: var(--r-md); background: var(--surface-inset); color: var(--text-tertiary); font-size: var(--fs-footnote); text-align: center; }
 
 @media (max-width: 1100px) {
   .ai-page-grid { grid-template-columns: 1fr; }
+  .ai-source-grid, .ai-shadow-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 720px) {
   .topbar { padding-left: var(--sp-4); padding-right: var(--sp-4); }
@@ -550,7 +583,56 @@
   .ai-secret-row { grid-template-columns: 1fr auto; }
   .ai-secret-row > button:last-child { grid-column: 1 / -1; }
   .ai-impact-grid { grid-template-columns: 1fr 1fr; }
+  .ai-source-grid, .ai-shadow-summary { grid-template-columns: 1fr; }
   .ai-recent-head { padding-left: 16px; padding-right: 16px; }
   .ai-record-table th:first-child, .ai-record-table td:first-child { padding-left: 16px; }
   .ai-record-table th:last-child, .ai-record-table td:last-child { padding-right: 16px; }
+  .ai-recent-card .tbl-wrap { overflow: visible; }
+  .ai-recent-card table.ai-record-table,
+  .ai-recent-card table.ai-shadow-table,
+  .ai-recent-card .ai-record-table tbody,
+  .ai-recent-card .ai-shadow-table tbody { display: block; width: 100%; min-width: 0; }
+  .ai-recent-card .ai-record-table thead,
+  .ai-recent-card .ai-shadow-table thead { display: none; }
+  .ai-recent-card .ai-record-table tr,
+  .ai-recent-card .ai-shadow-table tr { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px 12px; margin: 0 14px 12px; padding: 13px; border: 1px solid var(--border-hairline); border-radius: var(--r-md); background: var(--surface-inset); }
+  .ai-recent-card .ai-record-table td,
+  .ai-recent-card .ai-shadow-table td { display: block; min-width: 0; padding: 0 !important; border: 0 !important; }
+  .ai-recent-card .ai-record-table td:first-child,
+  .ai-recent-card .ai-shadow-table td:first-child { grid-column: 1 / -1; padding-bottom: 10px !important; border-bottom: 1px solid var(--border-hairline) !important; }
+  .ai-recent-card .ai-record-match { width: 100%; min-width: 0; }
+  .ai-recent-card .ai-record-copy { min-width: 0; overflow: hidden; }
+  .ai-recent-card .ai-record-table td:nth-child(4),
+  .ai-recent-card .ai-record-table td:nth-child(5) { grid-column: 1 / -1; }
+  .ai-recent-card .ai-record-table td:nth-child(n+2)::before,
+  .ai-recent-card .ai-shadow-table td:nth-child(n+2)::before { display: block; margin-bottom: 4px; color: var(--text-quaternary); font-size: 9px; font-weight: var(--fw-medium); }
+  .ai-record-table td:nth-child(2)::before, .ai-shadow-table td:nth-child(2)::before { content: "AI 结论"; }
+  .ai-record-table td:nth-child(3)::before { content: "置信度"; }
+  .ai-record-table td:nth-child(4)::before { content: "处理"; }
+  .ai-record-table td:nth-child(5)::before { content: "判断依据"; }
+  .ai-shadow-table td:nth-child(3)::before { content: "证据"; }
+  .ai-shadow-table td:nth-child(4)::before { content: "筛选结果"; }
+  .ai-shadow-table td:nth-child(5)::before { content: "仓位 / 收益"; }
+  .ai-recent-card .ai-record-reason, .ai-recent-card .ai-screen-reason { max-width: 100%; }
+  .ai-recent-card td.empty-cell { grid-column: 1 / -1; padding: 18px !important; border: 0 !important; }
+}
+
+/* Keep the existing navigation system usable on genuinely narrow screens.
+   The rail remains visible, but labels collapse so page cards still receive a
+   real single-column canvas instead of being squeezed behind a 264px sidebar. */
+@media (max-width: 640px) {
+  :root { --page-pad: var(--sp-4); --gutter: var(--sp-4); }
+  .app-shell .ps-sidebar { width: 76px; padding: var(--sp-4) 10px; }
+  .app-shell .ps-brand { justify-content: center; padding: var(--sp-1) 0 var(--sp-5); }
+  .app-shell .ps-brand-name, .app-shell .ps-nav-group-label,
+  .app-shell .ps-nav-count { display: none; }
+  .app-shell .ps-nav-label { flex: none; width: 0; height: 0; overflow: hidden; opacity: 0; font-size: 0; }
+  .app-shell .ps-nav-item { justify-content: center; padding: 0; }
+  .app-shell .ps-nav-item.active::before { display: none; }
+  .app-shell .ps-nav-item.active { box-shadow: inset 3px 0 0 var(--accent), var(--inner-highlight); }
+  .app-shell .ps-sidebar-foot { padding: var(--sp-4) 0 0; }
+  .theme-toggle { flex-direction: column; padding: var(--sp-2) var(--sp-1); }
+  .theme-toggle span { font-size: 0; }
+  .topbar-title { display: none; }
+  .ov-performance-card .ps-stat.sz-lg .ps-stat-value { font-size: 38px; letter-spacing: var(--ls-title); }
 }

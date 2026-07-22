@@ -354,7 +354,8 @@ function OverviewPage({ data, onNav, onOpenFollow }) {
           <div><span>强冲突拦截</span><b>{ai.blocked_count || 0}</b></div>
           <div><span>一致放行</span><b>{ai.agree_count || 0}</b></div>
           <div><span>已结算拦截</span><b>{ai.resolved_blocked_count || 0}</b></div>
-          <div className="ov-ai-impact"><span>实质净影响</span><b className={pnlClass(ai.net_effect_usdc || 0)}>{signedMoney(ai.net_effect_usdc || 0)}</b><small>{(ai.net_effect_usdc || 0) >= 0 ? "避免亏损多于少赚" : "少赚多于避免亏损"}</small></div>
+          <div className="ov-ai-impact"><span>钱包风控净影响</span><b className={pnlClass(ai.net_effect_usdc || 0)}>{signedMoney(ai.net_effect_usdc || 0)}</b><small>拦截避免亏损 − 错失盈利</small></div>
+          <div className="ov-ai-impact"><span>自营影子收益</span><b className={pnlClass(ai.proprietary_pnl_usdc || 0)}>{signedMoney(ai.proprietary_pnl_usdc || 0)}</b><small>{ai.proprietary_open_count || 0} 个开放仓位</small></div>
         </div>
         <Button variant="ghost" size="sm" onClick={() => nav("ai")}>查看判断明细</Button>
       </Card>
@@ -1484,6 +1485,9 @@ function ProgressMask({ kind, done, error, label, hint, onClose }) {
    Shell + data orchestration
    ============================================================ */
 function AiRiskPage({ toast }) {
+  const [tab, setTab] = React.useState("wallet");
+  const [shadowPage, setShadowPage] = React.useState(1);
+  const shadowPageSize = 10;
   const [data, setData] = React.useState(null);
   const [wrap, setWrap] = React.useState(null);
   const [secret, setSecret] = React.useState("");
@@ -1492,21 +1496,20 @@ function AiRiskPage({ toast }) {
   const [dataShow, setDataShow] = React.useState(false);
   const [busy, setBusy] = React.useState("");
   const load = React.useCallback(async () => {
-    const [status, key] = await Promise.all([Api.aiRisk(), Api.aiWrapKey()]);
+    const [status, key] = await Promise.all([Api.aiRisk({ proprietary_limit: shadowPageSize, proprietary_offset: (shadowPage - 1) * shadowPageSize }), Api.aiWrapKey()]);
     setData(status); setWrap(key);
-  }, []);
+  }, [shadowPage]);
   React.useEffect(() => { load().catch(() => toast("AI 风控状态加载失败", "error")); }, [load, toast]);
   if (!data) return <CenterLoad />;
   const cfg = data.settings || {};
   const credential = data.credential || {};
   const dataCredential = data.data_credential || {};
-  const balance = data.balance;
   const summary = data.summary || {};
   const connectionTone = credential.status === "valid" ? "up" : credential.status === "error" ? "down" : "neutral";
   const connectionText = credential.status === "valid" ? "连接正常" : credential.status === "error" ? "连接异常" : "未配置";
   const dataConnectionTone = dataCredential.status === "valid" ? "up" : dataCredential.status === "error" ? "down" : "neutral";
   const dataConnectionText = dataCredential.status === "valid" ? "数据正常" : dataCredential.status === "error" ? "连接异常" : "未配置";
-  const radarRunning = !!cfg.enabled && !!credential.configured && !!dataCredential.configured;
+  const radarRunning = !!cfg.enabled && !!credential.configured;
 
   const save = async () => {
     if (!secret.trim() || !wrap) return;
@@ -1514,15 +1517,15 @@ function AiRiskPage({ toast }) {
     try {
       const envelope = await window.PSEncryptCredential(secret.trim(), wrap);
       await Api.saveAiCredential(envelope); setSecret(""); setShow(false); await load();
-      toast("DeepSeek Key 已在浏览器加密并验证", "success");
+      toast("Gemini Key 已在浏览器加密并验证", "success");
     } catch (e) {
       toast(e && e.message === "secure_context_required" ? "请通过 HTTPS 或 localhost 配置凭证" : "保存失败，请检查 API Key", "error");
     } finally { setBusy(""); }
   };
   const test = async () => {
     setBusy("test");
-    try { await Api.testAiCredential(); await load(); toast("DeepSeek 连接与余额正常", "success"); }
-    catch (e) { await load().catch(() => {}); toast("DeepSeek 连接测试失败", "error"); }
+    try { await Api.testAiCredential(); await load(); toast("Gemini 连接正常", "success"); }
+    catch (e) { await load().catch(() => {}); toast("Gemini 连接测试失败", "error"); }
     finally { setBusy(""); }
   };
   const saveData = async () => {
@@ -1545,18 +1548,18 @@ function AiRiskPage({ toast }) {
   const toggle = async (enabled) => {
     setBusy("toggle");
     try { await Api.saveAiSettings(enabled); await load(); toast(enabled ? "AI 主盘风控已开启" : "AI 主盘风控已关闭", "success"); }
-    catch (e) { toast(e && e.error === "deepseek_not_configured" ? "请先保存并验证 DeepSeek Key" : e && e.error === "pandascore_not_configured" ? "请先保存并验证 PandaScore Key" : "AI 风控状态更新失败", "error"); }
+    catch (e) { toast(e && e.error === "gemini_not_configured" ? "请先保存并验证 Gemini Key" : "AI 风控状态更新失败", "error"); }
     finally { setBusy(""); }
   };
   const remove = async () => {
-    if (!window.confirm("删除 DeepSeek 凭证？历史 AI 判断与拦截记录会保留。")) return;
+    if (!window.confirm("删除 Gemini 凭证？历史 AI 判断与拦截记录会保留。")) return;
     setBusy("delete");
-    try { await Api.deleteAiCredential(); await load(); toast("DeepSeek 凭证已删除", "success"); }
+    try { await Api.deleteAiCredential(); await load(); toast("Gemini 凭证已删除", "success"); }
     catch (e) { toast("删除失败", "error"); }
     finally { setBusy(""); }
   };
   const removeData = async () => {
-    if (!window.confirm("删除 PandaScore 凭证？AI 风控会同时关闭。")) return;
+    if (!window.confirm("删除 PandaScore 凭证？其他公开证据源仍可继续工作。")) return;
     setBusy("delete-data");
     try { await Api.deleteAiDataCredential(); await load(); toast("PandaScore 凭证已删除", "success"); }
     catch (e) { toast("删除失败", "error"); }
@@ -1573,12 +1576,40 @@ function AiRiskPage({ toast }) {
     intentActions.set(cid, actions);
   });
   const recent = (data.recent_assessments || []).slice(0, 10);
+  const sourceMap = new Map((data.source_health || []).map((row) => [String(row.provider || "").toLowerCase(), row]));
+  const sources = [
+    { id: "pandascore", label: "PandaScore", scope: "全游戏" },
+    { id: "opendota", label: "OpenDota", scope: "Dota2" },
+    { id: "leaguepedia", label: "Leaguepedia", scope: "LoL" },
+    { id: "liquipedia", label: "Liquipedia", scope: "CS2" },
+  ].map((item) => ({ ...item, health: sourceMap.get(item.id) || {} }));
+  const proprietary = data.proprietary_records || [];
+  const proprietaryPage = data.proprietary_page || { total: proprietary.length };
+  const sourceStatus = (row) => row.status === "ok" ? "正常" : row.status === "empty" ? "无样本" : row.status === "limited" ? "限流" : row.status === "error" ? "异常" : "等待首检";
+  const sourceTone = (row) => row.status === "ok" ? "up" : row.status === "error" ? "down" : "neutral";
+  const sourceMeta = (row) => {
+    const checked = row.last_success_at ? new Date(Number(row.last_success_at) * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+    if (row.status === "ok" || row.status === "empty") return `覆盖 ${row.coverage || 0} 场${checked ? ` · ${checked}` : ""}`;
+    return row.error || "尚未触发对应比赛";
+  };
+  const screeningLabel = (row) => ({
+    entered: "已入场", settled: "已结算", evidence_insufficient: "证据不足",
+    no_positive_edge: "无正向优势", strategy_price_gate: "价格不符",
+    volume_insufficient: "等待成交量", orderbook_missing_side: "等待深度",
+    depth_insufficient: "深度不足", spread_too_wide: "价差过宽",
+    assessment_unavailable: "研判重试", assessment_queued: "等待研判",
+    evidence_source_unavailable: "证据源重试", orderbook_rejected: "盘口未达标",
+    vwap_unfillable: "深度不足", bankroll_insufficient: "可用资金不足",
+    awaiting_liquidity_window: "等待探测窗口", orderbook_token_missing: "等待盘口",
+    cold_market: "冷门跳过", start_time_missing: "开赛时间缺失",
+    transient_error: "数据重试", void: "已作废",
+  }[row.decision] || "筛选中");
 
   return <div className="page-inner ai-page">
     <Card className={"ai-control-card" + (radarRunning ? " is-live" : "")}>
       <div className="ai-control-copy">
         <span className="ai-control-icon"><Ico n="radar" /></span>
-        <div><h2>AI 风控雷达</h2><p>目标钱包的主盘买入通过策略检查后，读取 PandaScore 赛前历史并交由 DeepSeek 判断全场胜方；强冲突时拦截。</p></div>
+        <div><h2>AI 风控雷达</h2><p>多源赛前证据交由 Gemini 独立判断主盘胜方：强冲突拦截钱包信号，高质量机会进入独立自营影子账本。</p></div>
       </div>
       <div className="ai-control-state">
         <Badge tone={radarRunning ? "up" : "neutral"} dot>{radarRunning ? "运行中" : cfg.enabled ? "待配置" : "已关闭"}</Badge>
@@ -1586,18 +1617,37 @@ function AiRiskPage({ toast }) {
       </div>
     </Card>
 
+    <div className="ai-tabs-row">
+      <Tabs value={tab} onChange={setTab} tabs={[
+        { id: "wallet", label: "钱包风控", count: summary.intent_count || 0 },
+        { id: "proprietary", label: "自营影子", count: summary.proprietary_open_count || 0 },
+      ]} />
+    </div>
+
+    <Card className="ai-source-card">
+      <div className="ai-source-title"><div><h3>证据来源</h3><p>按游戏并行补强；单源失败会降低证据分，不会伪造数据。</p></div></div>
+      <div className="ai-source-grid">
+        {sources.map(({ id, label, scope, health }) => <div className="ai-source-row" key={id}>
+          <div className="ai-source-name"><b>{label}</b><span>{scope}</span></div>
+          <Badge tone={sourceTone(health)} dot>{sourceStatus(health)}</Badge>
+          <span className="ai-source-meta" title={health.error || sourceMeta(health)}>{sourceMeta(health)}</span>
+        </div>)}
+      </div>
+    </Card>
+
+    {tab === "wallet" && <>
+
     <div className="ai-page-grid">
       <Card className="ai-connection-card">
         <div className="ai-section-head"><div><h3>模型与数据连接</h3><p>两组 Key 均在浏览器加密后保存</p></div></div>
-        <div className="ai-provider-head"><div><b>DeepSeek</b><span>{cfg.model || "deepseek-v4-pro"}</span></div><Badge tone={connectionTone} dot>{connectionText}</Badge></div>
+        <div className="ai-provider-head"><div><b>Gemini</b><span>{cfg.model || "gemini-3.6-flash"}</span></div><Badge tone={connectionTone} dot>{connectionText}</Badge></div>
         <div className="ai-secret-row">
-          <Input type={show ? "text" : "password"} value={secret} onChange={(e) => setSecret(e.target.value)} placeholder={credential.configured ? "输入新 Key 可安全替换" : "sk-••••••••••••"} autoComplete="off" />
+          <Input type={show ? "text" : "password"} value={secret} onChange={(e) => setSecret(e.target.value)} placeholder={credential.configured ? "输入新 Key 可安全替换" : "Gemini API Key"} autoComplete="off" />
           <Button variant="ghost" size="sm" onClick={() => setShow((v) => !v)}>{show ? "隐藏" : "显示"}</Button>
           <Button variant="primary" size="sm" disabled={!secret.trim() || !!busy || !wrap?.ready} onClick={save}>{busy === "save" ? "验证中…" : "加密保存"}</Button>
         </div>
         <p className="ai-security-note"><Ico n="lock-keyhole" /> 明文 Key 不进入数据库和请求日志。</p>
-        {balance && <div className="ai-balance-strip"><span><small>账户余额</small><b>{Number(balance.total_balance || 0).toFixed(2)} {balance.currency || ""}</b></span><span><small>最近检查</small><b>{balance.checked_at ? new Date(balance.checked_at * 1000).toLocaleString() : "—"}</b></span></div>}
-        <div className="ai-connection-actions"><Button variant="ghost" size="sm" disabled={!credential.configured || !!busy} onClick={test}>{busy === "test" ? "测试中…" : "测试连接 / 刷新余额"}</Button>{credential.configured && <Button variant="danger" size="sm" disabled={!!busy} onClick={remove}>删除凭证</Button>}</div>
+        <div className="ai-connection-actions"><Button variant="ghost" size="sm" disabled={!credential.configured || !!busy} onClick={test}>{busy === "test" ? "测试中…" : "测试模型连接"}</Button>{credential.configured && <Button variant="danger" size="sm" disabled={!!busy} onClick={remove}>删除凭证</Button>}</div>
         <div className="ai-provider-divider"></div>
         <div className="ai-provider-head"><div><b>PandaScore</b><span>120 天主窗口 · 样本不足回补至 180 天</span></div><Badge tone={dataConnectionTone} dot>{dataConnectionText}</Badge></div>
         <div className="ai-secret-row">
@@ -1651,6 +1701,46 @@ function AiRiskPage({ toast }) {
         </table>
       </div>
     </Card>
+    </>}
+
+    {tab === "proprietary" && <>
+      <div className="ai-shadow-summary">
+        <Card><span>独立权益</span><b>{money(summary.proprietary_bankroll_usdc || 5000)}</b><small>初始本金 $5,000.00</small></Card>
+        <Card><span>开放仓位</span><b>{summary.proprietary_open_count || 0}</b><small>每个主盘最多一仓</small></Card>
+        <Card><span>已结算胜率</span><b>{summary.proprietary_settled_count ? Math.round((summary.proprietary_win_count || 0) / summary.proprietary_settled_count * 100) + "%" : "—"}</b><small>{summary.proprietary_win_count || 0} / {summary.proprietary_settled_count || 0}</small></Card>
+        <Card><span>自营净收益</span><b className={pnlClass(summary.proprietary_pnl_usdc || 0)}>{signedMoney(summary.proprietary_pnl_usdc || 0)}</b><small>与钱包拦截收益分开统计</small></Card>
+        <Card><span>Brier Score</span><b>{summary.proprietary_brier_score != null ? Number(summary.proprietary_brier_score).toFixed(3) : "—"}</b><small>越低代表概率校准越好</small></Card>
+      </div>
+
+      <Card className="ai-recent-card" pad="flush">
+        <div className="ai-recent-head"><div><h3>自营影子记录</h3><p>仅主盘 · 深度、证据和正向优势全部通过后才建仓</p></div></div>
+        <div className="tbl-wrap">
+          <table className="ps-table ai-shadow-table">
+            <thead><tr><th>对阵</th><th>AI 方向</th><th>证据</th><th>筛选结果</th><th>仓位 / 收益</th></tr></thead>
+            <tbody>
+              {proprietary.map((row) => {
+                const teams = row.outcomes || [];
+                const assessment = row.assessment || {};
+                const assessedIndex = assessment.verdict === "team_a" ? 0 : assessment.verdict === "team_b" ? 1 : -1;
+                const predictedIndex = Number(row.outcome_index) >= 0 ? Number(row.outcome_index) : assessedIndex;
+                const winner = predictedIndex >= 0 ? teams[predictedIndex] : null;
+                const probability = row.ai_probability != null ? row.ai_probability : predictedIndex === 0 ? assessment.team_a_win_probability : predictedIndex === 1 ? assessment.team_b_win_probability : null;
+                const screenDetail = row.error || row.cold_reason || row.book?.reason || (row.probe_count ? `第 ${row.probe_count}/3 次流动性探测` : "");
+                return <tr key={row.condition_id}>
+                  <td><div className="ai-record-match"><GameIcon game={Adapt.normalizeGame(row.game_family)} base={ASSET_BASE} chip /><div className="ai-record-copy"><b title={(teams[0] || "") + " vs " + (teams[1] || "")}>{teams[0] || "待识别"} <i>vs</i> {teams[1] || "待识别"}</b><span>{String(row.game_family || "").toUpperCase()} · 主盘</span></div></div></td>
+                  <td><b className="ai-record-verdict">{winner || "—"}{winner && probability != null ? ` ${Math.round(Number(probability))}%` : ""}</b></td>
+                  <td><span className="ai-evidence-score">{row.evidence_score || 0}</span><small>/ 100</small></td>
+                  <td><Badge tone={row.status === "settled" || row.status === "open" ? "up" : row.status === "watching" ? "neutral" : "warn"}>{screeningLabel(row)}</Badge><span className="ai-screen-reason" title={screenDetail || row.decision || ""}>{screenDetail}</span></td>
+                  <td>{row.status === "open" ? <><b>{money(row.stake_usdc || 0)}</b><small>@ {Number(row.entry_price || 0).toFixed(3)}</small></> : row.status === "settled" ? <><b className={pnlClass(row.realized_pnl || 0)}>{signedMoney(row.realized_pnl || 0)}</b><small>{row.prediction_correct ? "命中" : "未命中"}</small></> : <span className="muted">—</span>}</td>
+                </tr>;
+              })}
+              {!proprietary.length && <tr><td colSpan="5" className="empty-cell">尚无符合成交量与订单簿门槛的主盘</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        {(proprietaryPage.total || 0) > shadowPageSize && <div className="ai-shadow-pager"><Pager total={proprietaryPage.total || 0} pageSize={shadowPageSize} page={shadowPage} onChange={setShadowPage} unit="场" /></div>}
+      </Card>
+    </>}
   </div>;
 }
 

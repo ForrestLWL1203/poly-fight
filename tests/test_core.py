@@ -8279,7 +8279,7 @@ class CoreTest(unittest.TestCase):
             )
 
             with patch("poly_fight.cli.refresh_team_logo_cache_from_active_markets", side_effect=fake_logo_refresh):
-                summary = command_follow(args, client=FakeClient(), emit=False)
+                summary = command_follow(args, client=FakeClient(), emit=False, refresh_logos=True)
 
             self.assertEqual(summary["follow_wallet_count"], 0)
             self.assertEqual(summary["watched_market_count"], 1)
@@ -9645,7 +9645,7 @@ class CoreTest(unittest.TestCase):
                     cookie_secure=True,
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -9696,7 +9696,7 @@ class CoreTest(unittest.TestCase):
                     username="admin", password="pw", cookie_secret="secret",
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -9741,7 +9741,7 @@ class CoreTest(unittest.TestCase):
                     cookie_secret="secret",
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -9819,7 +9819,7 @@ class CoreTest(unittest.TestCase):
                     cookie_secret="secret",
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -9852,7 +9852,7 @@ class CoreTest(unittest.TestCase):
                     cookie_secret="secret",
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -9880,7 +9880,7 @@ class CoreTest(unittest.TestCase):
                     cookie_secret="secret",
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -9913,7 +9913,7 @@ class CoreTest(unittest.TestCase):
                     cookie_secret="secret",
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -9954,7 +9954,7 @@ class CoreTest(unittest.TestCase):
                     cookie_secret="secret",
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -10012,7 +10012,7 @@ class CoreTest(unittest.TestCase):
                     cookie_secret="secret",
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -10058,7 +10058,7 @@ class CoreTest(unittest.TestCase):
                     cookie_secret="secret",
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -10115,7 +10115,7 @@ class CoreTest(unittest.TestCase):
                     cookie_secret="secret",
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -10161,7 +10161,7 @@ class CoreTest(unittest.TestCase):
                     cookie_secret="secret",
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -10199,7 +10199,7 @@ class CoreTest(unittest.TestCase):
                     max_stream_clients=1,
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             conn = None
             try:
@@ -10272,7 +10272,7 @@ class CoreTest(unittest.TestCase):
                     cookie_secret="secret",
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -11242,7 +11242,7 @@ class CoreTest(unittest.TestCase):
                     ],
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -11294,7 +11294,7 @@ class CoreTest(unittest.TestCase):
                     runner_process_starter=fake_starter,
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -11356,7 +11356,7 @@ class CoreTest(unittest.TestCase):
                     cookie_secret="secret",
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -11413,7 +11413,7 @@ class CoreTest(unittest.TestCase):
                     runner_process_lister=lambda: [],
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -11485,7 +11485,7 @@ class CoreTest(unittest.TestCase):
                     ],
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 token = make_session_token("admin", "secret", now=int(datetime.now(timezone.utc).timestamp()))
@@ -11529,7 +11529,7 @@ class CoreTest(unittest.TestCase):
                     wallet_refresh_runner=fake_runner,
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -13835,7 +13835,7 @@ class CoreTest(unittest.TestCase):
                     client=FakeClient(),
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -13884,7 +13884,7 @@ class CoreTest(unittest.TestCase):
                     cookie_secret="secret",
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]
@@ -13925,7 +13925,7 @@ class CoreTest(unittest.TestCase):
                     static_dir=static_dir,
                 )
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
             try:
                 host, port = server.server_address[:2]

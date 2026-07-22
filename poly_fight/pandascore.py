@@ -1,4 +1,4 @@
-"""Compact PandaScore evidence for the DeepSeek main-match risk gate.
+"""Compact PandaScore evidence for the multi-source Gemini risk gate.
 
 Raw provider payloads never reach the model or persistent cache.  Team history is
 normalized, bounded by both time and count, and upserted per team.  Match-specific
@@ -24,8 +24,8 @@ PANDASCORE_API_URL = "https://api.pandascore.co"
 PANDASCORE_PROVIDER = "pandascore"
 REQUEST_TIMEOUT_SECONDS = 12
 TEAM_CACHE_TTL_SECONDS = 6 * 3600
-ALIAS_CACHE_TTL_SECONDS = 30 * 86400
-CACHE_IDLE_SECONDS = 7 * 86400
+ALIAS_CACHE_TTL_SECONDS = 7 * 86400
+CACHE_IDLE_SECONDS = 24 * 3600
 PRIMARY_LOOKBACK_DAYS = 120
 FALLBACK_LOOKBACK_DAYS = 180
 PRIMARY_MIN_MATCHES = 8
@@ -170,6 +170,7 @@ def compact_team_evidence(
         ),
         "recent": [
             {
+                "raw_id": row.get("match_id"),
                 "d": row.get("date"), "opp": row.get("opponent"),
                 "r": "W" if row.get("won") else "L",
                 "bo": row.get("best_of") or None, "s": row.get("score"), "event": row.get("event") or None,
@@ -332,7 +333,7 @@ class PandaScoreEvidenceService:
                 include_current_roster=include_current_roster,
             ),
             "h2h": [
-                {"d": row.get("date"), "winner": "A" if row.get("won") else "B",
+                {"raw_id": row.get("match_id"), "d": row.get("date"), "winner": "A" if row.get("won") else "B",
                  "bo": row.get("best_of") or None, "s": row.get("score"), "event": row.get("event") or None}
                 for row in h2h_rows[:MAX_H2H_MATCHES]
             ],

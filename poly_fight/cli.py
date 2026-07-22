@@ -7116,10 +7116,17 @@ def command_follow(
     collector: "OnchainFollowCollector | None" = None,
     backfill_positions: bool = False,
     backfilled_wallets: set[str] | None = None,
-    refresh_logos: bool = True,
+    refresh_logos: bool | None = None,
     ai_risk_service: AiRiskService | None = None,
 ) -> dict[str, Any]:
+    client_was_injected = client is not None
     client = client or build_client(args)
+    # Injected clients are used by deterministic unit/integration tests and
+    # offline callers.  Do not silently bypass them with a real network logo
+    # fetch; production `follow` still refreshes, while `run` passes its own
+    # throttled decision explicitly.
+    if refresh_logos is None:
+        refresh_logos = not client_was_injected
     data_dir = resolve_dashboard_root(args)
     follow_dir = resolve_follow_dir(args, data_dir)
     now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -7293,6 +7300,15 @@ def command_follow(
         observe_window_hours=args.observe_window_hours,
         post_start_grace_seconds=args.post_start_trade_grace_seconds,
     )
+    # AI self-run shadow is independent from leaderboard wallets.  It scans
+    # every pre-match esports main market already in the watched universe and
+    # persists screening outcomes idempotently; no real order endpoint exists.
+    proprietary_started_mono = time.monotonic()
+    try:
+        proprietary_stats = ai_risk_service.scan_proprietary(watched, now_ts=now_ts)
+    except Exception as exc:
+        proprietary_stats = {"errors": 1, "error": str(exc)[:180]}
+    stage_seconds["ai_proprietary"] = round(time.monotonic() - proprietary_started_mono, 3)
     gate_open = bool(watched or open_signals)
     # On-chain detection: keep the WS collector's subscription tracking the
     # current watched-market token ids + follow wallet set. Detection then comes
@@ -7930,7 +7946,8 @@ def command_follow(
     resolutions: dict[str, int] = {}
     price_settled_cids: set[str] = set()
     open_ai_shadows = ai_risk_service.follow_store.load_ai_shadows(open_only=True)
-    resolution_candidates = [*open_signals, *open_ai_shadows]
+    open_proprietary = ai_risk_service.follow_store.load_ai_proprietary_positions(open_only=True)
+    resolution_candidates = [*open_signals, *open_ai_shadows, *open_proprietary]
     if resolution_candidates and (
         resolution_poll_interval <= 0
         or now_ts - max(
@@ -7952,6 +7969,7 @@ def command_follow(
         )
     open_signals, settled = settle_open_signals(open_signals, resolutions, now_ts=now_ts)
     ai_risk_service.settle_shadows(resolutions, now_ts=now_ts, void_index=VOID_RESOLUTION_INDEX)
+    ai_risk_service.settle_proprietary(resolutions, now_ts=now_ts, void_index=VOID_RESOLUTION_INDEX)
     # 价格隐含结算(盘口未 closed,靠实时价≈1.0 判定)的信号打审计标记,区别于 Polymarket
     # 正式结算结果;后续 dashboard / 复盘可据此分辨"提前按盘口价结"的单。
     if price_settled_cids:
@@ -8476,7 +8494,7 @@ def command_reconcile_balance(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_ai_backtest(args: argparse.Namespace) -> int:
-    """Replay settled main matches through PandaScore evidence + DeepSeek without changing follow state."""
+    """Replay settled main matches through multi-source evidence + Gemini without changing follow state."""
     data_dir = resolve_dashboard_root(args)
     follow_dir = resolve_follow_dir(args, data_dir)
     store = FollowStore(follow_dir / "follow.db")
@@ -8816,7 +8834,7 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.set_defaults(func=command_reconcile_balance)
 
     ai_backtest = subparsers.add_parser(
-        "ai-backtest", help="replay settled main matches through PandaScore evidence and DeepSeek"
+        "ai-backtest", help="replay settled main matches through multi-source evidence and Gemini"
     )
     ai_backtest.add_argument("--follow-dir")
     ai_backtest.add_argument("--limit", type=int, default=50, help="maximum distinct settled conditions")

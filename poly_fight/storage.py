@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import secrets
 import sqlite3
 import time
@@ -882,6 +883,19 @@ class FollowStore:
                     updated_at INTEGER NOT NULL,
                     raw_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ai_proprietary_positions (
+                    condition_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    outcome_index INTEGER,
+                    evidence_score INTEGER NOT NULL DEFAULT 0,
+                    stake_usdc REAL NOT NULL DEFAULT 0,
+                    entry_price REAL,
+                    realized_pnl REAL NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL
+                );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_follow_strategy_library_name
                     ON follow_strategy_library(name COLLATE NOCASE);
                 CREATE INDEX IF NOT EXISTS idx_follow_signals_status ON follow_signals(status);
@@ -902,6 +916,7 @@ class FollowStore:
                 CREATE INDEX IF NOT EXISTS idx_ai_data_cache_kind_used ON ai_data_cache(cache_kind, last_used_at);
                 CREATE INDEX IF NOT EXISTS idx_ai_data_cache_team ON ai_data_cache(game, team_id);
                 CREATE INDEX IF NOT EXISTS idx_ai_backtest_condition ON ai_backtest_cases(condition_id, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_ai_proprietary_status_at ON ai_proprietary_positions(status, updated_at);
                 """
             )
             self._migrate_market_cache_schema(conn)
@@ -2309,7 +2324,7 @@ class FollowStore:
             conn.close()
         return {"db_ready": True, "signals": signals}
 
-    # ---- DeepSeek pre-match risk audit ---------------------------------
+    # ---- Evidence-grounded pre-match AI risk audit ----------------------
 
     def load_ai_assessment(self, condition_id: str) -> dict[str, Any] | None:
         conn = self.connect_readonly()
@@ -2530,7 +2545,7 @@ class FollowStore:
                 f"DELETE FROM ai_data_cache WHERE cache_key IN ({placeholders})", keys
             ).rowcount or 0)
 
-    def prune_ai_data_cache(self, *, now_ts: int, idle_seconds: int = 7 * 86400) -> int:
+    def prune_ai_data_cache(self, *, now_ts: int, idle_seconds: int = 24 * 3600) -> int:
         self.init_db()
         cutoff = int(now_ts) - max(1, int(idle_seconds))
         with self.connect() as conn:
@@ -2570,6 +2585,71 @@ class FollowStore:
             rows = conn.execute(
                 "SELECT raw_json FROM ai_backtest_cases ORDER BY updated_at DESC LIMIT ?",
                 (max(1, int(limit)),),
+            ).fetchall()
+            return [_loads(row["raw_json"], {}) for row in rows]
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+
+    def save_ai_proprietary_position(self, row: dict[str, Any]) -> None:
+        condition_id = str(row.get("condition_id") or "").lower()
+        if not condition_id:
+            raise ValueError("AI proprietary position requires condition_id")
+        self.init_db()
+        now = _to_int(row.get("updated_at") or row.get("created_at") or time.time())
+        created = _to_int(row.get("created_at") or now)
+        normalized = {**row, "condition_id": condition_id, "created_at": created, "updated_at": now}
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_proprietary_positions
+                (condition_id,status,decision,outcome_index,evidence_score,stake_usdc,entry_price,
+                 realized_pnl,created_at,updated_at,raw_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(condition_id) DO UPDATE SET
+                    status=excluded.status,decision=excluded.decision,outcome_index=excluded.outcome_index,
+                    evidence_score=excluded.evidence_score,stake_usdc=excluded.stake_usdc,
+                    entry_price=excluded.entry_price,realized_pnl=excluded.realized_pnl,
+                    updated_at=excluded.updated_at,raw_json=excluded.raw_json
+                """,
+                (
+                    condition_id, str(row.get("status") or "screened"), str(row.get("decision") or "unknown"),
+                    _to_int(row.get("outcome_index"), -1), _to_int(row.get("evidence_score")),
+                    _to_float(row.get("stake_usdc")),
+                    (_to_float(row.get("entry_price")) if row.get("entry_price") is not None else None),
+                    _to_float(row.get("realized_pnl")), created, now, _dumps(normalized),
+                ),
+            )
+
+    def load_ai_proprietary_positions(self, *, open_only: bool = False, limit: int = 1000, offset: int = 0) -> list[dict[str, Any]]:
+        conn = self.connect_readonly()
+        if conn is None:
+            return []
+        try:
+            if "ai_proprietary_positions" not in _table_names(conn):
+                return []
+            sql = "SELECT raw_json FROM ai_proprietary_positions"
+            params: list[Any] = []
+            if open_only:
+                sql += " WHERE status='open'"
+            sql += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+            params.extend((max(1, int(limit)), max(0, int(offset))))
+            return [_loads(row["raw_json"], {}) for row in conn.execute(sql, params).fetchall()]
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+
+    def load_ai_provider_health(self) -> list[dict[str, Any]]:
+        conn = self.connect_readonly()
+        if conn is None:
+            return []
+        try:
+            if "ai_data_cache" not in _table_names(conn):
+                return []
+            rows = conn.execute(
+                "SELECT raw_json FROM ai_data_cache WHERE cache_kind='provider_health' ORDER BY cache_key"
             ).fetchall()
             return [_loads(row["raw_json"], {}) for row in rows]
         except sqlite3.Error:
@@ -2648,6 +2728,17 @@ class FollowStore:
             "ai_inverse_win_count": 0,
             "ai_inverse_pnl_usdc": 0.0,
             "ai_vs_wallet_usdc": 0.0,
+            "proprietary_screened_count": 0,
+            "proprietary_open_count": 0,
+            "proprietary_settled_count": 0,
+            "proprietary_win_count": 0,
+            "proprietary_pnl_usdc": 0.0,
+            "proprietary_roi": 0.0,
+            "proprietary_bankroll_usdc": 5000.0,
+            "proprietary_brier_score": None,
+            "proprietary_market_edge": None,
+            "proprietary_wallet_same_count": 0,
+            "proprietary_wallet_opposite_count": 0,
         }
         conn = self.connect_readonly()
         if conn is None:
@@ -2689,10 +2780,51 @@ class FollowStore:
                   AND shadow_kind = 'ai_prediction'
                 """
             ).fetchone()
+            proprietary = (
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS screened,
+                           SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open_count,
+                           SUM(CASE WHEN status='settled' THEN 1 ELSE 0 END) AS settled_count,
+                           SUM(CASE WHEN status='settled' AND realized_pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                           SUM(CASE WHEN status='settled' THEN COALESCE(realized_pnl,0) ELSE 0 END) AS pnl,
+                           SUM(CASE WHEN status='settled' THEN COALESCE(stake_usdc,0) ELSE 0 END) AS settled_stake
+                    FROM ai_proprietary_positions
+                    """
+                ).fetchone()
+                if "ai_proprietary_positions" in tables else None
+            )
+            proprietary_rows = (
+                [_loads(row["raw_json"], {}) for row in conn.execute(
+                    "SELECT raw_json FROM ai_proprietary_positions WHERE status='settled'"
+                ).fetchall()]
+                if "ai_proprietary_positions" in tables else []
+            )
+            direction_rows = (
+                conn.execute(
+                    """
+                    SELECT p.condition_id,p.outcome_index AS self_outcome,i.outcome_index AS wallet_outcome
+                    FROM ai_proprietary_positions p
+                    JOIN ai_follow_intents i ON i.condition_id=p.condition_id
+                    WHERE p.outcome_index >= 0 AND i.outcome_index >= 0
+                    """
+                ).fetchall()
+                if "ai_proprietary_positions" in tables else []
+            )
         except sqlite3.Error:
             return empty
         finally:
             conn.close()
+        proprietary_pnl = _to_float(proprietary["pnl"]) if proprietary else 0.0
+        proprietary_stake = _to_float(proprietary["settled_stake"]) if proprietary else 0.0
+        briers = [_to_float(row.get("brier_score"), float("nan")) for row in proprietary_rows]
+        briers = [value for value in briers if math.isfinite(value)]
+        market_edges = [
+            _to_float(row.get("ai_probability")) / 100.0 - _to_float(row.get("market_implied_probability"))
+            for row in proprietary_rows if row.get("ai_probability") is not None and row.get("market_implied_probability") is not None
+        ]
+        wallet_same = sum(_to_int(row["self_outcome"], -1) == _to_int(row["wallet_outcome"], -2) for row in direction_rows)
+        wallet_opposite = len(direction_rows) - wallet_same
         return {
             "assessment_count": _to_int(assessment["n"]),
             "intent_count": _to_int(intents["n"]),
@@ -2708,6 +2840,17 @@ class FollowStore:
             "ai_inverse_win_count": _to_int(inverse["wins"]),
             "ai_inverse_pnl_usdc": round(_to_float(inverse["pnl"]), 8),
             "ai_vs_wallet_usdc": round(_to_float(inverse["comparison"]), 8),
+            "proprietary_screened_count": _to_int(proprietary["screened"]) if proprietary else 0,
+            "proprietary_open_count": _to_int(proprietary["open_count"]) if proprietary else 0,
+            "proprietary_settled_count": _to_int(proprietary["settled_count"]) if proprietary else 0,
+            "proprietary_win_count": _to_int(proprietary["wins"]) if proprietary else 0,
+            "proprietary_pnl_usdc": round(proprietary_pnl, 8),
+            "proprietary_roi": round(proprietary_pnl / proprietary_stake, 8) if proprietary_stake > 0 else 0.0,
+            "proprietary_bankroll_usdc": round(5000.0 + proprietary_pnl, 8),
+            "proprietary_brier_score": round(sum(briers) / len(briers), 8) if briers else None,
+            "proprietary_market_edge": round(sum(market_edges) / len(market_edges), 8) if market_edges else None,
+            "proprietary_wallet_same_count": wallet_same,
+            "proprietary_wallet_opposite_count": wallet_opposite,
         }
 
     def load_dashboard_wallet_follow_detail(self, wallet: str, *, statuses: set[str] | None = None) -> dict[str, Any]:

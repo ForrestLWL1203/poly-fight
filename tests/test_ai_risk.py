@@ -68,7 +68,7 @@ def market(condition_id="c1"):
     }
 
 
-class FakeDeepSeek:
+class FakeGemini:
     calls = []
 
     def __init__(self, secret):
@@ -77,9 +77,11 @@ class FakeDeepSeek:
     def assess(self, prompt, *, model):
         self.__class__.calls.append((prompt, model))
         return ({
-            "winner": "A", "a": 82, "b": 18, "confidence": 91,
-            "knowledge": "ok", "reason": "优势：历史实力与交手；风险：BO1波动",
-        }, {"model": model, "usage": {"prompt_tokens": 41, "completion_tokens": 35}}, 12)
+            "status": "decisive", "winner": "team_a", "team_a_score": 82,
+            "team_b_score": 18, "confidence": 91,
+            "supporting_evidence_ids": ["ev_test"], "risk_flags": ["bo1_variance"],
+            "reason_zh": "历史实力与交手明显占优",
+        }, type("Response", (), {"model_version": model, "usage_metadata": None})(), 12)
 
 
 class FakeEvidence:
@@ -88,14 +90,27 @@ class FakeEvidence:
 
     def build_evidence(self, market, *, cutoff_ts, now_ts):
         return {
-            "source": "PandaScore",
             "as_of": "2026-07-22T00:00:00Z",
-            "window": {"primary_days": 120, "fallback_days": 180, "max_matches_per_team": 20},
-            "team_a": {"name": "T1", "record": {"n": 10, "w": 8, "l": 2, "wr": 80}},
-            "team_b": {"name": "Kiwoom DRX", "record": {"n": 10, "w": 4, "l": 6, "wr": 40}},
-            "h2h": [{"d": "2026-07-01", "winner": "A", "bo": 3}],
+            "evidence_score": 88,
+            "score_components": {"identity": 15, "sample_freshness": 25},
+            "coverage": {"successful_sources": ["pandascore", "leaguepedia"]},
+            "normalized": {"team_a": [{"id": "ev_test", "d": "2026-07-01", "opp": "DRX", "r": "W"}], "team_b": [], "h2h": []},
+            "valid_evidence_ids": ["ev_test"],
             "cache_keys": ["pandascore:team:lol:1", "pandascore:team:lol:2"],
         }
+
+
+class MediumEvidence(FakeEvidence):
+    def build_evidence(self, market, *, cutoff_ts, now_ts):
+        return {**super().build_evidence(market, cutoff_ts=cutoff_ts, now_ts=now_ts), "evidence_score": 67}
+
+
+class RecordingEvidence(FakeEvidence):
+    cutoffs = []
+
+    def build_evidence(self, market, *, cutoff_ts, now_ts):
+        self.__class__.cutoffs.append(cutoff_ts)
+        return super().build_evidence(market, cutoff_ts=cutoff_ts, now_ts=now_ts)
 
 
 class FakePandaScore:
@@ -151,6 +166,21 @@ class FakePandaScore:
 
 
 class AiRiskTests(unittest.TestCase):
+    def test_live_assessment_cutoff_never_advances_to_future_match_start(self):
+        RecordingEvidence.cutoffs = []
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            service = AiRiskService(
+                data_dir, store, client_factory=FakeGemini, evidence_factory=RecordingEvidence,
+            )
+            service.config.save_credential(encrypted_envelope(service.config, "gemini-test"))
+            service.config.save_settings(enabled=True)
+            now_ts = 1_783_000_000
+            service.ensure_assessment(market("future-cutoff"), now_ts=now_ts)
+            self.assertEqual(RecordingEvidence.cutoffs, [now_ts])
+            service.close()
+
     def test_pandascore_history_is_time_bounded_compacted_and_cached(self):
         cutoff_ts = int(datetime(2026, 7, 22, tzinfo=timezone.utc).timestamp())
         with tempfile.TemporaryDirectory() as tmp:
@@ -176,31 +206,45 @@ class AiRiskTests(unittest.TestCase):
             self.assertEqual(len(client.calls), 2)
 
     def test_minimal_prompt_excludes_follow_direction_and_wallet_data(self):
-        metadata, prompt = build_match_prompt(market(), now_ts=1_783_000_000)
+        metadata, prompt = build_match_prompt(
+            market(), now_ts=1_783_000_000,
+            evidence={"source": "PandaScore", "team_a": {"record": {"n": 4}}},
+        )
         encoded = str(prompt)
         self.assertIn("T1", encoded)
         self.assertIn("Kiwoom DRX", encoded)
-        self.assertIn("根据历史数据", encoded)
+        self.assertIn("Evidence Pack", encoded)
         self.assertIn("KeSPA Cup", encoded)
         self.assertIn("Match Winner", SYSTEM_PROMPT)
         self.assertIn("50:50", SYSTEM_PROMPT)
-        self.assertIn("UNKNOWN", SYSTEM_PROMPT)
+        self.assertIn("insufficient", SYSTEM_PROMPT)
         self.assertNotIn("wallet", encoded.lower())
         self.assertNotIn("outcome_index", encoded)
         self.assertNotIn("condition_id", encoded)
         self.assertNotIn("0.62", encoded)
+        self.assertIn("evidence_pack", prompt)
         self.assertEqual(metadata["team_a"], "T1")
+
+    def test_dota2_is_supported_by_ai_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            service = AiRiskService(Path(tmp), store, client_factory=FakeGemini)
+            dota_market = {**market(), "game_family": "dota2"}
+            self.assertTrue(service.eligible_market(dota_market))
+            service.close()
 
     def test_minimal_output_validation_and_threshold(self):
         parsed = validate_assessment_output({
-            "winner": "B", "a": 31, "b": 69, "confidence": 80,
-            "knowledge": "ok", "reason": "优势：B队历史表现更稳；风险：阵容变动",
-        })
+            "status": "decisive", "winner": "team_b", "team_a_score": 31,
+            "team_b_score": 69, "confidence": 80,
+            "supporting_evidence_ids": ["ev1"], "risk_flags": ["roster_change"],
+            "reason_zh": "B队历史表现更稳",
+        }, valid_evidence_ids={"ev1"})
         self.assertEqual(parsed["verdict"], "team_b")
-        self.assertEqual(assessment_direction({"status": "ok", **parsed}, {
+        self.assertEqual(assessment_direction({"status": "ok", "evidence_score": 80, **parsed}, {
             "win_probability_threshold": 65, "confidence_threshold": 75,
         }), "team_b")
-        boundary = {**parsed, "status": "ok", "team_a_win_probability": 35, "team_b_win_probability": 65, "confidence": 75}
+        boundary = {**parsed, "status": "ok", "evidence_score": 80, "team_a_win_probability": 35, "team_b_win_probability": 65, "confidence": 75}
         self.assertEqual(assessment_direction(boundary, {
             "win_probability_threshold": 65, "confidence_threshold": 75,
         }), "team_b")
@@ -218,7 +262,7 @@ class AiRiskTests(unittest.TestCase):
             self.assertTrue(config.db_path.is_relative_to(Path(tmp) / ".secrets"))
             self.assertNotIn("sk-private-test", config.db_path.read_bytes().decode("latin1"))
 
-    def test_gemini_settings_migrate_back_to_deepseek_without_disabling(self):
+    def test_model_migrates_to_fixed_gemini_without_deleting_deepseek_ciphertext(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             config = AiConfigStore(data_dir)
@@ -230,9 +274,10 @@ class AiRiskTests(unittest.TestCase):
                     "VALUES ('deepseek',1,'old','old','old','old','valid',1,1)"
                 )
             migrated = AiConfigStore(data_dir)
-            self.assertEqual(migrated.settings()["model"], "deepseek-v4-pro")
+            self.assertEqual(migrated.settings()["model"], "gemini-3.6-flash")
             self.assertTrue(migrated.settings()["enabled"])
-            self.assertIsNotNone(migrated.credential_envelope())
+            self.assertIsNone(migrated.credential_envelope())
+            self.assertIsNotNone(migrated.credential_envelope("deepseek"))
 
     def test_explicit_data_reset_preserves_encrypted_credential(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -248,13 +293,13 @@ class AiRiskTests(unittest.TestCase):
             self.assertEqual(AiConfigStore(data_dir).secret(), "sk-survives-reset")
 
     def test_strong_conflict_blocks_and_shadow_settles(self):
-        FakeDeepSeek.calls = []
+        FakeGemini.calls = []
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             store = FollowStore(data_dir / "follow" / "follow.db")
             store.init_db()
             service = AiRiskService(
-                data_dir, store, client_factory=FakeDeepSeek, evidence_factory=FakeEvidence,
+                data_dir, store, client_factory=FakeGemini, evidence_factory=FakeEvidence,
             )
             service.config.save_credential(encrypted_envelope(service.config, "sk-test"))
             service.config.save_credential(
@@ -274,7 +319,7 @@ class AiRiskTests(unittest.TestCase):
             )
             self.assertTrue(decision["blocked"])
             self.assertEqual(decision["action"], "blocked")
-            self.assertEqual(len(FakeDeepSeek.calls), 1)
+            self.assertEqual(len(FakeGemini.calls), 1)
             # Same condition reuses the neutral assessment.
             agree = service.decide(
                 market=market(), wallet="0x" + "2" * 40, outcome_index=0,
@@ -282,7 +327,7 @@ class AiRiskTests(unittest.TestCase):
                 wallet_trade_size=80, now_ts=1_783_000_001,
             )
             self.assertEqual(agree["action"], "agree")
-            self.assertEqual(len(FakeDeepSeek.calls), 1)
+            self.assertEqual(len(FakeGemini.calls), 1)
             service.settle_shadows({"c1": 0}, now_ts=1_783_000_100)
             shadows = store.load_ai_shadows()
             wallet_shadow = next(row for row in shadows if row["shadow_kind"] == "wallet_original")
@@ -293,18 +338,39 @@ class AiRiskTests(unittest.TestCase):
             self.assertAlmostEqual(
                 ai_shadow["comparison_pnl"], ai_shadow["realized_pnl"] - wallet_shadow["realized_pnl"],
             )
-            self.assertIsNone(store.load_ai_data_cache(
+            self.assertIsNotNone(store.load_ai_data_cache(
                 "pandascore:team:lol:1", now_ts=1_783_000_101, touch=False,
             ))
             finalized = store.load_ai_assessment("c1")
             self.assertNotIn("provider_request", finalized)
             self.assertNotIn("parsed_output", finalized)
+            self.assertTrue(finalized["evidence_snapshot"]["valid_evidence_ids"])
+            service.close()
+
+    def test_medium_evidence_is_assessed_but_cannot_block_wallet(self):
+        FakeGemini.calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = FollowStore(data_dir / "follow" / "follow.db")
+            service = AiRiskService(
+                data_dir, store, client_factory=FakeGemini, evidence_factory=MediumEvidence,
+            )
+            service.config.save_credential(encrypted_envelope(service.config, "gemini-test"))
+            service.config.save_settings(enabled=True)
+            decision = service.decide(
+                market=market("medium"), wallet="0x" + "4" * 40, outcome_index=1,
+                intended_stake=25, entry_price=0.4, trade_id="tx-medium",
+                wallet_trade_size=50, now_ts=1_783_000_000,
+            )
+            self.assertEqual(decision["action"], "insufficient")
+            self.assertFalse(decision["blocked"])
+            self.assertEqual(len(FakeGemini.calls), 1)
             service.close()
 
     def test_ai_scope_is_esports_main_match_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = FollowStore(Path(tmp) / "follow" / "follow.db")
-            service = AiRiskService(Path(tmp), store, client_factory=FakeDeepSeek)
+            service = AiRiskService(Path(tmp), store, client_factory=FakeGemini)
             self.assertFalse(hasattr(service, "prefetch"))
             self.assertTrue(service.eligible_market(market()))
             self.assertFalse(service.eligible_market({**market(), "market_type": "game_winner"}))
@@ -348,15 +414,12 @@ class AiRiskTests(unittest.TestCase):
             self.assertFalse(config.public_key_path.exists())
 
     def test_ai_dashboard_routes_require_auth_and_accept_encrypted_envelope(self):
-        class BalanceClient:
+        class ModelClient:
             def __init__(self, secret):
                 self.secret = secret
 
-            def balance(self):
-                return {"is_available": True, "balance_infos": [{
-                    "currency": "CNY", "total_balance": "12.50",
-                    "granted_balance": "0", "topped_up_balance": "12.50",
-                }]}
+            def test(self, *, model):
+                return {"ok": True, "model": model, "latency_ms": 1}
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -366,7 +429,7 @@ class AiRiskTests(unittest.TestCase):
                 data_dir=data_dir, host="127.0.0.1", port=0,
                 username="admin", password="pw", cookie_secret="secret",
             ))
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
             thread.start()
 
             def call(method, path, body=None, cookie=""):
@@ -386,7 +449,7 @@ class AiRiskTests(unittest.TestCase):
                 self.assertEqual(status, 401)
                 token = make_session_token("admin", "secret")
                 cookie = "poly_fight_session=" + token
-                with patch("poly_fight.dashboard.DeepSeekClient", BalanceClient):
+                with patch("poly_fight.dashboard.GeminiClient", ModelClient):
                     status, payload = call("POST", "/api/ai-risk/credential", {"envelope": envelope}, cookie)
                 self.assertEqual(status, 200)
                 self.assertTrue(payload["data"]["configured"])

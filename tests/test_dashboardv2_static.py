@@ -72,11 +72,11 @@ class DashboardV2StaticTests(unittest.TestCase):
     def test_ai_risk_ui_uses_compact_operational_language(self):
         app = _read("app.jsx")
         css = _read("app.css")
-        for token in ("AI 风控雷达", "AI 研判记录", "证据不足", "ai-record-table", "ai-decision-badge"):
+        for token in ("AI 风控雷达", "AI 研判记录", "证据不足", "ai-record-table", "ai-decision-badge", "钱包风控", "自营影子"):
             self.assertIn(token, app)
         for noisy in ("PRE-MATCH INTELLIGENCE", "让历史实力成为主盘的第二道门", "独立赛前结论", "AI不确定"):
             self.assertNotIn(noisy, app)
-        self.assertIn("DeepSeek 凭证", app)
+        self.assertIn("Gemini 凭证", app)
         self.assertIn(".ai-control-card", css)
         self.assertIn(".ai-record-table", css)
 
