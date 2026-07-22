@@ -172,6 +172,60 @@ class EvidenceTests(unittest.TestCase):
             client.scoreboard_games(["Alpha", "Beta"], cutoff_ts=1_784_700_000)
         client.close()
 
+    def test_leaguepedia_uses_contact_user_agent_and_bounded_cargo_query(self):
+        LeaguepediaClient._last_request_at = 0
+        LeaguepediaClient._circuit_open_until = 0
+        captured = {}
+
+        def handle(request):
+            captured["user_agent"] = request.headers.get("user-agent")
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json={"cargoquery": []})
+
+        with patch.dict("os.environ", {"POLY_FIGHT_CONTACT_EMAIL": "ops@example.com"}):
+            client = LeaguepediaClient(transport=httpx.MockTransport(handle))
+            try:
+                client.scoreboard_games(["Alpha", "Beta"], cutoff_ts=1_784_700_000)
+            finally:
+                client.close()
+        self.assertEqual(captured["user_agent"], "poly-fight/1.1 (ops@example.com)")
+        self.assertEqual(captured["params"]["limit"], "200")
+        self.assertEqual(captured["params"]["formatversion"], "2")
+        self.assertNotIn("GameId", captured["params"]["fields"])
+        self.assertNotIn("OverviewPage", captured["params"]["fields"])
+
+    def test_leaguepedia_bot_password_logs_in_before_cargo_query(self):
+        LeaguepediaClient._last_request_at = 0
+        LeaguepediaClient._circuit_open_until = 0
+        actions = []
+
+        def handle(request):
+            action = request.url.params.get("action")
+            if request.method == "POST":
+                from urllib.parse import parse_qs
+                action = parse_qs(request.content.decode()).get("action", [""])[0]
+            actions.append(action)
+            if action == "query":
+                return httpx.Response(200, json={"query": {"tokens": {"logintoken": "token+\\"}}})
+            if action == "login":
+                return httpx.Response(200, json={"login": {"result": "Success"}})
+            return httpx.Response(200, json={"cargoquery": []})
+
+        credential = json.dumps({
+            "username": "User@PolyFight", "password": "bot-secret",
+            "contact_email": "ops@example.com",
+        })
+        client = LeaguepediaClient(
+            credential=credential,
+            transport=httpx.MockTransport(handle),
+        )
+        try:
+            self.assertEqual(client.scoreboard_games(["Alpha", "Beta"], cutoff_ts=1_784_700_000), [])
+            self.assertTrue(client.authenticated)
+        finally:
+            client.close()
+        self.assertEqual(actions, ["query", "login", "cargoquery"])
+
     def test_leaguepedia_queue_waits_one_minute_between_requests(self):
         LeaguepediaClient._last_request_at = 0
         LeaguepediaClient._circuit_open_until = 0

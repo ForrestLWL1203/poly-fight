@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .core import to_float
 from .evidence import EvidenceRouter, game_key
+from .leaguepedia import LEAGUEPEDIA_PROVIDER
 from .orderbook import PolymarketOrderbookClient, evaluate_books, market_token_ids
 from .pandascore import PANDASCORE_PROVIDER
 from .storage import FollowStore
@@ -368,12 +369,17 @@ class AiConfigStore:
                 "SELECT status,last_error,updated_at,last_validated_at FROM provider_credential WHERE provider=?",
                 (PANDASCORE_PROVIDER,),
             ).fetchone()
+            leaguepedia_credential = conn.execute(
+                "SELECT status,last_error,updated_at,last_validated_at FROM provider_credential WHERE provider=?",
+                (LEAGUEPEDIA_PROVIDER,),
+            ).fetchone()
             balance = conn.execute(
                 "SELECT * FROM provider_balance_snapshot WHERE provider=? ORDER BY balance_id DESC LIMIT 1",
                 (PROVIDER,),
             ).fetchone()
         value = self._status_rows(settings, credential, balance)
         value["data_credential"] = self._credential_status_row(data_credential)
+        value["leaguepedia_credential"] = self._credential_status_row(leaguepedia_credential)
         return value
 
     @staticmethod
@@ -406,6 +412,7 @@ class AiConfigStore:
             },
             "credential": AiConfigStore._credential_status_row(credential),
             "data_credential": AiConfigStore._credential_status_row(None),
+            "leaguepedia_credential": AiConfigStore._credential_status_row(None),
             "balance": ({
                 "checked_at": int(balance["checked_at"]),
                 "currency": balance["currency"],
@@ -434,6 +441,11 @@ class AiConfigStore:
                     "FROM provider_credential WHERE provider=?",
                     (PANDASCORE_PROVIDER,),
                 ).fetchone()
+                leaguepedia_credential = conn.execute(
+                    "SELECT status,last_error,updated_at,last_validated_at "
+                    "FROM provider_credential WHERE provider=?",
+                    (LEAGUEPEDIA_PROVIDER,),
+                ).fetchone()
                 balance = conn.execute(
                     "SELECT * FROM provider_balance_snapshot WHERE provider=? ORDER BY balance_id DESC LIMIT 1",
                     (PROVIDER,),
@@ -442,6 +454,7 @@ class AiConfigStore:
             return cls._status_rows(None, None, None)
         value = cls._status_rows(settings, credential, balance)
         value["data_credential"] = cls._credential_status_row(data_credential)
+        value["leaguepedia_credential"] = cls._credential_status_row(leaguepedia_credential)
         return value
 
 
@@ -657,7 +670,9 @@ class AiRiskService:
             )
         if self._evidence_router is None:
             self._evidence_router = EvidenceRouter(
-                self.follow_store, pandascore_key=self.config.secret(PANDASCORE_PROVIDER)
+                self.follow_store,
+                pandascore_key=self.config.secret(PANDASCORE_PROVIDER),
+                leaguepedia_credential=self.config.secret(LEAGUEPEDIA_PROVIDER),
             )
         return self._evidence_router.build_evidence(market, cutoff_ts=cutoff_ts, now_ts=now_ts)
 

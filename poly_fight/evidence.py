@@ -9,7 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
-from .leaguepedia import LeaguepediaEvidenceService
+from .leaguepedia import LeaguepediaClient, LeaguepediaEvidenceService
 from .liquipedia import LiquipediaEvidenceService
 from .opendota import OpenDotaEvidenceService
 from .pandascore import PANDASCORE_PROVIDER, PandaScoreClient, PandaScoreEvidenceService
@@ -163,21 +163,25 @@ class EvidenceRouter:
         store: FollowStore,
         *,
         pandascore_key: str | None = None,
+        leaguepedia_credential: str | None = None,
         service_factories: dict[str, Callable[[], Any]] | None = None,
     ):
         self.store = store
         self.pandascore_key = str(pandascore_key or "").strip()
+        self.leaguepedia_credential = str(leaguepedia_credential or "").strip()
         self.service_factories = service_factories or {}
-        self._services: list[Any] = []
+        self._services: dict[str, Any] = {}
 
     def close(self) -> None:
-        for service in self._services:
+        for service in self._services.values():
             close = getattr(service, "close", None)
             if close:
                 close()
         self._services.clear()
 
     def _service(self, provider: str) -> Any:
+        if provider in self._services:
+            return self._services[provider]
         if provider in self.service_factories:
             service = self.service_factories[provider]()
         elif provider == "pandascore":
@@ -187,12 +191,15 @@ class EvidenceRouter:
         elif provider == "opendota":
             service = OpenDotaEvidenceService(self.store)
         elif provider == "leaguepedia":
-            service = LeaguepediaEvidenceService(self.store)
+            service = LeaguepediaEvidenceService(
+                self.store,
+                LeaguepediaClient(credential=self.leaguepedia_credential or None),
+            )
         elif provider == "liquipedia":
             service = LiquipediaEvidenceService(self.store)
         else:
             raise ValueError("unknown_evidence_provider")
-        self._services.append(service)
+        self._services[provider] = service
         return service
 
     def _save_health(self, provider: str, *, now_ts: int, ok: bool, game: str, error: str = "", coverage: int = 0) -> None:

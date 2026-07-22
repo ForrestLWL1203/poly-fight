@@ -31,6 +31,7 @@ PRIMARY_MIN_SERIES = 8
 MAX_TEAM_SERIES = 30
 MAX_PROMPT_SERIES = 12
 MAX_H2H_SERIES = 5
+MAX_CARGO_ROWS = 200
 MIN_REQUEST_INTERVAL_SECONDS = 60
 CIRCUIT_BREAKER_SECONDS = 15 * 60
 
@@ -41,8 +42,29 @@ def normalize_team_name(value: Any) -> str:
 
 def _user_agent() -> str:
     contact = str(os.environ.get("POLY_FIGHT_CONTACT_EMAIL") or "").strip()
-    identity = contact or "https://github.com/ForrestLWL1203/poly-fight"
-    return f"poly-fight/1.0 ({identity})"
+    # Fandom/MediaWiki asks automated clients to identify the project/version
+    # and provide an email contact. Production supplies the operator address
+    # through POLY_FIGHT_CONTACT_EMAIL; keep an email-shaped project fallback
+    # so every runtime remains well-formed.
+    identity = contact or "ForrestLWL1203@users.noreply.github.com"
+    return f"poly-fight/1.1 ({identity})"
+
+
+def _credential(value: str | dict[str, Any] | None) -> dict[str, str] | None:
+    if value is None:
+        return None
+    try:
+        raw = json.loads(value) if isinstance(value, str) else dict(value)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid_leaguepedia_credential") from exc
+    credential = {
+        "username": str(raw.get("username") or "").strip(),
+        "password": str(raw.get("password") or "").strip(),
+        "contact_email": str(raw.get("contact_email") or "").strip(),
+    }
+    if not all(credential.values()) or "@" not in credential["contact_email"]:
+        raise ValueError("invalid_leaguepedia_credential")
+    return credential
 
 
 class LeaguepediaClient:
@@ -50,11 +72,27 @@ class LeaguepediaClient:
     _last_request_at = 0.0
     _circuit_open_until = 0.0
 
-    def __init__(self, *, timeout_seconds: int = 12, transport: httpx.BaseTransport | None = None):
+    def __init__(
+        self,
+        *,
+        credential: str | dict[str, Any] | None = None,
+        timeout_seconds: int = 12,
+        transport: httpx.BaseTransport | None = None,
+    ):
+        self.credential = _credential(credential)
+        self.authenticated = False
+        self._auth_lock = threading.Lock()
+        contact_email = (self.credential or {}).get("contact_email")
         self.client = httpx.Client(
             timeout=timeout_seconds,
             transport=transport,
-            headers={"User-Agent": _user_agent(), "Accept": "application/json", "Accept-Encoding": "gzip"},
+            headers={
+                "User-Agent": (
+                    f"poly-fight/1.1 ({contact_email})" if contact_email else _user_agent()
+                ),
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+            },
         )
 
     def close(self) -> None:
@@ -80,8 +118,53 @@ class LeaguepediaClient:
         with cls._request_lock:
             cls._circuit_open_until = max(cls._circuit_open_until, now + CIRCUIT_BREAKER_SECONDS)
 
+    def _ensure_authenticated(self) -> None:
+        if not self.credential or self.authenticated:
+            return
+        with self._auth_lock:
+            if self.authenticated:
+                return
+            try:
+                token_response = self.client.get(
+                    LEAGUEPEDIA_API_URL,
+                    params={
+                        "action": "query", "meta": "tokens", "type": "login",
+                        "format": "json", "formatversion": "2",
+                    },
+                )
+                token_response.raise_for_status()
+                token_payload = token_response.json()
+                if not isinstance(token_payload, dict):
+                    raise ValueError("login_token_invalid")
+                token = str(
+                    (((token_payload.get("query") or {}).get("tokens") or {}).get("logintoken"))
+                    or ""
+                )
+                if not token:
+                    raise ValueError("login_token_missing")
+                login_response = self.client.post(
+                    LEAGUEPEDIA_API_URL,
+                    data={
+                        "action": "login", "format": "json", "formatversion": "2",
+                        "lgname": self.credential["username"],
+                        "lgpassword": self.credential["password"],
+                        "lgtoken": token,
+                    },
+                )
+                login_response.raise_for_status()
+                login_payload = login_response.json()
+                if not isinstance(login_payload, dict):
+                    raise ValueError("login_response_invalid")
+                result = str((login_payload.get("login") or {}).get("result") or "")
+            except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
+                raise RuntimeError("leaguepedia_login_unavailable") from exc
+            if result.lower() != "success":
+                raise RuntimeError("leaguepedia_login_failed")
+            self.authenticated = True
+
     def scoreboard_games(self, team_names: list[str], *, cutoff_ts: int) -> list[dict[str, Any]]:
         now = self._enter_queue()
+        self._ensure_authenticated()
         escaped = [str(name).replace("'", "''") for name in team_names if str(name).strip()]
         if not escaped:
             return []
@@ -91,17 +174,21 @@ class LeaguepediaClient:
         params = {
             "action": "cargoquery",
             "format": "json",
+            "formatversion": "2",
             "tables": "ScoreboardGames=SG",
             "fields": (
-                "SG.MatchId,SG.GameId,SG.N_GameInMatch,SG.DateTime_UTC,SG.Team1,SG.Team2,"
-                "SG.Winner,SG.Tournament,SG.OverviewPage,SG.Team1Players,SG.Team2Players"
+                "SG.MatchId,SG.N_GameInMatch,SG.DateTime_UTC,SG.Team1,SG.Team2,"
+                "SG.Winner,SG.Tournament,SG.Team1Players,SG.Team2Players"
             ),
             "where": (
                 f"(SG.Team1 IN ({teams}) OR SG.Team2 IN ({teams})) AND "
                 f"SG.DateTime_UTC >= '{start_day}' AND SG.DateTime_UTC < '{cutoff_day}'"
             ),
             "order_by": "SG.DateTime_UTC DESC",
-            "limit": "500",
+            # Both teams share one indexed, time-bounded query. Two hundred
+            # game rows cover the capped series history without requesting
+            # Fandom's full anonymous 500-row allowance.
+            "limit": str(MAX_CARGO_ROWS),
         }
         try:
             response = self.client.get(LEAGUEPEDIA_API_URL, params=params)
