@@ -80,6 +80,14 @@ class DashboardV2StaticTests(unittest.TestCase):
         self.assertIn(".ai-control-card", css)
         self.assertIn(".ai-record-table", css)
 
+    def test_follow_ai_badge_only_shows_decision_action(self):
+        app = _read("app.jsx")
+        badge = app.split("function AiDecisionBadge", 1)[1].split("function MatchCell", 1)[0]
+        for label in ("判定：一致", "判定：拦截", "判定：证据不足"):
+            self.assertIn(label, badge)
+        for removed_detail in ("winner", "probability", "AI判定 ·"):
+            self.assertNotIn(removed_detail, badge)
+
     def test_ai_risk_layout_does_not_override_game_chip_or_leak_live_accent(self):
         app = _read("app.jsx")
         css = _read("app.css")

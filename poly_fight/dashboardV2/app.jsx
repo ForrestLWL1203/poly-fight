@@ -140,15 +140,11 @@ function AiDecisionBadge({ action, assessment, blocked = false }) {
   const resolvedAction = action || (blocked ? "blocked" : "");
   if (!resolvedAction && !assessment) return null;
   const a = assessment || {};
-  const verdict = String(a.verdict || "");
-  const winner = verdict === "team_a" ? a.team_a : verdict === "team_b" ? a.team_b : "";
-  const probability = verdict === "team_a" ? a.team_a_win_probability : verdict === "team_b" ? a.team_b_win_probability : null;
-  const hasConclusion = winner && resolvedAction !== "insufficient" && resolvedAction !== "unavailable";
   const label = resolvedAction === "blocked"
-    ? `AI拦截${hasConclusion ? ` · ${winner}${probability != null ? " " + Math.round(Number(probability)) + "%" : ""}` : ""}`
-    : hasConclusion
-      ? `AI判定 · ${winner}${probability != null ? " " + Math.round(Number(probability)) + "%" : ""}`
-      : "证据不足";
+    ? "判定：拦截"
+    : resolvedAction === "agree"
+      ? "判定：一致"
+      : "判定：证据不足";
   const tone = resolvedAction === "blocked" ? "down" : resolvedAction === "agree" ? "up" : "neutral";
   return <Badge className="ai-decision-badge" tone={tone} title={a.reason_zh || a.error || ""}>{label}</Badge>;
 }
