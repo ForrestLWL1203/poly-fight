@@ -1611,7 +1611,7 @@ function AiRiskPage({ toast }) {
     if (state === "ok" || state === "empty") return `覆盖 ${row.coverage || 0} 场${checked ? ` · ${checked}` : ""}`;
     return row.error || "尚未触发对应比赛";
   };
-  const screeningLabel = (row) => (row.status === "watching" && row.decision === "strategy_price_gate" ? "等待合适价格" : row.status === "watching" && row.decision === "no_positive_edge" ? "等待正向优势" : ({
+  const screeningLabel = (row) => (row.decision === "cold_market" && row.cold_reason === "volume_insufficient" ? "成交量不足" : row.decision === "cold_market" && row.cold_reason === "depth_insufficient" ? "深度不足" : row.decision === "cold_market" ? "盘口未达标" : row.status === "watching" && row.decision === "strategy_price_gate" ? "等待合适价格" : row.status === "watching" && row.decision === "no_positive_edge" ? "等待正向优势" : ({
     entered: "已入场", settled: "已结算", evidence_insufficient: "证据不足",
     no_positive_edge: "无正向优势", strategy_price_gate: "价格不符",
     volume_insufficient: "等待成交量", orderbook_missing_side: "等待深度",
@@ -1620,7 +1620,7 @@ function AiRiskPage({ toast }) {
     evidence_source_unavailable: "证据源重试", orderbook_rejected: "盘口未达标",
     vwap_unfillable: "深度不足", bankroll_insufficient: "可用资金不足",
     awaiting_liquidity_window: "等待探测窗口", orderbook_token_missing: "等待盘口",
-    cold_market: "冷门跳过", start_time_missing: "开赛时间缺失",
+    cold_market: "盘口未达标", start_time_missing: "开赛时间缺失",
     transient_error: "数据重试", void: "已作废",
   }[row.decision] || "筛选中"));
 
@@ -1750,12 +1750,16 @@ function AiRiskPage({ toast }) {
                   ? "钱包研判后提前探测"
                   : row.probe_trigger === "initial_window"
                     ? "进入 24 小时窗口后首次探测"
-                    : row.scheduled_probe_count ? `第 ${row.scheduled_probe_count}/6 次流动性探测` : "";
+                    : row.scheduled_probe_count ? `第 ${row.scheduled_probe_count}/7 次流动性探测` : "";
                 const screenDetail = row.decision === "strategy_price_gate"
                   ? `当前 ${observedPrice != null ? observedPrice.toFixed(3) : "—"}${row.max_entry_price ? ` · 策略上限 ${Number(row.max_entry_price).toFixed(3)}` : " · 超出策略价格范围"}${retryText}`
                   : row.decision === "no_positive_edge"
                     ? `当前 ${observedPrice != null ? observedPrice.toFixed(3) : "—"} · AI 保守公平价 ${Number(row.ai_fair_price || 0).toFixed(3)}${retryText}`
-                    : row.error || row.cold_reason || (row.book?.eligible ? "" : row.book?.reason) || probeText;
+                    : row.decision === "cold_market" && row.cold_reason === "volume_insufficient"
+                      ? `成交量 ${money(row.volume_usdc || 0)} · 门槛 ${money(row.required_volume_usdc || 0)}`
+                      : row.decision === "cold_market" && row.cold_reason === "depth_insufficient"
+                        ? `可成交深度 ${money(row.book?.depth_usdc || 0)} · 要求 ${money(row.book?.required_depth_usdc || 0)}`
+                        : row.error || row.cold_reason || (row.book?.eligible ? "" : row.book?.reason) || probeText;
                 return <tr key={row.condition_id}>
                   <td><div className="ai-record-match"><GameIcon game={Adapt.normalizeGame(row.game_family)} base={ASSET_BASE} chip /><div className="ai-record-copy"><b title={(teams[0] || "") + " vs " + (teams[1] || "")}>{teams[0] || "待识别"} <i>vs</i> {teams[1] || "待识别"}</b><span>{String(row.game_family || "").toUpperCase()} · 主盘{row.match_start_time ? ` · 开始 ${Adapt.fmtClock(row.match_start_time)}` : ""}</span></div></div></td>
                   <td><b className="ai-record-verdict">{winner || "—"}{winner && probability != null ? ` ${Math.round(Number(probability))}%` : ""}</b></td>

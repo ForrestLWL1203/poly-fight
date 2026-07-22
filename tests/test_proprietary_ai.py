@@ -169,7 +169,8 @@ class ProprietaryAiTests(unittest.TestCase):
             for hours, expected_status, expected_retry in (
                 (3, "watching", start - 2 * 3600),
                 (2, "watching", start - 1 * 3600),
-                (1, "skipped", None),
+                (1, "watching", int(start - .5 * 3600)),
+                (.5, "skipped", None),
             ):
                 service.scan_proprietary({"c-self": candidate}, now_ts=start - hours * 3600)
                 row = store.load_ai_proprietary_positions()[0]
@@ -178,6 +179,51 @@ class ProprietaryAiTests(unittest.TestCase):
                 self.assertEqual(row.get("next_retry_at") if expected_retry is not None else None, expected_retry)
                 self.assertEqual(row["observed_entry_price"], .75)
                 self.assertEqual(row["max_entry_price"], .68)
+            service.close()
+
+    def test_same_start_assessments_queue_for_next_tick_instead_of_terminal_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = FollowStore(root / "follow" / "follow.db")
+            service = AiRiskService(root, store, client_factory=Model, evidence_factory=Evidence, orderbook_client=Books())
+            service.config.save_credential(envelope(service.config, "gemini-test"))
+            service.config.save_settings(enabled=True)
+            start = TEST_NOW + 30 * 60
+            candidates = {}
+            for cid in ("c-1", "c-2", "c-3"):
+                candidates[cid] = {**market(start_ts=start), "condition_id": cid}
+
+            service.scan_proprietary(candidates, now_ts=TEST_NOW)
+            rows = {row["condition_id"]: row for row in store.load_ai_proprietary_positions()}
+            queued = [row for row in rows.values() if row["decision"] == "assessment_queued"]
+            self.assertEqual(len(queued), 1)
+            self.assertEqual(queued[0]["status"], "watching")
+            self.assertEqual(queued[0]["next_retry_at"], TEST_NOW + 60)
+
+            service.scan_proprietary(candidates, now_ts=TEST_NOW + 60)
+            rows = {row["condition_id"]: row for row in store.load_ai_proprietary_positions()}
+            self.assertEqual(rows[queued[0]["condition_id"]]["status"], "open")
+            service.close()
+
+    def test_pre_v3_terminal_queue_is_reactivated_once_before_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = FollowStore(root / "follow" / "follow.db")
+            service = AiRiskService(root, store, client_factory=Model, evidence_factory=Evidence, orderbook_client=Books())
+            service.config.save_credential(envelope(service.config, "gemini-test"))
+            service.config.save_settings(enabled=True)
+            start = TEST_NOW + 30 * 60
+            candidate = market(start_ts=start)
+            store.save_ai_proprietary_position({
+                "condition_id": "c-self", "status": "skipped", "decision": "assessment_queued",
+                "schedule_version": 2, "match_start_time": candidate["match_start_time"],
+                "created_at": TEST_NOW - 300, "updated_at": TEST_NOW - 300,
+            })
+
+            service.scan_proprietary({"c-self": candidate}, now_ts=TEST_NOW)
+            row = store.load_ai_proprietary_positions()[0]
+            self.assertEqual(row["schedule_version"], 3)
+            self.assertEqual(row["status"], "open")
             service.close()
 
     def test_popular_market_first_seen_inside_twenty_four_hours_is_screened_immediately(self):
@@ -206,7 +252,7 @@ class ProprietaryAiTests(unittest.TestCase):
             rows = store.load_ai_proprietary_positions(order_by_start=True, now_ts=TEST_NOW)
             self.assertEqual([row["condition_id"] for row in rows], ["near", "far", "past"])
 
-    def test_cold_market_uses_adaptive_twenty_four_to_one_hour_schedule(self):
+    def test_cold_market_uses_adaptive_twenty_four_hour_to_thirty_minute_schedule(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = FollowStore(root / "follow" / "follow.db")
@@ -228,7 +274,8 @@ class ProprietaryAiTests(unittest.TestCase):
                 (6, start - 3 * 3600, "watching"),
                 (3, start - 2 * 3600, "watching"),
                 (2, start - 1 * 3600, "watching"),
-                (1, None, "skipped"),
+                (1, int(start - .5 * 3600), "watching"),
+                (.5, None, "skipped"),
             ):
                 service.scan_proprietary({"c-self": thin_market}, now_ts=start - hours * 3600)
                 row = store.load_ai_proprietary_positions()[0]
@@ -237,7 +284,7 @@ class ProprietaryAiTests(unittest.TestCase):
                     self.assertEqual(row["next_retry_at"], expected_next)
             self.assertEqual(row["decision"], "cold_market")
             self.assertEqual(row["cold_reason"], "volume_insufficient")
-            self.assertEqual(row["probe_count"], 6)
+            self.assertEqual(row["probe_count"], 7)
             service.close()
 
     def test_model_retry_waits_for_next_scheduled_liquidity_probe(self):

@@ -45,8 +45,8 @@ ERROR_RETRY_SECONDS = 300
 SUPPORTED_GAMES = frozenset({"lol", "cs2", "dota2"})
 PROPRIETARY_INITIAL_BANKROLL = 5000.0
 PROPRIETARY_MIN_VOLUME = 1000.0
-PROPRIETARY_LIQUIDITY_PROBE_HOURS = (24, 12, 6, 3, 2, 1)
-PROPRIETARY_SCHEDULE_VERSION = 2
+PROPRIETARY_LIQUIDITY_PROBE_HOURS = (24, 12, 6, 3, 2, 1, 0.5)
+PROPRIETARY_SCHEDULE_VERSION = 3
 
 
 SYSTEM_PROMPT = """你是全球电竞（CS2、LoL、Dota2）全场赛前胜负精算师。
@@ -972,11 +972,17 @@ class AiRiskService:
                 continue
             if prior and prior.get("status") == "skipped":
                 retryable_price_decisions = {"strategy_price_gate", "no_positive_edge"}
-                if prior.get("decision") not in retryable_price_decisions or not start_ts:
+                recoverable_legacy_decisions = retryable_price_decisions | {
+                    "assessment_unavailable", "assessment_queued", "evidence_source_unavailable",
+                    "transient_error", "cold_market",
+                }
+                if prior.get("decision") not in recoverable_legacy_decisions or not start_ts:
                     continue
                 if int(prior.get("schedule_version") or 0) >= PROPRIETARY_SCHEDULE_VERSION:
+                    if prior.get("decision") not in retryable_price_decisions:
+                        continue
                     future_slots = sorted(
-                        start_ts - hours * 3600
+                        int(start_ts - hours * 3600)
                         for hours in PROPRIETARY_LIQUIDITY_PROBE_HOURS
                         if start_ts - hours * 3600 > now_ts
                     )
@@ -1029,14 +1035,14 @@ class AiRiskService:
             if start_ts - now_ts > PROPRIETARY_LIQUIDITY_PROBE_HOURS[0] * 3600 and not wallet_assessment_trigger:
                 self.follow_store.save_ai_proprietary_position({
                     **base, "decision": "awaiting_liquidity_window",
-                    "next_retry_at": start_ts - PROPRIETARY_LIQUIDITY_PROBE_HOURS[0] * 3600,
+                    "next_retry_at": int(start_ts - PROPRIETARY_LIQUIDITY_PROBE_HOURS[0] * 3600),
                 })
                 stats["watching"] += 1
                 continue
 
             def next_probe_at() -> int | None:
                 slots = [
-                    start_ts - hours * 3600
+                    int(start_ts - hours * 3600)
                     for hours in PROPRIETARY_LIQUIDITY_PROBE_HOURS
                     if start_ts - hours * 3600 > now_ts
                 ]
@@ -1116,7 +1122,17 @@ class AiRiskService:
                 base["liquidity_passed_at"] = int((prior or {}).get("liquidity_passed_at") or now_ts)
                 cached_assessment = self.follow_store.load_ai_assessment(cid)
                 if not cached_assessment and assessments_started >= 2:
-                    record_retry_or_skip("assessment_queued")
+                    if start_ts - now_ts > 90:
+                        self.follow_store.save_ai_proprietary_position({
+                            **base, "decision": "assessment_queued",
+                            "next_retry_at": min(now_ts + 60, start_ts - 60),
+                        })
+                        stats["watching"] += 1
+                    else:
+                        self.follow_store.save_ai_proprietary_position({
+                            **base, "status": "skipped", "decision": "assessment_queued",
+                        })
+                        stats["skipped"] += 1
                     continue
                 prefetched_evidence = None
                 if not cached_assessment:
