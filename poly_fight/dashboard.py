@@ -321,7 +321,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "recent_intents": _compact_rows(audit.get("intents") or [], _AI_INTENT_LIST_FIELDS),
                 "source_health": follow_store.load_ai_provider_health(),
                 "proprietary_records": follow_store.load_ai_proprietary_positions(
-                    limit=proprietary_limit, offset=proprietary_offset,
+                    limit=proprietary_limit, offset=proprietary_offset, order_by_start=True,
                 ),
                 "proprietary_page": {
                     "limit": proprietary_limit, "offset": proprietary_offset,

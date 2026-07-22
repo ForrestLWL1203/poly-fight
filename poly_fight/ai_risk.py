@@ -45,7 +45,8 @@ ERROR_RETRY_SECONDS = 300
 SUPPORTED_GAMES = frozenset({"lol", "cs2", "dota2"})
 PROPRIETARY_INITIAL_BANKROLL = 5000.0
 PROPRIETARY_MIN_VOLUME = 1000.0
-PROPRIETARY_LIQUIDITY_PROBE_HOURS = (3, 2, 1)
+PROPRIETARY_LIQUIDITY_PROBE_HOURS = (24, 12, 6, 3, 2, 1)
+PROPRIETARY_SCHEDULE_VERSION = 2
 
 
 SYSTEM_PROMPT = """你是全球电竞（CS2、LoL、Dota2）全场赛前胜负精算师。
@@ -956,6 +957,7 @@ class AiRiskService:
         if not self.enabled():
             return stats
         existing = {str(row.get("condition_id") or "").lower(): row for row in self.follow_store.load_ai_proprietary_positions(limit=10_000)}
+        wallet_intent_conditions = self.follow_store.load_ai_intent_condition_ids()
         plan = self._proprietary_plan()
         assessments_started = 0
         for condition_id, market in sorted(markets.items()):
@@ -966,9 +968,43 @@ class AiRiskService:
             if start_ts and start_ts <= now_ts:
                 continue
             prior = existing.get(cid)
-            if prior and prior.get("status") in {"open", "settled", "skipped"}:
+            if prior and prior.get("status") in {"open", "settled"}:
                 continue
-            if prior and int(prior.get("next_retry_at") or 0) > now_ts:
+            if prior and prior.get("status") == "skipped":
+                retryable_price_decisions = {"strategy_price_gate", "no_positive_edge"}
+                if prior.get("decision") not in retryable_price_decisions or not start_ts:
+                    continue
+                if int(prior.get("schedule_version") or 0) >= PROPRIETARY_SCHEDULE_VERSION:
+                    future_slots = sorted(
+                        start_ts - hours * 3600
+                        for hours in PROPRIETARY_LIQUIDITY_PROBE_HOURS
+                        if start_ts - hours * 3600 > now_ts
+                    )
+                    if not future_slots:
+                        continue
+                    self.follow_store.save_ai_proprietary_position({
+                        **prior, "status": "watching", "next_retry_at": future_slots[0], "updated_at": now_ts,
+                    })
+                    stats["watching"] += 1
+                    continue
+                prior = {**prior, "status": "watching", "next_retry_at": 0}
+            cached_before_window = self.follow_store.load_ai_assessment(cid)
+            cached_verdict = str((cached_before_window or {}).get("verdict") or "insufficient")
+            cached_probability = (
+                to_float((cached_before_window or {}).get(f"{cached_verdict}_win_probability"))
+                if cached_verdict in {"team_a", "team_b"} else 0.0
+            )
+            wallet_assessment_trigger = bool(
+                start_ts
+                and cid in wallet_intent_conditions
+                and (cached_before_window or {}).get("status") == "ok"
+                and int((cached_before_window or {}).get("evidence_score") or 0) >= PROPRIETARY_MIN_EVIDENCE_SCORE
+                and cached_probability >= WIN_PROBABILITY_THRESHOLD
+                and to_float((cached_before_window or {}).get("confidence")) >= CONFIDENCE_THRESHOLD
+                and not int((prior or {}).get("signal_probe_at") or 0)
+            )
+            current_schedule = int((prior or {}).get("schedule_version") or 0) >= PROPRIETARY_SCHEDULE_VERSION
+            if prior and int(prior.get("next_retry_at") or 0) > now_ts and current_schedule and not wallet_assessment_trigger:
                 continue
             stake = to_float(plan.get("stake"))
             base = {
@@ -981,13 +1017,16 @@ class AiRiskService:
                 "end_date": market.get("end_date"), "created_at": int((prior or {}).get("created_at") or now_ts),
                 "updated_at": now_ts,
                 "probe_count": int((prior or {}).get("probe_count") or 0),
+                "scheduled_probe_count": int((prior or {}).get("scheduled_probe_count") or 0),
+                "signal_probe_at": int((prior or {}).get("signal_probe_at") or 0),
+                "schedule_version": PROPRIETARY_SCHEDULE_VERSION,
                 "liquidity_qualified": bool((prior or {}).get("liquidity_qualified")),
             }
             if not start_ts:
                 self.follow_store.save_ai_proprietary_position({**base, "status": "skipped", "decision": "start_time_missing"})
                 stats["skipped"] += 1
                 continue
-            if start_ts - now_ts > PROPRIETARY_LIQUIDITY_PROBE_HOURS[0] * 3600:
+            if start_ts - now_ts > PROPRIETARY_LIQUIDITY_PROBE_HOURS[0] * 3600 and not wallet_assessment_trigger:
                 self.follow_store.save_ai_proprietary_position({
                     **base, "decision": "awaiting_liquidity_window",
                     "next_retry_at": start_ts - PROPRIETARY_LIQUIDITY_PROBE_HOURS[0] * 3600,
@@ -998,7 +1037,7 @@ class AiRiskService:
             def next_probe_at() -> int | None:
                 slots = [
                     start_ts - hours * 3600
-                    for hours in PROPRIETARY_LIQUIDITY_PROBE_HOURS[1:]
+                    for hours in PROPRIETARY_LIQUIDITY_PROBE_HOURS
                     if start_ts - hours * 3600 > now_ts
                 ]
                 return min(slots) if slots else None
@@ -1035,6 +1074,12 @@ class AiRiskService:
                 stats["watching"] += 1
                 continue
             base["probe_count"] += 1
+            if wallet_assessment_trigger:
+                base["probe_trigger"] = "wallet_assessment"
+                base["signal_probe_at"] = now_ts
+            else:
+                base["probe_trigger"] = "initial_window" if not int((prior or {}).get("probe_count") or 0) else "scheduled"
+                base["scheduled_probe_count"] += 1
             base["last_probe_at"] = now_ts
             volume = to_float(market.get("volume") or market.get("volumeNum") or market.get("volume24hr"))
             required_volume = max(PROPRIETARY_MIN_VOLUME, stake * 10.0)
@@ -1135,12 +1180,18 @@ class AiRiskService:
                 max_entry = to_float(prefilters.get("max_follow_entry_price"))
                 min_entry = to_float(prefilters.get("min_follow_entry_price"))
                 if (max_entry > 0 and entry > max_entry) or (min_entry > 0 and entry < min_entry):
-                    self.follow_store.save_ai_proprietary_position({**terminal, "decision": "strategy_price_gate", "book": book_check})
-                    stats["skipped"] += 1
+                    record_retry_or_skip(
+                        "strategy_price_gate",
+                        evidence_score=evidence_score, assessment=terminal["assessment"], book=book_check,
+                        observed_entry_price=round(entry, 8), min_entry_price=min_entry, max_entry_price=max_entry,
+                    )
                     continue
                 if probability / 100.0 * 0.95 <= entry:
-                    self.follow_store.save_ai_proprietary_position({**terminal, "decision": "no_positive_edge", "book": book_check})
-                    stats["skipped"] += 1
+                    record_retry_or_skip(
+                        "no_positive_edge",
+                        evidence_score=evidence_score, assessment=terminal["assessment"], book=book_check,
+                        observed_entry_price=round(entry, 8), ai_fair_price=round(probability / 100.0 * 0.95, 8),
+                    )
                     continue
                 outcomes = list(market.get("outcomes") or [])
                 self.follow_store.save_ai_proprietary_position({

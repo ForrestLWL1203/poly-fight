@@ -892,6 +892,7 @@ class FollowStore:
                     stake_usdc REAL NOT NULL DEFAULT 0,
                     entry_price REAL,
                     realized_pnl REAL NOT NULL DEFAULT 0,
+                    match_start_ts INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     raw_json TEXT NOT NULL
@@ -930,9 +931,29 @@ class FollowStore:
                     "comparison_pnl": "REAL",
                 },
             )
+            _ensure_columns(
+                conn,
+                "ai_proprietary_positions",
+                {"match_start_ts": "INTEGER NOT NULL DEFAULT 0"},
+            )
+            stale_start_rows = conn.execute(
+                "SELECT condition_id,raw_json FROM ai_proprietary_positions WHERE match_start_ts=0"
+            ).fetchall()
+            for stale in stale_start_rows:
+                value = _loads(stale["raw_json"], {})
+                start_ts = _timestamp(value.get("match_start_time") or value.get("market_start_time"))
+                if start_ts:
+                    conn.execute(
+                        "UPDATE ai_proprietary_positions SET match_start_ts=? WHERE condition_id=?",
+                        (start_ts, stale["condition_id"]),
+                    )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_ai_shadow_kind_status "
                 "ON ai_shadow_positions(shadow_kind, status)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ai_proprietary_start "
+                "ON ai_proprietary_positions(match_start_ts, updated_at)"
             )
             _ensure_columns(
                 conn,
@@ -2605,24 +2626,34 @@ class FollowStore:
                 """
                 INSERT INTO ai_proprietary_positions
                 (condition_id,status,decision,outcome_index,evidence_score,stake_usdc,entry_price,
-                 realized_pnl,created_at,updated_at,raw_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 realized_pnl,match_start_ts,created_at,updated_at,raw_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(condition_id) DO UPDATE SET
                     status=excluded.status,decision=excluded.decision,outcome_index=excluded.outcome_index,
                     evidence_score=excluded.evidence_score,stake_usdc=excluded.stake_usdc,
                     entry_price=excluded.entry_price,realized_pnl=excluded.realized_pnl,
-                    updated_at=excluded.updated_at,raw_json=excluded.raw_json
+                    match_start_ts=excluded.match_start_ts,updated_at=excluded.updated_at,raw_json=excluded.raw_json
                 """,
                 (
                     condition_id, str(row.get("status") or "screened"), str(row.get("decision") or "unknown"),
                     _to_int(row.get("outcome_index"), -1), _to_int(row.get("evidence_score")),
                     _to_float(row.get("stake_usdc")),
                     (_to_float(row.get("entry_price")) if row.get("entry_price") is not None else None),
-                    _to_float(row.get("realized_pnl")), created, now, _dumps(normalized),
+                    _to_float(row.get("realized_pnl")),
+                    _timestamp(row.get("match_start_time") or row.get("market_start_time")),
+                    created, now, _dumps(normalized),
                 ),
             )
 
-    def load_ai_proprietary_positions(self, *, open_only: bool = False, limit: int = 1000, offset: int = 0) -> list[dict[str, Any]]:
+    def load_ai_proprietary_positions(
+        self,
+        *,
+        open_only: bool = False,
+        limit: int = 1000,
+        offset: int = 0,
+        order_by_start: bool = False,
+        now_ts: int | None = None,
+    ) -> list[dict[str, Any]]:
         conn = self.connect_readonly()
         if conn is None:
             return []
@@ -2633,7 +2664,17 @@ class FollowStore:
             params: list[Any] = []
             if open_only:
                 sql += " WHERE status='open'"
-            sql += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+            if order_by_start:
+                current = int(now_ts if now_ts is not None else time.time())
+                sql += (
+                    " ORDER BY CASE WHEN match_start_ts>=? THEN 0 ELSE 1 END,"
+                    " CASE WHEN match_start_ts>=? THEN match_start_ts ELSE -match_start_ts END ASC,"
+                    " updated_at DESC"
+                )
+                params.extend((current, current))
+            else:
+                sql += " ORDER BY updated_at DESC"
+            sql += " LIMIT ? OFFSET ?"
             params.extend((max(1, int(limit)), max(0, int(offset))))
             return [_loads(row["raw_json"], {}) for row in conn.execute(sql, params).fetchall()]
         except sqlite3.Error:
@@ -2710,6 +2751,24 @@ class FollowStore:
             "intents": [_loads(row["raw_json"], {}) for row in intent_rows],
             "shadows": [_loads(row["raw_json"], {}) for row in shadow_rows],
         }
+
+    def load_ai_intent_condition_ids(self) -> set[str]:
+        conn = self.connect_readonly()
+        if conn is None:
+            return set()
+        try:
+            if "ai_follow_intents" not in _table_names(conn):
+                return set()
+            return {
+                str(row["condition_id"] or "").lower()
+                for row in conn.execute(
+                    "SELECT DISTINCT condition_id FROM ai_follow_intents WHERE condition_id<>''"
+                ).fetchall()
+            }
+        except sqlite3.Error:
+            return set()
+        finally:
+            conn.close()
 
     def load_ai_summary(self) -> dict[str, Any]:
         """Aggregate the complete AI audit history without loading every JSON row."""

@@ -1611,7 +1611,7 @@ function AiRiskPage({ toast }) {
     if (state === "ok" || state === "empty") return `覆盖 ${row.coverage || 0} 场${checked ? ` · ${checked}` : ""}`;
     return row.error || "尚未触发对应比赛";
   };
-  const screeningLabel = (row) => ({
+  const screeningLabel = (row) => (row.status === "watching" && row.decision === "strategy_price_gate" ? "等待合适价格" : row.status === "watching" && row.decision === "no_positive_edge" ? "等待正向优势" : ({
     entered: "已入场", settled: "已结算", evidence_insufficient: "证据不足",
     no_positive_edge: "无正向优势", strategy_price_gate: "价格不符",
     volume_insufficient: "等待成交量", orderbook_missing_side: "等待深度",
@@ -1622,7 +1622,7 @@ function AiRiskPage({ toast }) {
     awaiting_liquidity_window: "等待探测窗口", orderbook_token_missing: "等待盘口",
     cold_market: "冷门跳过", start_time_missing: "开赛时间缺失",
     transient_error: "数据重试", void: "已作废",
-  }[row.decision] || "筛选中");
+  }[row.decision] || "筛选中"));
 
   return <div className="page-inner ai-page">
     <Card className={"ai-control-card" + (radarRunning ? " is-live" : "")}>
@@ -1744,9 +1744,20 @@ function AiRiskPage({ toast }) {
                 const predictedIndex = Number(row.outcome_index) >= 0 ? Number(row.outcome_index) : assessedIndex;
                 const winner = predictedIndex >= 0 ? teams[predictedIndex] : null;
                 const probability = row.ai_probability != null ? row.ai_probability : predictedIndex === 0 ? assessment.team_a_win_probability : predictedIndex === 1 ? assessment.team_b_win_probability : null;
-                const screenDetail = row.error || row.cold_reason || row.book?.reason || (row.probe_count ? `第 ${row.probe_count}/3 次流动性探测` : "");
+                const observedPrice = row.observed_entry_price != null ? Number(row.observed_entry_price) : row.book?.vwap != null ? Number(row.book.vwap) : null;
+                const retryText = row.next_retry_at ? ` · 下次 ${Adapt.fmtClock(row.next_retry_at)}` : "";
+                const probeText = row.probe_trigger === "wallet_assessment"
+                  ? "钱包研判后提前探测"
+                  : row.probe_trigger === "initial_window"
+                    ? "进入 24 小时窗口后首次探测"
+                    : row.scheduled_probe_count ? `第 ${row.scheduled_probe_count}/6 次流动性探测` : "";
+                const screenDetail = row.decision === "strategy_price_gate"
+                  ? `当前 ${observedPrice != null ? observedPrice.toFixed(3) : "—"}${row.max_entry_price ? ` · 策略上限 ${Number(row.max_entry_price).toFixed(3)}` : " · 超出策略价格范围"}${retryText}`
+                  : row.decision === "no_positive_edge"
+                    ? `当前 ${observedPrice != null ? observedPrice.toFixed(3) : "—"} · AI 保守公平价 ${Number(row.ai_fair_price || 0).toFixed(3)}${retryText}`
+                    : row.error || row.cold_reason || (row.book?.eligible ? "" : row.book?.reason) || probeText;
                 return <tr key={row.condition_id}>
-                  <td><div className="ai-record-match"><GameIcon game={Adapt.normalizeGame(row.game_family)} base={ASSET_BASE} chip /><div className="ai-record-copy"><b title={(teams[0] || "") + " vs " + (teams[1] || "")}>{teams[0] || "待识别"} <i>vs</i> {teams[1] || "待识别"}</b><span>{String(row.game_family || "").toUpperCase()} · 主盘</span></div></div></td>
+                  <td><div className="ai-record-match"><GameIcon game={Adapt.normalizeGame(row.game_family)} base={ASSET_BASE} chip /><div className="ai-record-copy"><b title={(teams[0] || "") + " vs " + (teams[1] || "")}>{teams[0] || "待识别"} <i>vs</i> {teams[1] || "待识别"}</b><span>{String(row.game_family || "").toUpperCase()} · 主盘{row.match_start_time ? ` · 开始 ${Adapt.fmtClock(row.match_start_time)}` : ""}</span></div></div></td>
                   <td><b className="ai-record-verdict">{winner || "—"}{winner && probability != null ? ` ${Math.round(Number(probability))}%` : ""}</b></td>
                   <td><span className="ai-evidence-score">{row.evidence_score || 0}</span><small>/ 100</small></td>
                   <td><Badge tone={row.status === "settled" || row.status === "open" ? "up" : row.status === "watching" ? "neutral" : "warn"}>{screeningLabel(row)}</Badge><span className="ai-screen-reason" title={screenDetail || row.decision || ""}>{screenDetail}</span></td>

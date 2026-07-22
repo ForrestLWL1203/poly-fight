@@ -84,6 +84,14 @@ class ShallowBooks(Books):
         ]
 
 
+class ExpensiveBooks(Books):
+    def books(self, token_ids):
+        return [
+            {"asset_id": token_ids[0], "bids": [{"price": ".74", "size": "300"}], "asks": [{"price": ".75", "size": "300"}]},
+            {"asset_id": token_ids[1], "bids": [{"price": ".24", "size": "300"}], "asks": [{"price": ".25", "size": "300"}]},
+        ]
+
+
 TEST_NOW = 1_784_700_000
 
 
@@ -98,23 +106,126 @@ def market(*, start_ts: int = TEST_NOW + 9_000, volume: float = 2500):
 
 
 class ProprietaryAiTests(unittest.TestCase):
-    def test_cold_market_is_probed_only_at_three_two_and_one_hours(self):
+    def test_wallet_triggered_high_quality_assessment_gets_one_early_probe(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = FollowStore(root / "follow" / "follow.db")
             service = AiRiskService(root, store, client_factory=Model, evidence_factory=Evidence, orderbook_client=Books())
             service.config.save_credential(envelope(service.config, "gemini-test"))
             service.config.save_settings(enabled=True)
+            candidate = market(start_ts=TEST_NOW + 30 * 3600)
+            service.ensure_assessment(candidate, now_ts=TEST_NOW)
+            store.save_ai_intent({
+                "intent_id": "wallet-trigger", "condition_id": "c-self", "action": "agree",
+                "status": "open", "created_at": TEST_NOW, "updated_at": TEST_NOW,
+            })
+
+            stats = service.scan_proprietary({"c-self": candidate}, now_ts=TEST_NOW + 60)
+            row = store.load_ai_proprietary_positions()[0]
+            self.assertEqual(stats["entered"], 1)
+            self.assertEqual(row["status"], "open")
+            self.assertEqual(row["probe_trigger"], "wallet_assessment")
+            self.assertEqual(row["probe_count"], 1)
+            self.assertEqual(row["scheduled_probe_count"], 0)
+            service.close()
+
+    def test_wallet_probe_failure_waits_for_twenty_four_hour_slot_instead_of_polling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = FollowStore(root / "follow" / "follow.db")
+            service = AiRiskService(root, store, client_factory=Model, evidence_factory=Evidence, orderbook_client=Books())
+            service.config.save_credential(envelope(service.config, "gemini-test"))
+            service.config.save_settings(enabled=True)
+            start = TEST_NOW + 30 * 3600
+            candidate = market(start_ts=start, volume=0)
+            service.ensure_assessment(candidate, now_ts=TEST_NOW)
+            store.save_ai_intent({
+                "intent_id": "wallet-trigger", "condition_id": "c-self", "action": "agree",
+                "status": "open", "created_at": TEST_NOW, "updated_at": TEST_NOW,
+            })
+
+            service.scan_proprietary({"c-self": candidate}, now_ts=TEST_NOW + 60)
+            row = store.load_ai_proprietary_positions()[0]
+            self.assertEqual(row["decision"], "volume_insufficient")
+            self.assertEqual(row["next_retry_at"], start - 24 * 3600)
+            self.assertEqual(row["probe_count"], 1)
+            service.scan_proprietary({"c-self": candidate}, now_ts=TEST_NOW + 120)
+            self.assertEqual(store.load_ai_proprietary_positions()[0]["probe_count"], 1)
+            service.close()
+
+    def test_price_gate_retries_at_remaining_scheduled_slots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = FollowStore(root / "follow" / "follow.db")
+            service = AiRiskService(root, store, client_factory=Model, evidence_factory=Evidence, orderbook_client=ExpensiveBooks())
+            service.config.save_credential(envelope(service.config, "gemini-test"))
+            service.config.save_settings(enabled=True)
+            strategy = store.load_follow_strategy_readonly()
+            strategy["prefilters"]["max_follow_entry_price"] = .68
+            store.save_follow_strategy(strategy, ts=TEST_NOW)
             start = TEST_NOW + 4 * 3600
+            candidate = market(start_ts=start)
+
+            for hours, expected_status, expected_retry in (
+                (3, "watching", start - 2 * 3600),
+                (2, "watching", start - 1 * 3600),
+                (1, "skipped", None),
+            ):
+                service.scan_proprietary({"c-self": candidate}, now_ts=start - hours * 3600)
+                row = store.load_ai_proprietary_positions()[0]
+                self.assertEqual(row["decision"], "strategy_price_gate")
+                self.assertEqual(row["status"], expected_status)
+                self.assertEqual(row.get("next_retry_at") if expected_retry is not None else None, expected_retry)
+                self.assertEqual(row["observed_entry_price"], .75)
+                self.assertEqual(row["max_entry_price"], .68)
+            service.close()
+
+    def test_popular_market_first_seen_inside_twenty_four_hours_is_screened_immediately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = FollowStore(root / "follow" / "follow.db")
+            service = AiRiskService(root, store, client_factory=Model, evidence_factory=Evidence, orderbook_client=Books())
+            service.config.save_credential(envelope(service.config, "gemini-test"))
+            service.config.save_settings(enabled=True)
+            stats = service.scan_proprietary({"c-self": market(start_ts=TEST_NOW + 20 * 3600)}, now_ts=TEST_NOW)
+            row = store.load_ai_proprietary_positions()[0]
+            self.assertEqual(stats["entered"], 1)
+            self.assertEqual(row["probe_trigger"], "initial_window")
+            self.assertEqual(row["status"], "open")
+            service.close()
+
+    def test_proprietary_rows_sort_upcoming_near_to_far_then_recent_past(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow" / "follow.db")
+            for cid, start in (("far", TEST_NOW + 7200), ("past", TEST_NOW - 60), ("near", TEST_NOW + 600)):
+                store.save_ai_proprietary_position({
+                    "condition_id": cid, "status": "watching", "decision": "pending",
+                    "match_start_time": datetime.fromtimestamp(start, tz=timezone.utc).isoformat(),
+                    "created_at": TEST_NOW, "updated_at": TEST_NOW,
+                })
+            rows = store.load_ai_proprietary_positions(order_by_start=True, now_ts=TEST_NOW)
+            self.assertEqual([row["condition_id"] for row in rows], ["near", "far", "past"])
+
+    def test_cold_market_uses_adaptive_twenty_four_to_one_hour_schedule(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = FollowStore(root / "follow" / "follow.db")
+            service = AiRiskService(root, store, client_factory=Model, evidence_factory=Evidence, orderbook_client=Books())
+            service.config.save_credential(envelope(service.config, "gemini-test"))
+            service.config.save_settings(enabled=True)
+            start = TEST_NOW + 25 * 3600
             thin_market = market(start_ts=start, volume=0)
 
             service.scan_proprietary({"c-self": thin_market}, now_ts=TEST_NOW)
             row = store.load_ai_proprietary_positions()[0]
             self.assertEqual(row["decision"], "awaiting_liquidity_window")
-            self.assertEqual(row["next_retry_at"], start - 3 * 3600)
+            self.assertEqual(row["next_retry_at"], start - 24 * 3600)
             self.assertEqual(row["probe_count"], 0)
 
             for hours, expected_next, expected_status in (
+                (24, start - 12 * 3600, "watching"),
+                (12, start - 6 * 3600, "watching"),
+                (6, start - 3 * 3600, "watching"),
                 (3, start - 2 * 3600, "watching"),
                 (2, start - 1 * 3600, "watching"),
                 (1, None, "skipped"),
@@ -126,7 +237,7 @@ class ProprietaryAiTests(unittest.TestCase):
                     self.assertEqual(row["next_retry_at"], expected_next)
             self.assertEqual(row["decision"], "cold_market")
             self.assertEqual(row["cold_reason"], "volume_insufficient")
-            self.assertEqual(row["probe_count"], 3)
+            self.assertEqual(row["probe_count"], 6)
             service.close()
 
     def test_model_retry_waits_for_next_scheduled_liquidity_probe(self):
