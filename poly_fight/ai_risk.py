@@ -454,7 +454,14 @@ class GeminiClient:
                     system_instruction=SYSTEM_PROMPT,
                     response_mime_type="application/json",
                     response_json_schema=GEMINI_RESPONSE_SCHEMA,
-                    max_output_tokens=512,
+                    # Gemini 3.x accounts for internal reasoning inside the
+                    # generation ceiling.  Medium thinking keeps the matchup
+                    # comparison substantive; 4K prevents a valid short JSON
+                    # answer from being cut off after its thought phase.
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level=types.ThinkingLevel.MEDIUM,
+                    ),
+                    max_output_tokens=4096,
                 ),
             )
             parsed = response.parsed if isinstance(getattr(response, "parsed", None), dict) else json.loads(str(response.text or ""))
