@@ -44,7 +44,48 @@ class StaticService:
         return self.payload
 
 
+class FailingService:
+    def __init__(self, error):
+        self.error = error
+
+    def build_evidence(self, market, *, cutoff_ts, now_ts):
+        raise ValueError(self.error)
+
+
 class EvidenceTests(unittest.TestCase):
+    def test_unresolved_team_is_a_coverage_gap_not_a_provider_outage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            router = EvidenceRouter(store, pandascore_key="x", service_factories={
+                "pandascore": lambda: StaticService(source("PandaScore")),
+                "opendota": lambda: FailingService("opendota_team_unresolved"),
+            })
+            pack = router.build_evidence(market("dota2"), cutoff_ts=1_784_678_400, now_ts=1_784_678_000)
+            self.assertEqual(pack["coverage"]["failed_sources"]["opendota"], "opendota_team_unresolved")
+            health = {row["provider"]: row for row in store.load_ai_provider_health()}
+            self.assertEqual(health["opendota"]["status"], "empty")
+            self.assertEqual(health["opendota"]["gap_code"], "opendota_team_unresolved")
+            self.assertEqual(health["opendota"]["error"], "")
+            self.assertEqual(health["opendota"]["last_error_at"], 0)
+
+    def test_unresolved_team_preserves_prior_success_as_partial_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            good = EvidenceRouter(store, pandascore_key="x", service_factories={
+                "pandascore": lambda: StaticService(source("PandaScore")),
+                "opendota": lambda: StaticService(source("OpenDota")),
+            })
+            good.build_evidence(market("dota2"), cutoff_ts=1_784_678_400, now_ts=1_784_678_000)
+            gap = EvidenceRouter(store, pandascore_key="x", service_factories={
+                "pandascore": lambda: StaticService(source("PandaScore")),
+                "opendota": lambda: FailingService("opendota_team_unresolved"),
+            })
+            gap.build_evidence(market("dota2"), cutoff_ts=1_784_678_500, now_ts=1_784_678_100)
+            health = {row["provider"]: row for row in store.load_ai_provider_health()}
+            self.assertEqual(health["opendota"]["status"], "partial")
+            self.assertEqual(health["opendota"]["coverage"], 12)
+            self.assertEqual(health["opendota"]["last_success_at"], 1_784_678_000)
+
     def test_empty_provider_does_not_receive_multi_source_quality_credit(self):
         empty = source("Leaguepedia")
         for side in ("team_a", "team_b"):

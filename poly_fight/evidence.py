@@ -199,13 +199,25 @@ class EvidenceRouter:
         previous = self.store.load_ai_data_cache(f"provider_health:{provider}", now_ts=now_ts, touch=False) or {}
         error_text = str(error)[:180]
         limited = any(token in error_text.lower() for token in ("rate_limit", "ratelimited", "circuit"))
+        coverage_gap = any(token in error_text.lower() for token in ("team_unresolved", "team_id_missing"))
+        previous_success = int(previous.get("last_success_at") or 0)
+        if ok:
+            status = "ok" if coverage > 0 else "empty"
+        elif coverage_gap:
+            status = "partial" if previous_success else "empty"
+        elif limited:
+            status = "limited"
+        else:
+            status = "error"
         self.store.save_ai_data_cache({
             "cache_key": f"provider_health:{provider}", "cache_kind": "provider_health", "game": game,
             "team_id": provider, "provider": provider,
-            "status": "ok" if ok and coverage > 0 else "empty" if ok else "limited" if limited else "error",
-            "last_success_at": now_ts if ok else int(previous.get("last_success_at") or 0),
-            "last_error_at": int(previous.get("last_error_at") or 0) if ok else now_ts,
-            "error": "" if ok else error_text,
+            "status": status,
+            "last_success_at": now_ts if ok else previous_success,
+            "last_error_at": int(previous.get("last_error_at") or 0) if ok or coverage_gap else now_ts,
+            "last_gap_at": now_ts if coverage_gap else int(previous.get("last_gap_at") or 0),
+            "gap_code": error_text if coverage_gap else "",
+            "error": "" if ok or coverage_gap else error_text,
             "coverage": int(coverage) if ok else int(previous.get("coverage") or 0), "fetched_at": now_ts,
             "last_used_at": now_ts, "expires_at": now_ts + HEALTH_CACHE_SECONDS,
         })

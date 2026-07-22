@@ -1585,11 +1585,18 @@ function AiRiskPage({ toast }) {
   ].map((item) => ({ ...item, health: sourceMap.get(item.id) || {} }));
   const proprietary = data.proprietary_records || [];
   const proprietaryPage = data.proprietary_page || { total: proprietary.length };
-  const sourceStatus = (row) => row.status === "ok" ? "正常" : row.status === "empty" ? "无样本" : row.status === "limited" ? "限流" : row.status === "error" ? "异常" : "等待首检";
-  const sourceTone = (row) => row.status === "ok" ? "up" : row.status === "error" ? "down" : "neutral";
+  const sourceState = (row) => {
+    const gap = row.gap_code || /team_(?:unresolved|id_missing)/i.test(String(row.error || ""));
+    return gap ? (row.last_success_at ? "partial" : "empty") : row.status;
+  };
+  const sourceStatus = (row) => sourceState(row) === "ok" ? "正常" : sourceState(row) === "partial" ? "覆盖有限" : sourceState(row) === "empty" ? "无匹配" : sourceState(row) === "limited" ? "限流" : sourceState(row) === "error" ? "异常" : "等待首检";
+  const sourceTone = (row) => sourceState(row) === "ok" ? "up" : sourceState(row) === "error" ? "down" : "neutral";
   const sourceMeta = (row) => {
+    const state = sourceState(row);
     const checked = row.last_success_at ? new Date(Number(row.last_success_at) * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
-    if (row.status === "ok" || row.status === "empty") return `覆盖 ${row.coverage || 0} 场${checked ? ` · ${checked}` : ""}`;
+    if (state === "partial") return `部分对阵未收录 · 已覆盖 ${row.coverage || 0} 场${checked ? ` · ${checked}` : ""}`;
+    if (state === "empty" && (row.gap_code || row.error)) return "当前对阵存在未收录队伍";
+    if (state === "ok" || state === "empty") return `覆盖 ${row.coverage || 0} 场${checked ? ` · ${checked}` : ""}`;
     return row.error || "尚未触发对应比赛";
   };
   const screeningLabel = (row) => ({
