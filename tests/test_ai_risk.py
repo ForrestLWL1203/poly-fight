@@ -32,6 +32,7 @@ from poly_fight.dashboard import (
 from poly_fight.storage import FollowStore
 from poly_fight.pandascore import (
     MAX_PROMPT_MATCHES,
+    PANDASCORE_PROVIDER,
     PandaScoreEvidenceService,
 )
 
@@ -256,6 +257,9 @@ class AiRiskTests(unittest.TestCase):
                 data_dir, store, client_factory=FakeDeepSeek, evidence_factory=FakeEvidence,
             )
             service.config.save_credential(encrypted_envelope(service.config, "sk-test"))
+            service.config.save_credential(
+                encrypted_envelope(service.config, "pandascore-test"), PANDASCORE_PROVIDER,
+            )
             service.config.save_settings(enabled=True)
             for team_id in (1, 2):
                 store.save_ai_data_cache({
@@ -325,7 +329,8 @@ class AiRiskTests(unittest.TestCase):
             })
             AiConfigStore(data_dir).save_settings(enabled=True)
             ai = build_overview(data_dir)["ai_risk"]
-            self.assertTrue(ai["enabled"])
+            self.assertFalse(ai["enabled"])
+            self.assertTrue(ai["requested_enabled"])
             self.assertEqual(ai["blocked_count"], 1)
             self.assertEqual(ai["net_effect_usdc"], 100)
 
@@ -337,7 +342,8 @@ class AiRiskTests(unittest.TestCase):
             config.private_key_path.unlink()
             config.public_key_path.unlink()
             ai = build_overview(data_dir)["ai_risk"]
-            self.assertTrue(ai["enabled"])
+            self.assertFalse(ai["enabled"])
+            self.assertTrue(ai["requested_enabled"])
             self.assertFalse(config.private_key_path.exists())
             self.assertFalse(config.public_key_path.exists())
 

@@ -1162,12 +1162,16 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
     overview.update(_overview_full_app_aggregates(open_signals, results))
     # A normal overview read must not create or mutate the credential store.
     ai_config = AiConfigStore.read_existing_status(Path(data_dir))
+    ai_requested = bool((ai_config.get("settings") or {}).get("enabled"))
+    ai_model_ready = bool((ai_config.get("credential") or {}).get("configured"))
+    ai_data_ready = bool((ai_config.get("data_credential") or {}).get("configured"))
     overview["ai_risk"] = {
         **ai_audit_summary(store),
-        "enabled": bool((ai_config.get("settings") or {}).get("enabled")),
-        "credential_configured": bool((ai_config.get("credential") or {}).get("configured")),
+        "enabled": bool(ai_requested and ai_model_ready and ai_data_ready),
+        "requested_enabled": ai_requested,
+        "credential_configured": ai_model_ready,
         "credential_status": str((ai_config.get("credential") or {}).get("status") or "not_configured"),
-        "data_credential_configured": bool((ai_config.get("data_credential") or {}).get("configured")),
+        "data_credential_configured": ai_data_ready,
         "data_credential_status": str((ai_config.get("data_credential") or {}).get("status") or "not_configured"),
     }
     return overview

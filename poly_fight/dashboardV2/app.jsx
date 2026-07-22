@@ -1510,6 +1510,7 @@ function AiRiskPage({ toast }) {
   const connectionText = credential.status === "valid" ? "连接正常" : credential.status === "error" ? "连接异常" : "未配置";
   const dataConnectionTone = dataCredential.status === "valid" ? "up" : dataCredential.status === "error" ? "down" : "neutral";
   const dataConnectionText = dataCredential.status === "valid" ? "数据正常" : dataCredential.status === "error" ? "连接异常" : "未配置";
+  const radarRunning = !!cfg.enabled && !!credential.configured && !!dataCredential.configured;
 
   const save = async () => {
     if (!secret.trim() || !wrap) return;
@@ -1578,13 +1579,13 @@ function AiRiskPage({ toast }) {
   const recent = (data.recent_assessments || []).slice(0, 10);
 
   return <div className="page-inner ai-page">
-    <Card className={"ai-control-card" + (cfg.enabled ? " is-live" : "")}>
+    <Card className={"ai-control-card" + (radarRunning ? " is-live" : "")}>
       <div className="ai-control-copy">
         <span className="ai-control-icon"><Ico n="radar" /></span>
         <div><h2>AI 风控雷达</h2><p>目标钱包的主盘买入通过策略检查后，读取 PandaScore 赛前历史并交由 DeepSeek 判断全场胜方；强冲突时拦截。</p></div>
       </div>
       <div className="ai-control-state">
-        <Badge tone={cfg.enabled ? "up" : "neutral"} dot>{cfg.enabled ? "运行中" : "已关闭"}</Badge>
+        <Badge tone={radarRunning ? "up" : "neutral"} dot>{radarRunning ? "运行中" : cfg.enabled ? "待配置" : "已关闭"}</Badge>
         <Switch checked={!!cfg.enabled} disabled={!!busy} onChange={toggle} accent />
       </div>
     </Card>

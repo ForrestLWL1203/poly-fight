@@ -757,7 +757,7 @@ class AiRiskService:
         now_ts: int,
     ) -> dict[str, Any] | None:
         settings = self.config.settings()
-        if not settings.get("enabled") or not self.eligible_market(market):
+        if not self.enabled() or not self.eligible_market(market):
             return None
         assessment = self.ensure_assessment(market, now_ts=now_ts)
         direction = assessment_direction(assessment, settings)
