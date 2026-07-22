@@ -86,6 +86,9 @@ class DashboardV2StaticTests(unittest.TestCase):
         self.assertIn('className="ai-record-copy"', app)
         self.assertIn(".ai-record-match > .ps-gamechip { display: inline-flex", css)
         self.assertNotIn(".ai-record-match b, .ai-record-match span", css)
+        self.assertNotIn(".ai-provider-head b, .ai-provider-head span", css)
+        self.assertIn(".ai-provider-head > div > span", css)
+        self.assertIn(".ai-provider-head > .ps-badge { flex: none; }", css)
         live_rule = css.split(".ai-control-card.is-live", 1)[1].split("}", 1)[0]
         self.assertNotIn("inset", live_rule)
         self.assertIn(".ai-control-card.is-live { border-color: var(--border-hairline)", css)
