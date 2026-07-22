@@ -1147,6 +1147,7 @@ def process_follow_trades(
                 "condition_id": condition_id,
                 "outcome_index": outcome_index,
                 "outcome": outcomes[outcome_index] if 0 <= outcome_index < len(outcomes) else None,
+                "outcomes": list(outcomes),
                 "event_title": market.get("title"),
                 "category": market_category,
                 "league": market.get("league"),

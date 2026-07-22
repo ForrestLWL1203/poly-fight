@@ -121,6 +121,9 @@
   const saveAiCredential = (envelope) => post("/api/ai-risk/credential", { envelope });
   const testAiCredential = () => post("/api/ai-risk/credential/test", {});
   const deleteAiCredential = () => post("/api/ai-risk/credential/delete", {});
+  const saveAiDataCredential = (envelope) => post("/api/ai-risk/data-credential", { envelope });
+  const testAiDataCredential = () => post("/api/ai-risk/data-credential/test", {});
+  const deleteAiDataCredential = () => post("/api/ai-risk/data-credential/delete", {});
   const saveAiSettings = (enabled) => post("/api/ai-risk/settings", { enabled: !!enabled });
 
   /* ---- live stream (SSE) with polling fallback ---- */
@@ -150,7 +153,8 @@
     setFavorite, setQuarantine, setAccountBalance, saveStrategy,
     strategies, createStrategy, updateStrategy, activateStrategy, deleteStrategy,
     runnerStart, runnerStop, resetData, walletRefresh,
-    saveAiCredential, testAiCredential, deleteAiCredential, saveAiSettings,
+    saveAiCredential, testAiCredential, deleteAiCredential,
+    saveAiDataCredential, testAiDataCredential, deleteAiDataCredential, saveAiSettings,
     openStream,
   };
 
@@ -190,6 +194,9 @@
     api.saveAiCredential = () => okEcho({ configured: true, status: "valid" });
     api.testAiCredential = () => okEcho({ configured: true, status: "valid" });
     api.deleteAiCredential = () => okEcho({ deleted: true, enabled: false });
+    api.saveAiDataCredential = () => okEcho({ configured: true, status: "valid" });
+    api.testAiDataCredential = () => okEcho({ configured: true, status: "valid" });
+    api.deleteAiDataCredential = () => okEcho({ deleted: true, enabled: false });
     api.saveAiSettings = (enabled) => okEcho({ enabled: !!enabled });
     api.resetData = () => okEcho({ status: "reset" });
     api.walletRefresh = m.walletRefresh ? wrap(m.walletRefresh) : () => okEcho({ status: "running" });

@@ -501,6 +501,12 @@
 .ai-balance-strip small { color: var(--text-tertiary); font-size: 10px; }
 .ai-balance-strip b { margin-top: 3px; font-size: 12px; }
 .ai-connection-actions { display: flex; align-items: center; gap: 8px; margin-top: var(--sp-4); }
+.ai-provider-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); margin: 2px 0 10px; }
+.ai-provider-head > div { min-width: 0; }
+.ai-provider-head b, .ai-provider-head span { display: block; }
+.ai-provider-head b { font-size: 13px; }
+.ai-provider-head span { margin-top: 2px; color: var(--text-tertiary); font-size: 10px; }
+.ai-provider-divider { height: 1px; margin: 16px 0; background: var(--border-hairline); }
 
 .ai-impact-total { font-size: 24px; letter-spacing: -.035em; font-variant-numeric: tabular-nums; }
 .ai-impact-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }

@@ -7,7 +7,7 @@ following their entries as paper legs — **no live orders, private keys,
 balances, or approvals are ever used.**
 
 The project keeps dependencies deliberately small. `cryptography` is the only
-third-party runtime dependency and is used for the encrypted DeepSeek BYOK
+third-party runtime dependency and protects the encrypted DeepSeek BYOK
 credential envelope; the dashboard UI ships vendored JS assets.
 
 ---
@@ -171,16 +171,17 @@ python3 -m poly_fight.cli --data-dir data serve --host 127.0.0.1 --port 8787
 The dashboard serves **every** response from SQLite (`follow.db` plus the
 per-category `leaderboard.db`) — it never parses raw JSON outputs. Access is
 **read-only** (`mode=ro`, `PRAGMA query_only=1`); it never places trades. The
-only live external request it makes is the wallet-trades proxy. Authenticated
-users can trigger a background smart-wallet refresh, start/stop the runner, set
+live external requests are the wallet-trades proxy and explicit authenticated
+DeepSeek/PandaScore credential tests. Authenticated users can trigger a
+background smart-wallet refresh, start/stop the runner, set
 a manual paper balance cap, manage favorites, and reset generated data — nothing
 that writes follow-signal state directly.
 
-- **VPS / TLS:** deploy via the launcher (`launcher/launcher.py` → 远程 VPS →
-  环境准备), which clones the repo, installs a `poly-fight-dashboard` systemd unit
-  (bound to `127.0.0.1`), and fronts it with **Caddy** for automatic HTTPS. The
-  dashboard is reachable only through Caddy, never exposed directly. See
-  `launcher/README.md`.
+- **VPS / TLS:** use the launcher only for first-time provisioning (repository,
+  systemd, Caddy and firewall). Routine releases commit/push locally, update the
+  VPS checkout over direct SSH, install locked requirements, and restart only the
+  `poly-fight-dashboard` unit. The dashboard binds to `127.0.0.1` behind Caddy.
+  See `launcher/README.md`.
 - **Static assets:** the UI defaults to `poly_fight/dashboardV2/`. Override with
   `--static-dir <dir>`.
 - **Mock mode:** append `?mock=1` to the dashboard URL to render the UI from
@@ -204,7 +205,7 @@ data/follow/
   follow_state.json         # thin metadata/compatibility file
   follow_control.json       # runner/refresh/pause control
 data/.secrets/
-  ai_config.db              # DeepSeek settings + ciphertext envelope only
+  ai_config.db              # AI settings + encrypted provider envelopes only
   credential_wrap_private.pem  # local RSA key, chmod 0600
 ```
 
@@ -221,15 +222,35 @@ paper signals, legs, behavior events, results, quarantine, CLV/contested fields,
 performance, manual balance cap, run ticks, the configurable follow strategy,
 and AI assessment/intent/shadow-position audit records.
 
-### DeepSeek main-match risk gate
+### PandaScore-grounded DeepSeek main-match risk gate
 
 The optional AI risk radar evaluates only LOL/CS2/Dota2 full-match winner BUYs.
-It receives a compact neutral prompt containing only the game, the two team
-names, BO format, and analysis date. Wallet identity, intended side, price and
-stake never leave the process. Strong opponent predictions (>=65% win
+Only after a BUY passes the deterministic strategy gates does the runner query
+PandaScore. Team history uses a 120-day primary window; if a team has fewer than
+8 matches it extends to 180 days, capped at 20 matches per team. Before calling
+DeepSeek, raw responses are compacted: the most recent 10 matches retain bounded
+date/opponent/result/BO/event details, while matches 11-20 contribute only to
+aggregate record, recent-5/10 and BO splits. URLs, streams and unrelated provider
+fields never enter the prompt.
+
+The versioned prompt scores the full-match winner from a 50:50 baseline using
+only this pre-match evidence. Wallet identity, intended side, price and stake
+never leave the process. Strong opponent predictions (>=65% win
 probability and >=75 confidence) block the paper leg; insufficient/stale data
 or provider failures fail open. The feature is off by default and can be
 configured, tested, enabled, or disabled from the dashboard's **AI 风控** page.
+Each blocked intent maintains both the original-wallet shadow and a same-stake
+AI-side hold-to-settlement shadow. Referenced team caches are removed after the
+match settles; idle/expired rows are pruned automatically.
+
+Historical settled main matches can be replayed without changing follow state:
+
+```bash
+python3 -m poly_fight.cli --data-dir data ai-backtest --limit 50
+```
+
+Historical opposite-side prices were not retained, so that command labels its
+AI-side PnL as an estimate using the binary complement of the original entry.
 
 Runtime-downloaded team logos are cached locally under `logs/`-adjacent dirs and
 are git-ignored — they persist locally but are never committed.

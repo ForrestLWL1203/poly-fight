@@ -76,6 +76,7 @@ class DashboardV2StaticTests(unittest.TestCase):
             self.assertIn(token, app)
         for noisy in ("PRE-MATCH INTELLIGENCE", "让历史实力成为主盘的第二道门", "独立赛前结论", "AI不确定"):
             self.assertNotIn(noisy, app)
+        self.assertIn("DeepSeek 凭证", app)
         self.assertIn(".ai-control-card", css)
         self.assertIn(".ai-record-table", css)
 

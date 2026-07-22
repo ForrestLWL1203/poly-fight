@@ -22,7 +22,7 @@ from urllib.parse import quote, unquote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from .api import PolymarketClient, RateLimiter
-from .ai_risk import AiRiskService
+from .ai_risk import AiRiskService, PROMPT_VERSION
 from .core import (
     ALLOWED_GAME_FAMILIES,
     FOLLOWABLE_PRICE_CEILING,
@@ -8475,6 +8475,114 @@ def command_reconcile_balance(args: argparse.Namespace) -> dict[str, Any]:
     return out
 
 
+def command_ai_backtest(args: argparse.Namespace) -> int:
+    """Replay settled main matches through PandaScore evidence + DeepSeek without changing follow state."""
+    data_dir = resolve_dashboard_root(args)
+    follow_dir = resolve_follow_dir(args, data_dir)
+    store = FollowStore(follow_dir / "follow.db")
+    store.init_db()
+    service = AiRiskService(data_dir, store)
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    aliases = {"league of legends": "lol", "dota 2": "dota2", "counter-strike": "cs2"}
+    for row in store.load_results():
+        cid = str(row.get("condition_id") or "").lower()
+        game = str(row.get("game_family") or row.get("league") or "").lower()
+        game = aliases.get(game, game)
+        if (
+            cid and row.get("status") == "settled" and not row.get("void")
+            and str(row.get("market_type") or "main_match").lower() == "main_match"
+            and game in {"lol", "cs2", "dota2"}
+        ):
+            grouped.setdefault(cid, []).append(row)
+    existing = {str(row.get("case_id") or ""): row for row in store.load_ai_backtest_cases(limit=10000)}
+    cases: list[dict[str, Any]] = []
+    ordered = sorted(
+        grouped.items(), key=lambda item: max(int(row.get("settled_at") or 0) for row in item[1]), reverse=True
+    )
+    for cid, rows in ordered:
+        if len(cases) >= max(1, int(args.limit)):
+            break
+        representative = rows[0]
+        outcomes = [str(value) for value in representative.get("outcomes") or []]
+        title = str(representative.get("event_title") or representative.get("market_question") or "")
+        title_game, title_a, title_b = _match_title_teams(
+            title, fallback_game=str(representative.get("game_family") or representative.get("league") or "")
+        )
+        if len(outcomes) != 2 and title_a and title_b:
+            outcomes = [title_a, title_b]
+        start_dt = parse_dt(representative.get("match_start_time") or representative.get("market_start_time"))
+        start_ts = int(start_dt.timestamp()) if start_dt else 0
+        if len(outcomes) != 2 or not start_ts:
+            continue
+        case_id = f"{PROMPT_VERSION}:{cid}"
+        if case_id in existing and not args.force:
+            cases.append(existing[case_id])
+            continue
+        market = {
+            "condition_id": cid, "category": "esports", "market_type": "main_match",
+            "game_family": representative.get("game_family") or representative.get("league") or title_game,
+            "title": title, "question": representative.get("market_question"), "outcomes": outcomes,
+            "match_start_time": representative.get("match_start_time"),
+        }
+        assessment = service.assess_backtest(market, cutoff_ts=start_ts, now_ts=now_ts)
+        direction = str(assessment.get("direction") or "unavailable")
+        predicted_index = 0 if direction == "team_a" else 1 if direction == "team_b" else None
+        original_pnl = round(sum(to_float(row.get("our_paper_pnl", row.get("our_realized_pnl"))) for row in rows), 8)
+        gated_pnl = 0.0
+        inverse_pnl = 0.0
+        blocked_stake = 0.0
+        winner_indexes: list[int] = []
+        for row in rows:
+            side = int(row.get("outcome_index") or 0)
+            row_winner = side if row.get("outcome_won") else 1 - side
+            winner_indexes.append(row_winner)
+            row_pnl = to_float(row.get("our_paper_pnl", row.get("our_realized_pnl")))
+            if predicted_index is None or predicted_index == side:
+                gated_pnl += row_pnl
+                continue
+            for leg in row.get("legs") or []:
+                stake = to_float(leg.get("funded_stake", leg.get("stake")))
+                original_entry = to_float(leg.get("our_entry_price"))
+                ai_entry = 1.0 - original_entry
+                blocked_stake += stake
+                if 0 < ai_entry < 1:
+                    inverse_pnl += stake * (1.0 - ai_entry) / ai_entry if predicted_index == row_winner else -stake
+        winner_index = winner_indexes[0] if winner_indexes and all(v == winner_indexes[0] for v in winner_indexes) else None
+        case = {
+            "case_id": case_id, "condition_id": cid, "status": assessment.get("status"),
+            "event_title": title, "game": market["game_family"], "outcomes": outcomes,
+            "match_start_ts": start_ts, "winner_index": winner_index,
+            "prediction_index": predicted_index,
+            "prediction_correct": (
+                predicted_index == winner_index if predicted_index is not None and winner_index is not None else None
+            ),
+            "assessment": assessment, "signal_count": len(rows),
+            "original_wallet_pnl": original_pnl, "gated_pnl": round(gated_pnl, 8),
+            "gate_net_effect": round(gated_pnl - original_pnl, 8),
+            "blocked_stake": round(blocked_stake, 8),
+            "ai_inverse_pnl_estimate": round(inverse_pnl, 8),
+            "ai_inverse_price_note": "uses 1-original_entry; historical opposing quote was not retained",
+            "created_at": now_ts, "updated_at": now_ts,
+        }
+        store.save_ai_backtest_case(case)
+        cases.append(case)
+    service.close()
+    completed = [row for row in cases if row.get("prediction_index") is not None and row.get("winner_index") is not None]
+    correct = sum(1 for row in completed if row.get("prediction_correct"))
+    summary = {
+        "case_count": len(cases), "decisive_count": len(completed), "correct_count": correct,
+        "accuracy": correct / len(completed) if completed else None,
+        "original_wallet_pnl": round(sum(to_float(row.get("original_wallet_pnl")) for row in cases), 8),
+        "gated_pnl": round(sum(to_float(row.get("gated_pnl")) for row in cases), 8),
+        "gate_net_effect": round(sum(to_float(row.get("gate_net_effect")) for row in cases), 8),
+        "ai_inverse_pnl_estimate": round(sum(to_float(row.get("ai_inverse_pnl_estimate")) for row in cases), 8),
+        "cases": cases,
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Polymarket esports smart-wallet analysis")
     parser.add_argument("--data-dir", default=None)
@@ -8706,6 +8814,14 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--initial", type=float, required=True, help="initial paper bankroll (e.g. 5000)")
     reconcile.add_argument("--apply", action="store_true", help="write the recomputed cash (default: dry-run print only)")
     reconcile.set_defaults(func=command_reconcile_balance)
+
+    ai_backtest = subparsers.add_parser(
+        "ai-backtest", help="replay settled main matches through PandaScore evidence and DeepSeek"
+    )
+    ai_backtest.add_argument("--follow-dir")
+    ai_backtest.add_argument("--limit", type=int, default=50, help="maximum distinct settled conditions")
+    ai_backtest.add_argument("--force", action="store_true", help="re-run cases already stored for this prompt version")
+    ai_backtest.set_defaults(func=command_ai_backtest)
 
     follow = subparsers.add_parser("follow", help="run one paper follow tick")
     add_follow_arguments(follow)

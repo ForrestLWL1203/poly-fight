@@ -1,8 +1,8 @@
-"""DeepSeek-backed, pre-match risk gate for esports main-match paper follows.
+"""DeepSeek-backed, evidence-grounded risk gate for esports main-match paper follows.
 
-The model receives match metadata only.  Wallet identity, intended side, price and
-stake never enter the prompt; the local gate compares the returned independent
-prediction with the candidate side after all ordinary strategy checks pass.
+The model receives compact pre-cutoff PandaScore team evidence. Wallet identity,
+intended side, price and stake never enter the prompt; the local gate compares the
+independent prediction with the candidate side after ordinary strategy checks pass.
 """
 
 from __future__ import annotations
@@ -26,13 +26,15 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .core import to_float
+from .pandascore import PANDASCORE_PROVIDER, PandaScoreClient, PandaScoreEvidenceService
 from .storage import FollowStore
 
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
+PROVIDER = "deepseek"
 DEFAULT_MODEL = "deepseek-v4-pro"
-PROMPT_VERSION = "esports-main-v1"
+PROMPT_VERSION = "esports-main-pandascore-v1"
 WIN_PROBABILITY_THRESHOLD = 65.0
 CONFIDENCE_THRESHOLD = 75.0
 REQUEST_TIMEOUT_SECONDS = 15
@@ -41,10 +43,20 @@ SUPPORTED_GAMES = frozenset({"lol", "cs2", "dota2"})
 HARD_UNCERTAINTY_FLAGS = frozenset({"roster_unknown", "stale_knowledge"})
 
 
-SYSTEM_PROMPT = (
-    "你是电竞赛前历史实力判断器。仅按已有历史资料判断，不参考赔率、钱包、下注方向；"
-    "资料不足或过时则不要猜。只返回JSON。"
-)
+SYSTEM_PROMPT = """你是全球电竞（CS2、LoL、Dota2）全场赛前胜负精算师。
+只评估整场比赛最终大比分胜方（Match Winner），绝不预测或提及 Map、单局、击杀等子盘口。
+
+只能使用用户提供的PandaScore赛前证据，不得用模型记忆补全比赛、阵容或赛果。双方从50:50开始，综合：
+长期与近期战绩、对手含金量、历史交锋、阵容稳定性、赛事等级和BO赛制。
+不得参考投注市场、赔率、钱包、下注方向或金额；不得使用目标比赛开赛后的赛果；不得编造资料。
+
+两队分值必须在0-100且合计100。除非资料完全镜像，否则不得给50:50。
+无法识别队伍、资料不足或知识可能过时时，winner必须为UNKNOWN，knowledge标为stale或insufficient，
+并降低confidence；不要勉强猜测。
+
+只返回一个JSON对象，不要Markdown或额外文字：
+{"winner":"A|B|UNKNOWN","a":0,"b":0,"confidence":0,
+ "knowledge":"ok|stale|insufficient","reason":"优势：核心依据；风险：主要不确定性（40字内）"}"""
 
 
 def _json_dumps(value: Any) -> str:
@@ -131,6 +143,13 @@ class AiConfigStore:
                 "(id,enabled,model,win_probability_threshold,confidence_threshold,updated_at) "
                 "VALUES (1,0,?,?,?,?)",
                 (DEFAULT_MODEL, WIN_PROBABILITY_THRESHOLD, CONFIDENCE_THRESHOLD, _now()),
+            )
+            # A short-lived local Gemini branch may have initialized this row.
+            # Restore the established DeepSeek model without touching the
+            # encrypted DeepSeek credential or the user's enabled state.
+            conn.execute(
+                "UPDATE ai_risk_settings SET model=?,updated_at=? WHERE lower(model) LIKE 'gemini%'",
+                (DEFAULT_MODEL, _now()),
             )
         try:
             os.chmod(self.db_path, 0o600)
@@ -221,10 +240,12 @@ class AiConfigStore:
             conn.execute("UPDATE ai_risk_settings SET enabled=?, updated_at=? WHERE id=1", (1 if enabled else 0, _now()))
         return self.settings()
 
-    def credential_envelope(self) -> dict[str, Any] | None:
+    def credential_envelope(self, provider: str = PROVIDER) -> dict[str, Any] | None:
         with _db_connect(self.db_path) as conn:
             row = conn.execute(
-                "SELECT envelope_version,key_id,wrapped_key,nonce,ciphertext FROM provider_credential WHERE provider='deepseek'"
+                "SELECT envelope_version,key_id,wrapped_key,nonce,ciphertext "
+                "FROM provider_credential WHERE provider=?",
+                (str(provider),),
             ).fetchone()
         if not row:
             return None
@@ -236,11 +257,11 @@ class AiConfigStore:
             "ciphertext": row["ciphertext"],
         }
 
-    def secret(self) -> str | None:
-        envelope = self.credential_envelope()
+    def secret(self, provider: str = PROVIDER) -> str | None:
+        envelope = self.credential_envelope(provider)
         return self.decrypt_envelope(envelope) if envelope else None
 
-    def save_credential(self, envelope: dict[str, Any]) -> None:
+    def save_credential(self, envelope: dict[str, Any], provider: str = PROVIDER) -> None:
         # Decrypt before writing so malformed envelopes never replace a working key.
         self.decrypt_envelope(envelope)
         now = _now()
@@ -249,37 +270,37 @@ class AiConfigStore:
                 """
                 INSERT INTO provider_credential
                 (provider,envelope_version,key_id,wrapped_key,nonce,ciphertext,status,last_error,created_at,updated_at,last_validated_at)
-                VALUES ('deepseek',?,?,?,?,?,'valid',NULL,?,?,?)
+                VALUES (?,?,?,?,?,?,'valid',NULL,?,?,?)
                 ON CONFLICT(provider) DO UPDATE SET
                     envelope_version=excluded.envelope_version,key_id=excluded.key_id,
                     wrapped_key=excluded.wrapped_key,nonce=excluded.nonce,ciphertext=excluded.ciphertext,
                     status='valid',last_error=NULL,updated_at=excluded.updated_at,last_validated_at=excluded.last_validated_at
                 """,
                 (
-                    int(envelope["envelopeVersion"]), envelope["keyId"], envelope["wrappedKey"],
+                    str(provider), int(envelope["envelopeVersion"]), envelope["keyId"], envelope["wrappedKey"],
                     envelope["nonce"], envelope["ciphertext"], now, now, now,
                 ),
             )
 
-    def mark_credential_error(self, error: str) -> None:
+    def mark_credential_error(self, error: str, provider: str = PROVIDER) -> None:
         with _db_connect(self.db_path) as conn:
             conn.execute(
-                "UPDATE provider_credential SET status='error',last_error=?,updated_at=? WHERE provider='deepseek'",
-                (str(error)[:300], _now()),
+                "UPDATE provider_credential SET status='error',last_error=?,updated_at=? WHERE provider=?",
+                (str(error)[:300], _now(), str(provider)),
             )
 
-    def mark_credential_valid(self) -> None:
+    def mark_credential_valid(self, provider: str = PROVIDER) -> None:
         now = _now()
         with _db_connect(self.db_path) as conn:
             conn.execute(
                 "UPDATE provider_credential SET status='valid',last_error=NULL,updated_at=?,last_validated_at=? "
-                "WHERE provider='deepseek'",
-                (now, now),
+                "WHERE provider=?",
+                (now, now, str(provider)),
             )
 
-    def delete_credential(self) -> bool:
+    def delete_credential(self, provider: str = PROVIDER) -> bool:
         with _db_connect(self.db_path) as conn:
-            changed = conn.execute("DELETE FROM provider_credential WHERE provider='deepseek'").rowcount
+            changed = conn.execute("DELETE FROM provider_credential WHERE provider=?", (str(provider),)).rowcount
         return bool(changed)
 
     def save_balance(self, response: dict[str, Any] | None, *, error: str = "") -> dict[str, Any]:
@@ -298,9 +319,9 @@ class AiConfigStore:
             conn.execute(
                 "INSERT INTO provider_balance_snapshot "
                 "(provider,checked_at,currency,total_balance,granted_balance,topped_up_balance,is_available,error) "
-                "VALUES ('deepseek',?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?)",
                 (
-                    row["checked_at"], row["currency"], row["total_balance"], row["granted_balance"],
+                    PROVIDER, row["checked_at"], row["currency"], row["total_balance"], row["granted_balance"],
                     row["topped_up_balance"], 1 if available else 0, row["error"] or None,
                 ),
             )
@@ -310,12 +331,30 @@ class AiConfigStore:
         with _db_connect(self.db_path) as conn:
             settings = conn.execute("SELECT * FROM ai_risk_settings WHERE id=1").fetchone()
             credential = conn.execute(
-                "SELECT status,last_error,updated_at,last_validated_at FROM provider_credential WHERE provider='deepseek'"
+                "SELECT status,last_error,updated_at,last_validated_at FROM provider_credential WHERE provider=?",
+                (PROVIDER,),
+            ).fetchone()
+            data_credential = conn.execute(
+                "SELECT status,last_error,updated_at,last_validated_at FROM provider_credential WHERE provider=?",
+                (PANDASCORE_PROVIDER,),
             ).fetchone()
             balance = conn.execute(
-                "SELECT * FROM provider_balance_snapshot WHERE provider='deepseek' ORDER BY balance_id DESC LIMIT 1"
+                "SELECT * FROM provider_balance_snapshot WHERE provider=? ORDER BY balance_id DESC LIMIT 1",
+                (PROVIDER,),
             ).fetchone()
-        return self._status_rows(settings, credential, balance)
+        value = self._status_rows(settings, credential, balance)
+        value["data_credential"] = self._credential_status_row(data_credential)
+        return value
+
+    @staticmethod
+    def _credential_status_row(credential: sqlite3.Row | None) -> dict[str, Any]:
+        return {
+            "configured": bool(credential),
+            "status": str(credential["status"]) if credential else "not_configured",
+            "last_error": str(credential["last_error"] or "") if credential else "",
+            "updated_at": int(credential["updated_at"] or 0) if credential else 0,
+            "last_validated_at": int(credential["last_validated_at"] or 0) if credential else 0,
+        }
 
     @staticmethod
     def _status_rows(
@@ -335,13 +374,8 @@ class AiConfigStore:
                 ),
                 "updated_at": int(settings["updated_at"]) if settings else 0,
             },
-            "credential": {
-                "configured": bool(credential),
-                "status": str(credential["status"]) if credential else "not_configured",
-                "last_error": str(credential["last_error"] or "") if credential else "",
-                "updated_at": int(credential["updated_at"] or 0) if credential else 0,
-                "last_validated_at": int(credential["last_validated_at"] or 0) if credential else 0,
-            },
+            "credential": AiConfigStore._credential_status_row(credential),
+            "data_credential": AiConfigStore._credential_status_row(None),
             "balance": ({
                 "checked_at": int(balance["checked_at"]),
                 "currency": balance["currency"],
@@ -362,15 +396,23 @@ class AiConfigStore:
                 settings = conn.execute("SELECT * FROM ai_risk_settings WHERE id=1").fetchone()
                 credential = conn.execute(
                     "SELECT status,last_error,updated_at,last_validated_at "
-                    "FROM provider_credential WHERE provider='deepseek'"
+                    "FROM provider_credential WHERE provider=?",
+                    (PROVIDER,),
+                ).fetchone()
+                data_credential = conn.execute(
+                    "SELECT status,last_error,updated_at,last_validated_at "
+                    "FROM provider_credential WHERE provider=?",
+                    (PANDASCORE_PROVIDER,),
                 ).fetchone()
                 balance = conn.execute(
-                    "SELECT * FROM provider_balance_snapshot WHERE provider='deepseek' "
-                    "ORDER BY balance_id DESC LIMIT 1"
+                    "SELECT * FROM provider_balance_snapshot WHERE provider=? ORDER BY balance_id DESC LIMIT 1",
+                    (PROVIDER,),
                 ).fetchone()
         except sqlite3.Error:
             return cls._status_rows(None, None, None)
-        return cls._status_rows(settings, credential, balance)
+        value = cls._status_rows(settings, credential, balance)
+        value["data_credential"] = cls._credential_status_row(data_credential)
+        return value
 
 
 class DeepSeekClient:
@@ -414,7 +456,7 @@ class DeepSeekClient:
                 "thinking": {"type": "disabled"},
                 "response_format": {"type": "json_object"},
                 "temperature": 0.1,
-                "max_tokens": 120,
+                "max_tokens": 180,
             },
         )
         try:
@@ -469,7 +511,20 @@ def _game_key(market: dict[str, Any]) -> str:
     return aliases.get(raw, raw)
 
 
-def build_match_prompt(market: dict[str, Any], *, now_ts: int) -> tuple[dict[str, Any], dict[str, Any]]:
+def _parse_timestamp(value: Any) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    try:
+        from datetime import datetime
+        return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return 0
+
+
+def build_match_prompt(
+    market: dict[str, Any], *, now_ts: int, evidence: dict[str, Any] | None = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
     outcomes = [str(value).strip() for value in (market.get("outcomes") or [])]
     if len(outcomes) != 2 or not outcomes[0] or not outcomes[1]:
         raise ValueError("main_match_teams_missing")
@@ -489,19 +544,25 @@ def build_match_prompt(market: dict[str, Any], *, now_ts: int) -> tuple[dict[str
         "start_time": market.get("match_start_time") or market.get("market_start_time") or market.get("eventStartTime"),
         "analysis_date_utc": time.strftime("%Y-%m-%d", time.gmtime(now_ts)),
     }
-    # Deliberately excludes condition_id from the provider payload as well; it adds no sporting evidence.
-    # Provider input intentionally stays close to the user's shortest useful
-    # question. Tournament/title is retained locally for audit/UI, but omitted
-    # here because it commonly repeats both team names and wastes prompt tokens.
-    compact_match = "｜".join(
-        str(value) for value in (
-            game.upper(), f"{outcomes[0]} vs {outcomes[1]}", metadata["best_of"],
-            metadata["analysis_date_utc"],
-        ) if value and value != "unknown"
-    )
+    # Keep the provider blind to condition_id, wallet, intended side, price and
+    # stake. Tournament/stage and the time cutoff help disambiguate similarly
+    # named teams and prevent accidental use of a later result.
     prompt = {
-        "question": f"{compact_match}。按历史实力判断谁赢面更大？",
-        "json": {"winner": "A|B|unknown", "a": "0-100", "b": "0-100", "confidence": "0-100", "knowledge": "ok|stale|insufficient", "reason": "24字内"},
+        "task": "根据历史数据独立评估两队赢下整场比赛的赢面与置信度",
+        "match": {
+            "game": game.upper(),
+            "team_a": outcomes[0],
+            "team_b": outcomes[1],
+            "tournament_stage": " · ".join(
+                value for value in (metadata["tournament"], metadata["stage"]) if value
+            )[:360] or "unknown",
+            "best_of": metadata["best_of"],
+            "match_start": str(metadata["start_time"] or "unknown"),
+            "analysis_date_utc": metadata["analysis_date_utc"],
+        },
+        "pandascore_evidence": {
+            key: value for key, value in (evidence or {}).items() if key != "cache_keys"
+        },
     }
     return metadata, prompt
 
@@ -529,10 +590,18 @@ def assessment_direction(assessment: dict[str, Any], settings: dict[str, Any]) -
 class AiRiskService:
     """Hot-reloadable AI gate shared across runner ticks."""
 
-    def __init__(self, data_dir: Path, follow_store: FollowStore, *, client_factory=DeepSeekClient):
+    def __init__(
+        self,
+        data_dir: Path,
+        follow_store: FollowStore,
+        *,
+        client_factory=DeepSeekClient,
+        evidence_factory=None,
+    ):
         self.config = AiConfigStore(Path(data_dir))
         self.follow_store = follow_store
         self.client_factory = client_factory
+        self.evidence_factory = evidence_factory
         self._lock = threading.Lock()
         self._assessment_locks: dict[str, threading.Lock] = {}
 
@@ -541,7 +610,19 @@ class AiRiskService:
 
     def enabled(self) -> bool:
         status = self.config.status()
-        return bool(status["settings"]["enabled"] and status["credential"]["configured"])
+        return bool(
+            status["settings"]["enabled"]
+            and status["credential"]["configured"]
+            and status["data_credential"]["configured"]
+        )
+
+    def _evidence_service(self) -> PandaScoreEvidenceService:
+        if self.evidence_factory is not None:
+            return self.evidence_factory(self.follow_store)
+        secret = self.config.secret(PANDASCORE_PROVIDER)
+        if not secret:
+            raise ValueError("pandascore_not_configured")
+        return PandaScoreEvidenceService(self.follow_store, PandaScoreClient(secret))
 
     def eligible_market(self, market: dict[str, Any]) -> bool:
         return (
@@ -549,6 +630,42 @@ class AiRiskService:
             and str(market.get("market_type") or "main_match").lower() == "main_match"
             and _game_key(market) in SUPPORTED_GAMES
         )
+
+    def assess_backtest(self, market: dict[str, Any], *, cutoff_ts: int, now_ts: int) -> dict[str, Any]:
+        """Replay one settled match from pre-match PandaScore evidence without mutating live assessments.
+
+        The result is indicative rather than a guarantee: target results are excluded by timestamp and the
+        prompt forbids model-memory completion, but callers should still label historical LLM evaluation as
+        a replay rather than a perfectly leakage-free experiment.
+        """
+        settings = self.config.settings()
+        base = {"prompt_version": PROMPT_VERSION, "model": settings["model"], "cutoff_ts": int(cutoff_ts)}
+        try:
+            evidence = self._evidence_service().build_evidence(market, cutoff_ts=cutoff_ts, now_ts=now_ts)
+            metadata, prompt = build_match_prompt(market, now_ts=cutoff_ts, evidence=evidence)
+            prompt["mode"] = "historical_replay"
+            prompt["leakage_guard"] = "只能使用所给证据；目标比赛结果已从数据中截断"
+            secret = self.config.secret()
+            if not secret:
+                raise ValueError("deepseek_not_configured")
+            parsed, response, latency_ms = self.client_factory(secret).assess(prompt, model=settings["model"])
+            validated = validate_assessment_output(parsed)
+            usage = response.get("usage") or {}
+            return {
+                **base, **metadata, **validated, "status": "ok", "latency_ms": latency_ms,
+                "direction": assessment_direction({"status": "ok", **validated}, settings),
+                "usage": {key: int(usage.get(key) or 0) for key in (
+                    "prompt_tokens", "completion_tokens", "total_tokens"
+                )},
+                "evidence_summary": {
+                    "team_a": (evidence.get("team_a") or {}).get("record"),
+                    "team_b": (evidence.get("team_b") or {}).get("record"),
+                    "h2h_count": len(evidence.get("h2h") or []),
+                    "window": evidence.get("window"),
+                },
+            }
+        except Exception as exc:
+            return {**base, "status": "unavailable", "error": str(exc)[:300], "direction": "unavailable"}
 
     def ensure_assessment(self, market: dict[str, Any], *, now_ts: int) -> dict[str, Any]:
         condition_id = str(market.get("condition_id") or market.get("conditionId") or "").lower()
@@ -562,26 +679,39 @@ class AiRiskService:
     def _ensure_assessment_locked(
         self, market: dict[str, Any], *, now_ts: int, condition_id: str
     ) -> dict[str, Any]:
-        try:
-            metadata, prompt = build_match_prompt({**market, "condition_id": condition_id}, now_ts=now_ts)
-        except ValueError as exc:
-            return {"condition_id": condition_id, "status": "unavailable", "error": str(exc)}
-        input_hash = hashlib.sha256((PROMPT_VERSION + _json_dumps(prompt)).encode("utf-8")).hexdigest()
         cached = self.follow_store.load_ai_assessment(condition_id)
-        if cached and cached.get("input_hash") == input_hash:
+        if cached and cached.get("prompt_version") == PROMPT_VERSION:
             if cached.get("status") == "ok" or now_ts - int(cached.get("updated_at") or 0) < ERROR_RETRY_SECONDS:
                 return cached
         settings = self.config.settings()
         created_at = int((cached or {}).get("created_at") or now_ts)
-        base = {
-            **metadata,
-            "prompt_version": PROMPT_VERSION,
-            "model": settings["model"],
-            "input_hash": input_hash,
-            "created_at": created_at,
-            "updated_at": now_ts,
-        }
+        base = {"condition_id": condition_id, "prompt_version": PROMPT_VERSION,
+                "model": settings["model"], "created_at": created_at, "updated_at": now_ts}
         try:
+            start_value = (
+                market.get("match_start_time") or market.get("market_start_time")
+                or market.get("eventStartTime")
+            )
+            cutoff_ts = _parse_timestamp(start_value) or int(now_ts)
+            evidence = self._evidence_service().build_evidence(
+                {**market, "condition_id": condition_id}, cutoff_ts=cutoff_ts, now_ts=now_ts
+            )
+            metadata, prompt = build_match_prompt(
+                {**market, "condition_id": condition_id}, now_ts=now_ts, evidence=evidence
+            )
+            input_hash = hashlib.sha256((PROMPT_VERSION + _json_dumps(prompt)).encode("utf-8")).hexdigest()
+            base.update({
+                **metadata,
+                "input_hash": input_hash,
+                "pandascore_cache_keys": list(evidence.get("cache_keys") or []),
+                "evidence_summary": {
+                    "source": evidence.get("source"), "as_of": evidence.get("as_of"),
+                    "window": evidence.get("window"),
+                    "team_a": (evidence.get("team_a") or {}).get("record"),
+                    "team_b": (evidence.get("team_b") or {}).get("record"),
+                    "h2h_count": len(evidence.get("h2h") or []),
+                },
+            })
             secret = self.config.secret()
             if not secret:
                 raise ValueError("deepseek_not_configured")
@@ -600,12 +730,17 @@ class AiRiskService:
                     "total_tokens": int(usage.get("total_tokens") or 0),
                 },
                 "provider_request": prompt,
-                "provider_response": response,
                 "parsed_output": parsed,
                 "response_model": str(response.get("model") or settings["model"]),
             }
         except Exception as exc:  # fail open, but preserve a sanitized audit record
-            assessment = {**base, "status": "unavailable", "error": str(exc)[:300]}
+            assessment = {
+                **base,
+                "input_hash": str(base.get("input_hash") or hashlib.sha256(
+                    f"{PROMPT_VERSION}|{condition_id}".encode("utf-8")
+                ).hexdigest()),
+                "status": "unavailable", "error": str(exc)[:300],
+            }
         self.follow_store.save_ai_assessment(assessment)
         return assessment
 
@@ -657,12 +792,20 @@ class AiRiskService:
             "created_at": now_ts,
             "updated_at": now_ts,
         }
+        if action == "blocked":
+            predicted_index = 0 if direction == "team_a" else 1
+            prices = [to_float(value) for value in (market.get("outcome_prices") or [])]
+            ai_entry_price = prices[predicted_index] if 0 <= predicted_index < len(prices) else 0.0
+            intent["ai_outcome_index"] = predicted_index
+            intent["ai_outcome"] = outcomes[predicted_index] if predicted_index < len(outcomes) else None
+            intent["ai_entry_price"] = round(ai_entry_price, 8) if 0 < ai_entry_price < 1 else None
         self.follow_store.save_ai_intent(intent)
         if action == "blocked":
             self.follow_store.save_ai_shadow(
                 {
-                    "shadow_id": "shadow:" + intent_id,
+                    "shadow_id": "wallet:" + intent_id,
                     "intent_id": intent_id,
+                    "shadow_kind": "wallet_original",
                     "condition_id": condition_id,
                     "wallet": str(wallet).lower(),
                     "outcome_index": int(outcome_index),
@@ -683,6 +826,33 @@ class AiRiskService:
                     "updated_at": now_ts,
                 }
             )
+            ai_entry_price = to_float(intent.get("ai_entry_price"))
+            if 0 < ai_entry_price < 1:
+                predicted_index = int(intent.get("ai_outcome_index") or 0)
+                self.follow_store.save_ai_shadow(
+                    {
+                        "shadow_id": "ai:" + intent_id,
+                        "intent_id": intent_id,
+                        "shadow_kind": "ai_prediction",
+                        "condition_id": condition_id,
+                        "wallet": str(wallet).lower(),
+                        "outcome_index": predicted_index,
+                        "outcome": intent.get("ai_outcome"),
+                        "status": "open",
+                        "match_start_time": intent.get("match_start_time"),
+                        "end_date": intent.get("end_date"),
+                        "event_title": intent.get("event_title"),
+                        "market_type": intent.get("market_type"),
+                        "game_family": intent.get("game_family"),
+                        "entry_price": round(ai_entry_price, 8),
+                        "baseline_stake": round(float(intended_stake), 8),
+                        "remaining_stake": round(float(intended_stake), 8),
+                        "realized_pnl": 0.0,
+                        "hold_policy": "to_settlement",
+                        "created_at": now_ts,
+                        "updated_at": now_ts,
+                    }
+                )
         return {
             "intent_id": intent_id,
             "action": action,
@@ -700,7 +870,8 @@ class AiRiskService:
     def observe_sell(self, *, wallet: str, trade: dict[str, Any], condition_id: str, outcome_index: int, price: float, now_ts: int) -> int:
         matches = [
             row for row in self.follow_store.load_ai_shadows(open_only=True)
-            if str(row.get("wallet") or "").lower() == str(wallet).lower()
+            if str(row.get("shadow_kind") or "wallet_original") == "wallet_original"
+            and str(row.get("wallet") or "").lower() == str(wallet).lower()
             and str(row.get("condition_id") or "").lower() == str(condition_id).lower()
             and int(row.get("outcome_index") or 0) == int(outcome_index)
         ]
@@ -744,6 +915,8 @@ class AiRiskService:
             return 0
         changed = 0
         for shadow in self.follow_store.load_ai_shadows(open_only=True):
+            if str(shadow.get("shadow_kind") or "wallet_original") != "wallet_original":
+                continue
             prices = prices_by_condition.get(str(shadow.get("condition_id") or "").lower()) or []
             index = int(shadow.get("outcome_index") or 0)
             current = to_float(prices[index]) if 0 <= index < len(prices) else 0.0
@@ -767,6 +940,7 @@ class AiRiskService:
 
     def settle_shadows(self, resolutions: dict[str, int], *, now_ts: int, void_index: int = -2) -> int:
         changed = 0
+        affected_intents: set[str] = set()
         for shadow in self.follow_store.load_ai_shadows(open_only=True):
             winner = resolutions.get(str(shadow.get("condition_id") or "").lower())
             if winner is None:
@@ -785,11 +959,44 @@ class AiRiskService:
             shadow["outcome_won"] = outcome_won
             shadow["resolved_at"] = now_ts
             shadow["updated_at"] = now_ts
-            shadow["ai_net_effect"] = round(-to_float(shadow.get("realized_pnl")), 8)
+            if str(shadow.get("shadow_kind") or "wallet_original") == "wallet_original":
+                shadow["ai_net_effect"] = round(-to_float(shadow.get("realized_pnl")), 8)
             self.follow_store.save_ai_shadow(shadow)
-            self.follow_store.update_ai_intent_status(shadow.get("intent_id"), "settled", updated_at=now_ts)
+            affected_intents.add(str(shadow.get("intent_id") or ""))
             changed += 1
+        for intent_id in affected_intents:
+            rows = self.follow_store.load_ai_shadows_for_intent(intent_id)
+            wallet_shadow = next((row for row in rows if str(row.get("shadow_kind") or "wallet_original") == "wallet_original"), None)
+            ai_shadow = next((row for row in rows if row.get("shadow_kind") == "ai_prediction"), None)
+            if wallet_shadow and ai_shadow and all(row.get("status") in {"settled", "exited"} for row in rows):
+                wallet_pnl = to_float(wallet_shadow.get("realized_pnl"))
+                ai_pnl = to_float(ai_shadow.get("realized_pnl"))
+                ai_shadow["comparison_pnl"] = round(ai_pnl - wallet_pnl, 8)
+                ai_shadow["ai_vs_no_trade_pnl"] = round(ai_pnl, 8)
+                ai_shadow["ai_vs_wallet_pnl"] = round(ai_pnl - wallet_pnl, 8)
+                ai_shadow["updated_at"] = now_ts
+                self.follow_store.save_ai_shadow(ai_shadow)
+            self.follow_store.update_ai_intent_status(intent_id, "settled", updated_at=now_ts)
+        for condition_id in resolutions:
+            self.finalize_condition(str(condition_id).lower(), now_ts=now_ts)
         return changed
+
+    def finalize_condition(self, condition_id: str, *, now_ts: int) -> int:
+        """Drop large request/cache material after settlement, retaining compact audit results."""
+        assessment = self.follow_store.load_ai_assessment(condition_id)
+        if not assessment:
+            return 0
+        cache_keys = [str(value) for value in assessment.get("pandascore_cache_keys") or []]
+        removed = self.follow_store.delete_ai_data_cache(cache_keys)
+        for key in ("provider_request", "parsed_output"):
+            assessment.pop(key, None)
+        assessment["finalized_at"] = int(now_ts)
+        assessment["updated_at"] = int(now_ts)
+        self.follow_store.save_ai_assessment(assessment)
+        self.follow_store.prune_ai_data_cache(now_ts=now_ts)
+        with self._lock:
+            self._assessment_locks.pop(str(condition_id).lower(), None)
+        return removed
 
 
 def ai_audit_summary(store: FollowStore) -> dict[str, Any]:

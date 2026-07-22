@@ -858,8 +858,28 @@ class FollowStore:
                     status TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
+                    shadow_kind TEXT NOT NULL DEFAULT 'wallet_original',
                     realized_pnl REAL NOT NULL DEFAULT 0,
                     ai_net_effect REAL,
+                    comparison_pnl REAL,
+                    raw_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ai_data_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    cache_kind TEXT NOT NULL,
+                    game TEXT,
+                    team_id TEXT,
+                    fetched_at INTEGER NOT NULL,
+                    last_used_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ai_backtest_cases (
+                    case_id TEXT PRIMARY KEY,
+                    condition_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
                     raw_json TEXT NOT NULL
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_follow_strategy_library_name
@@ -879,6 +899,9 @@ class FollowStore:
                 CREATE INDEX IF NOT EXISTS idx_ai_intents_condition_at ON ai_follow_intents(condition_id, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_ai_intents_action_at ON ai_follow_intents(action, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_ai_shadow_status_condition ON ai_shadow_positions(status, condition_id);
+                CREATE INDEX IF NOT EXISTS idx_ai_data_cache_kind_used ON ai_data_cache(cache_kind, last_used_at);
+                CREATE INDEX IF NOT EXISTS idx_ai_data_cache_team ON ai_data_cache(game, team_id);
+                CREATE INDEX IF NOT EXISTS idx_ai_backtest_condition ON ai_backtest_cases(condition_id, updated_at);
                 """
             )
             self._migrate_market_cache_schema(conn)
@@ -888,7 +911,13 @@ class FollowStore:
                 {
                     "realized_pnl": "REAL NOT NULL DEFAULT 0",
                     "ai_net_effect": "REAL",
+                    "shadow_kind": "TEXT NOT NULL DEFAULT 'wallet_original'",
+                    "comparison_pnl": "REAL",
                 },
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ai_shadow_kind_status "
+                "ON ai_shadow_positions(shadow_kind, status)"
             )
             _ensure_columns(
                 conn,
@@ -2392,13 +2421,15 @@ class FollowStore:
                 """
                 INSERT INTO ai_shadow_positions
                 (shadow_id, intent_id, condition_id, wallet, outcome_index, status, created_at, updated_at,
-                 realized_pnl, ai_net_effect, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 shadow_kind, realized_pnl, ai_net_effect, comparison_pnl, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(shadow_id) DO UPDATE SET
                     status=excluded.status,
                     updated_at=excluded.updated_at,
+                    shadow_kind=excluded.shadow_kind,
                     realized_pnl=excluded.realized_pnl,
                     ai_net_effect=excluded.ai_net_effect,
+                    comparison_pnl=excluded.comparison_pnl,
                     raw_json=excluded.raw_json
                 """,
                 (
@@ -2410,11 +2441,141 @@ class FollowStore:
                     str(shadow.get("status") or "open"),
                     created,
                     now,
+                    str(shadow.get("shadow_kind") or "wallet_original"),
                     _to_float(shadow.get("realized_pnl")),
                     (_to_float(shadow.get("ai_net_effect")) if shadow.get("ai_net_effect") is not None else None),
+                    (_to_float(shadow.get("comparison_pnl")) if shadow.get("comparison_pnl") is not None else None),
                     _dumps(normalized),
                 ),
             )
+
+    def load_ai_shadows_for_intent(self, intent_id: str) -> list[dict[str, Any]]:
+        conn = self.connect_readonly()
+        if conn is None:
+            return []
+        try:
+            if "ai_shadow_positions" not in _table_names(conn):
+                return []
+            rows = conn.execute(
+                "SELECT raw_json FROM ai_shadow_positions WHERE intent_id=? ORDER BY shadow_id",
+                (str(intent_id or ""),),
+            ).fetchall()
+            return [_loads(row["raw_json"], {}) for row in rows]
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+
+    def save_ai_data_cache(self, row: dict[str, Any]) -> None:
+        cache_key = str(row.get("cache_key") or "")
+        if not cache_key:
+            raise ValueError("AI data cache requires cache_key")
+        self.init_db()
+        fetched_at = _to_int(row.get("fetched_at") or time.time())
+        last_used_at = _to_int(row.get("last_used_at") or fetched_at)
+        expires_at = _to_int(row.get("expires_at") or fetched_at)
+        normalized = {
+            **row,
+            "cache_key": cache_key,
+            "fetched_at": fetched_at,
+            "last_used_at": last_used_at,
+            "expires_at": expires_at,
+        }
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_data_cache
+                (cache_key,cache_kind,game,team_id,fetched_at,last_used_at,expires_at,raw_json)
+                VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    cache_kind=excluded.cache_kind,game=excluded.game,team_id=excluded.team_id,
+                    fetched_at=excluded.fetched_at,last_used_at=excluded.last_used_at,
+                    expires_at=excluded.expires_at,raw_json=excluded.raw_json
+                """,
+                (
+                    cache_key, str(row.get("cache_kind") or ""), str(row.get("game") or ""),
+                    str(row.get("team_id") or ""), fetched_at, last_used_at, expires_at,
+                    _dumps(normalized),
+                ),
+            )
+
+    def load_ai_data_cache(self, cache_key: str, *, now_ts: int, touch: bool = True) -> dict[str, Any] | None:
+        self.init_db()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT expires_at,raw_json FROM ai_data_cache WHERE cache_key=?",
+                (str(cache_key or ""),),
+            ).fetchone()
+            if not row or _to_int(row["expires_at"]) < int(now_ts):
+                if row:
+                    conn.execute("DELETE FROM ai_data_cache WHERE cache_key=?", (str(cache_key or ""),))
+                return None
+            payload = _loads(row["raw_json"], {})
+            if touch:
+                payload["last_used_at"] = int(now_ts)
+                conn.execute(
+                    "UPDATE ai_data_cache SET last_used_at=?,raw_json=? WHERE cache_key=?",
+                    (int(now_ts), _dumps(payload), str(cache_key or "")),
+                )
+            return payload if isinstance(payload, dict) else None
+
+    def delete_ai_data_cache(self, cache_keys: list[str]) -> int:
+        keys = [str(value) for value in cache_keys if str(value)]
+        if not keys:
+            return 0
+        self.init_db()
+        placeholders = ",".join("?" for _ in keys)
+        with self.connect() as conn:
+            return int(conn.execute(
+                f"DELETE FROM ai_data_cache WHERE cache_key IN ({placeholders})", keys
+            ).rowcount or 0)
+
+    def prune_ai_data_cache(self, *, now_ts: int, idle_seconds: int = 7 * 86400) -> int:
+        self.init_db()
+        cutoff = int(now_ts) - max(1, int(idle_seconds))
+        with self.connect() as conn:
+            return int(conn.execute(
+                "DELETE FROM ai_data_cache WHERE expires_at < ? OR last_used_at < ?",
+                (int(now_ts), cutoff),
+            ).rowcount or 0)
+
+    def save_ai_backtest_case(self, row: dict[str, Any]) -> None:
+        case_id = str(row.get("case_id") or "")
+        condition_id = str(row.get("condition_id") or "").lower()
+        if not case_id or not condition_id:
+            raise ValueError("AI backtest case requires ids")
+        self.init_db()
+        now = _to_int(row.get("updated_at") or row.get("created_at") or time.time())
+        created = _to_int(row.get("created_at") or now)
+        normalized = {**row, "case_id": case_id, "condition_id": condition_id,
+                      "created_at": created, "updated_at": now}
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_backtest_cases(case_id,condition_id,status,created_at,updated_at,raw_json)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(case_id) DO UPDATE SET status=excluded.status,
+                    updated_at=excluded.updated_at,raw_json=excluded.raw_json
+                """,
+                (case_id, condition_id, str(row.get("status") or "unknown"), created, now, _dumps(normalized)),
+            )
+
+    def load_ai_backtest_cases(self, *, limit: int = 1000) -> list[dict[str, Any]]:
+        conn = self.connect_readonly()
+        if conn is None:
+            return []
+        try:
+            if "ai_backtest_cases" not in _table_names(conn):
+                return []
+            rows = conn.execute(
+                "SELECT raw_json FROM ai_backtest_cases ORDER BY updated_at DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [_loads(row["raw_json"], {}) for row in rows]
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
 
     def load_ai_shadows(self, *, open_only: bool = False) -> list[dict[str, Any]]:
         conn = self.connect_readonly()
@@ -2483,6 +2644,10 @@ class FollowStore:
             "avoided_loss_usdc": 0.0,
             "missed_profit_usdc": 0.0,
             "net_effect_usdc": 0.0,
+            "ai_inverse_resolved_count": 0,
+            "ai_inverse_win_count": 0,
+            "ai_inverse_pnl_usdc": 0.0,
+            "ai_vs_wallet_usdc": 0.0,
         }
         conn = self.connect_readonly()
         if conn is None:
@@ -2510,6 +2675,18 @@ class FollowStore:
                        SUM(COALESCE(ai_net_effect, 0)) AS net
                 FROM ai_shadow_positions
                 WHERE status IN ('settled','exited')
+                  AND shadow_kind = 'wallet_original'
+                """
+            ).fetchone()
+            inverse = conn.execute(
+                """
+                SELECT COUNT(*) AS n,
+                       SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                       SUM(COALESCE(realized_pnl, 0)) AS pnl,
+                       SUM(COALESCE(comparison_pnl, 0)) AS comparison
+                FROM ai_shadow_positions
+                WHERE status IN ('settled','exited')
+                  AND shadow_kind = 'ai_prediction'
                 """
             ).fetchone()
         except sqlite3.Error:
@@ -2527,6 +2704,10 @@ class FollowStore:
             "avoided_loss_usdc": round(_to_float(shadows["avoided"]), 8),
             "missed_profit_usdc": round(_to_float(shadows["missed"]), 8),
             "net_effect_usdc": round(_to_float(shadows["net"]), 8),
+            "ai_inverse_resolved_count": _to_int(inverse["n"]),
+            "ai_inverse_win_count": _to_int(inverse["wins"]),
+            "ai_inverse_pnl_usdc": round(_to_float(inverse["pnl"]), 8),
+            "ai_vs_wallet_usdc": round(_to_float(inverse["comparison"]), 8),
         }
 
     def load_dashboard_wallet_follow_detail(self, wallet: str, *, statuses: set[str] | None = None) -> dict[str, Any]:

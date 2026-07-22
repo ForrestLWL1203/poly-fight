@@ -1,6 +1,7 @@
 import base64
 import http.client
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -15,6 +16,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from poly_fight.ai_risk import (
     AiConfigStore,
     AiRiskService,
+    SYSTEM_PROMPT,
     assessment_direction,
     build_match_prompt,
     validate_assessment_output,
@@ -28,6 +30,10 @@ from poly_fight.dashboard import (
     reset_dashboard_data,
 )
 from poly_fight.storage import FollowStore
+from poly_fight.pandascore import (
+    MAX_PROMPT_MATCHES,
+    PandaScoreEvidenceService,
+)
 
 
 def encrypted_envelope(config: AiConfigStore, secret: str) -> dict:
@@ -71,26 +77,123 @@ class FakeDeepSeek:
         self.__class__.calls.append((prompt, model))
         return ({
             "winner": "A", "a": 82, "b": 18, "confidence": 91,
-            "knowledge": "ok", "reason": "历史实力与交手明显占优",
+            "knowledge": "ok", "reason": "优势：历史实力与交手；风险：BO1波动",
         }, {"model": model, "usage": {"prompt_tokens": 41, "completion_tokens": 35}}, 12)
 
 
+class FakeEvidence:
+    def __init__(self, store):
+        self.store = store
+
+    def build_evidence(self, market, *, cutoff_ts, now_ts):
+        return {
+            "source": "PandaScore",
+            "as_of": "2026-07-22T00:00:00Z",
+            "window": {"primary_days": 120, "fallback_days": 180, "max_matches_per_team": 20},
+            "team_a": {"name": "T1", "record": {"n": 10, "w": 8, "l": 2, "wr": 80}},
+            "team_b": {"name": "Kiwoom DRX", "record": {"n": 10, "w": 4, "l": 6, "wr": 40}},
+            "h2h": [{"d": "2026-07-01", "winner": "A", "bo": 3}],
+            "cache_keys": ["pandascore:team:lol:1", "pandascore:team:lol:2"],
+        }
+
+
+class FakePandaScore:
+    def __init__(self, *, cutoff_ts):
+        self.cutoff_ts = cutoff_ts
+        self.calls = []
+
+    def search_teams(self, game, name):
+        team_id = 1 if name == "T1" else 2
+        return [{"id": team_id, "name": name, "acronym": name, "players": [
+            {"name": f"{name}-player-{index}", "url": "must-not-reach-prompt"}
+            for index in range(5)
+        ]}]
+
+    def past_matches(self, game, team_id, *, cutoff_ts):
+        self.calls.append((game, team_id, cutoff_ts))
+        count = 12 if team_id == 1 else 6
+        rows = []
+        for index in range(count):
+            played_at = cutoff_ts - (index + 1) * (10 if team_id == 1 else 25) * 86400
+            opponent_id = (2 if team_id == 1 else 1) if index == 0 else 100 + index
+            opponents = [
+                {"opponent": {"id": team_id, "name": "T1" if team_id == 1 else "Kiwoom DRX"}},
+                {"opponent": {
+                    "id": opponent_id,
+                    "name": "Kiwoom DRX" if opponent_id == 2 else "T1" if opponent_id == 1 else f"Opponent {index}",
+                }},
+            ]
+            winner_id = team_id if index % 3 else opponent_id
+            rows.append({
+                "id": team_id * 1000 + index,
+                "begin_at": datetime.fromtimestamp(played_at, tz=timezone.utc).isoformat(),
+                "status": "finished",
+                "opponents": opponents,
+                "winner_id": winner_id,
+                "results": [
+                    {"team_id": team_id, "score": 2 if winner_id == team_id else 1},
+                    {"team_id": opponent_id, "score": 1 if winner_id == team_id else 2},
+                ],
+                "number_of_games": 3,
+                "tournament": {"name": "Compact Cup", "url": "must-not-reach-prompt"},
+                "streams_list": [{"raw_url": "must-not-reach-prompt"}],
+            })
+        # A target/future result must be rejected even if the provider returns it.
+        rows.append({
+            "id": 99999, "begin_at": datetime.fromtimestamp(cutoff_ts + 60, tz=timezone.utc).isoformat(),
+            "status": "finished", "opponents": [
+                {"opponent": {"id": team_id, "name": "future"}},
+                {"opponent": {"id": 999, "name": "future opponent"}},
+            ], "winner_id": team_id, "results": [], "number_of_games": 1,
+        })
+        return rows
+
+
 class AiRiskTests(unittest.TestCase):
+    def test_pandascore_history_is_time_bounded_compacted_and_cached(self):
+        cutoff_ts = int(datetime(2026, 7, 22, tzinfo=timezone.utc).timestamp())
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            client = FakePandaScore(cutoff_ts=cutoff_ts)
+            service = PandaScoreEvidenceService(store, client)
+            evidence = service.build_evidence(market(), cutoff_ts=cutoff_ts, now_ts=cutoff_ts - 60)
+            self.assertEqual(evidence["team_a"]["record"]["n"], 12)
+            self.assertEqual(evidence["team_b"]["record"]["n"], 6)
+            self.assertEqual(evidence["team_a"]["window_days"], 120)
+            self.assertEqual(evidence["team_b"]["window_days"], 180)
+            self.assertEqual(len(evidence["team_a"]["recent"]), MAX_PROMPT_MATCHES)
+            self.assertEqual(len(evidence["team_b"]["recent"]), 6)
+            self.assertEqual(evidence["team_a"]["days_since_last"], 10)
+            self.assertNotIn("must-not-reach-prompt", json.dumps(evidence))
+            self.assertNotIn("streams_list", json.dumps(evidence))
+            self.assertNotIn("match_id", json.dumps(evidence))
+            self.assertNotIn("opponent_id", json.dumps(evidence))
+            self.assertLess(len(json.dumps(evidence, ensure_ascii=False)), 10_000)
+            # Alias and history rows are reused for another signal in the same cache window.
+            again = service.build_evidence(market(), cutoff_ts=cutoff_ts, now_ts=cutoff_ts)
+            self.assertEqual(again["team_a"]["record"], evidence["team_a"]["record"])
+            self.assertEqual(len(client.calls), 2)
+
     def test_minimal_prompt_excludes_follow_direction_and_wallet_data(self):
         metadata, prompt = build_match_prompt(market(), now_ts=1_783_000_000)
         encoded = str(prompt)
-        self.assertIn("T1 vs Kiwoom DRX", encoded)
-        self.assertIn("winner", encoded)
+        self.assertIn("T1", encoded)
+        self.assertIn("Kiwoom DRX", encoded)
+        self.assertIn("根据历史数据", encoded)
+        self.assertIn("KeSPA Cup", encoded)
+        self.assertIn("Match Winner", SYSTEM_PROMPT)
+        self.assertIn("50:50", SYSTEM_PROMPT)
+        self.assertIn("UNKNOWN", SYSTEM_PROMPT)
         self.assertNotIn("wallet", encoded.lower())
         self.assertNotIn("outcome_index", encoded)
         self.assertNotIn("condition_id", encoded)
-        self.assertNotIn("KeSPA Cup", encoded)
+        self.assertNotIn("0.62", encoded)
         self.assertEqual(metadata["team_a"], "T1")
 
     def test_minimal_output_validation_and_threshold(self):
         parsed = validate_assessment_output({
             "winner": "B", "a": 31, "b": 69, "confidence": 80,
-            "knowledge": "ok", "reason": "B队历史表现更稳定",
+            "knowledge": "ok", "reason": "优势：B队历史表现更稳；风险：阵容变动",
         })
         self.assertEqual(parsed["verdict"], "team_b")
         self.assertEqual(assessment_direction({"status": "ok", **parsed}, {
@@ -114,6 +217,22 @@ class AiRiskTests(unittest.TestCase):
             self.assertTrue(config.db_path.is_relative_to(Path(tmp) / ".secrets"))
             self.assertNotIn("sk-private-test", config.db_path.read_bytes().decode("latin1"))
 
+    def test_gemini_settings_migrate_back_to_deepseek_without_disabling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            config = AiConfigStore(data_dir)
+            with sqlite3.connect(config.db_path) as conn:
+                conn.execute("UPDATE ai_risk_settings SET enabled=1,model='gemini-3.5-flash' WHERE id=1")
+                conn.execute(
+                    "INSERT INTO provider_credential "
+                    "(provider,envelope_version,key_id,wrapped_key,nonce,ciphertext,status,created_at,updated_at) "
+                    "VALUES ('deepseek',1,'old','old','old','old','valid',1,1)"
+                )
+            migrated = AiConfigStore(data_dir)
+            self.assertEqual(migrated.settings()["model"], "deepseek-v4-pro")
+            self.assertTrue(migrated.settings()["enabled"])
+            self.assertIsNotNone(migrated.credential_envelope())
+
     def test_explicit_data_reset_preserves_encrypted_credential(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "data"
@@ -133,9 +252,17 @@ class AiRiskTests(unittest.TestCase):
             data_dir = Path(tmp)
             store = FollowStore(data_dir / "follow" / "follow.db")
             store.init_db()
-            service = AiRiskService(data_dir, store, client_factory=FakeDeepSeek)
+            service = AiRiskService(
+                data_dir, store, client_factory=FakeDeepSeek, evidence_factory=FakeEvidence,
+            )
             service.config.save_credential(encrypted_envelope(service.config, "sk-test"))
             service.config.save_settings(enabled=True)
+            for team_id in (1, 2):
+                store.save_ai_data_cache({
+                    "cache_key": f"pandascore:team:lol:{team_id}", "cache_kind": "team_history",
+                    "game": "lol", "team_id": str(team_id), "fetched_at": 1_783_000_000,
+                    "last_used_at": 1_783_000_000, "expires_at": 1_783_100_000,
+                })
             decision = service.decide(
                 market=market(), wallet="0x" + "1" * 40, outcome_index=1,
                 intended_stake=100, entry_price=0.4, trade_id="tx1",
@@ -153,9 +280,21 @@ class AiRiskTests(unittest.TestCase):
             self.assertEqual(agree["action"], "agree")
             self.assertEqual(len(FakeDeepSeek.calls), 1)
             service.settle_shadows({"c1": 0}, now_ts=1_783_000_100)
-            shadow = store.load_ai_shadows()[0]
-            self.assertEqual(shadow["realized_pnl"], -100)
-            self.assertEqual(shadow["ai_net_effect"], 100)
+            shadows = store.load_ai_shadows()
+            wallet_shadow = next(row for row in shadows if row["shadow_kind"] == "wallet_original")
+            ai_shadow = next(row for row in shadows if row["shadow_kind"] == "ai_prediction")
+            self.assertEqual(wallet_shadow["realized_pnl"], -100)
+            self.assertEqual(wallet_shadow["ai_net_effect"], 100)
+            self.assertAlmostEqual(ai_shadow["realized_pnl"], 100 * (1 - 0.62) / 0.62)
+            self.assertAlmostEqual(
+                ai_shadow["comparison_pnl"], ai_shadow["realized_pnl"] - wallet_shadow["realized_pnl"],
+            )
+            self.assertIsNone(store.load_ai_data_cache(
+                "pandascore:team:lol:1", now_ts=1_783_000_101, touch=False,
+            ))
+            finalized = store.load_ai_assessment("c1")
+            self.assertNotIn("provider_request", finalized)
+            self.assertNotIn("parsed_output", finalized)
             service.close()
 
     def test_ai_scope_is_esports_main_match_only(self):
@@ -245,13 +384,22 @@ class AiRiskTests(unittest.TestCase):
                     status, payload = call("POST", "/api/ai-risk/credential", {"envelope": envelope}, cookie)
                 self.assertEqual(status, 200)
                 self.assertTrue(payload["data"]["configured"])
+                data_envelope = encrypted_envelope(config_store, "pandascore-route-test")
+                with patch("poly_fight.dashboard.PandaScoreClient.test", return_value=True):
+                    status, payload = call(
+                        "POST", "/api/ai-risk/data-credential", {"envelope": data_envelope}, cookie,
+                    )
+                self.assertEqual(status, 200)
+                self.assertTrue(payload["data"]["configured"])
                 status, payload = call("POST", "/api/ai-risk/settings", {"enabled": True}, cookie)
                 self.assertEqual(status, 200)
                 self.assertTrue(payload["data"]["enabled"])
                 status, payload = call("GET", "/api/ai-risk", cookie=cookie)
                 self.assertEqual(status, 200)
                 self.assertTrue(payload["data"]["settings"]["enabled"])
+                self.assertTrue(payload["data"]["data_credential"]["configured"])
                 self.assertNotIn("sk-route-test", json.dumps(payload))
+                self.assertNotIn("pandascore-route-test", json.dumps(payload))
             finally:
                 server.shutdown()
                 server.server_close()

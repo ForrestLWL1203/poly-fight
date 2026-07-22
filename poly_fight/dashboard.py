@@ -25,6 +25,7 @@ from typing import Any
 
 from .control import _pid_alive, read_follow_control, reconcile_wallet_refresh_status, set_pause_new_signals, update_wallet_refresh_status, write_follow_control
 from .ai_risk import AiConfigStore, DeepSeekClient, ai_audit_summary
+from .pandascore import PANDASCORE_PROVIDER, PandaScoreClient
 from .core import (
     GAME_FAMILY_LABELS,
     LEAGUE_LABELS,
@@ -258,6 +259,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/ai-risk/credential/delete":
                 self._ai_credential_delete()
+                return
+            if parsed.path == "/api/ai-risk/data-credential":
+                self._ai_data_credential_save()
+                return
+            if parsed.path == "/api/ai-risk/data-credential/test":
+                self._ai_data_credential_test()
+                return
+            if parsed.path == "/api/ai-risk/data-credential/delete":
+                self._ai_data_credential_delete()
                 return
             if parsed.path == "/api/ai-risk/settings":
                 self._ai_settings()
@@ -687,13 +697,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
         store.save_settings(enabled=False)
         self._ok({"deleted": store.delete_credential(), "enabled": False})
 
+    def _ai_data_credential_save(self) -> None:
+        form = self._read_request_form()
+        envelope = form.get("envelope") if isinstance(form.get("envelope"), dict) else form
+        store = AiConfigStore(self.dashboard_config.data_dir)
+        try:
+            secret = store.decrypt_envelope(envelope)
+            PandaScoreClient(secret).test()
+            store.save_credential(envelope, PANDASCORE_PROVIDER)
+            store.mark_credential_valid(PANDASCORE_PROVIDER)
+        except Exception as exc:
+            self._error("pandascore_credential_invalid", status=HTTPStatus.BAD_GATEWAY, detail=str(exc)[:200])
+            return
+        self._ok({"configured": True, "status": "valid"})
+
+    def _ai_data_credential_test(self) -> None:
+        store = AiConfigStore(self.dashboard_config.data_dir)
+        try:
+            secret = store.secret(PANDASCORE_PROVIDER)
+            if not secret:
+                self._error("pandascore_not_configured", status=HTTPStatus.BAD_REQUEST)
+                return
+            PandaScoreClient(secret).test()
+            store.mark_credential_valid(PANDASCORE_PROVIDER)
+        except Exception as exc:
+            store.mark_credential_error(str(exc), PANDASCORE_PROVIDER)
+            self._error("pandascore_connection_failed", status=HTTPStatus.BAD_GATEWAY, detail=str(exc)[:200])
+            return
+        self._ok({"configured": True, "status": "valid"})
+
+    def _ai_data_credential_delete(self) -> None:
+        store = AiConfigStore(self.dashboard_config.data_dir)
+        store.save_settings(enabled=False)
+        self._ok({"deleted": store.delete_credential(PANDASCORE_PROVIDER), "enabled": False})
+
     def _ai_settings(self) -> None:
         form = self._read_request_form()
         enabled = _request_bool(form.get("enabled"), default=False)
         store = AiConfigStore(self.dashboard_config.data_dir)
-        if enabled and not store.credential_envelope():
-            self._error("deepseek_not_configured", status=HTTPStatus.CONFLICT)
-            return
+        if enabled:
+            if not store.credential_envelope():
+                self._error("deepseek_not_configured", status=HTTPStatus.CONFLICT)
+                return
+            if not store.credential_envelope(PANDASCORE_PROVIDER):
+                self._error("pandascore_not_configured", status=HTTPStatus.CONFLICT)
+                return
         self._ok(store.save_settings(enabled=enabled))
 
     def _wallet_trades(self, raw_addr: str, query: dict[str, list[str]]) -> None:
@@ -1119,6 +1167,8 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
         "enabled": bool((ai_config.get("settings") or {}).get("enabled")),
         "credential_configured": bool((ai_config.get("credential") or {}).get("configured")),
         "credential_status": str((ai_config.get("credential") or {}).get("status") or "not_configured"),
+        "data_credential_configured": bool((ai_config.get("data_credential") or {}).get("configured")),
+        "data_credential_status": str((ai_config.get("data_credential") or {}).get("status") or "not_configured"),
     }
     return overview
 
@@ -1988,11 +2038,14 @@ def _merge_ai_audit_groups(
         if row.get("condition_id")
     }
     intents_by_condition: dict[str, list[dict[str, Any]]] = {}
-    shadows_by_intent = {
-        str(row.get("intent_id") or ""): row
-        for row in audit.get("shadows") or []
-        if row.get("intent_id")
-    }
+    shadows_by_intent: dict[str, list[dict[str, Any]]] = {}
+    for row in audit.get("shadows") or []:
+        if row.get("intent_id"):
+            shadows_by_intent.setdefault(str(row.get("intent_id")), []).append(row)
+
+    def original_shadow(intent_id: str) -> dict[str, Any]:
+        rows = shadows_by_intent.get(str(intent_id), [])
+        return next((row for row in rows if str(row.get("shadow_kind") or "wallet_original") == "wallet_original"), {})
     for intent in audit.get("intents") or []:
         cid = str(intent.get("condition_id") or "").lower()
         if cid:
@@ -2008,7 +2061,7 @@ def _merge_ai_audit_groups(
         for intent in intents:
             if intent.get("action") != "blocked":
                 continue
-            shadow = shadows_by_intent.get(str(intent.get("intent_id") or "")) or {}
+            shadow = original_shadow(str(intent.get("intent_id") or ""))
             pseudo.append({
                 "signal_id": "blocked:" + str(intent.get("intent_id") or ""),
                 "condition_id": cid,
@@ -2033,7 +2086,7 @@ def _merge_ai_audit_groups(
             # shadow lifecycle is carried separately for the audit/result view.
             built["status"] = "ai_blocked"
             built["ai_shadow_status"] = "open" if any(
-                (shadows_by_intent.get(str(row.get("intent_id") or "")) or {}).get("status") == "open"
+                original_shadow(str(row.get("intent_id") or "")).get("status") == "open"
                 for row in intents if row.get("action") == "blocked"
             ) else "settled"
             built["title"] = built.get("title") or sample.get("event_title")
@@ -2053,9 +2106,7 @@ def _merge_ai_audit_groups(
             action = str(intent.get("action") or "unavailable")
             action_counts[action] = action_counts.get(action, 0) + 1
         shadow_rows = [
-            shadows_by_intent[str(intent.get("intent_id"))]
-            for intent in intents
-            if str(intent.get("intent_id") or "") in shadows_by_intent
+            row for intent in intents for row in shadows_by_intent.get(str(intent.get("intent_id") or ""), [])
         ]
         group["ai_risk"] = assessments.get(cid)
         group["ai_action"] = str(intents[0].get("action") or "unavailable")
@@ -2064,7 +2115,13 @@ def _merge_ai_audit_groups(
         group["ai_blocked_intended_stake"] = round(sum(
             to_float(row.get("intended_stake")) for row in intents if row.get("action") == "blocked"
         ), 8)
-        group["ai_net_effect"] = round(sum(to_float(row.get("ai_net_effect")) for row in shadow_rows), 8)
+        group["ai_net_effect"] = round(sum(
+            to_float(row.get("ai_net_effect")) for row in shadow_rows
+            if str(row.get("shadow_kind") or "wallet_original") == "wallet_original"
+        ), 8)
+        group["ai_inverse_pnl"] = round(sum(
+            to_float(row.get("realized_pnl")) for row in shadow_rows if row.get("shadow_kind") == "ai_prediction"
+        ), 8)
     return groups
 
 
@@ -2237,7 +2294,9 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
     ai_assessment = (ai_audit.get("assessments") or [None])[0]
     ai_intents = ai_audit.get("intents") or []
     ai_shadows = ai_audit.get("shadows") or []
-    ai_shadow_by_intent = {str(row.get("intent_id") or ""): row for row in ai_shadows}
+    ai_shadows_by_intent: dict[str, list[dict[str, Any]]] = {}
+    for row in ai_shadows:
+        ai_shadows_by_intent.setdefault(str(row.get("intent_id") or ""), []).append(row)
     signals = result.get("signals", [])
     _annotate_signal_quality(signals)
     market = _active_market_by_condition(data_dir, condition_id, follow_dir=follow_dir)
@@ -2362,7 +2421,9 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
     for intent in ai_intents:
         if intent.get("action") != "blocked":
             continue
-        shadow = ai_shadow_by_intent.get(str(intent.get("intent_id") or "")) or {}
+        intent_shadows = ai_shadows_by_intent.get(str(intent.get("intent_id") or ""), [])
+        shadow = next((row for row in intent_shadows if str(row.get("shadow_kind") or "wallet_original") == "wallet_original"), {})
+        ai_shadow = next((row for row in intent_shadows if row.get("shadow_kind") == "ai_prediction"), {})
         blocked_wallets.append({
             "wallet": intent.get("wallet"),
             "short_addr": short_addr(str(intent.get("wallet") or "")),
@@ -2375,6 +2436,11 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
             "baseline_pnl": shadow.get("realized_pnl") if shadow.get("status") in {"settled", "exited"} else None,
             "ai_net_effect": shadow.get("ai_net_effect") if shadow.get("status") in {"settled", "exited"} else None,
             "outcome_won": shadow.get("outcome_won"),
+            "ai_outcome": ai_shadow.get("outcome"),
+            "ai_entry_price": ai_shadow.get("entry_price"),
+            "ai_shadow_status": ai_shadow.get("status"),
+            "ai_shadow_pnl": ai_shadow.get("realized_pnl") if ai_shadow.get("status") in {"settled", "exited"} else None,
+            "ai_vs_wallet_pnl": ai_shadow.get("comparison_pnl") if ai_shadow.get("status") in {"settled", "exited"} else None,
         })
     ai_detail = None
     if ai_assessment or ai_intents:
@@ -2385,7 +2451,16 @@ def build_follow_detail(data_dir: Path, condition_id: str, *, follow_dir: Path |
             "blocked_intent_count": action_counts.get("blocked", 0),
             "blocked_intended_stake": round(sum(to_float(row.get("intended_stake")) for row in ai_intents if row.get("action") == "blocked"), 8),
             "blocked_wallets": blocked_wallets,
-            "net_effect": round(sum(to_float(row.get("ai_net_effect")) for row in ai_shadows), 8),
+            "net_effect": round(sum(
+                to_float(row.get("ai_net_effect")) for row in ai_shadows
+                if str(row.get("shadow_kind") or "wallet_original") == "wallet_original"
+            ), 8),
+            "ai_inverse_pnl": round(sum(
+                to_float(row.get("realized_pnl")) for row in ai_shadows if row.get("shadow_kind") == "ai_prediction"
+            ), 8),
+            "ai_vs_wallet_pnl": round(sum(
+                to_float(row.get("comparison_pnl")) for row in ai_shadows if row.get("shadow_kind") == "ai_prediction"
+            ), 8),
             "counterfactual_label": "被拦截意图级反事实；不包含释放资金后续用途",
         }
     return {

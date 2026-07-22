@@ -18,6 +18,7 @@ python3 -m poly_fight.cli build-leaderboard --category sports
 python3 -m poly_fight.cli analyze-event
 python3 -m poly_fight.cli analyze-event --event-slug <slug>
 python3 -m poly_fight.cli analyze-event --condition-id <condition_id>
+python3 -m poly_fight.cli ai-backtest --limit 50
 
 python3 -m poly_fight.cli follow --stake-usdc 1 --stake-ratio-percent 10
 python3 -m poly_fight.cli run --stake-usdc 1 --stake-ratio-percent 10
@@ -351,6 +352,9 @@ POST /api/reset-data
 POST /api/ai-risk/credential
 POST /api/ai-risk/credential/test
 POST /api/ai-risk/credential/delete
+POST /api/ai-risk/data-credential
+POST /api/ai-risk/data-credential/test
+POST /api/ai-risk/data-credential/delete
 POST /api/ai-risk/settings
 ```
 
@@ -371,6 +375,31 @@ envelope under `data/.secrets/`; the plaintext key must never enter SQLite,
 logs, SSE, follow state, or control files. `reset-data` deliberately preserves
 this separate credential store; deleting it requires the explicit credential
 delete endpoint.
+
+AI risk provider rules:
+
+```text
+data/model = PandaScore compact team evidence -> DeepSeek / deepseek-v4-pro
+trigger = an otherwise eligible LOL/CS2/Dota2 main_match BUY intent only
+history = 120d primary; extend to 180d only when fewer than 8 matches;
+          at most 20 matches/team
+prompt compaction = recent 10 match details; matches 11-20 aggregate only;
+                    raw provider JSON, URLs, streams and IDs excluded
+cache = team history by PandaScore team id + one neutral assessment per
+        condition_id/prompt version
+provider input excludes wallet, intended side, price, stake and condition_id
+prompt = full-match winner only, 50:50 baseline, historical strength + form +
+         opponent quality + H2H + roster/system + event tier + BO format
+uncertain/stale knowledge = UNKNOWN with low confidence; never force a pick
+local block rule = opponent >=65% and confidence >=75%
+provider/schema/timeout/quota failure = fail open + audited unavailable
+settlement = delete referenced team-history cache and retain compact assessment
+blocked audit = original-wallet shadow + same-stake AI-side hold-to-settlement shadow
+```
+
+The provider response is strict JSON. Local code validates scores, confidence,
+knowledge state and winner/score consistency; only local code decides whether
+to block.
 
 `GET /api/stream` is same-origin, cookie-authenticated SSE. It sends an
 immediate frame, heartbeats, caps clients, and releases the count in `finally`.
@@ -424,6 +453,7 @@ poly_fight/api.py        read-only HTTP client
 poly_fight/cli.py        collect/follow/run/serve
 poly_fight/follow.py     paper follow logic
 poly_fight/ai_risk.py    DeepSeek assessment, encrypted BYOK config, local gate
+poly_fight/pandascore.py bounded team-history fetch, compaction, cache adapter
 poly_fight/dashboard.py  read-only dashboard/API
 poly_fight/storage.py    SQLite follow-state persistence
 tests/test_core.py       unittest coverage

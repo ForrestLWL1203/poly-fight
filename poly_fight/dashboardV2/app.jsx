@@ -1491,7 +1491,9 @@ function AiRiskPage({ toast }) {
   const [data, setData] = React.useState(null);
   const [wrap, setWrap] = React.useState(null);
   const [secret, setSecret] = React.useState("");
+  const [dataSecret, setDataSecret] = React.useState("");
   const [show, setShow] = React.useState(false);
+  const [dataShow, setDataShow] = React.useState(false);
   const [busy, setBusy] = React.useState("");
   const load = React.useCallback(async () => {
     const [status, key] = await Promise.all([Api.aiRisk(), Api.aiWrapKey()]);
@@ -1501,10 +1503,13 @@ function AiRiskPage({ toast }) {
   if (!data) return <CenterLoad />;
   const cfg = data.settings || {};
   const credential = data.credential || {};
+  const dataCredential = data.data_credential || {};
   const balance = data.balance;
   const summary = data.summary || {};
   const connectionTone = credential.status === "valid" ? "up" : credential.status === "error" ? "down" : "neutral";
   const connectionText = credential.status === "valid" ? "连接正常" : credential.status === "error" ? "连接异常" : "未配置";
+  const dataConnectionTone = dataCredential.status === "valid" ? "up" : dataCredential.status === "error" ? "down" : "neutral";
+  const dataConnectionText = dataCredential.status === "valid" ? "数据正常" : dataCredential.status === "error" ? "连接异常" : "未配置";
 
   const save = async () => {
     if (!secret.trim() || !wrap) return;
@@ -1523,16 +1528,40 @@ function AiRiskPage({ toast }) {
     catch (e) { await load().catch(() => {}); toast("DeepSeek 连接测试失败", "error"); }
     finally { setBusy(""); }
   };
+  const saveData = async () => {
+    if (!dataSecret.trim() || !wrap) return;
+    setBusy("save-data");
+    try {
+      const envelope = await window.PSEncryptCredential(dataSecret.trim(), wrap);
+      await Api.saveAiDataCredential(envelope); setDataSecret(""); setDataShow(false); await load();
+      toast("PandaScore Key 已加密保存并验证", "success");
+    } catch (e) {
+      toast(e && e.message === "secure_context_required" ? "请通过 HTTPS 或 localhost 配置凭证" : "PandaScore Key 验证失败", "error");
+    } finally { setBusy(""); }
+  };
+  const testData = async () => {
+    setBusy("test-data");
+    try { await Api.testAiDataCredential(); await load(); toast("PandaScore 数据连接正常", "success"); }
+    catch (e) { await load().catch(() => {}); toast("PandaScore 连接测试失败", "error"); }
+    finally { setBusy(""); }
+  };
   const toggle = async (enabled) => {
     setBusy("toggle");
     try { await Api.saveAiSettings(enabled); await load(); toast(enabled ? "AI 主盘风控已开启" : "AI 主盘风控已关闭", "success"); }
-    catch (e) { toast(e && e.error === "deepseek_not_configured" ? "请先保存并验证 DeepSeek Key" : "AI 风控状态更新失败", "error"); }
+    catch (e) { toast(e && e.error === "deepseek_not_configured" ? "请先保存并验证 DeepSeek Key" : e && e.error === "pandascore_not_configured" ? "请先保存并验证 PandaScore Key" : "AI 风控状态更新失败", "error"); }
     finally { setBusy(""); }
   };
   const remove = async () => {
     if (!window.confirm("删除 DeepSeek 凭证？历史 AI 判断与拦截记录会保留。")) return;
     setBusy("delete");
     try { await Api.deleteAiCredential(); await load(); toast("DeepSeek 凭证已删除", "success"); }
+    catch (e) { toast("删除失败", "error"); }
+    finally { setBusy(""); }
+  };
+  const removeData = async () => {
+    if (!window.confirm("删除 PandaScore 凭证？AI 风控会同时关闭。")) return;
+    setBusy("delete-data");
+    try { await Api.deleteAiDataCredential(); await load(); toast("PandaScore 凭证已删除", "success"); }
     catch (e) { toast("删除失败", "error"); }
     finally { setBusy(""); }
   };
@@ -1552,7 +1581,7 @@ function AiRiskPage({ toast }) {
     <Card className={"ai-control-card" + (cfg.enabled ? " is-live" : "")}>
       <div className="ai-control-copy">
         <span className="ai-control-icon"><Ico n="radar" /></span>
-        <div><h2>AI 风控雷达</h2><p>目标钱包的主盘买入通过策略检查后，DeepSeek 独立评估对阵；强冲突时拦截，证据不足或服务异常时按原策略放行。</p></div>
+        <div><h2>AI 风控雷达</h2><p>目标钱包的主盘买入通过策略检查后，读取 PandaScore 赛前历史并交由 DeepSeek 判断全场胜方；强冲突时拦截。</p></div>
       </div>
       <div className="ai-control-state">
         <Badge tone={cfg.enabled ? "up" : "neutral"} dot>{cfg.enabled ? "运行中" : "已关闭"}</Badge>
@@ -1562,7 +1591,8 @@ function AiRiskPage({ toast }) {
 
     <div className="ai-page-grid">
       <Card className="ai-connection-card">
-        <div className="ai-section-head"><div><h3>DeepSeek 凭证</h3><p>{cfg.model || "deepseek-v4-pro"} · 浏览器加密后保存</p></div><Badge tone={connectionTone} dot>{connectionText}</Badge></div>
+        <div className="ai-section-head"><div><h3>模型与数据连接</h3><p>两组 Key 均在浏览器加密后保存</p></div></div>
+        <div className="ai-provider-head"><div><b>DeepSeek</b><span>{cfg.model || "deepseek-v4-pro"}</span></div><Badge tone={connectionTone} dot>{connectionText}</Badge></div>
         <div className="ai-secret-row">
           <Input type={show ? "text" : "password"} value={secret} onChange={(e) => setSecret(e.target.value)} placeholder={credential.configured ? "输入新 Key 可安全替换" : "sk-••••••••••••"} autoComplete="off" />
           <Button variant="ghost" size="sm" onClick={() => setShow((v) => !v)}>{show ? "隐藏" : "显示"}</Button>
@@ -1571,6 +1601,14 @@ function AiRiskPage({ toast }) {
         <p className="ai-security-note"><Ico n="lock-keyhole" /> 明文 Key 不进入数据库和请求日志。</p>
         {balance && <div className="ai-balance-strip"><span><small>账户余额</small><b>{Number(balance.total_balance || 0).toFixed(2)} {balance.currency || ""}</b></span><span><small>最近检查</small><b>{balance.checked_at ? new Date(balance.checked_at * 1000).toLocaleString() : "—"}</b></span></div>}
         <div className="ai-connection-actions"><Button variant="ghost" size="sm" disabled={!credential.configured || !!busy} onClick={test}>{busy === "test" ? "测试中…" : "测试连接 / 刷新余额"}</Button>{credential.configured && <Button variant="danger" size="sm" disabled={!!busy} onClick={remove}>删除凭证</Button>}</div>
+        <div className="ai-provider-divider"></div>
+        <div className="ai-provider-head"><div><b>PandaScore</b><span>120 天主窗口 · 样本不足回补至 180 天</span></div><Badge tone={dataConnectionTone} dot>{dataConnectionText}</Badge></div>
+        <div className="ai-secret-row">
+          <Input type={dataShow ? "text" : "password"} value={dataSecret} onChange={(e) => setDataSecret(e.target.value)} placeholder={dataCredential.configured ? "输入新 Key 可安全替换" : "PandaScore API Key"} autoComplete="off" />
+          <Button variant="ghost" size="sm" onClick={() => setDataShow((v) => !v)}>{dataShow ? "隐藏" : "显示"}</Button>
+          <Button variant="primary" size="sm" disabled={!dataSecret.trim() || !!busy || !wrap?.ready} onClick={saveData}>{busy === "save-data" ? "验证中…" : "加密保存"}</Button>
+        </div>
+        <div className="ai-connection-actions"><Button variant="ghost" size="sm" disabled={!dataCredential.configured || !!busy} onClick={testData}>{busy === "test-data" ? "测试中…" : "测试数据连接"}</Button>{dataCredential.configured && <Button variant="danger" size="sm" disabled={!!busy} onClick={removeData}>删除凭证</Button>}</div>
       </Card>
 
       <Card className="ai-impact-card">
@@ -1580,6 +1618,8 @@ function AiRiskPage({ toast }) {
           <div><span>AI 拦截</span><b>{summary.blocked_count || 0}</b></div>
           <div><span>避免亏损</span><b className="pnl-up">+{money(summary.avoided_loss_usdc || 0)}</b></div>
           <div><span>错失盈利</span><b className="pnl-down">-{money(summary.missed_profit_usdc || 0)}</b></div>
+          <div><span>AI 反向模拟</span><b className={pnlClass(summary.ai_inverse_pnl_usdc || 0)}>{signedMoney(summary.ai_inverse_pnl_usdc || 0)}</b></div>
+          <div><span>相对跟钱包</span><b className={pnlClass(summary.ai_vs_wallet_usdc || 0)}>{signedMoney(summary.ai_vs_wallet_usdc || 0)}</b></div>
         </div>
       </Card>
     </div>
