@@ -71,6 +71,7 @@
   const events = () => get("/api/events");
   const runner = () => get("/api/runner");
   const followStrategy = () => get("/api/follow-strategy");
+  const followGameSettings = () => get("/api/follow-game-settings");
   const walletRefreshStatus = () => get("/api/wallet-refresh");
   const follows = (opts) => {
     const q = new URLSearchParams();
@@ -111,6 +112,7 @@
     post("/api/wallet-quarantine", { wallet, category, quarantined });
   const setAccountBalance = (balance_usdc) => post("/api/account-balance", { balance_usdc });
   const saveStrategy = (strategy) => post("/api/follow-strategy", strategy);
+  const saveFollowGameSettings = (games) => post("/api/follow-game-settings", { games });
   const strategies = () => get("/api/follow-strategies");
   const createStrategy = (name, strategy) => post("/api/follow-strategies", { name, strategy });
   const updateStrategy = (slug, name, strategy) =>
@@ -152,9 +154,9 @@
     // 注册会话过期回调(传 null 注销)。app 用它在 401 时强制切登录页。
     setAuthExpiredHandler: (fn) => { onAuthExpired = typeof fn === "function" ? fn : null; },
     get, post, login, logout,
-    health, overview, wallets, events, runner, followStrategy, walletRefreshStatus,
+    health, overview, wallets, events, runner, followStrategy, followGameSettings, walletRefreshStatus,
     follows, followDetail, walletFollows, marketPrices, walletTrades, aiRisk, aiWrapKey,
-    setFavorite, setQuarantine, setAccountBalance, saveStrategy,
+    setFavorite, setQuarantine, setAccountBalance, saveStrategy, saveFollowGameSettings,
     strategies, createStrategy, updateStrategy, activateStrategy, deleteStrategy,
     runnerStart, runnerStop, resetData, walletRefresh,
     saveAiCredential, testAiCredential, deleteAiCredential,
@@ -175,6 +177,7 @@
     api.events = wrap(m.events);
     api.runner = wrap(m.runner);
     api.followStrategy = wrap(m.followStrategy);
+    api.followGameSettings = wrap(m.followGameSettings);
     api.walletRefreshStatus = wrap(m.walletRefreshStatus);
     api.follows = wrap(m.follows);
     api.followDetail = wrap(m.followDetail);
@@ -187,6 +190,7 @@
     api.setQuarantine = (w, c, q) => okEcho({ wallet: w, category: c, quarantined: q });
     api.setAccountBalance = (b) => okEcho({ configured: true, balance_usdc: b });
     api.saveStrategy = (s) => okEcho(Object.assign({ configured: true }, s));
+    api.saveFollowGameSettings = (games) => Promise.resolve(m.saveFollowGameSettings(games));
     const tryMock = (fn) => (...args) => { try { return Promise.resolve(fn(...args)); } catch (e) { return Promise.reject(e); } };
     api.strategies = wrap(m.strategies);
     api.createStrategy = tryMock((name, s) => m.createStrategy(name, s));

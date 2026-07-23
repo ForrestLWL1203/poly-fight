@@ -250,6 +250,40 @@
 /* ============================================================
    Strategy library — named multi-strategy list + inline editor
    ============================================================ */
+.follow-game-scope {
+  display: grid;
+  grid-template-columns: minmax(260px, .9fr) minmax(520px, 1.6fr);
+  align-items: center;
+  gap: var(--sp-6);
+}
+.fgs-copy { min-width: 0; }
+.fgs-title { display: flex; align-items: center; gap: var(--sp-2); color: var(--text-primary); font: var(--text-headline); }
+.fgs-title svg { width: 18px; height: 18px; color: var(--accent); }
+.fgs-copy p { margin: 7px 0 0; color: var(--text-tertiary); font-size: var(--fs-footnote); line-height: 1.5; }
+.fgs-options { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--sp-3); }
+.fgs-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+  color: var(--text-tertiary);
+  transition: border-color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+.fgs-option.is-enabled {
+  border-color: color-mix(in srgb, var(--status-live) 28%, var(--border-hairline));
+  background: color-mix(in srgb, var(--status-live) 3%, var(--surface-inset));
+  color: var(--text-primary);
+}
+.fgs-option > span:nth-child(2) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-callout); font-weight: var(--fw-semibold); }
+.fgs-option .ps-switch-track { width: 40px; height: 24px; }
+.fgs-option .ps-switch-thumb { top: 3px; left: 3px; width: 18px; height: 18px; }
+.fgs-option .ps-switch.on .ps-switch-thumb { transform: translateX(16px); }
+
 .strat-toolbar { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); }
 .strat-toolbar-info { display: inline-flex; align-items: center; gap: var(--sp-3); }
 .stt-count { font: var(--fw-semibold) var(--fs-callout) var(--font-sans); color: var(--text-secondary); font-variant-numeric: tabular-nums; }
@@ -374,6 +408,7 @@
 }
 
 @media (max-width: 1280px) {
+  .follow-game-scope { grid-template-columns: 1fr; gap: var(--sp-4); }
   .cfg-sizing-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .cfg-risk-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
@@ -386,6 +421,7 @@
   .cfg-sell-strip p { text-align: left; }
 }
 @media (max-width: 640px) {
+  .fgs-options { grid-template-columns: 1fr; }
   .cfg-sizing-grid, .cfg-risk-grid { grid-template-columns: 1fr; }
   .strat-editor { padding-left: var(--sp-4); padding-right: var(--sp-4); }
   .se-actions { margin-left: calc(-1 * var(--sp-4)); margin-right: calc(-1 * var(--sp-4)); padding-left: var(--sp-4); padding-right: var(--sp-4); }

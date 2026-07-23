@@ -570,6 +570,7 @@ function LeaderboardPage({ data, merge, toast, onOpenWallet, onSample }) {
                 <option value="dota2">Dota 2</option>
                 <option value="cs2">CS2</option>
                 <option value="lol">LoL</option>
+                <option value="valorant">Valorant</option>
               </select>
               <span className="lb-updated" style={{ marginRight: 4 }}>最后更新 {updatedLabel} · {lb.activeCount} 个活跃</span>
               <div className={"collect-square" + (refreshing || !maxSeedValid ? " is-disabled" : "")}
@@ -663,7 +664,7 @@ function EventsPage({ data }) {
             <div className="filter-group">
               <label htmlFor="game-f">项目</label>
               <select id="game-f" className="ps-select" value={game} onChange={(e) => setGame(e.target.value)}>
-                <option value="all">全部</option><option value="dota2">Dota 2</option><option value="cs2">CS2</option><option value="lol">LoL</option>
+                <option value="all">全部</option><option value="dota2">Dota 2</option><option value="cs2">CS2</option><option value="lol">LoL</option><option value="valorant">Valorant</option>
               </select>
             </div>
           </div>
@@ -1309,6 +1310,51 @@ function strategyErrText(e) {
   return "操作失败";
 }
 
+const FOLLOW_GAMES = [
+  { id: "lol", label: "LoL" },
+  { id: "cs2", label: "CS2" },
+  { id: "dota2", label: "Dota 2" },
+  { id: "valorant", label: "Valorant" },
+];
+
+function FollowGameScope({ settings, merge, toast }) {
+  const [busy, setBusy] = React.useState("");
+  const games = { lol: true, cs2: true, dota2: true, valorant: true, ...((settings && settings.games) || {}) };
+  const toggle = async (game, enabled) => {
+    if (busy) return;
+    const next = { ...games, [game]: !!enabled };
+    setBusy(game);
+    merge({ gameSettings: { ...(settings || {}), games: next } });
+    try {
+      const saved = await Api.saveFollowGameSettings(next);
+      merge({ gameSettings: saved });
+      toast(enabled ? `${FOLLOW_GAMES.find((g) => g.id === game).label} 跟单已启用` : `${FOLLOW_GAMES.find((g) => g.id === game).label} 跟单已暂停`, "success");
+    } catch (_e) {
+      merge({ gameSettings: settings });
+      toast("跟单项目更新失败，请重试", "error");
+    } finally {
+      setBusy("");
+    }
+  };
+  return (
+    <Card className="follow-game-scope">
+      <div className="fgs-copy">
+        <div className="fgs-title"><Ico n="gamepad-2" /><span>跟单项目</span></div>
+        <p>关闭后立即停止该项目所有主盘与子盘的新跟单；已有持仓继续卖出和结算。</p>
+      </div>
+      <div className="fgs-options">
+        {FOLLOW_GAMES.map((game) => (
+          <div className={"fgs-option" + (games[game.id] ? " is-enabled" : "")} key={game.id}>
+            <GameIcon game={game.id} base={ASSET_BASE} size="sm" />
+            <span>{game.label}</span>
+            <Switch checked={!!games[game.id]} disabled={!!busy} onChange={(enabled) => toggle(game.id, enabled)} accent />
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
 function StrategyPage({ data, merge, toast }) {
   const wallet = data.overview && data.overview.account_balance && data.overview.account_balance.configured
     ? Adapt.num(data.overview.account_balance.balance_usdc) : 0;
@@ -1370,6 +1416,7 @@ function StrategyPage({ data, merge, toast }) {
 
   return (
     <div className="page-inner strat-page">
+      <FollowGameScope settings={data.gameSettings} merge={merge} toast={toast} />
       <div className="strat-toolbar">
         <div className="strat-toolbar-info">
           <span className="stt-count">已保存 {list.length} / {MAX_STRATEGIES}</span>
@@ -1613,6 +1660,8 @@ function AiRiskPage({ toast }) {
   };
   const screeningLabel = (row) => (row.decision === "cold_market" && row.cold_reason === "volume_insufficient" ? "成交量不足" : row.decision === "cold_market" && row.cold_reason === "depth_insufficient" ? "深度不足" : row.decision === "cold_market" ? "盘口未达标" : row.status === "watching" && row.decision === "strategy_price_gate" ? "等待合适价格" : row.status === "watching" && row.decision === "no_positive_edge" ? "等待正向优势" : ({
     entered: "已入场", settled: "已结算", evidence_insufficient: "证据不足",
+    assessment_insufficient: "研判不明确", probability_insufficient: "优势不足",
+    confidence_insufficient: "置信度不足",
     no_positive_edge: "无正向优势", strategy_price_gate: "价格不符",
     volume_insufficient: "等待成交量", orderbook_missing_side: "等待深度",
     depth_insufficient: "深度不足", spread_too_wide: "价差过宽",
@@ -1746,15 +1795,27 @@ function AiRiskPage({ toast }) {
                 const probability = row.ai_probability != null ? row.ai_probability : predictedIndex === 0 ? assessment.team_a_win_probability : predictedIndex === 1 ? assessment.team_b_win_probability : null;
                 const observedPrice = row.observed_entry_price != null ? Number(row.observed_entry_price) : row.book?.vwap != null ? Number(row.book.vwap) : null;
                 const retryText = row.next_retry_at ? ` · 下次 ${Adapt.fmtClock(row.next_retry_at)}` : "";
+                const scheduledProbeCount = Number(row.scheduled_probe_count || 0);
+                const scheduledProbeLimit = Number(row.scheduled_probe_limit || 7);
                 const probeText = row.probe_trigger === "wallet_assessment"
                   ? "钱包研判后提前探测"
                   : row.probe_trigger === "initial_window"
                     ? "进入 24 小时窗口后首次探测"
-                    : row.scheduled_probe_count ? `第 ${row.scheduled_probe_count}/7 次流动性探测` : "";
+                    : scheduledProbeCount > scheduledProbeLimit
+                      ? `已探测 ${scheduledProbeCount} 次（含旧调度）`
+                      : scheduledProbeCount ? `第 ${scheduledProbeCount}/${scheduledProbeLimit} 次流动性探测` : "";
                 const screenDetail = row.decision === "strategy_price_gate"
                   ? `当前 ${observedPrice != null ? observedPrice.toFixed(3) : "—"}${row.max_entry_price ? ` · 策略上限 ${Number(row.max_entry_price).toFixed(3)}` : " · 超出策略价格范围"}${retryText}`
                   : row.decision === "no_positive_edge"
                     ? `当前 ${observedPrice != null ? observedPrice.toFixed(3) : "—"} · AI 保守公平价 ${Number(row.ai_fair_price || 0).toFixed(3)}${retryText}`
+                    : row.decision === "evidence_insufficient"
+                      ? `证据 ${Number(row.evidence_score || 0)} · 门槛 ${Number(row.required_evidence_score || 80)}`
+                      : row.decision === "assessment_insufficient"
+                        ? assessment.reason_zh || "未给出明确胜方"
+                        : row.decision === "probability_insufficient"
+                          ? `AI 胜率 ${probability != null ? Math.round(Number(probability)) : 0}% · 门槛 ${Number(row.required_win_probability || 65)}%`
+                          : row.decision === "confidence_insufficient"
+                            ? `置信度 ${Math.round(Number(assessment.confidence || 0))}% · 门槛 ${Number(row.required_confidence || 75)}%`
                     : row.decision === "cold_market" && row.cold_reason === "volume_insufficient"
                       ? `成交量 ${money(row.volume_usdc || 0)} · 门槛 ${money(row.required_volume_usdc || 0)}`
                       : row.decision === "cold_market" && row.cold_reason === "depth_insufficient"
@@ -1807,7 +1868,7 @@ function Dashboard({ onLogout, toast }) {
   const closeModal = React.useCallback(() => setModal(null), []);
 
   const [data, setData] = React.useState({
-    overview: null, health: null, runner: null, strategy: null, strategies: null,
+    overview: null, health: null, runner: null, strategy: null, strategies: null, gameSettings: null,
     wallets: null, events: null, follows: null, refresh: null,
   });
   const merge = React.useCallback((patch) => setData((d) => ({ ...d, ...patch })), []);
@@ -1876,12 +1937,12 @@ function Dashboard({ onLogout, toast }) {
     let alive = true;
     (async () => {
       const safe = (p) => p.catch((e) => { if (e instanceof Api.AuthError) onLogout(); return null; });
-      const [overview, health, runner, strategy, strategies, wallets, events, follows, refresh] = await Promise.all([
-        safe(Api.overview()), safe(Api.health()), safe(Api.runner()), safe(Api.followStrategy()), safe(Api.strategies()),
+      const [overview, health, runner, strategy, strategies, gameSettings, wallets, events, follows, refresh] = await Promise.all([
+        safe(Api.overview()), safe(Api.health()), safe(Api.runner()), safe(Api.followStrategy()), safe(Api.strategies()), safe(Api.followGameSettings()),
         safe(Api.wallets()), safe(Api.events()), safe(Api.follows({ page: 1, size: 100 })),
         safe(Api.walletRefreshStatus()),
       ]);
-      if (alive) merge({ overview, health, runner, strategy, strategies, wallets, events, follows, refresh });
+      if (alive) merge({ overview, health, runner, strategy, strategies, gameSettings, wallets, events, follows, refresh });
     })();
     return () => { alive = false; };
   }, [merge, onLogout]);

@@ -36,7 +36,12 @@ from .core import (
     to_float,
 )
 from .cli import V2_DEFAULT_MAX_PROFILE_WALLETS, enrich_esports_bucket_scores, prepare_category_refresh_dir
-from .follow_strategy import default_follow_strategy, strategy_summary, validate_follow_strategy
+from .follow_strategy import (
+    default_follow_strategy,
+    normalize_follow_game_settings,
+    strategy_summary,
+    validate_follow_strategy,
+)
 from .storage import FollowStore, LeaderboardStore
 
 
@@ -246,6 +251,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/follow-strategy":
                 self._follow_strategy()
                 return
+            if parsed.path == "/api/follow-game-settings":
+                self._follow_game_settings()
+                return
             if parsed.path == "/api/follow-strategies":
                 self._follow_strategy_create()
                 return
@@ -341,6 +349,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 strategy = default_follow_strategy(balance_usdc=balance_value)
                 strategy["configured"] = False
             self._ok(strategy)
+            return
+        if parsed.path == "/api/follow-game-settings":
+            store = FollowStore(_follow_db_path(self.dashboard_config))
+            self._ok(store.load_follow_game_settings_readonly())
             return
         if parsed.path == "/api/follow-strategies":
             store = FollowStore(_follow_db_path(self.dashboard_config))
@@ -601,6 +613,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.BAD_REQUEST,
             )
             return
+        self._ok(saved)
+
+    def _follow_game_settings(self) -> None:
+        # Independent hot switch: unlike the complete strategy editor, this is
+        # intentionally writable while the runner is active and takes effect on
+        # the next tick. Existing positions keep their SELL/settlement lifecycle.
+        form = self._read_request_form()
+        settings = normalize_follow_game_settings(form)
+        store = FollowStore(_follow_db_path(self.dashboard_config))
+        saved = store.save_follow_game_settings(settings, ts=int(time.time()))
         self._ok(saved)
 
     def _follow_strategy_create(self) -> None:

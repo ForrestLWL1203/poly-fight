@@ -76,10 +76,10 @@ to find active candidates.
 Allowed esports:
 
 ```text
-LOL / CS2 / Dota2
+LOL / CS2 / Dota2 / Valorant
 main_match: full match winner
-game_winner: Dota2/LOL Game N Winner
-map_winner: CS2 Map N Winner
+game_winner: Dota2/LOL/Valorant Game N Winner
+map_winner: CS2/Valorant Map N Winner
 ```
 
 Allowed sports:
@@ -93,7 +93,7 @@ market_type = main_match / moneyline winner only
 Sports and esports are top-level categories. NBA and UFC are leagues inside
 `sports`, like LOL/Dota2/CS2 inside esports.
 
-Exclude Valorant, MLB, NFL, props, spreads, totals, handicaps, futures, correct
+Exclude MLB, NFL, props, spreads, totals, handicaps, futures, correct
 scores, kills, first blood, towers, Roshan, barracks, and similar derived plays.
 Use semantic `category`, `league`, and `market_type`; do not rely on raw title
 substring blacklists.
@@ -167,9 +167,9 @@ max_requests_per_second = 10
 request_burst = 5
 classification_lookback_days = 60 by default
 esports discovery buckets:
-  main_match = LOL 100 / CS2 100 / Dota2 100
+  main_match = LOL 100 / CS2 100 / Dota2 100 / Valorant 100
   game_winner = LOL 50 / Dota2 50
-  map_winner = CS2 50
+  map_winner = CS2 50 / Valorant 50
 market_batch_size = 50
 market_batch_count = 2
 max_pages_per_market = 3
@@ -345,6 +345,7 @@ POST /api/wallet-favorites
 POST /api/wallet-quarantine
 POST /api/account-balance
 POST /api/follow-strategy
+POST /api/follow-game-settings
 POST /api/follow-strategies      (+ /api/follow-strategies/<id>/{activate,delete})
 POST /api/runner/start
 POST /api/runner/stop
@@ -364,7 +365,10 @@ pin / quarantine buttons (manual quarantine is the only quarantine entry point â
 there is no automatic quarantine). `follow-strategy` saves the active follow
 strategy and `follow-strategies` manages the saved-strategy library (runner start
 requires a saved strategy); both mutate strategy config in `follow.db`, never
-follow signal/leg state. `account-balance` writes the manual paper usable-funds cap
+follow signal/leg state. `follow-game-settings` is a hot-reloadable game-wide BUY
+gate for LOL/CS2/Dota2/Valorant; disabling a game blocks all of its new main and
+submarket exposure while preserving SELL and settlement for existing positions.
+`account-balance` writes the manual paper usable-funds cap
 in `follow.db`; it must be locked while the runner is running. `reset-data` is an
 explicit personal-use destructive operation for clearing generated
 category/follow/log state; it must stay behind authenticated dashboard access

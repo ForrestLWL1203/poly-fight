@@ -181,8 +181,11 @@ from poly_fight.follow import (
     wallet_behavior_summary,
 )
 from poly_fight.follow_strategy import (
+    default_follow_game_settings,
     default_follow_strategy,
+    enabled_follow_games,
     evaluate_follow_candidate,
+    normalize_follow_game_settings,
     normalize_follow_strategy,
     strategy_from_legacy_args,
     validate_follow_strategy,
@@ -368,11 +371,11 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(event_league(mlb_event), "other")
         self.assertEqual(event_category(cs_event), "esports")
         self.assertEqual(event_league(cs_event), "cs2")
-        self.assertIsNone(event_category(valorant_event))
-        self.assertEqual(event_league(valorant_event), "other")
-        self.assertNotIn("valorant", ALLOWED_GAME_FAMILIES)
+        self.assertEqual(event_category(valorant_event), "esports")
+        self.assertEqual(event_league(valorant_event), "valorant")
+        self.assertIn("valorant", ALLOWED_GAME_FAMILIES)
 
-    def test_valorant_moneyline_is_out_of_scope(self):
+    def test_valorant_moneyline_is_in_scope(self):
         event = {
             "id": "valorant1",
             "slug": "valorant-nrg-leviatan-2026-06-08",
@@ -393,8 +396,10 @@ class CoreTest(unittest.TestCase):
 
         records = event_to_market_records(event)
 
-        self.assertIsNone(classify_market_type(event, event["markets"][0]))
-        self.assertEqual(records, [])
+        self.assertEqual(classify_market_type(event, event["markets"][0]), "main_match")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["game_family"], "valorant")
+        self.assertEqual(records[0]["market_type"], "main_match")
 
     def test_allowed_esports_uses_end_date_only_as_last_start_fallback(self):
         event = {
@@ -659,7 +664,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(records["game1"]["market_type"], "game_winner")
         self.assertNotIn("kills", records)
 
-    def test_market_classifier_accepts_cs_and_rejects_valorant(self):
+    def test_market_classifier_accepts_cs_and_valorant(self):
         cs_event = {
             "title": "Counter-Strike: 9z vs FlyQuest (BO1) - IEM Cologne",
             "tags": [{"slug": "counter-strike-2"}],
@@ -687,8 +692,8 @@ class CoreTest(unittest.TestCase):
         }
 
         self.assertEqual(classify_market_type(cs_event, cs_market), "map_winner")
-        self.assertIsNone(classify_market_type(valorant_event, valorant_market))
-        self.assertIsNone(classify_market_type(valorant_event, valorant_map_market))
+        self.assertEqual(classify_market_type(valorant_event, valorant_market), "main_match")
+        self.assertEqual(classify_market_type(valorant_event, valorant_map_market), "map_winner")
 
     def test_market_classifier_accepts_winner_alias_outcomes_but_rejects_prop_outcomes(self):
         event = {
@@ -1141,7 +1146,7 @@ class CoreTest(unittest.TestCase):
 
     def test_esports_discovery_slate_balances_game_family_buckets(self):
         markets = []
-        for game_family in ("lol", "cs2", "dota2"):
+        for game_family in ("lol", "cs2", "dota2", "valorant"):
             for i in range(120):
                 row = market(f"{game_family}-main-{i}", days_ago=1, volume=1_000_000 - i * 1_000)
                 row["category"] = "esports"
@@ -1161,6 +1166,12 @@ class CoreTest(unittest.TestCase):
             row["game_family"] = "cs2"
             row["market_type"] = "map_winner"
             markets.append(row)
+        for i in range(60):
+            row = market(f"valorant-map-{i}", days_ago=1, volume=45_000 - i * 400)
+            row["category"] = "esports"
+            row["game_family"] = "valorant"
+            row["market_type"] = "map_winner"
+            markets.append(row)
 
         slate, meta = build_discovery_slate(
             markets,
@@ -1175,11 +1186,12 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(counts["lol:main_match"], 100)
         self.assertEqual(counts["cs2:main_match"], 100)
         self.assertEqual(counts["dota2:main_match"], 100)
+        self.assertEqual(counts["valorant:main_match"], 100)
         self.assertEqual(counts["lol:game_winner"], 50)
         self.assertEqual(counts["dota2:game_winner"], 50)
         self.assertEqual(counts["cs2:map_winner"], 50)
+        self.assertEqual(counts["valorant:map_winner"], 50)
         self.assertEqual(meta["selected_by_game_market_type"], counts)
-        self.assertNotIn("valorant:main_match", meta["game_market_buckets"])
 
     def test_candidate_wallets_use_participation_or_large_size(self):
         trades_by_market = {
@@ -3548,7 +3560,7 @@ class CoreTest(unittest.TestCase):
             cached = read_json(cache_path, {})
 
         self.assertEqual(source, "api")
-        self.assertIn(("counter-strike-2", "league-of-legends", "dota-2"), client.tag_calls)
+        self.assertIn(("counter-strike-2", "league-of-legends", "dota-2", "valorant"), client.tag_calls)
         self.assertNotIn(("nba", "ufc"), client.tag_calls)
         self.assertEqual(markets["esports-m1"]["category"], "esports")
         self.assertNotIn("sports-m1", markets)
@@ -6049,6 +6061,28 @@ class CoreTest(unittest.TestCase):
             readonly = store.load_follow_strategy_readonly()
             self.assertEqual(readonly["balance"]["usable_balance_usdc"], 250)
 
+    def test_follow_game_settings_default_normalize_and_persist(self):
+        defaults = default_follow_game_settings()
+        self.assertEqual(
+            enabled_follow_games(defaults),
+            {"lol", "cs2", "dota2", "valorant"},
+        )
+        normalized = normalize_follow_game_settings(
+            {"games": {"lol": False, "valorant": 0}, "unknown": True},
+            updated_at=1234,
+        )
+        self.assertFalse(normalized["games"]["lol"])
+        self.assertFalse(normalized["games"]["valorant"])
+        self.assertTrue(normalized["games"]["cs2"])
+        self.assertNotIn("unknown", normalized)
+        self.assertEqual(normalized["updated_at"], 1234)
+
+        with TemporaryDirectory() as tmp:
+            store = FollowStore(Path(tmp) / "follow.db")
+            saved = store.save_follow_game_settings(normalized, ts=1234)
+            self.assertEqual(saved, store.load_follow_game_settings())
+            self.assertEqual(saved, store.load_follow_game_settings_readonly())
+
     def test_follow_store_rejects_invalid_follow_strategy(self):
         with TemporaryDirectory() as tmp:
             store = FollowStore(Path(tmp) / "follow.db")
@@ -6650,6 +6684,74 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(stats["insufficient_balance_count"], 1)
         self.assertEqual(stats["new_leg_count"], 0)
         self.assertEqual(signals, [])
+
+    def test_follow_game_switch_blocks_all_new_buys_but_allows_existing_sell(self):
+        now = 1000
+        market = {
+            "condition_id": "m1",
+            "outcomes": ["A", "B"],
+            "outcome_prices": [0.5, 0.5],
+            "match_start_time": datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            "title": "LoL: A vs B (BO3)",
+            "market_type": "game_winner",
+            "game_family": "lol",
+            "league": "lol",
+        }
+        buy = {
+            "id": "b1", "proxyWallet": "0xA", "market": "m1",
+            "outcomeIndex": 0, "side": "BUY", "price": 0.5,
+            "size": 20, "timestamp": now,
+        }
+
+        blocked, stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=[buy],
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            stake_usdc=1,
+            stake_ratio_percent=10,
+            max_follow_legs=10,
+            max_slippage=0.05,
+            enabled_game_families={"cs2", "dota2", "valorant"},
+        )
+        self.assertEqual(blocked, [])
+        self.assertEqual(stats["game_disabled_count"], 1)
+
+        opened, stats = process_follow_trades(
+            [],
+            wallet="0xA",
+            trades=[buy],
+            markets_by_condition={"m1": market},
+            now_ts=now,
+            stake_usdc=1,
+            stake_ratio_percent=10,
+            max_follow_legs=10,
+            max_slippage=0.05,
+            enabled_game_families={"lol", "cs2", "dota2", "valorant"},
+        )
+        self.assertEqual(stats["new_leg_count"], 1)
+        sell = {
+            "id": "s1", "proxyWallet": "0xA", "market": "m1",
+            "outcomeIndex": 0, "side": "SELL", "price": 0.95,
+            "size": 20, "timestamp": now + 1,
+        }
+        sell_market = {**market, "outcome_prices": [0.95, 0.05]}
+        updated, sell_stats = process_follow_trades(
+            opened,
+            wallet="0xA",
+            trades=[sell],
+            markets_by_condition={"m1": sell_market},
+            now_ts=now + 1,
+            stake_usdc=1,
+            stake_ratio_percent=10,
+            max_follow_legs=10,
+            max_slippage=0.05,
+            enabled_game_families={"cs2", "dota2", "valorant"},
+        )
+        self.assertEqual(sell_stats["game_disabled_count"], 0)
+        self.assertEqual(sell_stats["exited_signal_count"], 1)
+        self.assertEqual(updated[0]["status"], "exited")
 
     def test_prune_unfollowed_signals_removes_legacy_zero_funded_open_signal(self):
         signals = [
@@ -11464,6 +11566,60 @@ class CoreTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_dashboard_follow_game_settings_are_hot_and_persisted(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            server = create_server(
+                DashboardConfig(
+                    data_dir=data_dir,
+                    host="127.0.0.1",
+                    port=0,
+                    username="admin",
+                    password="pw",
+                    cookie_secret="secret",
+                    # A running process must not lock this hot setting.
+                    runner_process_lister=lambda: [{"pid": 1234}],
+                )
+            )
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                token = make_session_token("admin", "secret", now=int(datetime.now(timezone.utc).timestamp()))
+                cookie = f"poly_fight_session={token}"
+
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("GET", "/api/follow-game-settings", headers={"Cookie": cookie})
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["data"]["games"], {
+                    "lol": True, "cs2": True, "dota2": True, "valorant": True,
+                })
+
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/follow-game-settings",
+                    body=json.dumps({"games": {"lol": False, "valorant": False}}),
+                    headers={"Cookie": cookie, "Content-Type": "application/json"},
+                )
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode())
+                conn.close()
+                self.assertEqual(response.status, 200)
+                self.assertFalse(payload["data"]["games"]["lol"])
+                self.assertFalse(payload["data"]["games"]["valorant"])
+                self.assertTrue(payload["data"]["games"]["cs2"])
+                self.assertEqual(
+                    FollowStore(data_dir / "follow" / "follow.db").load_follow_game_settings()["games"],
+                    payload["data"]["games"],
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_dashboard_account_balance_api_locks_while_runner_running(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -14168,25 +14324,25 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(
             effective_discovery_defaults(esports),
             {
-                "target_markets": 300,
-                "submarket_target_markets": 150,
+                "target_markets": 400,
+                "submarket_target_markets": 200,
                 "game_winner_target_markets": 100,
-                "map_winner_target_markets": 50,
-                "max_markets_per_run": 300,
-                "submarket_max_markets_per_run": 150,
+                "map_winner_target_markets": 100,
+                "max_markets_per_run": 400,
+                "submarket_max_markets_per_run": 200,
                 "game_winner_max_markets_per_run": 100,
-                "map_winner_max_markets_per_run": 50,
+                "map_winner_max_markets_per_run": 100,
             },
         )
         self.assertEqual(
             effective_discovery_defaults(explicit_esports),
             {
                 "target_markets": 30,
-                "submarket_target_markets": 150,
+                "submarket_target_markets": 200,
                 "game_winner_target_markets": 40,
                 "map_winner_target_markets": 20,
                 "max_markets_per_run": 30,
-                "submarket_max_markets_per_run": 150,
+                "submarket_max_markets_per_run": 200,
                 "game_winner_max_markets_per_run": 40,
                 "map_winner_max_markets_per_run": 20,
             },
@@ -14265,7 +14421,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(calls[0][1]["sortBy"], "TOTAL_PNL")
         self.assertEqual(calls[0][1]["sortDirection"], "DESC")
 
-    def test_select_collector_target_markets_uses_six_buckets_without_backfill(self):
+    def test_select_collector_target_markets_uses_game_buckets_without_backfill(self):
         now = datetime(2026, 6, 9, tzinfo=timezone.utc)
 
         def row(condition_id, game_family, market_type, volume, days_ago=5):
@@ -14310,7 +14466,8 @@ class CoreTest(unittest.TestCase):
             ],
         )
         self.assertEqual(meta["bucket_counts"]["lol:main_match"], 2)
-        self.assertNotIn("valorant:main_match", meta["bucket_counts"])
+        self.assertEqual(meta["bucket_counts"]["valorant:main_match"], 0)
+        self.assertEqual(meta["bucket_counts"]["valorant:map_winner"], 0)
 
     def test_select_collector_target_markets_can_take_one_hundred_per_bucket(self):
         now = datetime(2026, 6, 9, tzinfo=timezone.utc)
@@ -14322,6 +14479,8 @@ class CoreTest(unittest.TestCase):
             ("dota2", "game_winner"),
             ("cs2", "main_match"),
             ("cs2", "map_winner"),
+            ("valorant", "main_match"),
+            ("valorant", "map_winner"),
         ]
         for game_family, market_type in buckets:
             for index in range(120):
@@ -14344,7 +14503,7 @@ class CoreTest(unittest.TestCase):
             bucket_market_limit=100,
         )
 
-        self.assertEqual(len(selected), 600)
+        self.assertEqual(len(selected), 800)
         self.assertEqual(
             meta["bucket_counts"],
             {
@@ -14354,6 +14513,8 @@ class CoreTest(unittest.TestCase):
                 "dota2:game_winner": 100,
                 "cs2:main_match": 100,
                 "cs2:map_winner": 100,
+                "valorant:main_match": 100,
+                "valorant:map_winner": 100,
             },
         )
         self.assertEqual(meta["bucket_shortfalls"], {})

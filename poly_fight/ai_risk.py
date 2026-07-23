@@ -46,10 +46,11 @@ SUPPORTED_GAMES = frozenset({"lol", "cs2", "dota2"})
 PROPRIETARY_INITIAL_BANKROLL = 5000.0
 PROPRIETARY_MIN_VOLUME = 1000.0
 PROPRIETARY_LIQUIDITY_PROBE_HOURS = (24, 12, 6, 3, 2, 1, 0.5)
-PROPRIETARY_SCHEDULE_VERSION = 3
+PROPRIETARY_SCHEDULE_VERSION = 4
+PROPRIETARY_SCHEDULED_PROBE_LIMIT = len(PROPRIETARY_LIQUIDITY_PROBE_HOURS)
 
 
-SYSTEM_PROMPT = """仅用输入E中的赛前证据判断电竞整场Match Winner；禁止模型记忆、搜索、赔率、钱包、金额、目标赛果及Map/单局预测。A/B从50开始，综合近况、对手强度、H2H、阵容与BO。只输出JSON，字段固定为s,w,a,b,c,e,f,r；s=d/i，w=a/b/null，a/b为双方分，c为置信度，e为证据id，f为风险，r用中文且不超过40字。d时a+b=100、胜方分更高且e只引用输入id；冲突或不足时s=i,w=null,a=50,b=50,c=0,e=[]。"""
+SYSTEM_PROMPT = """仅用输入E中的赛前证据判断电竞整场Match Winner；禁止模型记忆、搜索、赔率、钱包、金额、目标赛果及Map/单局预测。A/B从50开始，综合近况、对手强度、H2H、阵容与BO。只输出JSON，字段固定为s,w,a,b,c,e,f,r；s=d/i，w=a/b/null，a/b/c必须为0-100整数，a+b=100，c是百分制置信度（例如70，禁止输出0.7），e为证据id，f为风险，r用中文且不超过40字。d时胜方分更高且e只引用输入id；冲突或不足时s=i,w=null,a=50,b=50,c=0,e=[]。"""
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
@@ -562,6 +563,11 @@ def validate_assessment_output(value: Any, *, valid_evidence_ids: set[str] | Non
         confidence = float(value["confidence"])
     except (TypeError, ValueError) as exc:
         raise ValueError("assessment_bad_scores") from exc
+    # DeepSeek occasionally expresses confidence as a 0..1 ratio even though
+    # the contract is percentage based.  Normalize that unambiguous form here
+    # so 0.8 cannot silently become 0.8% and block every otherwise valid case.
+    if 0 < confidence <= 1:
+        confidence *= 100.0
     # Some JSON models use 0/0 as a sentinel for an explicitly insufficient
     # verdict. Probabilities are irrelevant in that branch; canonicalize it to
     # the neutral 50/50 stored representation before enforcing the sum rule.
@@ -573,7 +579,13 @@ def validate_assessment_output(value: Any, *, valid_evidence_ids: set[str] | Non
         raise ValueError("assessment_status_winner_mismatch")
     if winner == "team_a" and pa <= pb or winner == "team_b" and pb <= pa:
         raise ValueError("assessment_verdict_probability_mismatch")
-    ids = [str(item) for item in value.get("supporting_evidence_ids") or []]
+    raw_ids = value.get("supporting_evidence_ids") or []
+    if isinstance(raw_ids, str):
+        raw_ids = [raw_ids]
+    raw_flags = value.get("risk_flags") or []
+    if isinstance(raw_flags, str):
+        raw_flags = [raw_flags]
+    ids = [str(item) for item in raw_ids]
     if valid_evidence_ids is not None and any(item not in valid_evidence_ids for item in ids):
         raise ValueError("assessment_unknown_evidence_id")
     if status == "decisive" and not ids:
@@ -585,7 +597,7 @@ def validate_assessment_output(value: Any, *, valid_evidence_ids: set[str] | Non
         "confidence": round(confidence, 2),
         "reason_zh": str(value["reason_zh"] or "")[:120],
         "supporting_evidence_ids": ids[:8],
-        "risk_flags": [str(flag)[:60] for flag in value.get("risk_flags") or []][:8],
+        "risk_flags": [str(flag)[:60] for flag in raw_flags][:8],
     }
 
 
@@ -1104,10 +1116,12 @@ class AiRiskService:
                 and to_float((cached_before_window or {}).get("confidence")) >= CONFIDENCE_THRESHOLD
                 and not int((prior or {}).get("signal_probe_at") or 0)
             )
-            current_schedule = int((prior or {}).get("schedule_version") or 0) >= PROPRIETARY_SCHEDULE_VERSION
-            if prior and int(prior.get("next_retry_at") or 0) > now_ts and current_schedule and not wallet_assessment_trigger:
+            if prior and int(prior.get("next_retry_at") or 0) > now_ts and not wallet_assessment_trigger:
                 continue
             stake = to_float(plan.get("stake"))
+            prior_schedule_version = int((prior or {}).get("schedule_version") or 0)
+            same_schedule = prior_schedule_version == PROPRIETARY_SCHEDULE_VERSION
+            prior_scheduled_probes = int((prior or {}).get("scheduled_probe_count") or 0)
             base = {
                 "condition_id": cid, "status": "watching", "decision": "pending", "outcome_index": -1,
                 "evidence_score": 0, "stake_usdc": 0.0, "realized_pnl": 0.0,
@@ -1118,7 +1132,12 @@ class AiRiskService:
                 "end_date": market.get("end_date"), "created_at": int((prior or {}).get("created_at") or now_ts),
                 "updated_at": now_ts,
                 "probe_count": int((prior or {}).get("probe_count") or 0),
-                "scheduled_probe_count": int((prior or {}).get("scheduled_probe_count") or 0),
+                "scheduled_probe_count": prior_scheduled_probes if same_schedule else 0,
+                "scheduled_probe_limit": PROPRIETARY_SCHEDULED_PROBE_LIMIT,
+                "legacy_scheduled_probe_count": (
+                    int((prior or {}).get("legacy_scheduled_probe_count") or 0)
+                    + (prior_scheduled_probes if prior_schedule_version and not same_schedule else 0)
+                ),
                 "signal_probe_at": int((prior or {}).get("signal_probe_at") or 0),
                 "schedule_version": PROPRIETARY_SCHEDULE_VERSION,
                 "liquidity_qualified": bool((prior or {}).get("liquidity_qualified")),
@@ -1269,13 +1288,25 @@ class AiRiskService:
                     "evidence_score": evidence_score, "assessment": {
                         key: assessment.get(key) for key in ("verdict", "team_a_win_probability", "team_b_win_probability", "confidence", "reason_zh", "model", "prompt_version")
                     },
+                    "required_evidence_score": PROPRIETARY_MIN_EVIDENCE_SCORE,
+                    "required_win_probability": WIN_PROBABILITY_THRESHOLD,
+                    "required_confidence": CONFIDENCE_THRESHOLD,
                 }
                 if assessment.get("status") != "ok":
                     record_retry_or_skip("assessment_unavailable")
                     stats["errors"] += 1
                     continue
-                if evidence_score < PROPRIETARY_MIN_EVIDENCE_SCORE or verdict not in {"team_a", "team_b"} or probability < WIN_PROBABILITY_THRESHOLD or confidence < CONFIDENCE_THRESHOLD:
-                    self.follow_store.save_ai_proprietary_position(terminal)
+                rejection = None
+                if evidence_score < PROPRIETARY_MIN_EVIDENCE_SCORE:
+                    rejection = "evidence_insufficient"
+                elif verdict not in {"team_a", "team_b"}:
+                    rejection = "assessment_insufficient"
+                elif probability < WIN_PROBABILITY_THRESHOLD:
+                    rejection = "probability_insufficient"
+                elif confidence < CONFIDENCE_THRESHOLD:
+                    rejection = "confidence_insufficient"
+                if rejection:
+                    self.follow_store.save_ai_proprietary_position({**terminal, "decision": rejection})
                     stats["skipped"] += 1
                     continue
                 predicted_index = 0 if verdict == "team_a" else 1

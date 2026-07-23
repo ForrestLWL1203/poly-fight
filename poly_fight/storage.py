@@ -10,7 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .follow_strategy import ACTIVE_FOLLOW_STRATEGY_ID, normalize_follow_strategy, validate_follow_strategy
+from .follow_strategy import (
+    ACTIVE_FOLLOW_STRATEGY_ID,
+    normalize_follow_game_settings,
+    normalize_follow_strategy,
+    validate_follow_strategy,
+)
 
 class _AutoCloseConnection(sqlite3.Connection):
     """`with self.connect() as conn:` 退出时提交/回滚后**关闭连接**。
@@ -824,6 +829,11 @@ class FollowStore:
                     updated_at INTEGER NOT NULL,
                     raw_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS follow_game_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    updated_at INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS follow_strategy_library (
                     slug TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -1364,6 +1374,50 @@ class FollowStore:
             return normalize_follow_strategy(None)
         try:
             return self.load_follow_strategy(readonly)
+        finally:
+            readonly.close()
+
+    def save_follow_game_settings(self, settings: dict[str, Any], *, ts: int | None = None) -> dict[str, Any]:
+        self.init_db()
+        updated_at = int(ts or time.time())
+        normalized = normalize_follow_game_settings(settings, updated_at=updated_at)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO follow_game_settings(id, updated_at, raw_json)
+                VALUES (1, ?, ?)
+                """,
+                (updated_at, _dumps(normalized)),
+            )
+        return normalized
+
+    def load_follow_game_settings(self, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+        def read_from(active: sqlite3.Connection) -> dict[str, Any]:
+            try:
+                if "follow_game_settings" not in _table_names(active):
+                    return normalize_follow_game_settings(None)
+                row = active.execute(
+                    "SELECT raw_json FROM follow_game_settings WHERE id = 1"
+                ).fetchone()
+            except sqlite3.Error:
+                return normalize_follow_game_settings(None)
+            if not row:
+                return normalize_follow_game_settings(None)
+            payload = _loads(row["raw_json"], {})
+            return normalize_follow_game_settings(payload if isinstance(payload, dict) else None)
+
+        if conn is not None:
+            return read_from(conn)
+        self.init_db()
+        with self.connect() as active:
+            return read_from(active)
+
+    def load_follow_game_settings_readonly(self) -> dict[str, Any]:
+        readonly = self.connect_readonly()
+        if readonly is None:
+            return normalize_follow_game_settings(None)
+        try:
+            return self.load_follow_game_settings(readonly)
         finally:
             readonly.close()
 

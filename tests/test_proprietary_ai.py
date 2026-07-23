@@ -65,6 +65,33 @@ class UnavailableModel(Model):
         raise RuntimeError("temporary_model_failure")
 
 
+class LowProbabilityModel(Model):
+    def assess(self, prompt, *, model):
+        return ({
+            "status": "decisive", "winner": "team_a", "team_a_score": 63, "team_b_score": 37,
+            "confidence": 82, "supporting_evidence_ids": ["ev1"], "risk_flags": [],
+            "reason_zh": "A队略占优势",
+        }, type("Response", (), {"model_version": model, "usage_metadata": None})(), 3)
+
+
+class LowConfidenceModel(Model):
+    def assess(self, prompt, *, model):
+        return ({
+            "status": "decisive", "winner": "team_a", "team_a_score": 75, "team_b_score": 25,
+            "confidence": 74, "supporting_evidence_ids": ["ev1"], "risk_flags": [],
+            "reason_zh": "A队占优但变数较大",
+        }, type("Response", (), {"model_version": model, "usage_metadata": None})(), 3)
+
+
+class InsufficientModel(Model):
+    def assess(self, prompt, *, model):
+        return ({
+            "status": "insufficient", "winner": None, "team_a_score": 50, "team_b_score": 50,
+            "confidence": 0, "supporting_evidence_ids": [], "risk_flags": [],
+            "reason_zh": "数据冲突",
+        }, type("Response", (), {"model_version": model, "usage_metadata": None})(), 3)
+
+
 class Books:
     def books(self, token_ids):
         return [
@@ -222,7 +249,7 @@ class ProprietaryAiTests(unittest.TestCase):
 
             service.scan_proprietary({"c-self": candidate}, now_ts=TEST_NOW)
             row = store.load_ai_proprietary_positions()[0]
-            self.assertEqual(row["schedule_version"], 3)
+            self.assertEqual(row["schedule_version"], 4)
             self.assertEqual(row["status"], "open")
             service.close()
 
@@ -285,7 +312,54 @@ class ProprietaryAiTests(unittest.TestCase):
             self.assertEqual(row["decision"], "cold_market")
             self.assertEqual(row["cold_reason"], "volume_insufficient")
             self.assertEqual(row["probe_count"], 7)
+            self.assertEqual(row["scheduled_probe_count"], 7)
+            self.assertEqual(row["scheduled_probe_limit"], 7)
             service.close()
+
+    def test_schedule_migration_resets_current_probe_counter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = FollowStore(root / "follow" / "follow.db")
+            service = AiRiskService(root, store, client_factory=Model, evidence_factory=Evidence, orderbook_client=Books())
+            service.config.save_credential(envelope(service.config, "deepseek-test"))
+            service.config.save_settings(enabled=True)
+            start = TEST_NOW + 3 * 3600
+            candidate = market(start_ts=start, volume=0)
+            store.save_ai_proprietary_position({
+                "condition_id": "c-self", "status": "watching", "decision": "volume_insufficient",
+                "schedule_version": 3, "scheduled_probe_count": 8, "probe_count": 8,
+                "match_start_time": candidate["match_start_time"], "next_retry_at": 0,
+                "created_at": TEST_NOW - 3600, "updated_at": TEST_NOW - 300,
+            })
+
+            service.scan_proprietary({"c-self": candidate}, now_ts=TEST_NOW)
+            row = store.load_ai_proprietary_positions()[0]
+            self.assertEqual(row["schedule_version"], 4)
+            self.assertEqual(row["scheduled_probe_count"], 1)
+            self.assertEqual(row["scheduled_probe_limit"], 7)
+            self.assertEqual(row["legacy_scheduled_probe_count"], 8)
+            service.close()
+
+    def test_proprietary_rejection_reasons_are_not_all_called_evidence_insufficient(self):
+        cases = (
+            (LowProbabilityModel, "probability_insufficient"),
+            (LowConfidenceModel, "confidence_insufficient"),
+            (InsufficientModel, "assessment_insufficient"),
+        )
+        for model, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = FollowStore(root / "follow" / "follow.db")
+                service = AiRiskService(root, store, client_factory=model, evidence_factory=Evidence, orderbook_client=Books())
+                service.config.save_credential(envelope(service.config, "deepseek-test"))
+                service.config.save_settings(enabled=True)
+                service.scan_proprietary({"c-self": market()}, now_ts=TEST_NOW)
+                row = store.load_ai_proprietary_positions()[0]
+                self.assertEqual(row["decision"], expected)
+                self.assertEqual(row["required_evidence_score"], 80)
+                self.assertEqual(row["required_win_probability"], 65)
+                self.assertEqual(row["required_confidence"], 75)
+                service.close()
 
     def test_model_retry_waits_for_next_scheduled_liquidity_probe(self):
         with tempfile.TemporaryDirectory() as tmp:

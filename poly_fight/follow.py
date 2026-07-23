@@ -655,6 +655,7 @@ def process_follow_trades(
     eligible_buckets: set[str] | None = None,
     eligible_category: str | None = None,
     eligible_leagues: set[str] | None = None,
+    enabled_game_families: set[str] | None = None,
     conflict_policy: str = "block_opposite",
     bankroll_usdc: float = float("inf"),
     max_stake_usdc: float = 0.0,
@@ -677,6 +678,7 @@ def process_follow_trades(
         "hedge_event_count": 0,
         "ignored_trade_count": 0,
         "market_type_not_eligible_count": 0,
+        "game_disabled_count": 0,
         "league_not_eligible_count": 0,
         "opposite_blocked_count": 0,
         "low_entry_price_blocked_count": 0,
@@ -762,6 +764,19 @@ def process_follow_trades(
             continue
 
         if side != "BUY":
+            stats["ignored_trade_count"] += 1
+            continue
+
+        market_game = str(market.get("game_family") or market.get("league") or "").strip().lower()
+        if enabled_game_families is not None and market_game and market_game not in enabled_game_families:
+            # The switch only blocks new exposure. SELL was handled above so an
+            # existing position can still exit and settle normally.
+            cache_key = f"{wallet}|{condition_id}|{outcome_index}"
+            if pending_small_buys is not None:
+                pending_small_buys.pop(cache_key, None)
+            if held_pending_price is not None:
+                held_pending_price.pop(cache_key, None)
+            stats["game_disabled_count"] += 1
             stats["ignored_trade_count"] += 1
             continue
 

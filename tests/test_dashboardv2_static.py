@@ -83,6 +83,13 @@ class DashboardV2StaticTests(unittest.TestCase):
         initial_load = app.split("const load = React.useCallback", 1)[1].split("const ensureWrap", 1)[0]
         self.assertNotIn("Api.aiWrapKey", initial_load)
 
+    def test_self_shadow_reasons_and_probe_count_are_unambiguous(self):
+        app = _read("app.jsx")
+        for token in ("优势不足", "置信度不足", "研判不明确", "含旧调度"):
+            self.assertIn(token, app)
+        self.assertNotIn("`第 ${row.scheduled_probe_count}/7 次流动性探测`", app)
+        self.assertIn("scheduled_probe_limit", app)
+
     def test_follow_ai_badge_only_shows_decision_action(self):
         app = _read("app.jsx")
         badge = app.split("function AiDecisionBadge", 1)[1].split("function MatchCell", 1)[0]
@@ -122,9 +129,21 @@ class DashboardV2StaticTests(unittest.TestCase):
         for ep in ("/api/login", "/api/overview", "/api/wallets", "/api/events",
                    "/api/follows", "/api/follow-strategy", "/api/runner/start",
                    "/api/runner/stop", "/api/wallet-favorites", "/api/wallet-quarantine",
+                   "/api/follow-game-settings",
                    "/api/ai-risk", "/api/ai-risk/wrap-key", "/api/ai-risk/credential",
                    "/api/ai-risk/settings", "/api/stream"):
             self.assertIn(ep, api, f"api.js missing endpoint {ep}")
+
+    def test_strategy_has_hot_game_switches_and_valorant_filters(self):
+        app = _read("app.jsx")
+        css = _read("app.css")
+        mock = _read("mock.js")
+        for token in ("function FollowGameScope", "跟单项目", "LoL", "CS2", "Dota2", "Valorant"):
+            self.assertIn(token, app)
+        self.assertIn('value="valorant"', app)
+        self.assertIn(".follow-game-scope", css)
+        self.assertIn("saveFollowGameSettings", mock)
+        self.assertIn("valorant_main", mock)
 
     def test_mock_mode_available(self):
         self.assertIn("window.PSMock", _read("mock.js"))

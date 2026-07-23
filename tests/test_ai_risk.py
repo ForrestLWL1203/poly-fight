@@ -190,6 +190,8 @@ class AiRiskTests(unittest.TestCase):
         self.assertNotIn("top_p", captured)
         self.assertNotIn("top_k", captured)
         self.assertIn("json", captured["messages"][0]["content"].lower())
+        self.assertIn("0-100", captured["messages"][0]["content"])
+        self.assertIn("0.7", captured["messages"][0]["content"])
         canonical = validate_assessment_output(parsed, valid_evidence_ids=set())
         self.assertEqual(canonical["verdict"], "insufficient")
         self.assertEqual(canonical["team_a_win_probability"], 50)
@@ -279,6 +281,15 @@ class AiRiskTests(unittest.TestCase):
         self.assertEqual(assessment_direction(weak, {
             "win_probability_threshold": 65, "confidence_threshold": 75,
         }), "insufficient")
+
+    def test_fractional_confidence_and_scalar_lists_are_normalized(self):
+        parsed = validate_assessment_output({
+            "s": "d", "w": "a", "a": 70, "b": 30, "c": .8,
+            "e": "ev1", "f": "roster_change", "r": "A队近期表现更稳",
+        }, valid_evidence_ids={"ev1"})
+        self.assertEqual(parsed["confidence"], 80)
+        self.assertEqual(parsed["supporting_evidence_ids"], ["ev1"])
+        self.assertEqual(parsed["risk_flags"], ["roster_change"])
 
     def test_envelope_round_trip_and_reset_independent_location(self):
         with tempfile.TemporaryDirectory() as tmp:

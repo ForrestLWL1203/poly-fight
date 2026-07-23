@@ -182,12 +182,13 @@ MATERIAL_TWO_SIDED_MIN_MINORITY_FRAC = 0.20
 MAIN_MATCH = "main_match"
 GAME_WINNER = "game_winner"
 MAP_WINNER = "map_winner"
-ALLOWED_GAME_FAMILIES = {"cs2", "dota2", "lol"}
+ALLOWED_GAME_FAMILIES = {"cs2", "dota2", "lol", "valorant"}
 ESPORTS_CATEGORY_TAGS = {
     "dota-2",
     "counter-strike-2",
     "cs2",
     "league-of-legends",
+    "valorant",
 }
 SPORTS_LEAGUE_TAGS = {
     "nba": "nba",
@@ -206,9 +207,11 @@ ESPORTS_DISCOVERY_GAME_MARKET_TYPE_LIMITS = {
     "lol:main_match": 100,
     "cs2:main_match": 100,
     "dota2:main_match": 100,
+    "valorant:main_match": 100,
     "lol:game_winner": 50,
     "dota2:game_winner": 50,
     "cs2:map_winner": 50,
+    "valorant:map_winner": 50,
 }
 MARKET_TYPE_ORDER = {
     MAIN_MATCH: 0,
@@ -219,7 +222,6 @@ GAME_FAMILY_LABELS = {
     "cs2": "CS2",
     "dota2": "Dota2",
     "lol": "LoL",
-    # 历史跟单展示兼容；不代表恢复 Valorant 的采集、榜单或新跟单范围。
     "valorant": "Valorant",
     # 跨游戏盘口专家:在某盘口上跨游戏合并后达标(per-type 合格),无单一游戏专精桶。
     "multi": "跨游戏",
@@ -333,6 +335,8 @@ def game_family_from_event(event: dict[str, Any]) -> str:
         return "dota2"
     if "league-of-legends" in tags or title.startswith("lol:"):
         return "lol"
+    if "valorant" in tags or title.startswith("valorant:"):
+        return "valorant"
     return "other"
 
 
@@ -349,7 +353,7 @@ def is_settled_binary_prices(prices: list[float]) -> bool:
 
 def is_main_match_title(title: str) -> bool:
     text = title.lower()
-    has_game_prefix = text.startswith(("dota 2:", "counter-strike:", "lol:"))
+    has_game_prefix = text.startswith(("dota 2:", "counter-strike:", "lol:", "valorant:"))
     if has_game_prefix and " vs " in text:
         return True
     return " vs " in text and any(
@@ -507,9 +511,9 @@ def classify_market_type(event: dict[str, Any], market: dict[str, Any]) -> str |
         and not re.search(r"\b(game|map)\s+[1-5]\b", question_norm)
     ):
         return MAIN_MATCH
-    if game_family in {"dota2", "lol"} and is_numbered_winner_question(question_norm, "game"):
+    if game_family in {"dota2", "lol", "valorant"} and is_numbered_winner_question(question_norm, "game"):
         return GAME_WINNER
-    if game_family == "cs2" and is_numbered_winner_question(question_norm, "map"):
+    if game_family in {"cs2", "valorant"} and is_numbered_winner_question(question_norm, "map"):
         return MAP_WINNER
     return None
 

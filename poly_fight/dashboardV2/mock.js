@@ -37,6 +37,15 @@
       match_start_time: iso(-20), end_date: iso(-16),
       outcomes: ["T1", "Gen.G"], outcome_prices: [0.48, 0.52],
     },
+    valorant_main: {
+      condition_id: "0xmockvalorantsenfnc0004",
+      title: "Valorant: Sentinels vs Fnatic (BO3) - VCT Masters",
+      match_parts: { game: "Valorant", teamA: "Sentinels", teamB: "Fnatic", meta: "(BO3) VCT Masters" },
+      team_logos: { teamA: "", teamB: "" },
+      market_type: "main_match", market_type_label: "主盘",
+      match_start_time: iso(8), end_date: iso(12),
+      outcomes: ["Sentinels", "Fnatic"], outcome_prices: [0.54, 0.46],
+    },
   };
 
   /* ---- overview ---- */
@@ -138,6 +147,7 @@
       mkEvent(M.cs2_main, { open_signal_count: 5, signal_count: 5, side_counts: { PARIVISION: 4, Monte: 1 } }),
       mkEvent(M.dota_main, { open_signal_count: 2, signal_count: 2, side_counts: { "Team Spirit": 2 } }),
       mkEvent({ ...M.lol_main, match_start_time: iso(6), end_date: iso(10) }, { side_counts: {} }),
+      mkEvent(M.valorant_main, { side_counts: {} }),
       // 延期盘:原定结束已过、仍未结算(Polymarket 改期未更新档期)→ 应显示「延期中 / 原定截止」
       mkEvent({ ...M.dota_main, condition_id: "0xmockdelayed0001", match_start_time: iso(-30), end_date: iso(-6) }, { open_signal_count: 1, signal_count: 1, side_counts: { "Team Spirit": 1 } }),
     ],
@@ -258,6 +268,17 @@
     prefilters: { min_target_wallet_order_cash_usdc: 10, max_follow_entry_price: 0.85 },
     balance: { required: true, usable_balance_usdc: 5000 },
   };
+  let followGameSettings = {
+    games: { lol: true, cs2: true, dota2: true, valorant: true },
+    updated_at: ago(60),
+  };
+  function saveFollowGameSettings(games) {
+    followGameSettings = {
+      games: Object.assign({}, followGameSettings.games, games || {}),
+      updated_at: Math.floor(Date.now() / 1000),
+    };
+    return followGameSettings;
+  }
   /* ---- named strategy library (stateful: create/update/activate/delete) ---- */
   const mkStrat = (over) => Object.assign({
     configured: true, schema_version: 2, updated_at: ago(600),
@@ -380,6 +401,8 @@
     followDetail,
     walletFollows,
     followStrategy: () => strategy,
+    followGameSettings: () => followGameSettings,
+    saveFollowGameSettings,
     strategies: listStrategies,
     createStrategy,
     updateStrategy,

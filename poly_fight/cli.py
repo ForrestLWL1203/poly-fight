@@ -95,7 +95,7 @@ from .follow import (
     VOID_REDEMPTION_PRICE,
     VOID_RESOLUTION_INDEX,
 )
-from .follow_strategy import strategy_from_legacy_args, strategy_summary, validate_follow_strategy
+from .follow_strategy import enabled_follow_games, strategy_from_legacy_args, strategy_summary, validate_follow_strategy
 from .onchain import (
     OnchainFollowCollector,
     build_asset_map,
@@ -317,7 +317,7 @@ def build_client(args: argparse.Namespace) -> PolymarketClient:
 
 DATA_DIR = Path("data")
 CATEGORY_TAG_SLUGS = {
-    "esports": ("counter-strike-2", "league-of-legends", "dota-2"),
+    "esports": ("counter-strike-2", "league-of-legends", "dota-2", "valorant"),
 }
 # 每 scope(game_family)的 Gamma tag slug。校准器(及 P2 的 per-game 窗口/发现)按此逐游戏拉取。
 # 加新游戏时在此登记，分类白名单仍是独立的安全边界。
@@ -325,6 +325,7 @@ ESPORTS_GAME_TAGS = {
     "cs2": "counter-strike-2",
     "lol": "league-of-legends",
     "dota2": "dota-2",
+    "valorant": "valorant",
 }
 FOLLOW_SIGNAL_CATEGORIES = ("esports",)
 COLLECTOR_NAME = "wallet_collector"
@@ -420,6 +421,8 @@ COLLECTOR_BUCKETS = (
     ("dota2", GAME_WINNER),
     ("cs2", MAIN_MATCH),
     ("cs2", MAP_WINNER),
+    ("valorant", MAIN_MATCH),
+    ("valorant", MAP_WINNER),
 )
 ESPORTS_DEFAULT_CLASSIFICATION_LOOKBACK_DAYS = 60
 ESPORTS_DEFAULT_MIN_PROFILE_PARTICIPATED_MARKETS = 6
@@ -427,7 +430,10 @@ ESPORTS_DEFAULT_LEADERBOARD_MIN_PARTICIPATED_MARKETS = 6
 ESPORTS_DEFAULT_TARGET_MARKETS = sum(
     limit for key, limit in ESPORTS_DISCOVERY_GAME_MARKET_TYPE_LIMITS.items() if key.endswith(":main_match")
 )
-ESPORTS_DEFAULT_SUBMARKET_TARGET_MARKETS = 150
+ESPORTS_DEFAULT_SUBMARKET_TARGET_MARKETS = sum(
+    limit for key, limit in ESPORTS_DISCOVERY_GAME_MARKET_TYPE_LIMITS.items()
+    if not key.endswith(":main_match")
+)
 ESPORTS_DEFAULT_GAME_WINNER_TARGET_MARKETS = sum(
     limit for key, limit in ESPORTS_DISCOVERY_GAME_MARKET_TYPE_LIMITS.items() if key.endswith(":game_winner")
 )
@@ -435,7 +441,7 @@ ESPORTS_DEFAULT_MAP_WINNER_TARGET_MARKETS = sum(
     limit for key, limit in ESPORTS_DISCOVERY_GAME_MARKET_TYPE_LIMITS.items() if key.endswith(":map_winner")
 )
 ESPORTS_DEFAULT_MAX_MARKETS_PER_RUN = ESPORTS_DEFAULT_TARGET_MARKETS
-ESPORTS_DEFAULT_SUBMARKET_MAX_MARKETS_PER_RUN = 150
+ESPORTS_DEFAULT_SUBMARKET_MAX_MARKETS_PER_RUN = ESPORTS_DEFAULT_SUBMARKET_TARGET_MARKETS
 ESPORTS_DEFAULT_GAME_WINNER_MAX_MARKETS_PER_RUN = ESPORTS_DEFAULT_GAME_WINNER_TARGET_MARKETS
 ESPORTS_DEFAULT_MAP_WINNER_MAX_MARKETS_PER_RUN = ESPORTS_DEFAULT_MAP_WINNER_TARGET_MARKETS
 ESPORTS_DEFAULT_CANDIDATE_WALLETS_PER_MARKET_TYPE = 1_000
@@ -7375,6 +7381,7 @@ def command_follow(
     stake_below_minimum_count = 0
     condition_order_cap_blocked_count = 0
     condition_stake_cap_blocked_count = 0
+    game_disabled_count = 0
     wallet_fetch_error_count = 0
     wallet_fetch_seconds: list[float] = []
     observed_delay_values: list[int] = []
@@ -7388,6 +7395,8 @@ def command_follow(
         max_signal_stake_usdc = round(bankroll_usdc * max_signal_stake_balance_percent / 100.0, 8)
     strategy_source = str(getattr(args, "strategy_source", "auto") or "auto").lower()
     db_strategy = store.load_follow_strategy() if strategy_source in {"auto", "db"} else {"configured": False}
+    follow_game_settings = store.load_follow_game_settings()
+    enabled_game_families = enabled_follow_games(follow_game_settings)
     follow_strategy = None
     legacy_follow_strategy = None
     strategy_loaded_from = "legacy"
@@ -7466,6 +7475,7 @@ def command_follow(
                     eligible_buckets=eligible_buckets_by_wallet.get(scope_key),
                     eligible_category=category,
                     eligible_leagues=eligible_leagues_by_wallet.get(scope_key),
+                    enabled_game_families=enabled_game_families,
                     conflict_policy="block_opposite",
                     bankroll_usdc=bankroll_usdc,
                     max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
@@ -7671,6 +7681,7 @@ def command_follow(
                 eligible_buckets=eligible_buckets_by_wallet.get(scope_key) if wallet_can_open_new else None,
                 eligible_category=category if wallet_can_open_new else None,
                 eligible_leagues=eligible_leagues_by_wallet.get(scope_key) if wallet_can_open_new else None,
+                enabled_game_families=enabled_game_families,
                 conflict_policy="block_opposite",
                 bankroll_usdc=bankroll_usdc,
                 max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
@@ -7700,6 +7711,7 @@ def command_follow(
             stake_below_minimum_count += stats.get("stake_below_minimum_count", 0)
             condition_order_cap_blocked_count += stats.get("condition_order_cap_blocked_count", 0)
             condition_stake_cap_blocked_count += stats.get("condition_stake_cap_blocked_count", 0)
+            game_disabled_count += stats.get("game_disabled_count", 0)
             exited_signal_count += stats.get("exited_signal_count", 0)
             hedge_event_count += stats.get("hedge_event_count", 0)
             opposite_blocked_count += stats.get("opposite_blocked_count", 0)
@@ -7810,6 +7822,7 @@ def command_follow(
                 eligible_buckets=eligible_buckets_by_wallet.get(scope_key_h),
                 eligible_category=category_h,
                 eligible_leagues=eligible_leagues_by_wallet.get(scope_key_h),
+                enabled_game_families=enabled_game_families,
                 conflict_policy="block_opposite",
                 bankroll_usdc=bankroll_usdc,
                 max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
@@ -7863,6 +7876,7 @@ def command_follow(
                 max_stake_usdc=getattr(args, "max_stake_usdc", 0.0),
                 max_signal_stake_usdc=max_signal_stake_usdc,
                 follow_strategy=follow_strategy,
+                enabled_game_families=enabled_game_families,
                 held_pending_price=held_pending_price,
                 stop_loss_blocked=stop_loss_blocked,
                 ai_risk_handler=ai_risk_service,
@@ -8068,6 +8082,8 @@ def command_follow(
         "stake_below_minimum_count": stake_below_minimum_count,
         "condition_order_cap_blocked_count": condition_order_cap_blocked_count,
         "condition_stake_cap_blocked_count": condition_stake_cap_blocked_count,
+        "game_disabled_count": game_disabled_count,
+        "enabled_game_families": sorted(enabled_game_families),
         "max_signal_stake_usdc": max_signal_stake_usdc,
         "max_signal_stake_balance_percent": max_signal_stake_balance_percent,
         "opposite_blocked_count": opposite_blocked_count,
