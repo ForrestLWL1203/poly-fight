@@ -393,8 +393,10 @@ class LeaderboardStore:
         profiles: list[dict[str, Any]],
         *,
         category: str,
+        replace: bool = True,
     ) -> None:
-        conn.execute("DELETE FROM wallet_profiles WHERE category = ?", (category,))
+        if replace:
+            conn.execute("DELETE FROM wallet_profiles WHERE category = ?", (category,))
         for row in profiles:
             if not isinstance(row, dict):
                 continue
@@ -448,6 +450,10 @@ class LeaderboardStore:
         profiles: list[dict[str, Any]] | dict[str, dict[str, Any]],
         summary: dict[str, Any] | None,
         updated_at: int,
+        replace_profiles: bool = True,
+        delete_profile_wallets: set[str] | None = None,
+        prune_profiles_before: int | None = None,
+        max_profile_cache_wallets: int | None = None,
     ) -> dict[str, Any]:
         category = str(category or "esports").lower()
         updated_at = int(updated_at or time.time())
@@ -467,7 +473,114 @@ class LeaderboardStore:
         with self.connect() as conn:
             conn.execute("BEGIN")
             self._insert_leaderboard_rows(conn, leaderboard or [], category=category, updated_at=updated_at)
-            self._insert_wallet_profiles(conn, profile_rows, category=category)
+            self._insert_wallet_profiles(
+                conn,
+                profile_rows,
+                category=category,
+                replace=bool(replace_profiles),
+            )
+            deleted_wallets = {
+                str(wallet or "").lower()
+                for wallet in (delete_profile_wallets or set())
+                if str(wallet or "").strip()
+            }
+            explicit_delete_before = conn.total_changes
+            for offset in range(0, len(deleted_wallets), 500):
+                chunk = sorted(deleted_wallets)[offset : offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                conn.execute(
+                    f"DELETE FROM wallet_profiles WHERE category = ? AND wallet IN ({placeholders})",
+                    (category, *chunk),
+                )
+            explicit_delete_count = conn.total_changes - explicit_delete_before
+            age_prune_before = conn.total_changes
+            if prune_profiles_before is not None:
+                keep_wallets = {
+                    str(row.get("wallet") or "").lower()
+                    for row in (leaderboard or [])
+                    if isinstance(row, dict) and str(row.get("wallet") or "").strip()
+                }
+                params: list[Any] = [category, int(prune_profiles_before), int(prune_profiles_before)]
+                keep_clause = ""
+                if keep_wallets:
+                    keep = sorted(keep_wallets)
+                    keep_clause = f" AND wallet NOT IN ({','.join('?' for _ in keep)})"
+                    params.extend(keep)
+                conn.execute(
+                    """
+                    DELETE FROM wallet_profiles
+                    WHERE category = ?
+                      AND COALESCE(last_trade_at, 0) < ?
+                      AND COALESCE(profiled_at, 0) < ?
+                    """
+                    + keep_clause,
+                    tuple(params),
+                )
+            age_prune_count = conn.total_changes - age_prune_before
+            cap_prune_count = 0
+            cache_limit = int(max_profile_cache_wallets or 0)
+            if cache_limit > 0:
+                count_row = conn.execute(
+                    "SELECT COUNT(*) AS count FROM wallet_profiles WHERE category = ?",
+                    (category,),
+                ).fetchone()
+                excess = max(0, int(count_row["count"] or 0) - cache_limit)
+                if excess:
+                    # Rolling cache: keep current leaderboard rows unconditionally,
+                    # then prefer qualified and recently active/profiled rows.
+                    keep_wallets = {
+                        str(row.get("wallet") or "").lower()
+                        for row in (leaderboard or [])
+                        if isinstance(row, dict) and str(row.get("wallet") or "").strip()
+                    }
+                    params: list[Any] = [category]
+                    keep_clause = ""
+                    if keep_wallets:
+                        keep = sorted(keep_wallets)
+                        keep_clause = f" AND wallet NOT IN ({','.join('?' for _ in keep)})"
+                        params.extend(keep)
+                    params.append(excess)
+                    cap_wallet_rows = conn.execute(
+                        """
+                        SELECT wallet
+                        FROM wallet_profiles
+                        WHERE category = ?
+                        """
+                        + keep_clause
+                        + """
+                        ORDER BY
+                            CASE WHEN UPPER(COALESCE(grade, '')) = 'A' THEN 1 ELSE 0 END,
+                            MAX(COALESCE(last_trade_at, 0), COALESCE(profiled_at, 0)),
+                            wallet
+                        LIMIT ?
+                        """,
+                        tuple(params),
+                    ).fetchall()
+                    cap_wallets = [str(row["wallet"] or "").lower() for row in cap_wallet_rows if row["wallet"]]
+                    cap_prune_before = conn.total_changes
+                    for offset in range(0, len(cap_wallets), 500):
+                        chunk = cap_wallets[offset : offset + 500]
+                        placeholders = ",".join("?" for _ in chunk)
+                        conn.execute(
+                            f"DELETE FROM wallet_profiles WHERE category = ? AND wallet IN ({placeholders})",
+                            (category, *chunk),
+                        )
+                    cap_prune_count = conn.total_changes - cap_prune_before
+            profile_cache_count_row = conn.execute(
+                "SELECT COUNT(*) AS count FROM wallet_profiles WHERE category = ?",
+                (category,),
+            ).fetchone()
+            summary_payload["profile_cache_wallet_count"] = (
+                int(profile_cache_count_row["count"] or 0) if profile_cache_count_row else 0
+            )
+            summary_payload["profile_upsert_count"] = len(profile_rows)
+            summary_payload["profile_delete_count"] = (
+                explicit_delete_count + age_prune_count + cap_prune_count
+            )
+            summary_payload["profile_explicit_delete_count"] = explicit_delete_count
+            summary_payload["profile_age_prune_count"] = age_prune_count
+            summary_payload["profile_cap_prune_count"] = cap_prune_count
+            summary_payload["max_profile_cache_wallets"] = cache_limit
             conn.execute(
                 """
                 INSERT OR REPLACE INTO collection_runs(
@@ -499,6 +612,103 @@ class LeaderboardStore:
             )
             conn.execute("COMMIT")
         return summary_payload
+
+    def prune_wallet_profiles(
+        self,
+        *,
+        category: str,
+        prune_profiles_before: int | None = None,
+        max_profile_cache_wallets: int | None = None,
+    ) -> dict[str, int]:
+        """Roll the on-disk profile cache without hydrating raw profile JSON."""
+        category = str(category or "esports").lower()
+        cache_limit = int(max_profile_cache_wallets or 0)
+        self.init_db()
+        with self.connect() as conn:
+            conn.execute("BEGIN")
+            before_row = conn.execute(
+                "SELECT COUNT(*) AS count FROM wallet_profiles WHERE category = ?",
+                (category,),
+            ).fetchone()
+            before_count = int(before_row["count"] or 0) if before_row else 0
+            age_before = conn.total_changes
+            if prune_profiles_before is not None:
+                conn.execute(
+                    """
+                    DELETE FROM wallet_profiles
+                    WHERE category = ?
+                      AND COALESCE(last_trade_at, 0) < ?
+                      AND COALESCE(profiled_at, 0) < ?
+                      AND wallet NOT IN (
+                          SELECT wallet
+                          FROM leaderboard_wallets
+                          WHERE category = ?
+                      )
+                    """,
+                    (
+                        category,
+                        int(prune_profiles_before),
+                        int(prune_profiles_before),
+                        category,
+                    ),
+                )
+            age_prune_count = conn.total_changes - age_before
+            count_row = conn.execute(
+                "SELECT COUNT(*) AS count FROM wallet_profiles WHERE category = ?",
+                (category,),
+            ).fetchone()
+            after_age_count = int(count_row["count"] or 0) if count_row else 0
+            excess = max(0, after_age_count - cache_limit) if cache_limit > 0 else 0
+            cap_prune_count = 0
+            if excess:
+                cap_wallet_rows = conn.execute(
+                    """
+                    SELECT profile.wallet
+                    FROM wallet_profiles AS profile
+                    WHERE profile.category = ?
+                      AND profile.wallet NOT IN (
+                          SELECT wallet
+                          FROM leaderboard_wallets
+                          WHERE category = ?
+                      )
+                    ORDER BY
+                        CASE WHEN UPPER(COALESCE(profile.grade, '')) = 'A' THEN 1 ELSE 0 END,
+                        MAX(
+                            COALESCE(profile.last_trade_at, 0),
+                            COALESCE(profile.profiled_at, 0)
+                        ),
+                        profile.wallet
+                    LIMIT ?
+                    """,
+                    (category, category, excess),
+                ).fetchall()
+                cap_wallets = [
+                    str(row["wallet"] or "").lower()
+                    for row in cap_wallet_rows
+                    if row["wallet"]
+                ]
+                cap_before = conn.total_changes
+                for offset in range(0, len(cap_wallets), 500):
+                    chunk = cap_wallets[offset : offset + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    conn.execute(
+                        f"DELETE FROM wallet_profiles WHERE category = ? AND wallet IN ({placeholders})",
+                        (category, *chunk),
+                    )
+                cap_prune_count = conn.total_changes - cap_before
+            after_row = conn.execute(
+                "SELECT COUNT(*) AS count FROM wallet_profiles WHERE category = ?",
+                (category,),
+            ).fetchone()
+            after_count = int(after_row["count"] or 0) if after_row else 0
+            conn.execute("COMMIT")
+        return {
+            "before": before_count,
+            "after": after_count,
+            "age_pruned": age_prune_count,
+            "cap_pruned": cap_prune_count,
+            "max_profile_cache_wallets": cache_limit,
+        }
 
     def load_observe_analyzed(self, *, now_ts: int, retain_days: int = 7) -> dict[str, int]:
         """M4 已分析结算盘 condition_id → analyzed_at(只返回 retain_days 内的;只读)。"""
@@ -564,22 +774,142 @@ class LeaderboardStore:
         finally:
             conn.close()
 
-    def load_wallet_profiles(self, *, category: str | None = None) -> list[dict[str, Any]]:
+    def load_wallet_profile_summaries(
+        self,
+        *,
+        category: str,
+        wallets: set[str] | list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Load the cheap profile cache index without deserializing raw_json."""
+        conn = self.connect_readonly()
+        if conn is None:
+            return {}
+        category = str(category or "esports").lower()
+        wallet_values = sorted({
+            str(wallet or "").lower()
+            for wallet in (wallets or [])
+            if str(wallet or "").strip()
+        })
+        try:
+            if "wallet_profiles" not in _table_names(conn):
+                return {}
+            rows: list[sqlite3.Row] = []
+            if wallet_values:
+                for offset in range(0, len(wallet_values), 500):
+                    chunk = wallet_values[offset : offset + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows.extend(
+                        conn.execute(
+                            f"""
+                            SELECT category, wallet, grade, profile_state, profiled_at,
+                                   scoring_version, last_trade_at, profile_lookback_days,
+                                   json_extract(raw_json, '$.esports_condition_ids')
+                                       AS esports_condition_ids
+                            FROM wallet_profiles
+                            WHERE category = ? AND wallet IN ({placeholders})
+                            """,
+                            (category, *chunk),
+                        ).fetchall()
+                    )
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT category, wallet, grade, profile_state, profiled_at,
+                           scoring_version, last_trade_at, profile_lookback_days,
+                           json_extract(raw_json, '$.esports_condition_ids')
+                               AS esports_condition_ids
+                    FROM wallet_profiles
+                    WHERE category = ?
+                    """,
+                    (category,),
+                ).fetchall()
+            return {
+                str(row["wallet"] or "").lower(): {
+                    "category": str(row["category"] or "").lower(),
+                    "wallet": str(row["wallet"] or "").lower(),
+                    "grade": str(row["grade"] or ""),
+                    "profile_state": str(row["profile_state"] or ""),
+                    "profiled_at": int(row["profiled_at"] or 0),
+                    "scoring_version": int(row["scoring_version"] or 0),
+                    "last_trade_at": int(row["last_trade_at"] or 0),
+                    "last_esports_trade_at": int(row["last_trade_at"] or 0),
+                    "profile_lookback_days": int(row["profile_lookback_days"] or 0),
+                    "esports_condition_ids": _loads(
+                        row["esports_condition_ids"],
+                        [],
+                    ) if row["esports_condition_ids"] else [],
+                }
+                for row in rows
+                if row["wallet"]
+            }
+        except sqlite3.Error:
+            return {}
+        finally:
+            conn.close()
+
+    def load_wallet_profiles(
+        self,
+        *,
+        category: str | None = None,
+        wallets: set[str] | list[str] | tuple[str, ...] | None = None,
+        grades: set[str] | list[str] | tuple[str, ...] | None = None,
+        profiled_at_min: int | None = None,
+    ) -> list[dict[str, Any]]:
         conn = self.connect_readonly()
         if conn is None:
             return []
         try:
             if "wallet_profiles" not in _table_names(conn):
                 return []
-            params: tuple[Any, ...] = ()
-            where = ""
+            clauses: list[str] = []
+            params: list[Any] = []
             if category:
-                where = "WHERE category = ?"
-                params = (str(category).lower(),)
-            rows = conn.execute(
-                f"SELECT category, wallet, raw_json FROM wallet_profiles {where} ORDER BY category, wallet",
-                params,
-            ).fetchall()
+                clauses.append("category = ?")
+                params.append(str(category).lower())
+            grade_values = sorted({
+                str(grade or "").upper()
+                for grade in (grades or [])
+                if str(grade or "").strip()
+            })
+            if grade_values:
+                clauses.append(f"UPPER(grade) IN ({','.join('?' for _ in grade_values)})")
+                params.extend(grade_values)
+            if profiled_at_min is not None:
+                clauses.append("COALESCE(profiled_at, 0) >= ?")
+                params.append(int(profiled_at_min))
+            wallet_values = sorted({
+                str(wallet or "").lower()
+                for wallet in (wallets or [])
+                if str(wallet or "").strip()
+            })
+            rows: list[sqlite3.Row] = []
+            if wallet_values:
+                for offset in range(0, len(wallet_values), 500):
+                    chunk = wallet_values[offset : offset + 500]
+                    wallet_clause = f"wallet IN ({','.join('?' for _ in chunk)})"
+                    where = "WHERE " + " AND ".join([*clauses, wallet_clause])
+                    rows.extend(
+                        conn.execute(
+                            f"""
+                            SELECT category, wallet, raw_json
+                            FROM wallet_profiles
+                            {where}
+                            ORDER BY category, wallet
+                            """,
+                            (*params, *chunk),
+                        ).fetchall()
+                    )
+            else:
+                where = "WHERE " + " AND ".join(clauses) if clauses else ""
+                rows = conn.execute(
+                    f"""
+                    SELECT category, wallet, raw_json
+                    FROM wallet_profiles
+                    {where}
+                    ORDER BY category, wallet
+                    """,
+                    tuple(params),
+                ).fetchall()
             values = []
             for row in rows:
                 payload = _loads(row["raw_json"], {})

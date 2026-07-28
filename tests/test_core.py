@@ -13255,6 +13255,80 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(run["collector"], "wallet_collector")
             self.assertEqual(run["leaderboard_wallet_count"], 1)
 
+    def test_leaderboard_store_incremental_profile_publish_preserves_cache(self):
+        with TemporaryDirectory() as tmp:
+            store = storage_module.LeaderboardStore(Path(tmp) / "leaderboard.db")
+            store.publish_collection(
+                category="esports",
+                leaderboard=[{"wallet": "0xkeep", "grade": "A"}],
+                profiles=[
+                    {
+                        "wallet": "0xkeep",
+                        "grade": "A",
+                        "profile_state": "qualified",
+                        "profiled_at": 200,
+                        "last_trade_at": 200,
+                        "profile_lookback_days": 15,
+                    },
+                    {
+                        "wallet": "0xnegative",
+                        "grade": "B",
+                        "profile_state": "unqualified",
+                        "profiled_at": 200,
+                        "last_trade_at": 200,
+                        "profile_lookback_days": 15,
+                    },
+                ],
+                summary={"collector": "wallet_collector_v2"},
+                updated_at=200,
+            )
+            result = store.publish_collection(
+                category="esports",
+                leaderboard=[{"wallet": "0xnew", "grade": "A"}],
+                profiles=[
+                    {
+                        "wallet": "0xnew",
+                        "grade": "A",
+                        "profile_state": "qualified",
+                        "profiled_at": 300,
+                        "last_trade_at": 300,
+                        "profile_lookback_days": 15,
+                    }
+                ],
+                summary={"collector": "wallet_collector_v2", "source": "observe_live"},
+                updated_at=300,
+                replace_profiles=False,
+                delete_profile_wallets={"0xkeep"},
+            )
+
+            profiles = {
+                row["wallet"]: row
+                for row in store.load_wallet_profiles(category="esports")
+            }
+            self.assertEqual(set(profiles), {"0xnegative", "0xnew"})
+            self.assertEqual(result["profile_cache_wallet_count"], 2)
+            self.assertEqual(result["profile_upsert_count"], 1)
+            summaries = store.load_wallet_profile_summaries(
+                category="esports",
+                wallets={"0xnew"},
+            )
+            self.assertEqual(set(summaries), {"0xnew"})
+            self.assertNotIn("raw_json", summaries["0xnew"])
+            cleanup = store.prune_wallet_profiles(
+                category="esports",
+                max_profile_cache_wallets=1,
+            )
+            self.assertEqual(cleanup["before"], 2)
+            self.assertEqual(cleanup["after"], 1)
+            self.assertEqual(cleanup["cap_pruned"], 1)
+            self.assertEqual(
+                {
+                    row["wallet"]
+                    for row in store.load_wallet_profiles(category="esports")
+                },
+                {"0xnew"},
+            )
+
     def test_dashboard_wallets_use_observed_follow_trade_time(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -14980,8 +15054,12 @@ class CoreTest(unittest.TestCase):
         collector_dir.mkdir(parents=True, exist_ok=True)
         rows = [{"wallet": "0xdrop", "grade": "A"}, {"wallet": "0xkeep", "grade": "A"}]
         rows += [{"wallet": w, "grade": "A"} for w in extra]
-        storage_module.LeaderboardStore(esports_dir / "leaderboard.db").replace_leaderboard(
-            rows, category="esports", updated_at=now,
+        storage_module.LeaderboardStore(esports_dir / "leaderboard.db").publish_collection(
+            category="esports",
+            leaderboard=rows,
+            profiles=rows,
+            summary={"collector": "test_rescore_fixture"},
+            updated_at=now,
         )
         (collector_dir / "collector_v2_wallet_profiles.json").write_text(json.dumps(rows))
         # 已发布榜 JSON:精准删除路径从这里摘人(publish 链路也读它)。
@@ -15158,8 +15236,13 @@ class CoreTest(unittest.TestCase):
             self.assertNotIn("0xdrop", board)
             self.assertIn("0xkeep", board)
             # 打分 profile + 原始交易缓存被删
-            profiles = json.loads((collector_dir / "collector_v2_wallet_profiles.json").read_text())
-            self.assertEqual({normalize_wallet(p.get("wallet")) for p in profiles}, {"0xkeep"})
+            profile_rows = storage_module.LeaderboardStore(
+                esports_dir / "leaderboard.db"
+            ).load_wallet_profiles(category="esports")
+            self.assertEqual(
+                {normalize_wallet(p.get("wallet")) for p in profile_rows},
+                {"0xkeep"},
+            )
             self.assertFalse(drop_cache.exists())
 
     def test_rescore_demote_wallets_spares_favorite(self):
@@ -15261,8 +15344,13 @@ class CoreTest(unittest.TestCase):
             board_rows, _meta = storage_module.LeaderboardStore(esports_dir / "leaderboard.db").load_leaderboard(category="esports")
             self.assertNotIn("0xdrop", {normalize_wallet(r.get("wallet")) for r in board_rows})
             self.assertFalse(bad_cache.exists())
-            profiles = json.loads((collector_dir / "collector_v2_wallet_profiles.json").read_text())
-            self.assertEqual({normalize_wallet(p.get("wallet")) for p in profiles}, {"0xkeep"})
+            profile_rows = storage_module.LeaderboardStore(
+                esports_dir / "leaderboard.db"
+            ).load_wallet_profiles(category="esports")
+            self.assertEqual(
+                {normalize_wallet(p.get("wallet")) for p in profile_rows},
+                {"0xkeep"},
+            )
             q = store.load_wallet_quarantine(category="esports")
             qkeys = {normalize_wallet((info or {}).get("wallet") or k) for k, info in q.items()}
             self.assertNotIn("0xdrop", qkeys)        # 降级隔离行被清

@@ -4674,9 +4674,38 @@ def merge_collector_profiles_published_during_build(
 
 
 def load_collector_existing_profiles(
-    output_dir: Path, data_dir: Path | None = None, *, prefix: str = "collector"
+    output_dir: Path,
+    data_dir: Path | None = None,
+    *,
+    prefix: str = "collector",
+    wallets: set[str] | list[str] | tuple[str, ...] | None = None,
+    grades: set[str] | list[str] | tuple[str, ...] | None = None,
+    profiled_at_min: int | None = None,
 ) -> dict[str, dict[str, Any]]:
-    del data_dir
+    wallet_filter = {
+        normalize_wallet(wallet)
+        for wallet in (wallets or [])
+        if normalize_wallet(wallet)
+    }
+    grade_filter = {
+        str(grade or "").upper()
+        for grade in (grades or [])
+        if str(grade or "").strip()
+    }
+    if data_dir is not None:
+        db_path = leaderboard_db_path(Path(data_dir))
+        if db_path.exists():
+            rows = LeaderboardStore(db_path).load_wallet_profiles(
+                category="esports",
+                wallets=wallet_filter or None,
+                grades=grade_filter or None,
+                profiled_at_min=profiled_at_min,
+            )
+            return {
+                normalize_wallet(row.get("wallet")): row
+                for row in rows
+                if isinstance(row, dict) and normalize_wallet(row.get("wallet"))
+            }
     paths = [
         Path(output_dir) / f"{prefix}_wallet_profiles.json",
         Path(output_dir) / "wallet_profiles.json",
@@ -4687,7 +4716,17 @@ def load_collector_existing_profiles(
             return {
                 normalize_wallet(row.get("wallet")): row
                 for row in rows
-                if isinstance(row, dict) and normalize_wallet(row.get("wallet"))
+                if (
+                    isinstance(row, dict)
+                    and normalize_wallet(row.get("wallet"))
+                    and (not wallet_filter or normalize_wallet(row.get("wallet")) in wallet_filter)
+                    and (not grade_filter or str(row.get("grade") or "").upper() in grade_filter)
+                    and (
+                        profiled_at_min is None
+                        or max(to_int(row.get("profiled_at")), to_int(row.get("observed_at")))
+                        >= int(profiled_at_min)
+                    )
+                )
             }
     return {}
 
@@ -5715,18 +5754,37 @@ def _command_collect_wallets(
         condition_id: str(row.get("game_family") or "unknown")
         for condition_id, row in market_records_by_id.items()
     }
-    existing_profiles = load_collector_existing_profiles(output_dir, resolve_data_dir(args), prefix=prefix)
+    profile_wallet_keys = {
+        normalize_wallet(row.get("wallet"))
+        for row in profile_wallets
+        if normalize_wallet(row.get("wallet"))
+    }
+    # SQLite is the profile cache source of truth. Refresh planning needs only
+    # compact indexed fields plus the condition-id scope, not each raw profile.
+    profile_store = LeaderboardStore(leaderboard_db_path(resolve_data_dir(args)))
+    existing_profile_summaries = profile_store.load_wallet_profile_summaries(
+        category="esports",
+        wallets=profile_wallet_keys,
+    )
+    if not leaderboard_db_path(resolve_data_dir(args)).exists():
+        # Legacy/test fallback before the SQLite profile cache exists.
+        existing_profile_summaries = load_collector_existing_profiles(
+            output_dir,
+            None,
+            prefix=prefix,
+            wallets=profile_wallet_keys,
+        )
     profile_cache_ttl_hours = float(getattr(args, "collector_profile_cache_ttl_hours", 24) or 0)
     profile_refresh = build_collector_profile_refresh_plan(
         profile_wallets,
-        existing_profiles,
+        existing_profile_summaries,
         now_ts=now_ts,
         ttl_seconds=max(0, int(profile_cache_ttl_hours * 3600)),
         max_refresh_profiles=max_profile_wallets,
         profile_condition_ids=condition_ids,
         profile_lookback_days=profile_lookback_days,
     )
-    reused_profiles_by_wallet = profile_refresh["reused_profiles_by_wallet"]
+    reused_profile_wallets = set(profile_refresh["reused_profiles_by_wallet"])
     refresh_profile_wallets = profile_refresh["refresh_plan"]
     skipped_due_budget = profile_refresh["skipped_due_budget"]
 
@@ -5828,17 +5886,33 @@ def _command_collect_wallets(
             run_ordered_io_tasks(refresh_profile_wallets, profile_one, max_workers=getattr(args, "max_workers", 8))
         )
     ]
+    # Refreshed rows must be persisted. Reused negative rows stay in SQLite and
+    # need no hydration; reusable grade-A rows are loaded with the small ranking
+    # pool below.
     profiles_by_wallet = {
         normalize_wallet(row.get("wallet")): row
-        for row in [*reused_profiles_by_wallet.values(), *refreshed_profiles]
+        for row in refreshed_profiles
         if normalize_wallet(row.get("wallet"))
     }
     follow_activity_by_wallet = load_follow_activity_for_leaderboard(
         args, resolve_data_dir(args), category="esports"
     )
-    # 协调:保留 observer 累积发现的钱包,避免被全量重建丢掉;按打分窗口剪枝防膨胀。
+    # Keep only the small grade-A cache pool in the ranking working set. All
+    # unqualified/negative profiles stay persisted in SQLite and are hydrated
+    # only when their wallet is selected as a seed again.
     prune_cutoff = now_ts - max(1, profile_lookback_days) * 86400
-    for wallet_key, cached in existing_profiles.items():
+    qualified_cached_profiles = load_collector_existing_profiles(
+        output_dir,
+        resolve_data_dir(args),
+        prefix=prefix,
+        grades={"A"},
+    )
+    current_seed_by_wallet = {
+        normalize_wallet(row.get("wallet")): row
+        for row in profile_wallets
+        if normalize_wallet(row.get("wallet"))
+    }
+    for wallet_key, cached in qualified_cached_profiles.items():
         wallet_key = normalize_wallet(wallet_key or cached.get("wallet"))
         if not wallet_key or wallet_key in profiles_by_wallet:
             continue
@@ -5847,6 +5921,11 @@ def _command_collect_wallets(
             to_int(follow_activity_by_wallet.get(wallet_key)),
         )
         if last_trade and last_trade >= prune_cutoff:
+            if wallet_key in reused_profile_wallets and wallet_key in current_seed_by_wallet:
+                cached = merge_collector_cached_profile_with_seed(
+                    cached,
+                    current_seed_by_wallet[wallet_key],
+                )
             profiles_by_wallet[wallet_key] = cached
     mark_stage("wallet_profiles")
 
@@ -5940,7 +6019,10 @@ def _command_collect_wallets(
     # are merged instead of being overwritten by this collector's stale snapshot.
     with acquire_build_lock(resolve_data_dir(args), blocking=True):
         latest_profiles = load_collector_existing_profiles(
-            output_dir, resolve_data_dir(args), prefix=prefix
+            output_dir,
+            resolve_data_dir(args),
+            prefix=prefix,
+            profiled_at_min=now_ts,
         )
         profiles_by_wallet = merge_collector_profiles_published_during_build(
             profiles_by_wallet,
@@ -5962,11 +6044,6 @@ def _command_collect_wallets(
             follow_activity_by_wallet=follow_activity_by_wallet,
         )
         leaderboard = collector_result["leaderboard"]
-        cache_prune = prune_collector_trade_cache_files(
-            output_dir,
-            retained_wallets=set(profiles_by_wallet),
-            active_condition_ids=classification_condition_ids,
-        )
         write_json(
             output_dir / f"{prefix}_wallet_profiles.json",
             [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
@@ -5983,7 +6060,6 @@ def _command_collect_wallets(
                 "v2_per_game_counts": collector_result.get("per_game_counts", {}),
                 "v2_edge_type_counts": collector_result.get("edge_type_counts", {}),
                 "v2_rejected_counts": collector_result.get("rejected_counts", {}),
-                "cache_prune": cache_prune,
             }
         )
         dashboard_publish = publish_collector_dashboard_outputs(
@@ -5995,7 +6071,22 @@ def _command_collect_wallets(
             db_filename="leaderboard.db",
             profiles_publish_name="wallet_profiles_v2.json",
             collector_name=V2_COLLECTOR_NAME,
+            leaderboard_rows=[slim_profile_for_storage(row) for row in leaderboard],
+            profile_rows=[slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
+            replace_profiles=False,
+            prune_profiles_before=prune_cutoff,
+            max_profile_cache_wallets=max_profile_wallets,
         )
+        retained_profile_wallets = set(
+            LeaderboardStore(leaderboard_db_path(resolve_data_dir(args)))
+            .load_wallet_profile_summaries(category="esports")
+        )
+        cache_prune = prune_collector_trade_cache_files(
+            output_dir,
+            retained_wallets=retained_profile_wallets,
+            active_condition_ids=classification_condition_ids,
+        )
+        summary["cache_prune"] = cache_prune
     summary["dashboard_publish"] = dashboard_publish
     write_json(output_dir / f"{prefix}_build_summary.json", summary)
     # 只有完整 collect-v2 成功发布才更新池刷新时钟。observe-live / M5
@@ -6017,18 +6108,33 @@ def publish_collector_dashboard_outputs(
     db_filename: str = "leaderboard.db",
     profiles_publish_name: str = "wallet_profiles.json",
     collector_name: str = COLLECTOR_NAME,
+    leaderboard_rows: list[dict[str, Any]] | None = None,
+    profile_rows: list[dict[str, Any]] | None = None,
+    replace_profiles: bool = True,
+    delete_profile_wallets: set[str] | None = None,
+    prune_profiles_before: int | None = None,
+    max_profile_cache_wallets: int | None = None,
+    write_profile_snapshot: bool = True,
 ) -> dict[str, Any]:
     collector_output_dir = Path(collector_output_dir)
     data_dir = Path(data_dir)
     now_ts = int(now_ts or time.time())
-    leaderboard_value = read_json(collector_output_dir / f"{prefix}_leaderboard.json", [])
-    profiles_value = read_json(collector_output_dir / f"{prefix}_wallet_profiles.json", [])
-    leaderboard = [row for row in leaderboard_value if isinstance(row, dict)] if isinstance(leaderboard_value, list) else []
-    profiles = [row for row in profiles_value if isinstance(row, dict)] if isinstance(profiles_value, list) else []
+    if leaderboard_rows is None:
+        leaderboard_value = read_json(collector_output_dir / f"{prefix}_leaderboard.json", [])
+        leaderboard = [row for row in leaderboard_value if isinstance(row, dict)] if isinstance(leaderboard_value, list) else []
+    else:
+        leaderboard = [row for row in leaderboard_rows if isinstance(row, dict)]
+    if profile_rows is None:
+        profiles_value = read_json(collector_output_dir / f"{prefix}_wallet_profiles.json", [])
+        profiles = [row for row in profiles_value if isinstance(row, dict)] if isinstance(profiles_value, list) else []
+    else:
+        profiles = [row for row in profile_rows if isinstance(row, dict)]
 
     data_dir.mkdir(parents=True, exist_ok=True)
-    # v2 用独立的 profiles 落地名(wallet_profiles_v2.json),不覆盖 v1 dashboard 源。
-    write_json(data_dir / profiles_publish_name, profiles)
+    # Full collection keeps a human-inspectable current-run snapshot. Incremental
+    # observe/M5 writes SQLite directly and must not materialize the full cache.
+    if write_profile_snapshot:
+        write_json(data_dir / profiles_publish_name, profiles)
     publish_summary = {
         "published": True,
         "collector": collector_name,
@@ -6050,12 +6156,31 @@ def publish_collector_dashboard_outputs(
             "dashboard_publish": publish_summary,
         }
     )
-    LeaderboardStore(data_dir / db_filename).publish_collection(
+    persisted_summary = LeaderboardStore(data_dir / db_filename).publish_collection(
         category="esports",
         leaderboard=leaderboard,
         profiles=profiles,
         summary=dashboard_summary,
         updated_at=now_ts,
+        replace_profiles=replace_profiles,
+        delete_profile_wallets=delete_profile_wallets,
+        prune_profiles_before=prune_profiles_before,
+        max_profile_cache_wallets=max_profile_cache_wallets,
+    )
+    publish_summary["profile_cache_wallet_count"] = int(
+        persisted_summary.get("profile_cache_wallet_count") or 0
+    )
+    publish_summary["profile_upsert_count"] = int(
+        persisted_summary.get("profile_upsert_count") or 0
+    )
+    publish_summary["profile_delete_count"] = int(
+        persisted_summary.get("profile_delete_count") or 0
+    )
+    publish_summary["profile_age_prune_count"] = int(
+        persisted_summary.get("profile_age_prune_count") or 0
+    )
+    publish_summary["profile_cap_prune_count"] = int(
+        persisted_summary.get("profile_cap_prune_count") or 0
     )
     return publish_summary
 
@@ -6252,40 +6377,32 @@ def _delete_wallets_from_leaderboard(
     data_dir = resolve_data_dir(args)
     output_dir = resolve_collector_output_dir(args) / "collector_v2"
     with acquire_build_lock(data_dir, blocking=True):
-        profiles_by_wallet = dict(load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2"))
         for wallet in targets:
-            profiles_by_wallet.pop(wallet, None)
             try:
                 user_trades_cache_path(output_dir, wallet).unlink()
             except FileNotFoundError:
                 pass
-        write_json(
-            output_dir / "collector_v2_wallet_profiles.json",
-            [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
-        )
         # **精准删除**:只把被淘汰钱包从当前已发布榜里摘掉,其余行原样保留 —— 不再全量重算整张榜。
         # 全量重算会让一次"弱重评"(某游戏当下样本不足等)顺手把无辜的边界钱包一起抹掉 → 榜单
         # 人数无故跳动;M5 的职责只是摘掉刚结算跌出 A 的那几个,补位(空出名额谁上)是 observe/
         # collect 的活。评分决策(谁该降)仍在调用方用同一套 build_collector_leaderboard_v2 判定,
         # 三线(collect/observe/M5)评分口径不变,这里改的只是"发布"这一步。
-        current_board = read_json(output_dir / "collector_v2_leaderboard.json", [])
-        current_board = [row for row in current_board if isinstance(row, dict)] if isinstance(current_board, list) else []
-        if current_board:
-            leaderboard = [row for row in current_board if normalize_wallet(row.get("wallet")) not in set(targets)]
-            for new_rank, row in enumerate(leaderboard, start=1):
-                row["rank"] = new_rank
-        else:
-            # 退化兜底:榜 JSON 缺失时回退全量重算,避免发布空榜把 DB 榜清空。
-            leaderboard = build_collector_leaderboard_v2(
-                profiles_by_wallet, now_ts=now_ts,
-                per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
-                max_leaderboard_wallets=getattr(args, "max_leaderboard_wallets", V2_MAX_LEADERBOARD_WALLETS),
-                include_technical=bool(getattr(args, "v2_include_technical", V2_INCLUDE_TECHNICAL)),
-                gate_kwargs=_v2_gate_kwargs_from_args(args),
-                follow_activity_by_wallet=load_follow_activity_for_leaderboard(
-                    args, data_dir, category="esports"
-                ),
-            )["leaderboard"]
+        profile_store = LeaderboardStore(leaderboard_db_path(data_dir))
+        current_board, _meta = profile_store.load_leaderboard(category="esports")
+        if not current_board:
+            fallback_board = read_json(output_dir / "collector_v2_leaderboard.json", [])
+            current_board = (
+                [row for row in fallback_board if isinstance(row, dict)]
+                if isinstance(fallback_board, list)
+                else []
+            )
+        leaderboard = [
+            row
+            for row in current_board
+            if normalize_wallet(row.get("wallet")) not in set(targets)
+        ]
+        for new_rank, row in enumerate(leaderboard, start=1):
+            row["rank"] = new_rank
         write_json(
             output_dir / "collector_v2_leaderboard.json",
             [slim_profile_for_storage(row) for row in leaderboard],
@@ -6298,6 +6415,11 @@ def _delete_wallets_from_leaderboard(
                 summary={"collector": V2_COLLECTOR_NAME, "category": "esports", "source": source},
                 now_ts=now_ts, prefix="collector_v2", db_filename="leaderboard.db",
                 profiles_publish_name="wallet_profiles_v2.json", collector_name=V2_COLLECTOR_NAME,
+                leaderboard_rows=[slim_profile_for_storage(row) for row in leaderboard],
+                profile_rows=[],
+                replace_profiles=False,
+                delete_profile_wallets=set(targets),
+                write_profile_snapshot=False,
             )
         finally:
             for category in FOLLOW_SIGNAL_CATEGORIES:
@@ -6497,12 +6619,11 @@ def rescore_demote_wallets(
             ),
         )["leaderboard"]
 
-    # 内存重评现有 profiles；只有真正跌出 grade-A/活跃度/硬排除门才降级。
-    # favorite 是人工置顶覆盖项，不自动淘汰。
-    existing = load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2")
+    # 只重评目标钱包。资格判断关闭展示 quota/cap，因此无需把数千个无关
+    # profiles 装入内存才能判断这些目标是否仍为 grade-A。
     new_board = {
         normalize_wallet(r.get("wallet"))
-        for r in _rebuild_quality_eligible_wallets({**existing, **reprofiled})
+        for r in _rebuild_quality_eligible_wallets(reprofiled)
         if normalize_wallet(r.get("wallet"))
     }
     favorites = {
@@ -6541,6 +6662,24 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
     follow_dir = resolve_shared_follow_dir(args, data_dir)
     positions_per_market = getattr(args, "positions_per_market", 20)
     min_volume = to_float(getattr(args, "min_market_volume", LIVE_SEED_MIN_VOLUME) or 0.0)
+    profile_lookback_days = int(
+        getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
+        or V2_DEFAULT_PROFILE_LOOKBACK_DAYS
+    )
+    profile_cache_limit = resolve_collector_profile_wallet_limit(args)
+    profile_db = leaderboard_db_path(data_dir)
+    profile_db_existed = profile_db.exists()
+    profile_store = LeaderboardStore(profile_db)
+    profile_cache_cleanup: dict[str, Any] = {"skipped": "build_lock_busy"}
+    try:
+        with acquire_build_lock(data_dir, blocking=False):
+            profile_cache_cleanup = profile_store.prune_wallet_profiles(
+                category="esports",
+                prune_profiles_before=now_ts - max(1, profile_lookback_days) * 86400,
+                max_profile_cache_wallets=profile_cache_limit,
+            )
+    except BuildLockUnavailable:
+        pass
 
     # 1) 只读 follow runner 维护的 active 市场缓存(不重复 Gamma 拉取、不写 follow.db);
     #    只留未结算(winning_outcome_index None)且 volume 达门的盘。
@@ -6555,7 +6694,12 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
         and to_float(market.get("volume")) >= min_volume
     ]
     if not live_markets:
-        print(json.dumps({"event": "observe_live_tick", "live_markets": 0, "reason": "no_active_market_over_volume"}))
+        print(json.dumps({
+            "event": "observe_live_tick",
+            "live_markets": 0,
+            "reason": "no_active_market_over_volume",
+            "profile_cache_cleanup": profile_cache_cleanup,
+        }))
         return 0
 
     # 2) 每场双侧持仓者 → 种子(无 winner;当前盈亏只软排序不硬筛)
@@ -6575,19 +6719,61 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
             continue
         seed_positions.extend(collect_live_seed_positions(market, response, positions_per_market=positions_per_market))
     seed_wallets = aggregate_seed_wallets(seed_positions)
+    if not seed_wallets:
+        print(json.dumps({
+            "event": "observe_live_tick",
+            "live_markets": len(live_markets),
+            "seed_wallets": 0,
+            "new_candidates": 0,
+            "position_fetch_errors": position_fetch_error_count,
+            "profile_cache_cleanup": profile_cache_cleanup,
+        }))
+        return 0
 
-    # 3) 钱包级去重:新钱包直接 profile；已因沉寂出榜、但重新出现在活跃盘 holder 中的钱包，
-    #    最多每天重评一次。这样恢复活跃且质量仍强的钱包可以自然回榜，又不会每轮重复深扫。
-    existing = load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2")
+    # 3) 钱包级去重只读 SQLite 的轻量索引；绝不反序列化全量 raw profile。
+    # 新钱包直接 profile；负缓存按 TTL 到期后可重评；沉寂钱包重新出现在活跃盘
+    # holder 中时最多每天重评一次。
+    profile_summaries = profile_store.load_wallet_profile_summaries(
+        category="esports",
+        wallets=set(seed_wallets),
+    )
+    if not profile_db_existed:
+        # One-time legacy/test fallback before the SQLite profile cache exists.
+        legacy_profiles = load_collector_existing_profiles(
+            output_dir,
+            None,
+            prefix="collector_v2",
+            wallets=set(seed_wallets),
+        )
+        profile_summaries = {
+            wallet: {
+                "wallet": wallet,
+                "grade": profile.get("grade"),
+                "profile_state": profile.get("profile_state"),
+                "profiled_at": max(
+                    to_int(profile.get("profiled_at")),
+                    to_int(profile.get("observed_at")),
+                ),
+                "scoring_version": to_int(profile.get("scoring_version")),
+                "last_trade_at": to_int(profile.get("last_esports_trade_at")),
+                "last_esports_trade_at": to_int(profile.get("last_esports_trade_at")),
+                "profile_lookback_days": to_int(profile.get("profile_lookback_days")),
+            }
+            for wallet, profile in legacy_profiles.items()
+        }
     follow_activity_by_wallet = load_follow_activity_for_leaderboard(
         args, data_dir, category="esports"
     )
     # M5 降级冷却:窗口内不重新发现刚被降级删除的钱包(防 demote↔readd ping-pong)。
     cooled = store.load_m5_demote_cooldown_wallets(now_ts=now_ts, cooldown_seconds=M5_DEMOTE_COOLDOWN_SECONDS)
     max_idle_hours = int(getattr(args, "max_leaderboard_idle_hours", V2_MAX_LEADERBOARD_IDLE_HOURS))
+    profile_cache_ttl_seconds = max(
+        0,
+        int(float(getattr(args, "collector_profile_cache_ttl_hours", 24) or 0) * 3600),
+    )
     idle_refresh_due = {
         wallet
-        for wallet, profile in existing.items()
+        for wallet, profile in profile_summaries.items()
         if profile_is_idle_over_limit(
             {
                 **profile,
@@ -6598,10 +6784,35 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
         )
         and now_ts - to_int(profile.get("profiled_at") or profile.get("observed_at")) >= 24 * 3600
     }
+    negative_cache_expired = {
+        wallet
+        for wallet, profile in profile_summaries.items()
+        if str(profile.get("grade") or "").upper() != "A"
+        and (
+            profile_cache_ttl_seconds <= 0
+            or now_ts - to_int(profile.get("profiled_at")) >= profile_cache_ttl_seconds
+        )
+    }
+    schema_refresh_due = {
+        wallet
+        for wallet, profile in profile_summaries.items()
+        if (
+            (
+                to_int(profile.get("scoring_version")) > 0
+                and to_int(profile.get("scoring_version")) != SCORING_VERSION
+            )
+            or (
+                to_int(profile.get("profile_lookback_days")) > 0
+                and to_int(profile.get("profile_lookback_days")) != profile_lookback_days
+            )
+            or str(profile.get("profile_state") or "") == "failed_retryable"
+        )
+    }
+    refresh_due = idle_refresh_due | negative_cache_expired | schema_refresh_due
     new_seed_pool = {
         wallet: sw
         for wallet, sw in seed_wallets.items()
-        if (wallet not in existing or wallet in idle_refresh_due) and wallet not in cooled
+        if (wallet not in profile_summaries or wallet in refresh_due) and wallet not in cooled
     }
     new_seed_wallets = filter_profile_seed_wallets_v2(
         new_seed_pool,
@@ -6612,11 +6823,11 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
     if not new_seed_wallets:
         print(json.dumps({"event": "observe_live_tick", "live_markets": len(live_markets),
                           "seed_wallets": len(seed_wallets), "new_candidates": 0,
-                          "position_fetch_errors": position_fetch_error_count}))
+                          "position_fetch_errors": position_fetch_error_count,
+                          "profile_cache_cleanup": profile_cache_cleanup}))
         return 0
 
     # 4) 评分(与 collect-v2 同口径 scope/profile —— 复用同样的模块级函数,保证 grade 一致)
-    profile_lookback_days = int(getattr(args, "profile_lookback_days", V2_DEFAULT_PROFILE_LOOKBACK_DAYS) or V2_DEFAULT_PROFILE_LOOKBACK_DAYS)
     scope_params = load_scope_params(data_dir, client=client, now=now_dt, refresh=False)
     n_eff_floors = scope_n_eff_floors(scope_params)
     n_eff_subset_floors = scope_n_eff_subset_floors(scope_params)
@@ -6667,19 +6878,22 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
 
     new_profiles = [r for r in run_ordered_io_tasks(new_seed_wallets, profile_one, max_workers=getattr(args, "max_workers", 8)) if not isinstance(r, Exception)]
 
-    # 5) 合并 + 重建 A-only 榜 + 发布;临界区加 build lock(非阻塞)与 collect-v2 串行化。
-    #    锁内重读 existing → 不丢其它 writer 期间新增的 profile(防 lost-update)。
+    # 5) 只把当前 grade-A cache 池 + 本轮更新装入内存重建榜。数千条
+    # unqualified negative cache 留在 SQLite，不参与排名工作集。
     try:
         with acquire_build_lock(data_dir, blocking=False):
-            profiles_by_wallet = dict(load_collector_existing_profiles(output_dir, data_dir, prefix="collector_v2"))
+            profiles_by_wallet = dict(
+                load_collector_existing_profiles(
+                    output_dir,
+                    data_dir,
+                    prefix="collector_v2",
+                    grades={"A"},
+                )
+            )
             for profile in new_profiles:
                 wallet = normalize_wallet(profile.get("wallet"))
                 if wallet:
                     profiles_by_wallet[wallet] = profile
-            write_json(
-                output_dir / "collector_v2_wallet_profiles.json",
-                [slim_profile_for_storage(row) for row in profiles_by_wallet.values()],
-            )
             collector_result = build_collector_leaderboard_v2(
                 profiles_by_wallet, now_ts=now_ts,
                 per_game_quota=getattr(args, "v2_per_game_quota", V2_PER_GAME_QUOTA),
@@ -6700,9 +6914,24 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
             try:
                 publish_collector_dashboard_outputs(
                     output_dir, data_dir,
-                    summary={"collector": V2_COLLECTOR_NAME, "category": "esports", "source": "observe_live"},
+                    summary={
+                        "collector": V2_COLLECTOR_NAME,
+                        "category": "esports",
+                        "source": "observe_live",
+                        "seed_wallet_count": len(seed_wallets),
+                        "profile_wallet_count": len(new_seed_wallets),
+                        "profiled_wallet_count": len(new_profiles),
+                        "profile_index_match_count": len(profile_summaries),
+                        "negative_cache_expired_count": len(negative_cache_expired),
+                    },
                     now_ts=now_ts, prefix="collector_v2", db_filename="leaderboard.db",
                     profiles_publish_name="wallet_profiles_v2.json", collector_name=V2_COLLECTOR_NAME,
+                    leaderboard_rows=[slim_profile_for_storage(row) for row in leaderboard],
+                    profile_rows=[slim_profile_for_storage(row) for row in new_profiles],
+                    replace_profiles=False,
+                    prune_profiles_before=now_ts - max(1, profile_lookback_days) * 86400,
+                    max_profile_cache_wallets=resolve_collector_profile_wallet_limit(args),
+                    write_profile_snapshot=False,
                 )
             finally:
                 for category in FOLLOW_SIGNAL_CATEGORIES:
@@ -6719,6 +6948,7 @@ def _command_observe_live(args: argparse.Namespace, client: PolymarketClient | N
         "seed_wallets": len(seed_wallets), "new_candidates": len(new_seed_wallets),
         "profiled": len(new_profiles), "leaderboard": len(leaderboard), "new_live_on_board": new_on_board,
         "position_fetch_errors": position_fetch_error_count,
+        "profile_cache_cleanup": profile_cache_cleanup,
     }))
     return 0
 

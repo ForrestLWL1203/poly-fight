@@ -2,12 +2,13 @@
 + 钱包级去重 early-exit。评分/发布复用 collect-v2 已在产线验证的模块级函数,不在此重测。"""
 import json
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from poly_fight.cli import _command_observe_live, build_parser, write_json
-from poly_fight.storage import FollowStore
+from poly_fight.storage import FollowStore, LeaderboardStore
 
 
 def _args(data_dir: Path, follow_dir: Path):
@@ -142,6 +143,61 @@ class TestObserveLiveGates(unittest.TestCase):
             self.assertEqual(client.last_sort_by, "TOTAL_PNL")
             self.assertEqual(event["new_candidates"], 0)                  # 去重后无新候选
             self.assertEqual(client.list_events_calls, 0)                 # early-exit:没进评分(无分类集拉取)
+
+    def test_sqlite_profile_index_dedup_does_not_load_raw_profile_pool(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            profiles = [
+                {
+                    "wallet": f"0xcache{i}",
+                    "grade": "B",
+                    "profile_state": "unqualified",
+                    "profiled_at": now_ts,
+                    "last_trade_at": now_ts,
+                    "profile_lookback_days": 15,
+                }
+                for i in range(1500)
+            ]
+            profiles.append({
+                "wallet": "0xseen",
+                "grade": "A",
+                "profile_state": "qualified",
+                "profiled_at": now_ts,
+                "last_trade_at": now_ts,
+                "profile_lookback_days": 15,
+            })
+            LeaderboardStore(data_dir / "leaderboard.db").publish_collection(
+                category="esports",
+                leaderboard=[{"wallet": "0xseen", "grade": "A"}],
+                profiles=profiles,
+                summary={"collector": "wallet_collector_v2"},
+                updated_at=now_ts,
+            )
+            start = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+            markets = {
+                "m_live": {
+                    "condition_id": "m_live",
+                    "outcome_prices": [0.5, 0.5],
+                    "volume": 100000,
+                    "game_family": "lol",
+                    "market_type": "main_match",
+                    "match_start_time": start,
+                },
+            }
+            client = _FakeClient({"m_live": [
+                {"positions": [{"proxyWallet": "0xSEEN", "outcomeIndex": 0,
+                                "avgPrice": 0.5, "totalBought": 1000, "totalPnl": 100}]},
+                {"positions": []},
+            ]})
+            with patch.object(
+                LeaderboardStore,
+                "load_wallet_profiles",
+                side_effect=AssertionError("raw profile pool must not load on dedup early-exit"),
+            ):
+                event = self._run(data_dir, markets, client)
+            self.assertEqual(event["new_candidates"], 0)
+            self.assertEqual(client.list_events_calls, 0)
 
     def test_idle_existing_wallet_is_eligible_for_daily_live_reprofile(self):
         with TemporaryDirectory() as tmp:
