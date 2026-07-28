@@ -1149,6 +1149,12 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
     snapshot = store.load_dashboard_snapshot()
     account_balance = store.load_account_balance_readonly()
     open_signals = [signal for signal in snapshot.get("open_signals", []) if _signal_has_actual_follow(signal)]
+    now_ts = int(time.time())
+    display_open_signals = [
+        signal
+        for signal in open_signals
+        if _follow_display_status(signal, now_ts=now_ts) != "ended"
+    ]
     results = [signal for signal in snapshot.get("results", []) if _signal_has_actual_follow(signal)]
     all_signals = [*open_signals, *results]
     settled = [row for row in results if row.get("status") == "settled"]
@@ -1169,13 +1175,16 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
     wallet_basis_pnl = sum(_signal_wallet_pnl(row) for row in results)
     behavior = _behavior_counts(all_signals)
     tracking_started_at = _tracking_started_at(all_signals)
-    now_ts = int(time.time())
     open_exposure = sum(sum(_leg_actual_stake(leg) for leg in signal.get("legs") or []) for signal in open_signals)
     account_balance_usdc = _to_float(account_balance.get("balance_usdc")) if account_balance.get("configured") else float("nan")
     account_total_equity_usdc = account_balance_usdc + open_exposure if math.isfinite(account_balance_usdc) else None
     overview = {
         "db_ready": bool(snapshot.get("db_ready")),
-        "open_signal_count": len(open_signals),
+        # UI "进行中" semantics exclude overdue matches that are already
+        # displayed as ended. Keep the canonical unsettled count and exposure
+        # separately so pending settlement still reserves its paper balance.
+        "open_signal_count": len(display_open_signals),
+        "unsettled_signal_count": len(open_signals),
         "result_count": len(results),
         "settled_count": len(settled),
         "exited_count": len(exited),
@@ -1206,7 +1215,7 @@ def build_overview(data_dir: Path, *, follow_dir: Path | None = None) -> dict[st
         )
         for category in CATEGORIES
     }
-    overview.update(_overview_full_app_aggregates(open_signals, results))
+    overview.update(_overview_full_app_aggregates(display_open_signals, results))
     # A normal overview read must not create or mutate the credential store.
     ai_config = AiConfigStore.read_existing_status(Path(data_dir))
     ai_requested = bool((ai_config.get("settings") or {}).get("enabled"))

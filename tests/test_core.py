@@ -12185,6 +12185,7 @@ class CoreTest(unittest.TestCase):
             all_rows = build_follows(data_dir, page=1, size=10)["follows"]
             open_rows = build_follows(data_dir, page=1, size=10, status="open")["follows"]
             completed_rows = build_follows(data_dir, page=1, size=10, status="settled")["follows"]
+            overview = build_overview(data_dir)
 
             self.assertEqual([row["condition_id"] for row in all_rows], ["live", "stale"])
             stale = all_rows[1]
@@ -12193,6 +12194,9 @@ class CoreTest(unittest.TestCase):
             self.assertTrue(stale["resolution_pending"])
             self.assertEqual([row["condition_id"] for row in open_rows], ["live"])
             self.assertEqual([row["condition_id"] for row in completed_rows], ["stale"])
+            self.assertEqual(overview["open_signal_count"], 1)
+            self.assertEqual(overview["unsettled_signal_count"], 2)
+            self.assertEqual(overview["open_exposure"], 3)
 
     def test_dashboard_wallet_rows_omit_heavy_internal_payloads(self):
         with TemporaryDirectory() as tmp:
