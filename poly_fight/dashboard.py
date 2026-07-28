@@ -64,6 +64,10 @@ _AI_ASSESSMENT_LIST_FIELDS = (
     "model", "prompt_version", "updated_at",
 )
 _AI_INTENT_LIST_FIELDS = ("condition_id", "action", "status", "updated_at")
+# An unresolved market can remain active in Gamma long after a match was
+# cancelled/postponed. Keep the paper position open until actual resolution,
+# but stop presenting it as a live match after a conservative grace period.
+FOLLOW_ENDED_DISPLAY_GRACE_SECONDS = 24 * 3600
 
 
 @dataclass(frozen=True)
@@ -2183,11 +2187,16 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
         [signal for signal in result.get("signals", []) if _signal_has_actual_follow(signal)]
     )
     groups = _merge_ai_audit_groups(groups, store.load_ai_audit(limit=10_000))
-    # 进行中(未结算)的跟单排最前;组内再按开单时间(最近一次建腿动作)最近的在前。
+    now_ts = int(time.time())
+    for row in groups.values():
+        row["display_status"] = _follow_display_status(row, now_ts=now_ts)
+        row["resolution_pending"] = row["display_status"] == "ended"
+    # 真正进行中的跟单排最前。已过结束时间超过 24h、但 Polymarket 尚未结算的
+    # cancelled/delayed market 归入已完结显示组，避免永久占据顶部。
     rows = sorted(
         groups.values(),
         key=lambda row: (
-            1 if str(row.get("status") or "") in {"open", "insufficient_balance", "ai_blocked"} else 0,
+            1 if str(row.get("display_status") or "") in {"open", "insufficient_balance", "ai_blocked"} else 0,
             int(row.get("last_follow_action_at") or 0),
             int(row.get("last_activity_at") or 0),
             str(row.get("condition_id") or ""),
@@ -2195,11 +2204,19 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
         reverse=True,
     )
     if status_filter == "open":
-        rows = [row for row in rows if str(row.get("status") or "") in {"open", "insufficient_balance"}]
+        rows = [
+            row for row in rows
+            if str(row.get("display_status") or "") in {"open", "insufficient_balance"}
+        ]
     elif status_filter == "ai_blocked":
         rows = [row for row in rows if str(row.get("ai_action") or "") == "blocked"]
+    elif status_filter == "settled":
+        rows = [
+            row for row in rows
+            if str(row.get("display_status") or "") in {"settled", "ended"}
+        ]
     elif status_filter:
-        rows = [row for row in rows if str(row.get("status") or "") == status_filter]
+        rows = [row for row in rows if str(row.get("display_status") or "") == status_filter]
     if category_filter:
         rows = [row for row in rows if _signal_category(row) == category_filter]
     total = len(rows)
@@ -2212,7 +2229,7 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
     open_cids = [
         str(row.get("condition_id") or "")
         for row in rows
-        if str(row.get("status") or "") in {"open", "insufficient_balance"} and row.get("condition_id")
+        if str(row.get("display_status") or "") in {"open", "insufficient_balance"} and row.get("condition_id")
     ]
     live_prices_by_cid = _live_outcome_prices(client, open_cids)
     # 脱榜标记:源钱包已不在当前 leaderboard(被刷新排除)。跟单仍跟至结算,但需清晰标出。
@@ -2248,6 +2265,16 @@ def build_follows(data_dir: Path, *, page: int = 1, size: int = 25, status: str 
         "follows": rows,
         "db_ready": bool(result.get("db_ready")),
     }
+
+
+def _follow_display_status(row: dict[str, Any], *, now_ts: int) -> str:
+    status = str(row.get("status") or "")
+    if status not in {"open", "insufficient_balance"}:
+        return status
+    end_ts = _parse_timestamp(row.get("end_date"))
+    if end_ts and int(now_ts) >= end_ts + FOLLOW_ENDED_DISPLAY_GRACE_SECONDS:
+        return "ended"
+    return status
 
 
 def _attach_follow_unrealized_pnl(row: dict[str, Any], market: dict[str, Any]) -> None:

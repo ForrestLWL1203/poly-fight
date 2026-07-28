@@ -125,6 +125,8 @@ function FollowStatusBadge({ f }) {
   // AI 拦截由下面的 AiDecisionBadge 合并展示，避免同一状态重复两次。
   if (f.status === "ai_blocked") return null;
   if (f.status === "open") return <Badge tone="up" dot>进行中</Badge>;
+  if (f.status === "ended")
+    return <Badge tone="neutral" dot title="比赛已过原定结束时间，等待 Polymarket 最终结算">已完结</Badge>;
   let main;
   if (f.settlementType === "stop_loss")
     main = <Badge tone="down" title="主盘止损:现价较入场跌幅达到策略阈值,按现价全平、不等结算归零">止损</Badge>;
@@ -714,7 +716,9 @@ function FollowsPage({ data, goStrategy, onOpenFollow }) {
 
   if (!data.follows) return <CenterLoad />;
   const all = Adapt.follows(data.follows).rows;
-  const rows = status === "all" ? all : all.filter((f) => f.status === status);
+  const rows = status === "all"
+    ? all
+    : all.filter((f) => status === "settled" ? ["settled", "ended"].includes(f.status) : f.status === status);
   const PAGE = 10;
   const pages = Math.max(1, Math.ceil(rows.length / PAGE));
   const cur = Math.min(pg, pages);
@@ -728,7 +732,7 @@ function FollowsPage({ data, goStrategy, onOpenFollow }) {
             <div className="filter-group">
               <label htmlFor="st-f">状态</label>
               <select id="st-f" className="ps-select" value={status} onChange={(e) => setStatus(e.target.value)}>
-                <option value="all">全部</option><option value="open">进行中</option><option value="settled">已结算</option><option value="ai_blocked">AI拦截</option>
+                <option value="all">全部</option><option value="open">进行中</option><option value="settled">已完结</option><option value="ai_blocked">AI拦截</option>
               </select>
             </div>
             <Button size="sm" variant="ghost" iconLeft={<i data-lucide="sliders-horizontal"></i>} onClick={goStrategy}>调整策略</Button>

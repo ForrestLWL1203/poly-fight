@@ -1581,6 +1581,15 @@ def resolution_market_records_from_markets(markets: list[dict[str, Any]]) -> dic
             "condition_id": condition_id,
             "outcome_prices": prices,
             "closed": bool(market.get("closed")),
+            "active": bool(market.get("active")),
+            "event_start_time": (
+                market.get("eventStartTime")
+                or market.get("event_start_time")
+                or market.get("gameStartTime")
+                or market.get("game_start_time")
+            ),
+            "end_date": market.get("endDate") or market.get("end_date"),
+            "description": str(market.get("description") or ""),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     return records
@@ -2144,6 +2153,11 @@ def fetch_resolutions_for_open_signals(
     # the old 60s-TTL broad pull (which expired every tick anyway).
     direct_markets = client.markets_by_condition_ids(needed, limit=len(needed))
     direct_records = resolution_market_records_from_markets(direct_markets)
+    signal_by_condition = {
+        str(signal.get("condition_id") or "").lower(): signal
+        for signal in eligible_signals
+        if signal.get("condition_id")
+    }
     resolutions: dict[str, int] = {}
     for condition_id in needed:
         market = direct_records.get(condition_id)
@@ -2155,6 +2169,14 @@ def fetch_resolutions_for_open_signals(
         elif is_void_market(market):
             # 作废/退款盘([0.5,0.5],如横扫未打的 map):已结算但无赢家 → 哨兵,让
             # settle_open_signals 按 $0.50 赎回结掉,释放卡死的资金。
+            resolutions[condition_id] = VOID_RESOLUTION_INDEX
+        elif explicit_void_deadline_reached(
+            market,
+            signal=signal_by_condition.get(condition_id),
+            now_ts=now_ts,
+        ):
+            # Some cancelled esports markets remain active with mid prices even
+            # after their own "delayed beyond N days => 50-50" deadline.
             resolutions[condition_id] = VOID_RESOLUTION_INDEX
 
     # 价格隐含结算:比赛已结束但 Polymarket 盘口关闭有延迟时,上面的 closed=true 查询拿不到这些盘
@@ -2179,7 +2201,44 @@ def fetch_resolutions_for_open_signals(
             if winner is not None:
                 resolutions[condition_id] = winner
                 price_settled.add(condition_id)
+            elif explicit_void_deadline_reached(
+                market,
+                signal=signal_by_condition.get(condition_id),
+                now_ts=now_ts,
+            ):
+                resolutions[condition_id] = VOID_RESOLUTION_INDEX
     return resolutions, price_settled
+
+
+_VOID_DELAY_RULE_RE = re.compile(
+    r"delayed\s+(?:by\s+)?(?:beyond|more\s+than)\s+(\d+)\s+days?",
+    re.IGNORECASE,
+)
+
+
+def explicit_void_deadline_reached(
+    market: dict[str, Any],
+    *,
+    signal: dict[str, Any] | None,
+    now_ts: int,
+) -> bool:
+    """Honor an explicit market rule that unresolved delay becomes 50-50."""
+    description = str(market.get("description") or "")
+    match = _VOID_DELAY_RULE_RE.search(description)
+    if not match or "50-50" not in description:
+        return False
+    delay_days = to_int(match.group(1))
+    if delay_days <= 0 or delay_days > 30:
+        return False
+    start_dt = parse_dt(
+        market.get("event_start_time")
+        or market.get("game_start_time")
+        or (signal or {}).get("match_start_time")
+        or (signal or {}).get("market_start_time")
+    )
+    if not start_dt:
+        return False
+    return int(now_ts) >= int(start_dt.timestamp()) + delay_days * SECONDS_PER_DAY
 
 
 def fetch_user_trades_until_cursor(

@@ -178,6 +178,7 @@ from poly_fight.follow import (
     _build_trade_cursor,
     settle_open_signals,
     summarize_wallet_fills,
+    VOID_RESOLUTION_INDEX,
     wallet_behavior_summary,
 )
 from poly_fight.follow_strategy import (
@@ -8217,6 +8218,53 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(resolutions, {})
         self.assertEqual(price_settled, set())
 
+    def test_follow_resolution_honors_explicit_delayed_market_void_deadline(self):
+        start_ts = 1_700_000_000
+        description = (
+            "If the match is delayed beyond 7 days from the scheduled date "
+            "without a winner determined, this market will resolve to 50-50."
+        )
+        market_row = {
+            "conditionId": "m1",
+            "eventStartTime": datetime.fromtimestamp(start_ts, timezone.utc).isoformat(),
+            "outcomePrices": '["0.525", "0.475"]',
+            "closed": False,
+            "active": True,
+            "description": description,
+        }
+
+        class FakeClient:
+            def markets_by_condition_ids(self, condition_ids, *, limit=500):
+                return [market_row]
+
+            def gamma(self, path, **params):
+                return [market_row]
+
+        signal = {
+            "condition_id": "m1",
+            "match_start_time": datetime.fromtimestamp(start_ts, timezone.utc).isoformat(),
+        }
+        before, _ = fetch_resolutions_for_open_signals(
+            FakeClient(),
+            [signal],
+            state={},
+            now_ts=start_ts + 7 * 86400 - 1,
+            gamma_pages=1,
+            ttl_seconds=900,
+        )
+        due, price_settled = fetch_resolutions_for_open_signals(
+            FakeClient(),
+            [signal],
+            state={},
+            now_ts=start_ts + 7 * 86400,
+            gamma_pages=1,
+            ttl_seconds=900,
+        )
+
+        self.assertEqual(before, {})
+        self.assertEqual(due, {"m1": VOID_RESOLUTION_INDEX})
+        self.assertEqual(price_settled, set())
+
     def test_follow_tick_does_not_write_performance_json(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -12103,6 +12151,48 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(settled_page["total"], 1)
             self.assertEqual(settled_page["status"], "settled")
             self.assertEqual(settled_page["follows"][0]["condition_id"], "m1")
+
+    def test_dashboard_follows_marks_long_overdue_open_match_ended_and_deprioritizes_it(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            now_ts = int(time.time())
+            FollowStore(data_dir / "follow" / "follow.db").save_follow_snapshot(
+                wallet_trade_state={},
+                open_signals=[
+                    {
+                        "signal_id": "stale",
+                        "wallet": "0xabc",
+                        "condition_id": "stale",
+                        "status": "open",
+                        "created_at": now_ts,
+                        "end_date": datetime.fromtimestamp(now_ts - 2 * 86400, timezone.utc).isoformat(),
+                        "legs": [{"stake": 2, "our_entry_price": 0.5, "would_follow": True}],
+                    },
+                    {
+                        "signal_id": "live",
+                        "wallet": "0xdef",
+                        "condition_id": "live",
+                        "status": "open",
+                        "created_at": now_ts - 3600,
+                        "end_date": datetime.fromtimestamp(now_ts + 3600, timezone.utc).isoformat(),
+                        "legs": [{"stake": 1, "our_entry_price": 0.5, "would_follow": True}],
+                    },
+                ],
+                result_events=[],
+                performance={},
+            )
+
+            all_rows = build_follows(data_dir, page=1, size=10)["follows"]
+            open_rows = build_follows(data_dir, page=1, size=10, status="open")["follows"]
+            completed_rows = build_follows(data_dir, page=1, size=10, status="settled")["follows"]
+
+            self.assertEqual([row["condition_id"] for row in all_rows], ["live", "stale"])
+            stale = all_rows[1]
+            self.assertEqual(stale["status"], "open")  # canonical settlement state is untouched
+            self.assertEqual(stale["display_status"], "ended")
+            self.assertTrue(stale["resolution_pending"])
+            self.assertEqual([row["condition_id"] for row in open_rows], ["live"])
+            self.assertEqual([row["condition_id"] for row in completed_rows], ["stale"])
 
     def test_dashboard_wallet_rows_omit_heavy_internal_payloads(self):
         with TemporaryDirectory() as tmp:

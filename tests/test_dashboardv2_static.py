@@ -98,6 +98,14 @@ class DashboardV2StaticTests(unittest.TestCase):
         for removed_detail in ("winner", "probability", "AI判定 ·"):
             self.assertNotIn(removed_detail, badge)
 
+    def test_overdue_follow_is_displayed_as_completed_pending_resolution(self):
+        app = _read("app.jsx")
+        adapt = _read("adapt.js")
+        self.assertIn('f.status === "ended"', app)
+        self.assertIn(">已完结</Badge>", app)
+        self.assertIn("row.display_status || row.status", adapt)
+        self.assertIn('status: aiBlockedOpen ? "ai_blocked" : ended ? "ended"', adapt)
+
     def test_ai_risk_layout_does_not_override_game_chip_or_leak_live_accent(self):
         app = _read("app.jsx")
         css = _read("app.css")

@@ -363,9 +363,11 @@
   function follow(row, nowMs) {
     const info = matchInfo(row);
     const pnl = num(row.display_pnl);
-    const open = row.status === "open";
+    const displayStatus = row.display_status || row.status;
+    const open = displayStatus === "open";
+    const ended = displayStatus === "ended";
     const aiBlockedOpen = row.status === "ai_blocked";
-    const settlement = open ? "未结算" : (pnl > 0 ? "盈利" : pnl < 0 ? "亏损" : "未结算");
+    const settlement = (open || ended) ? "未结算" : (pnl > 0 ? "盈利" : pnl < 0 ? "亏损" : "未结算");
     const mtLabel = row.market_type_label || row.market_type || "";
     const marketType = marketTypeTag(mtLabel, row.question || row.market_question);
     return {
@@ -375,10 +377,10 @@
       marketType,
       // 我们买入哪一边(可能两边:对手盘 / 自对冲)。
       sides: (row.sides || []).map((s) => ({ outcome: String(s.outcome || ""), index: num(s.outcome_index), legs: num(s.leg_count) })),
-      status: aiBlockedOpen ? "ai_blocked" : open ? "open" : "settled",
+      status: aiBlockedOpen ? "ai_blocked" : ended ? "ended" : open ? "open" : "settled",
       // 已平仓的细分:manual_exit=目标清仓/对账兜底,我们提前镜像平仓;
       // auto_settlement=等到市场结算;auto_and_manual=多信号混合。用于区分"提前卖出 vs 自动结算"。
-      settlementType: open ? "" : String(row.settlement_type || ""),
+      settlementType: (open || ended) ? "" : String(row.settlement_type || ""),
       // 价格隐含结算:盘口还没正式关闭,我们按实时盘口价≈1.0 提前结算这场。
       settledByPrice: !open && !!row.settled_by_price,
       settlement,
@@ -390,6 +392,7 @@
       pnlKind: row.display_pnl_kind === "unrealized" ? "unrealized" : "realized",
       quality: followQuality(row),
       sourceOffLeaderboard: !!row.source_off_leaderboard,
+      resolutionPending: !!row.resolution_pending,
       aiAction: String(row.ai_action || ""),
       aiRisk: row.ai_risk || null,
       aiIntentCount: num(row.ai_intent_count),
